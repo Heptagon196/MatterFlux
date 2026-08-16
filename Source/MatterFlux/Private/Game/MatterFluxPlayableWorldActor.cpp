@@ -966,6 +966,7 @@ void AMatterFluxPlayableWorldActor::Tick(const float DeltaSeconds)
 		FragmentSourceProxy->FlushPendingChanges();
 	}
 	AdvanceAsyncGeneration();
+	ProcessPendingTerrainChunkPrefetches();
 	AdvanceLogicalSourceCombustion(DeltaSeconds);
 	if (!MaterialSimulation)
 	{
@@ -1355,9 +1356,26 @@ void AMatterFluxPlayableWorldActor::SanitizeGenerationSettings()
 	TerrainStreamingChunkSize =
 		FMath::Clamp(TerrainStreamingChunkSize, 8, 128);
 	TerrainStreamingChunkRadius =
-		FMath::Clamp(TerrainStreamingChunkRadius, 0, 4);
+		FMath::Clamp(TerrainStreamingChunkRadius, 0, 5);
+	const int32 StreamingDiameter =
+		(TerrainStreamingChunkRadius + 1) * 2 + 1;
+	const int32 CameraWindowOverlapSide =
+		FMath::Max(StreamingDiameter - 2, 0);
+	const int32 MinimumTerrainCacheSize = FMath::Min(
+		StreamingDiameter * StreamingDiameter * 2
+			- CameraWindowOverlapSide * CameraWindowOverlapSide,
+		256);
 	TerrainChunkCacheLimit =
-		FMath::Clamp(TerrainChunkCacheLimit, 9, 256);
+		FMath::Clamp(
+			TerrainChunkCacheLimit,
+			FMath::Max(MinimumTerrainCacheSize, 9),
+			256);
+	MaxTerrainChunkPrefetchesPerFrame =
+		FMath::Clamp(MaxTerrainChunkPrefetchesPerFrame, 1, 8);
+	TerrainChunkPrefetchBudgetMilliseconds = FMath::Clamp(
+		TerrainChunkPrefetchBudgetMilliseconds,
+		0.5f,
+		16.0f);
 	FragmentSourceProxyCacheLimit =
 		FMath::Clamp(FragmentSourceProxyCacheLimit, 9, 256);
 	MaxDecorationSpawnsPerFrame =
@@ -5609,6 +5627,10 @@ void AMatterFluxPlayableWorldActor::RefreshVisibleFragmentSources(
 	}
 	MatterFlux::WorldStreaming::FChunkWindowRequest WindowRequest;
 	WindowRequest.FocusChunks = FocusChunks;
+	WindowRequest.WindowOffsets = {
+		FIntPoint::ZeroValue,
+		FIntPoint(2, -2)
+	};
 	WindowRequest.Radius = TerrainStreamingChunkRadius;
 	WindowRequest.MaximumChunkCount = MaxStreamingWindowChunks;
 	TArray<FIntPoint> OrderedDesiredChunks;
@@ -6203,6 +6225,13 @@ void AMatterFluxPlayableWorldActor::RefreshVisibleLevelLayers(
 				: TerrainStreamingChunkRadius;
 		MatterFlux::WorldStreaming::FChunkWindowRequest WindowRequest;
 		WindowRequest.FocusChunks = FocusChunks;
+		if (Radius > 0)
+		{
+			WindowRequest.WindowOffsets = {
+				FIntPoint::ZeroValue,
+				FIntPoint(2, -2)
+			};
+		}
 		WindowRequest.Radius = Radius;
 		WindowRequest.MaximumChunkCount = MaxStreamingWindowChunks;
 		TArray<FIntPoint> OrderedLayerChunks;
@@ -6255,7 +6284,7 @@ bool AMatterFluxPlayableWorldActor::RefreshVisibleTerrainChunks(
 	WindowRequest.FocusChunks = FocusChunks;
 	WindowRequest.WindowOffsets = {
 		FIntPoint::ZeroValue,
-		FIntPoint(1, -1)
+		FIntPoint(2, -2)
 	};
 	WindowRequest.Radius = TerrainStreamingChunkRadius;
 	WindowRequest.MaximumChunkCount = MaxStreamingWindowChunks;
@@ -6273,7 +6302,9 @@ bool AMatterFluxPlayableWorldActor::RefreshVisibleTerrainChunks(
 			*WindowError);
 		return false;
 	}
-	// The fixed isometric camera sees one chunk farther toward +X/-Y. The
+	// The fixed isometric camera sees two chunks farther toward +X/-Y at
+	// maximum zoom. The expanded radius keeps the visible frustum inside an
+	// already-resident ring instead of exposing chunk creation at its edge. The
 	// planner unions that render window with every player collision window and
 	// returns a stable order for component creation.
 	TSet<FIntPoint> DesiredChunks;
@@ -6282,12 +6313,12 @@ bool AMatterFluxPlayableWorldActor::RefreshVisibleTerrainChunks(
 	{
 		DesiredChunks.Add(Chunk);
 	}
+	DesiredTerrainChunks = DesiredChunks;
 
-	// The current playable map fits exactly inside the configured terrain
-	// cache. Build it while Regenerate is still part of loading so ordinary
-	// player movement never has to synchronously cook procedural collision at
-	// a chunk boundary. Larger future maps continue to stream on demand.
-	if (bForce)
+	// Legacy finite heightfields may fit entirely inside the hot cache. Seeded
+	// infinite terrain deliberately skips that path and keeps only the bounded
+	// streaming window plus LRU history resident.
+	if (bForce && !TerrainHeightField.bInfinite)
 	{
 		bTerrainCacheCoversWholeMap = false;
 		const FIntPoint FirstWorldCell(
@@ -6378,7 +6409,11 @@ bool AMatterFluxPlayableWorldActor::RefreshVisibleTerrainChunks(
 
 	for (const FIntPoint Coordinate : OrderedDesiredChunks)
 	{
-		if (!GeneratedTerrainChunks.Contains(Coordinate))
+		// A forced rebuild fills the whole visible window. During ordinary
+		// streaming, only a genuinely missing player-floor chunk is critical;
+		// the camera ring is safe to complete through the bounded prefetch queue.
+		if ((bForce || FocusChunks.Contains(Coordinate))
+			&& !GeneratedTerrainChunks.Contains(Coordinate))
 		{
 			if (CreateTerrainChunkComponent(Coordinate))
 			{
@@ -6409,6 +6444,52 @@ bool AMatterFluxPlayableWorldActor::RefreshVisibleTerrainChunks(
 		GeneratedTerrainChunks.Remove(EvictionCandidate);
 		TerrainChunkLastUsed.Remove(EvictionCandidate);
 	}
+
+	// The next ring is generated incrementally on subsequent frames. Missing
+	// active cells are queued first; under normal walking they were already in
+	// the previous ring. A large teleport receives its immediate floor above,
+	// while the remaining camera window finishes through the loading flow.
+	MatterFlux::WorldStreaming::FChunkWindowRequest PrefetchRequest;
+	PrefetchRequest.FocusChunks = FocusChunks;
+	PrefetchRequest.WindowOffsets = WindowRequest.WindowOffsets;
+	PrefetchRequest.Radius = TerrainStreamingChunkRadius + 1;
+	PrefetchRequest.MaximumChunkCount = MaxStreamingWindowChunks;
+	TArray<FIntPoint> OrderedPrefetchChunks;
+	FString PrefetchError;
+	if (!MatterFlux::WorldStreaming::BuildChunkWindow(
+		PrefetchRequest,
+		OrderedPrefetchChunks,
+		PrefetchError))
+	{
+		UE_LOG(
+			LogMatterFlux,
+			Error,
+			TEXT("Cannot plan terrain prefetch window: %s"),
+			*PrefetchError);
+		return false;
+	}
+	PendingTerrainChunkPrefetches.Reset();
+	PendingTerrainChunkPrefetches.Reserve(OrderedPrefetchChunks.Num());
+	TSet<FIntPoint> QueuedChunks;
+	QueuedChunks.Reserve(OrderedPrefetchChunks.Num());
+	const auto QueueMissingChunk = [this, &QueuedChunks](
+		const FIntPoint Coordinate)
+		{
+			if (!GeneratedTerrainChunks.Contains(Coordinate)
+				&& !QueuedChunks.Contains(Coordinate))
+			{
+				QueuedChunks.Add(Coordinate);
+				PendingTerrainChunkPrefetches.Add(Coordinate);
+			}
+		};
+	for (const FIntPoint Coordinate : OrderedDesiredChunks)
+	{
+		QueueMissingChunk(Coordinate);
+	}
+	for (const FIntPoint Coordinate : OrderedPrefetchChunks)
+	{
+		QueueMissingChunk(Coordinate);
+	}
 	bool bActiveChunkSetChanged =
 		PreviouslyActiveChunks.Num() != ActiveTerrainChunks.Num();
 	if (!bActiveChunkSetChanged)
@@ -6429,6 +6510,88 @@ bool AMatterFluxPlayableWorldActor::RefreshVisibleTerrainChunks(
 		PendingGroundCombustionVisualCellIndices.Reset();
 	}
 	return true;
+}
+
+void AMatterFluxPlayableWorldActor::ProcessPendingTerrainChunkPrefetches()
+{
+	if (PendingTerrainChunkPrefetches.IsEmpty()
+		|| !TerrainHeightField.IsValid())
+	{
+		return;
+	}
+
+	const double StartSeconds = FPlatformTime::Seconds();
+	int32 CreatedChunkCount = 0;
+	while (!PendingTerrainChunkPrefetches.IsEmpty()
+		&& CreatedChunkCount < MaxTerrainChunkPrefetchesPerFrame)
+	{
+		if (CreatedChunkCount > 0
+			&& (FPlatformTime::Seconds() - StartSeconds) * 1000.0
+				>= TerrainChunkPrefetchBudgetMilliseconds)
+		{
+			break;
+		}
+
+		const FIntPoint Coordinate = PendingTerrainChunkPrefetches[0];
+		PendingTerrainChunkPrefetches.RemoveAt(
+			0,
+			1,
+			EAllowShrinking::No);
+		if (GeneratedTerrainChunks.Contains(Coordinate))
+		{
+			continue;
+		}
+
+		UProceduralMeshComponent* Component =
+			CreateTerrainChunkComponent(Coordinate);
+		if (!Component)
+		{
+			continue;
+		}
+		++CreatedChunkCount;
+		const bool bShouldBeActive =
+			DesiredTerrainChunks.Contains(Coordinate);
+		Component->SetVisibility(
+			bShouldBeActive && GetNetMode() != NM_DedicatedServer,
+			true);
+		Component->SetHiddenInGame(
+			!bShouldBeActive || GetNetMode() == NM_DedicatedServer,
+			true);
+		Component->SetCollisionEnabled(
+			bShouldBeActive
+				? ECollisionEnabled::QueryAndPhysics
+				: ECollisionEnabled::NoCollision);
+		TerrainChunkLastUsed.Add(Coordinate, ++TerrainChunkUseCounter);
+		if (bShouldBeActive)
+		{
+			ActiveTerrainChunks.Add(Coordinate);
+			bGroundCombustionVisualDirty = true;
+			bGroundCombustionVisualNeedsFullRebuild = true;
+			PendingGroundCombustionVisualCellIndices.Reset();
+		}
+	}
+
+	while (GeneratedTerrainChunks.Num() > TerrainChunkCacheLimit)
+	{
+		TArray<FIntPoint> ResidentChunks;
+		GeneratedTerrainChunks.GenerateKeyArray(ResidentChunks);
+		FIntPoint EvictionCandidate;
+		if (!MatterFlux::WorldStreaming::SelectEvictionCandidate(
+			ResidentChunks,
+			ActiveTerrainChunks,
+			TerrainChunkLastUsed,
+			EvictionCandidate))
+		{
+			break;
+		}
+		if (UProceduralMeshComponent* Component =
+			GeneratedTerrainChunks.FindRef(EvictionCandidate))
+		{
+			RetireTerrainChunkComponent(Component);
+		}
+		GeneratedTerrainChunks.Remove(EvictionCandidate);
+		TerrainChunkLastUsed.Remove(EvictionCandidate);
+	}
 }
 
 UProceduralMeshComponent*
@@ -6463,6 +6626,12 @@ AMatterFluxPlayableWorldActor::CreateTerrainChunkComponent(
 	// Static mobility keeps character moves in world space and avoids both the
 	// unresolved-base corrections and the per-frame network warning storm.
 	Component->SetMobility(EComponentMobility::Static);
+	// Chunk geometry is generated on the game thread, but Chaos triangle-mesh
+	// cooking is substantially more expensive than filling the render buffers.
+	// The active window already extends well beyond the camera, so asynchronous
+	// cooking finishes while a prefetched chunk is still far from the player
+	// instead of stalling the exact frame in which a chunk boundary is crossed.
+	Component->bUseAsyncCooking = true;
 	// Character based-movement replication may still include the component
 	// pointer while transitioning on or off the floor. Deterministic names plus
 	// this flag make those occasional references resolvable without replicating
@@ -6540,7 +6709,9 @@ void AMatterFluxPlayableWorldActor::DestroyTerrainChunkMeshes()
 		}
 	}
 	GeneratedTerrainChunks.Reset();
+	DesiredTerrainChunks.Reset();
 	ActiveTerrainChunks.Reset();
+	PendingTerrainChunkPrefetches.Reset();
 	TerrainChunkLastUsed.Reset();
 	TerrainChunkUseCounter = 0;
 	bTerrainCacheCoversWholeMap = false;

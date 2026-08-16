@@ -51,6 +51,8 @@ namespace MatterFlux::PlayableLevel
 
 	struct MATTERFLUX_API FLevelTerrain
 	{
+		int32 Seed = 0;
+		bool bInfinite = false;
 		int32 Width = 0;
 		int32 Height = 0;
 		float CellSize = 0.0f;
@@ -67,6 +69,7 @@ namespace MatterFlux::PlayableLevel
 				* static_cast<int64>(Height);
 			return Width > 0
 				&& Height > 0
+				&& (!bInfinite || Seed != 0)
 				&& CellCount > 0
 				&& CellCount <= MAX_int32
 				&& FMath::IsFinite(CellSize)
@@ -88,6 +91,17 @@ namespace MatterFlux::PlayableLevel
 		{
 			return Heights[ToIndex(X, Y)];
 		}
+
+		/**
+		 * Samples the deterministic terrain lattice by global cell coordinate.
+		 * Finite cached cells are returned verbatim; infinite terrain evaluates
+		 * the same seeded noise function outside that cache.
+		 */
+		bool TrySampleWorldCell(
+			int64 WorldCellX,
+			int64 WorldCellY,
+			float& OutHeight,
+			uint8& OutColorBand) const;
 	};
 
 	struct MATTERFLUX_API FLevelLayout

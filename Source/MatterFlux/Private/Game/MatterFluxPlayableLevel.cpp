@@ -1,4 +1,5 @@
 #include "Game/MatterFluxPlayableLevel.h"
+#include "MatterFluxLog.h"
 
 namespace MatterFlux::PlayableLevel
 {
@@ -10,6 +11,50 @@ namespace MatterFlux::PlayableLevel
 			-(static_cast<float>(TerrainCellsY) - 1.0f) * TerrainCellSize * 0.5f;
 		constexpr float DecorationFacingYaw = 45.0f;
 		constexpr float GroundAttachmentEmbedFraction = 0.5f;
+
+		FVector2D MakeTerrainNoiseOffset(const int32 Seed)
+		{
+			const uint32 SeedBits = static_cast<uint32>(Seed);
+			return FVector2D(
+				static_cast<float>(SeedBits & 0xffffu) / 1024.0f,
+				static_cast<float>((SeedBits >> 16u) & 0xffffu) / 1024.0f);
+		}
+
+		float SampleFractalPerlin(
+			const double X,
+			const double Y,
+			const FVector2D& SeedOffset)
+		{
+			const float BroadShape = FMath::PerlinNoise2D(FVector2D(
+				X * 0.00048 + SeedOffset.X,
+				Y * 0.00048 + SeedOffset.Y));
+			const float Detail = FMath::PerlinNoise2D(FVector2D(
+				X * 0.0017 + SeedOffset.X * 1.73,
+				Y * 0.0017 + SeedOffset.Y * 1.41));
+			return BroadShape * 0.74f + Detail * 0.26f;
+		}
+
+		float SampleTerrainHeight(
+			const double WorldX,
+			const double WorldY,
+			const FVector2D& SeedOffset)
+		{
+			float Height = FMath::GridSnap(
+				130.0f
+					+ SampleFractalPerlin(WorldX, WorldY, SeedOffset)
+						* 120.0f,
+				TerrainCellSize);
+			return FMath::Clamp(Height, 50.0f, 245.0f);
+		}
+
+		uint8 SelectTerrainColorBand(const float Height)
+		{
+			if (Height >= 168.0f)
+			{
+				return 2;
+			}
+			return Height >= 112.0f ? 1 : 0;
+		}
 
 		FVector EmbedGroundAttachment(
 			const FVector& SurfaceLocation,
@@ -35,10 +80,7 @@ namespace MatterFlux::PlayableLevel
 				: Seed(InSeed)
 				, Content(InContent)
 			{
-				const uint32 SeedBits = static_cast<uint32>(Seed);
-				NoiseOffset = FVector2D(
-					static_cast<float>(SeedBits & 0xffffu) / 1024.0f,
-					static_cast<float>((SeedBits >> 16u) & 0xffffu) / 1024.0f);
+				NoiseOffset = MakeTerrainNoiseOffset(Seed);
 			}
 
 			FRandomStream MakeRuleStream(const uint32 RuleSalt) const
@@ -240,20 +282,6 @@ namespace MatterFlux::PlayableLevel
 			Source.Mask = MoveTemp(Mask);
 		}
 
-		float SampleFractalPerlin(
-			const float X,
-			const float Y,
-			const FVector2D& SeedOffset)
-		{
-			const float BroadShape = FMath::PerlinNoise2D(FVector2D(
-				X * 0.00048f + SeedOffset.X,
-				Y * 0.00048f + SeedOffset.Y));
-			const float Detail = FMath::PerlinNoise2D(FVector2D(
-				X * 0.0017f + SeedOffset.X * 1.73f,
-				Y * 0.0017f + SeedOffset.Y * 1.41f));
-			return BroadShape * 0.74f + Detail * 0.26f;
-		}
-
 		void GenerateTerrain(FGenerationContext& Context, FLevelLayout& Layout)
 		{
 			const float MapSizeX = static_cast<float>(TerrainCellsX) * TerrainCellSize;
@@ -262,6 +290,8 @@ namespace MatterFlux::PlayableLevel
 				Context,
 				TEXT("grassland"),
 				FLinearColor(0.018f, 0.18f, 0.035f));
+			Layout.Terrain.Seed = Context.Seed;
+			Layout.Terrain.bInfinite = true;
 			Layout.Terrain.Width = TerrainCellsX;
 			Layout.Terrain.Height = TerrainCellsY;
 			Layout.Terrain.CellSize = TerrainCellSize;
@@ -310,11 +340,10 @@ namespace MatterFlux::PlayableLevel
 				{
 					const float WorldX = TerrainOriginX + static_cast<float>(X) * TerrainCellSize;
 					const float WorldY = TerrainOriginY + static_cast<float>(Y) * TerrainCellSize;
-					float Height = FMath::GridSnap(
-						130.0f + SampleFractalPerlin(WorldX, WorldY, Context.NoiseOffset) * 120.0f,
-						TerrainCellSize);
-					Height = FMath::Clamp(Height, 50.0f, 245.0f);
-
+					const float Height = SampleTerrainHeight(
+						WorldX,
+						WorldY,
+						Context.NoiseOffset);
 					Context.SurfaceHeights.Add(Height);
 				}
 			}
@@ -334,32 +363,10 @@ namespace MatterFlux::PlayableLevel
 				MidlandColor,
 				HighlandColor
 			};
-			TArray<int32> HeightOrder;
-			HeightOrder.Reserve(Context.SurfaceHeights.Num());
 			for (int32 Index = 0; Index < Context.SurfaceHeights.Num(); ++Index)
 			{
-				HeightOrder.Add(Index);
-			}
-			HeightOrder.Sort(
-				[&Context](const int32 Left, const int32 Right)
-				{
-					const float LeftHeight = Context.SurfaceHeights[Left];
-					const float RightHeight = Context.SurfaceHeights[Right];
-					return LeftHeight == RightHeight ? Left < Right : LeftHeight < RightHeight;
-				});
-			for (int32 Rank = 0; Rank < HeightOrder.Num(); ++Rank)
-			{
-				const int32 CellIndex = HeightOrder[Rank];
-				uint8 HeightBand = 0;
-				if (Rank >= HeightOrder.Num() * 2 / 3)
-				{
-					HeightBand = 2;
-				}
-				else if (Rank >= HeightOrder.Num() / 3)
-				{
-					HeightBand = 1;
-				}
-				Layout.Terrain.ColorBands[CellIndex] = HeightBand;
+				Layout.Terrain.ColorBands[Index] =
+					SelectTerrainColorBand(Context.SurfaceHeights[Index]);
 			}
 
 			Context.StreamColumns.Reserve(TerrainCellsY);
@@ -927,6 +934,64 @@ namespace MatterFlux::PlayableLevel
 			&GenerateTrees,
 			&GenerateGroundCover
 		};
+	}
+
+	bool FLevelTerrain::TrySampleWorldCell(
+		const int64 WorldCellX,
+		const int64 WorldCellY,
+		float& OutHeight,
+		uint8& OutColorBand) const
+	{
+		if (!IsValid())
+		{
+			return false;
+		}
+		const double FirstCellX = FirstCellCenter.X / CellSize;
+		const double FirstCellY = FirstCellCenter.Y / CellSize;
+		if (!FMath::IsFinite(FirstCellX)
+			|| !FMath::IsFinite(FirstCellY)
+			|| FirstCellX < static_cast<double>(MIN_int32)
+			|| FirstCellX > static_cast<double>(MAX_int32)
+			|| FirstCellY < static_cast<double>(MIN_int32)
+			|| FirstCellY > static_cast<double>(MAX_int32))
+		{
+			return false;
+		}
+		const int64 FirstWorldCellX = FMath::FloorToInt64(FirstCellX);
+		const int64 FirstWorldCellY = FMath::FloorToInt64(FirstCellY);
+		const int64 LocalX = WorldCellX - FirstWorldCellX;
+		const int64 LocalY = WorldCellY - FirstWorldCellY;
+		if (LocalX >= 0 && LocalX < Width
+			&& LocalY >= 0 && LocalY < Height)
+		{
+			const int32 Index = ToIndex(
+				static_cast<int32>(LocalX),
+				static_cast<int32>(LocalY));
+			OutHeight = Heights[Index];
+			OutColorBand = ColorBands[Index];
+			return true;
+		}
+		if (!bInfinite || Seed == 0)
+		{
+			return false;
+		}
+
+		const double WorldX = FirstCellCenter.X
+			+ static_cast<double>(WorldCellX - FirstWorldCellX)
+				* CellSize;
+		const double WorldY = FirstCellCenter.Y
+			+ static_cast<double>(WorldCellY - FirstWorldCellY)
+				* CellSize;
+		if (!FMath::IsFinite(WorldX) || !FMath::IsFinite(WorldY))
+		{
+			return false;
+		}
+		OutHeight = SampleTerrainHeight(
+			WorldX,
+			WorldY,
+			MakeTerrainNoiseOffset(Seed));
+		OutColorBand = SelectTerrainColorBand(OutHeight);
+		return true;
 	}
 
 	const FLevelLayer* FLevelLayout::FindLayer(const FName LayerName) const

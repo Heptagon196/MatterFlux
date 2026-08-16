@@ -92,22 +92,22 @@ bool FMatterFluxStreamingWindowCameraUnionTest::RunTest(
 	Request.FocusChunks = { FIntPoint::ZeroValue };
 	Request.WindowOffsets = {
 		FIntPoint::ZeroValue,
-		FIntPoint(1, -1)
+		FIntPoint(2, -2)
 	};
-	Request.Radius = 1;
-	Request.MaximumChunkCount = 14;
+	Request.Radius = 4;
+	Request.MaximumChunkCount = 113;
 
 	TArray<FIntPoint> Chunks;
 	FString Error;
 	TestTrue(
-		TEXT("Isometric camera union builds at its exact budget"),
+		TEXT("Expanded isometric camera union builds at its exact budget"),
 		MatterFlux::WorldStreaming::BuildChunkWindow(
 			Request,
 			Chunks,
 			Error));
-	TestEqual(TEXT("Two overlapping 3x3 windows contain 14 chunks"), Chunks.Num(), 14);
-	TestTrue(TEXT("Player corner remains resident"), Chunks.Contains(FIntPoint(-1, 1)));
-	TestTrue(TEXT("Camera corner remains resident"), Chunks.Contains(FIntPoint(2, -2)));
+	TestEqual(TEXT("Two offset 9x9 windows contain 113 chunks"), Chunks.Num(), 113);
+	TestTrue(TEXT("Player corner remains resident"), Chunks.Contains(FIntPoint(-4, 4)));
+	TestTrue(TEXT("Camera-ahead corner remains resident"), Chunks.Contains(FIntPoint(6, -6)));
 	TestTrue(TEXT("Camera union is strictly sorted"), IsLexicographicallySorted(Chunks));
 	return true;
 }

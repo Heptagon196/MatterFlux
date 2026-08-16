@@ -605,7 +605,7 @@ bool FMatterFluxLargeWorldStreamingPerformanceTest::RunTest(
 			> WorldActor->GetResidentMaterialChunkCount());
 	TestTrue(
 		TEXT("Visible terrain triangles are bounded by streamed chunks"),
-		WorldActor->GetVisibleTerrainTriangleCount() < 200000);
+		WorldActor->GetVisibleTerrainTriangleCount() < 3000000);
 	TestTrue(
 		TEXT("Most decoration masks stay cached outside the loaded window"),
 		WorldActor->GetCachedFragmentSourceCount()
@@ -828,10 +828,11 @@ bool FMatterFluxLargeWorldStreamingPerformanceTest::RunTest(
 				<= ExpectedActiveDiameter * ExpectedActiveDiameter);
 		TestTrue(
 			TEXT("Movement does not load the full terrain render grid"),
-			WorldActor->GetVisibleTerrainTriangleCount() < 200000);
+			WorldActor->GetVisibleTerrainTriangleCount() < 3000000);
 		TestTrue(
 			TEXT("Terrain mesh hot cache stays within its configured cap"),
-			WorldActor->GetCachedTerrainChunkCount() <= 48);
+			WorldActor->GetCachedTerrainChunkCount()
+				<= WorldActor->GetTerrainChunkCacheLimit());
 		TestTrue(
 			*FString::Printf(
 				TEXT("%s traversal does not accumulate streamed Source actors"),

@@ -218,6 +218,18 @@ public:
 	int32 GetVisibleTerrainTriangleCount() const;
 
 	UFUNCTION(BlueprintPure, Category = "Playable World|Streaming")
+	int32 GetTerrainStreamingChunkRadius() const
+	{
+		return TerrainStreamingChunkRadius;
+	}
+
+	UFUNCTION(BlueprintPure, Category = "Playable World|Streaming")
+	int32 GetTerrainChunkCacheLimit() const
+	{
+		return TerrainChunkCacheLimit;
+	}
+
+	UFUNCTION(BlueprintPure, Category = "Playable World|Streaming")
 	int32 GetMaterialActiveChunkDiameter() const
 	{
 		return MaterialSimulationActiveChunkRadius * 2 + 1;
@@ -291,11 +303,17 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "Playable World|Streaming", meta = (ClampMin = "8", ClampMax = "128"))
 	int32 TerrainStreamingChunkSize = 64;
 
-	UPROPERTY(EditAnywhere, Category = "Playable World|Streaming", meta = (ClampMin = "0", ClampMax = "4"))
-	int32 TerrainStreamingChunkRadius = 1;
+	UPROPERTY(EditAnywhere, Category = "Playable World|Streaming", meta = (ClampMin = "0", ClampMax = "5"))
+	int32 TerrainStreamingChunkRadius = 4;
 
 	UPROPERTY(EditAnywhere, Category = "Playable World|Streaming", meta = (ClampMin = "9", ClampMax = "256"))
-	int32 TerrainChunkCacheLimit = 48;
+	int32 TerrainChunkCacheLimit = 192;
+
+	UPROPERTY(EditAnywhere, Category = "Playable World|Streaming", meta = (ClampMin = "1", ClampMax = "8"))
+	int32 MaxTerrainChunkPrefetchesPerFrame = 2;
+
+	UPROPERTY(EditAnywhere, Category = "Playable World|Streaming", meta = (ClampMin = "0.5", ClampMax = "16.0"))
+	float TerrainChunkPrefetchBudgetMilliseconds = 8.0f;
 
 	UPROPERTY(EditAnywhere, Category = "Playable World|Streaming", meta = (ClampMin = "9", ClampMax = "256"))
 	int32 FragmentSourceProxyCacheLimit = 128;
@@ -419,6 +437,7 @@ private:
 	bool RefreshVisibleTerrainChunks(
 		bool bForce,
 		const TArray<FIntPoint>& FocusChunks);
+	void ProcessPendingTerrainChunkPrefetches();
 	UProceduralMeshComponent* CreateTerrainChunkComponent(
 		FIntPoint ChunkCoordinate);
 	void DestroyTerrainChunkMeshes();
@@ -441,7 +460,9 @@ private:
 	UPROPERTY(Transient)
 	TMap<FIntPoint, TObjectPtr<UProceduralMeshComponent>>
 		GeneratedTerrainChunks;
+	TSet<FIntPoint> DesiredTerrainChunks;
 	TSet<FIntPoint> ActiveTerrainChunks;
+	TArray<FIntPoint> PendingTerrainChunkPrefetches;
 	TMap<FIntPoint, uint64> TerrainChunkLastUsed;
 	uint64 TerrainChunkUseCounter = 0;
 	bool bTerrainCacheCoversWholeMap = false;

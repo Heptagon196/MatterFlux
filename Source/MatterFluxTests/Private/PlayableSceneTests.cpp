@@ -213,8 +213,8 @@ bool FMatterFluxFineTerrainChunkMeshTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("Chunk keeps three material bands"), Chunk.Sections.Num(), 3);
 	TestEqual(TEXT("Interior chunk covers 32 by 32 pixels"),
 		Chunk.CellBounds.Area(), 32 * 32);
-	TestTrue(TEXT("Merged mesh contains at least two top triangles per pixel"),
-		Chunk.GetTriangleCount() >= Chunk.CellBounds.Area() * 2);
+	double TopSurfaceArea = 0.0;
+	int32 TopTriangleCount = 0;
 	for (const MatterFlux::TerrainMesh::FSection& Section : Chunk.Sections)
 	{
 		if (!Section.Vertices.IsEmpty())
@@ -233,6 +233,13 @@ bool FMatterFluxFineTerrainChunkMeshTest::RunTest(const FString& Parameters)
 				const FVector WindingNormal = FVector::CrossProduct(
 					Section.Vertices[B] - Section.Vertices[A],
 					Section.Vertices[C] - Section.Vertices[A]).GetSafeNormal();
+				if (Section.Normals[A].Z > 0.99)
+				{
+					++TopTriangleCount;
+					TopSurfaceArea += FMath::Abs(FVector::CrossProduct(
+						Section.Vertices[B] - Section.Vertices[A],
+						Section.Vertices[C] - Section.Vertices[A]).Z) * 0.5;
+				}
 				TestTrue(
 					TEXT("Triangle winding faces the supplied Unreal mesh normal"),
 					FVector::DotProduct(WindingNormal, Section.Normals[A])
@@ -240,6 +247,12 @@ bool FMatterFluxFineTerrainChunkMeshTest::RunTest(const FString& Parameters)
 			}
 		}
 	}
+	TestEqual(TEXT("Merged top rectangles preserve the exact cell footprint"),
+		TopSurfaceArea,
+		static_cast<double>(Chunk.CellBounds.Area())
+			* Terrain.CellSize * Terrain.CellSize);
+	TestTrue(TEXT("Coplanar top pixels are greedily merged"),
+		TopTriangleCount < Chunk.CellBounds.Area() * 2);
 	MatterFlux::TerrainMesh::FChunk InvalidChunk;
 	TestFalse(
 		TEXT("Extreme chunk coordinates are rejected without integer overflow"),
@@ -276,6 +289,105 @@ bool FMatterFluxFineTerrainChunkMeshTest::RunTest(const FString& Parameters)
 	TestFalse(
 		TEXT("Non-finite terrain geometry leaves no valid chunk"),
 		InvalidChunk.IsValid());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxInfiniteSeededTerrainTest,
+	"MatterFlux.Playable.SeededTerrainExtendsAcrossFarChunks",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxInfiniteSeededTerrainTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::PlayableLevel::FLevelLayout FirstLayout;
+	MatterFlux::PlayableLevel::FLevelLayout SameSeedLayout;
+	MatterFlux::PlayableLevel::FLevelLayout DifferentSeedLayout;
+	if (!TestTrue(TEXT("First seeded terrain builds"),
+		MatterFlux::PlayableLevel::BuildLevelLayout(24681357, FirstLayout))
+		|| !TestTrue(TEXT("Same seeded terrain builds"),
+			MatterFlux::PlayableLevel::BuildLevelLayout(24681357, SameSeedLayout))
+		|| !TestTrue(TEXT("Different seeded terrain builds"),
+			MatterFlux::PlayableLevel::BuildLevelLayout(975318642, DifferentSeedLayout)))
+	{
+		return false;
+	}
+	TestTrue(TEXT("Playable terrain declares an infinite procedural domain"),
+		FirstLayout.Terrain.bInfinite);
+
+	const FIntPoint FarCells[] = {
+		FIntPoint(640000, -544000),
+		FIntPoint(-720000, 608000),
+		FIntPoint(1048576, 1048576)
+	};
+	bool bDifferentSeedChangedAnyHeight = false;
+	for (const FIntPoint Cell : FarCells)
+	{
+		float FirstHeight = 0.0f;
+		float SameHeight = 0.0f;
+		float DifferentHeight = 0.0f;
+		uint8 FirstBand = MAX_uint8;
+		uint8 SameBand = MAX_uint8;
+		uint8 DifferentBand = MAX_uint8;
+		TestTrue(TEXT("Far positive or negative world cell samples"),
+			FirstLayout.Terrain.TrySampleWorldCell(
+				Cell.X, Cell.Y, FirstHeight, FirstBand));
+		TestTrue(TEXT("Same-seed far world cell samples"),
+			SameSeedLayout.Terrain.TrySampleWorldCell(
+				Cell.X, Cell.Y, SameHeight, SameBand));
+		TestTrue(TEXT("Different-seed far world cell samples"),
+			DifferentSeedLayout.Terrain.TrySampleWorldCell(
+				Cell.X, Cell.Y, DifferentHeight, DifferentBand));
+		TestEqual(TEXT("Same seed reproduces far height exactly"),
+			SameHeight, FirstHeight);
+		TestEqual(TEXT("Same seed reproduces far color band exactly"),
+			SameBand, FirstBand);
+		bDifferentSeedChangedAnyHeight |= DifferentHeight != FirstHeight;
+	}
+	TestTrue(TEXT("Changing the world seed changes distant terrain"),
+		bDifferentSeedChangedAnyHeight);
+
+	constexpr int32 ChunkSize = 32;
+	const FIntPoint FarChunk(20000, -17000);
+	MatterFlux::TerrainMesh::FChunk FirstChunk;
+	MatterFlux::TerrainMesh::FChunk RebuiltChunk;
+	MatterFlux::TerrainMesh::FChunk DifferentChunk;
+	if (!TestTrue(TEXT("A chunk far beyond the original map builds"),
+		MatterFlux::TerrainMesh::BuildChunk(
+			FirstLayout.Terrain, FarChunk, ChunkSize, FirstChunk))
+		|| !TestTrue(TEXT("The same far chunk rebuilds"),
+			MatterFlux::TerrainMesh::BuildChunk(
+				SameSeedLayout.Terrain, FarChunk, ChunkSize, RebuiltChunk))
+		|| !TestTrue(TEXT("A different-seed far chunk builds"),
+			MatterFlux::TerrainMesh::BuildChunk(
+				DifferentSeedLayout.Terrain, FarChunk, ChunkSize, DifferentChunk)))
+	{
+		return false;
+	}
+	TestEqual(TEXT("Far chunk covers the full requested area"),
+		FirstChunk.CellBounds.Area(), ChunkSize * ChunkSize);
+	TestEqual(TEXT("Same-seed chunk section count is stable"),
+		RebuiltChunk.Sections.Num(), FirstChunk.Sections.Num());
+	bool bDifferentChunkHasDifferentVertices = false;
+	for (int32 SectionIndex = 0;
+		SectionIndex < FirstChunk.Sections.Num();
+		++SectionIndex)
+	{
+		const MatterFlux::TerrainMesh::FSection& FirstSection =
+			FirstChunk.Sections[SectionIndex];
+		const MatterFlux::TerrainMesh::FSection& SameSection =
+			RebuiltChunk.Sections[SectionIndex];
+		const MatterFlux::TerrainMesh::FSection& DifferentSection =
+			DifferentChunk.Sections[SectionIndex];
+		TestTrue(TEXT("Same-seed far vertices are byte-stable"),
+			FirstSection.Vertices == SameSection.Vertices);
+		TestTrue(TEXT("Same-seed far triangle order is stable"),
+			FirstSection.Triangles == SameSection.Triangles);
+		bDifferentChunkHasDifferentVertices |=
+			FirstSection.Vertices != DifferentSection.Vertices;
+	}
+	TestTrue(TEXT("Different seeds produce different far chunk geometry"),
+		bDifferentChunkHasDifferentVertices);
 	return true;
 }
 
@@ -1468,6 +1580,17 @@ bool FMatterFluxPlayableWorldDefaultsTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Material world has an ordered configurable vertical range"),
 		WorldActor->GetMaterialSimulationMinHeight()
 			< WorldActor->GetMaterialSimulationMaxHeight());
+	TestTrue(TEXT("Terrain streaming keeps at least four chunks beyond the player"),
+		WorldActor->GetTerrainStreamingChunkRadius() >= 4);
+	const int32 StreamingDiameter =
+		(WorldActor->GetTerrainStreamingChunkRadius() + 1) * 2 + 1;
+	const int32 CameraOverlapSide = FMath::Max(StreamingDiameter - 2, 0);
+	const int32 RequiredCameraWindowChunks =
+		StreamingDiameter * StreamingDiameter * 2
+			- CameraOverlapSide * CameraOverlapSide;
+	TestTrue(TEXT("Terrain LRU cache contains the visible window and prefetch ring"),
+		WorldActor->GetTerrainChunkCacheLimit()
+			>= RequiredCameraWindowChunks);
 	TestEqual(TEXT("Generated HISM adapters are created from layout layers at runtime"),
 		WorldActor->GetGeneratedLayerCount(), 0);
 	TestNotNull(TEXT("World actor has a directional light"), WorldActor->SunLight.Get());
