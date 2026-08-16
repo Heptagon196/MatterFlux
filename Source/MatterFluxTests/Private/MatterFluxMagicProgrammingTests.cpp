@@ -1043,9 +1043,12 @@ bool FMatterFluxMagicLuaAndEvaluationTest::RunTest(
 	State.Mana = 100.0f;
 	State.DeckCursor = 0;
 	State.CastSerial = 7;
-	const TArray<FName> Slots = { TEXT("spell.spark_bolt") };
+	TArray<FName> Slots;
+	Slots.Init(NAME_None, 8);
+	Slots[0] = TEXT("spell.spark_bolt");
 	FMatterFluxWandCastPlan First;
 	FMatterFluxWandCastPlan Second;
+	FMatterFluxWandCastPlan Consecutive;
 	TestTrue(
 		TEXT("First cast evaluates"),
 		FMatterFluxWandProgram::Evaluate(
@@ -1066,6 +1069,17 @@ bool FMatterFluxMagicLuaAndEvaluationTest::RunTest(
 			State,
 			1337,
 			Second,
+			Error));
+	Error.Reset();
+	TestTrue(
+		TEXT("The same spell evaluates again after the deck wraps past empty capacity"),
+		FMatterFluxWandProgram::Evaluate(
+			*Registry,
+			TEXT("wand.apprentice"),
+			Slots,
+			First.NextState,
+			1338,
+			Consecutive,
 			Error));
 
 	TestEqual(TEXT("One projectile emitted"), First.Projectiles.Num(), 1);
@@ -1095,6 +1109,14 @@ bool FMatterFluxMagicLuaAndEvaluationTest::RunTest(
 		0.20f,
 		0.001f);
 	TestTrue(TEXT("Plans are deterministic"), First == Second);
+	TestEqual(
+		TEXT("Empty capacity slots do not suppress the next cast"),
+		Consecutive.Projectiles.Num(),
+		1);
+	TestEqual(
+		TEXT("Repeated casts continue advancing the logical deck"),
+		Consecutive.NextState.DeckCursor,
+		2);
 
 	MatterFluxMagicTests::RestoreDefault(Runtime);
 	return true;

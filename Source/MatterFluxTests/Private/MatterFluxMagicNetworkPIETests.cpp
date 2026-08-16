@@ -2,6 +2,7 @@
 #include "Engine/Engine.h"
 #include "EngineUtils.h"
 #include "GAS/GA_CastWand.h"
+#include "Game/MatterFluxCharacter.h"
 #include "Game/MatterFluxPlayerState.h"
 #include "GameFramework/PlayerController.h"
 #include "HAL/PlatformTime.h"
@@ -15,6 +16,8 @@
 
 namespace MatterFluxMagicNetworkTests
 {
+	constexpr int32 NetworkCastEquipmentSlot = 3;
+
 	void FindPIEWorlds(UWorld*& OutServer, TArray<UWorld*>& OutClients)
 	{
 		OutServer = nullptr;
@@ -78,6 +81,25 @@ namespace MatterFluxMagicNetworkTests
 			return *It;
 		}
 		return nullptr;
+	}
+
+	int32 GetEquippedWandCastSerial(
+		const UMatterFluxMagicInventoryComponent* Inventory,
+		const int32 EquipmentSlot)
+	{
+		if (!Inventory)
+		{
+			return INDEX_NONE;
+		}
+		const FGuid WandId = Inventory->GetEquippedWandId(EquipmentSlot);
+		for (const FMatterFluxOwnedWand& Wand : Inventory->GetOwnedWands())
+		{
+			if (Wand.InstanceId == WandId)
+			{
+				return Wand.CastSerial;
+			}
+		}
+		return INDEX_NONE;
 	}
 
 	FGameplayAbilitySpecHandle FindWandAbilityHandle(
@@ -193,7 +215,7 @@ namespace MatterFluxMagicNetworkTests
 				FMatterFluxMagicEdit SelectWand;
 				SelectWand.Type = EMatterFluxMagicEditType::SelectEquipmentSlot;
 				SelectWand.ExpectedRevision = InitialRevision + 1;
-				SelectWand.EquipmentSlot = 2;
+				SelectWand.EquipmentSlot = NetworkCastEquipmentSlot;
 				ClientInventory->RequestEdit(SelectWand);
 				bEditReplicated = true;
 				BeginNextPhase();
@@ -209,13 +231,15 @@ namespace MatterFluxMagicNetworkTests
 					? ServerState->GetAbilitySystemComponent()
 					: nullptr;
 				const FGameplayAbilitySpecHandle WandHandle =
-					FindWandAbilityHandle(ASC, 2);
+					FindWandAbilityHandle(ASC, NetworkCastEquipmentSlot);
 				const FGameplayAbilitySpecHandle ServerWandHandle =
-					FindWandAbilityHandle(ServerASC, 2);
+					FindWandAbilityHandle(ServerASC, NetworkCastEquipmentSlot);
 				if (!ASC
 					|| !ServerASC
-					|| ClientInventory->GetActiveEquipmentSlot() != 2
-					|| ServerInventory->GetActiveEquipmentSlot() != 2
+					|| ClientInventory->GetActiveEquipmentSlot()
+						!= NetworkCastEquipmentSlot
+					|| ServerInventory->GetActiveEquipmentSlot()
+						!= NetworkCastEquipmentSlot
 					|| ClientInventory->GetInventoryRevision() != InitialRevision + 2
 					|| !ASC->AbilityActorInfo.IsValid()
 					|| !ASC->AbilityActorInfo->AvatarActor.IsValid()
@@ -226,11 +250,43 @@ namespace MatterFluxMagicNetworkTests
 				{
 					return FailOnTimeout(TEXT("Client/server wand ability actor info or restored active slot was not ready."));
 				}
-				if (!ASC->TryActivateAbility(WandHandle))
+				AActor* ServerAvatar = ServerASC->AbilityActorInfo
+					->AvatarActor.Get();
+				ServerAvatar->SetActorLocation(
+					FVector(0.0f, 0.0f, 2500.0f),
+					false,
+					nullptr,
+					ETeleportType::TeleportPhysics);
+				AMatterFluxCharacter* ClientAvatar = Cast<AMatterFluxCharacter>(
+					ASC->AbilityActorInfo->AvatarActor.Get());
+				if (!ClientAvatar)
 				{
-					return FailOnTimeout(TEXT("Owning client could not request the server-only wand ability."));
+					return FailOnTimeout(TEXT("Owning client has no MatterFlux character avatar."));
 				}
+				ClientAvatar->ApplyPlayerOperation(
+					EMatterFluxPlayerOperation::CastWand,
+					FVector2D::ZeroVector,
+					NetworkCastEquipmentSlot);
 				bRequestedCast = true;
+				BeginNextPhase();
+				return false;
+			}
+
+			const int32 ServerCastSerial = GetEquippedWandCastSerial(
+				ServerInventory,
+				NetworkCastEquipmentSlot);
+			if (!bFirstCastObserved)
+			{
+				const int32 ClientCastSerial = GetEquippedWandCastSerial(
+					ClientInventory,
+					NetworkCastEquipmentSlot);
+				if (ServerCastSerial <= 0
+					|| ClientCastSerial != ServerCastSerial)
+				{
+					return FailOnTimeout(TEXT("First wand cast serial did not commit and replicate to its owner."));
+				}
+				FirstCastSerial = ServerCastSerial;
+				bFirstCastObserved = true;
 				BeginNextPhase();
 				return false;
 			}
@@ -238,24 +294,97 @@ namespace MatterFluxMagicNetworkTests
 			AMatterFluxMagicProjectile* ServerProjectile = FindProjectile(Server);
 			AMatterFluxMagicProjectile* ClientProjectile = FindProjectile(Clients[0]);
 			AMatterFluxMagicProjectile* OtherProjectile = FindProjectile(Clients[1]);
-			if (!ServerProjectile || !ClientProjectile || !OtherProjectile)
+			if (ServerProjectile && ClientProjectile && OtherProjectile)
 			{
-				return FailOnTimeout(TEXT("Server wand projectile did not replicate to both clients."));
+				const FMatterFluxMagicProjectilePresentation& ServerView =
+					ServerProjectile->GetPresentation();
+				const FMatterFluxMagicProjectilePresentation& ClientView =
+					ClientProjectile->GetPresentation();
+				const FMatterFluxMagicProjectilePresentation& OtherView =
+					OtherProjectile->GetPresentation();
+				if (ServerView.SpellId != ClientView.SpellId
+					|| ServerView.SpellId != OtherView.SpellId
+					|| !FMath::IsNearlyEqual(ServerView.Speed, ClientView.Speed)
+					|| !FMath::IsNearlyEqual(ServerView.Speed, OtherView.Speed)
+					|| !FMath::IsNearlyEqual(ServerView.Radius, ClientView.Radius)
+					|| !FMath::IsNearlyEqual(ServerView.Radius, OtherView.Radius))
+				{
+					Test->AddError(TEXT("Replicated projectile presentation differs across peers."));
+				}
 			}
-			const FMatterFluxMagicProjectilePresentation& ServerView =
-				ServerProjectile->GetPresentation();
-			const FMatterFluxMagicProjectilePresentation& ClientView =
-				ClientProjectile->GetPresentation();
-			const FMatterFluxMagicProjectilePresentation& OtherView =
-				OtherProjectile->GetPresentation();
-			if (ServerView.SpellId != ClientView.SpellId
-				|| ServerView.SpellId != OtherView.SpellId
-				|| !FMath::IsNearlyEqual(ServerView.Speed, ClientView.Speed)
-				|| !FMath::IsNearlyEqual(ServerView.Speed, OtherView.Speed)
-				|| !FMath::IsNearlyEqual(ServerView.Radius, ClientView.Radius)
-				|| !FMath::IsNearlyEqual(ServerView.Radius, OtherView.Radius))
+
+			UAbilitySystemComponent* ASC = ClientState
+				? ClientState->GetAbilitySystemComponent()
+				: nullptr;
+			const FGameplayAbilitySpecHandle WandHandle =
+				FindWandAbilityHandle(ASC, NetworkCastEquipmentSlot);
+			if (!bRequestedSecondCast)
 			{
-				Test->AddError(TEXT("Replicated projectile presentation differs across peers."));
+				if (FPlatformTime::Seconds() - PhaseStart < 0.8)
+				{
+					return false;
+				}
+				AMatterFluxCharacter* ClientAvatar = ASC
+					? Cast<AMatterFluxCharacter>(
+						ASC->AbilityActorInfo->AvatarActor.Get())
+					: nullptr;
+				if (!ClientAvatar || !WandHandle.IsValid())
+				{
+					Test->AddError(TEXT("The same held wand cannot activate a second time after its recharge."));
+					return true;
+				}
+				ClientAvatar->ApplyPlayerOperation(
+					EMatterFluxPlayerOperation::CastWand,
+					FVector2D::ZeroVector,
+					NetworkCastEquipmentSlot);
+				bRequestedSecondCast = true;
+				BeginNextPhase();
+				return false;
+			}
+			if (!bSecondCastObserved)
+			{
+				const int32 ClientCastSerial = GetEquippedWandCastSerial(
+					ClientInventory,
+					NetworkCastEquipmentSlot);
+				if (ServerCastSerial < FirstCastSerial + 1
+					|| ClientCastSerial != ServerCastSerial)
+				{
+					return FailOnTimeout(TEXT("Second consecutive wand cast did not commit and replicate to its owner."));
+				}
+				bSecondCastObserved = true;
+				BeginNextPhase();
+				return false;
+			}
+			if (!bRequestedThirdCast)
+			{
+				if (FPlatformTime::Seconds() - PhaseStart < 0.8)
+				{
+					return false;
+				}
+				AMatterFluxCharacter* ClientAvatar = ASC
+					? Cast<AMatterFluxCharacter>(
+						ASC->AbilityActorInfo->AvatarActor.Get())
+					: nullptr;
+				if (!ClientAvatar || !WandHandle.IsValid())
+				{
+					Test->AddError(TEXT("The same held wand cannot activate a third time after its recharge."));
+					return true;
+				}
+				ClientAvatar->ApplyPlayerOperation(
+					EMatterFluxPlayerOperation::CastWand,
+					FVector2D::ZeroVector,
+					NetworkCastEquipmentSlot);
+				bRequestedThirdCast = true;
+				BeginNextPhase();
+				return false;
+			}
+			const int32 ClientCastSerial = GetEquippedWandCastSerial(
+				ClientInventory,
+				NetworkCastEquipmentSlot);
+			if (ServerCastSerial < FirstCastSerial + 2
+				|| ClientCastSerial != ServerCastSerial)
+			{
+				return FailOnTimeout(TEXT("Third consecutive wand cast did not commit and replicate to its owner."));
 			}
 			return true;
 		}
@@ -284,6 +413,11 @@ namespace MatterFluxMagicNetworkTests
 		bool bRequestedEdit = false;
 		bool bEditReplicated = false;
 		bool bRequestedCast = false;
+		int32 FirstCastSerial = INDEX_NONE;
+		bool bFirstCastObserved = false;
+		bool bRequestedSecondCast = false;
+		bool bSecondCastObserved = false;
+		bool bRequestedThirdCast = false;
 	};
 }
 

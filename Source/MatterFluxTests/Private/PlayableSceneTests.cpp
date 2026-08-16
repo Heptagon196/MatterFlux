@@ -1,13 +1,16 @@
 #include "Camera/CameraComponent.h"
 #include "Components/DirectionalLightComponent.h"
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
+#include "Components/InstancedStaticMeshComponent.h"
 #include "Components/SkyLightComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "EnhancedInputComponent.h"
 #include "EngineUtils.h"
 #include "Fragment/Fragment2DActor.h"
 #include "Fragment/Fragment2DSourceActor.h"
 #include "Fragment/FragmentGeometry.h"
 #include "Fragment/FragmentSimulationSubsystem.h"
+#include "GAS/GA_CastWand.h"
 #include "Game/MatterFluxCharacter.h"
 #include "Game/MatterFluxGameMode.h"
 #include "Game/MatterFluxPlayableLevel.h"
@@ -447,6 +450,9 @@ bool FMatterFluxPlayableCharacterDefaultsTest::RunTest(const FString& Parameters
 				->GetPathName().Contains(TEXT("/Cube.")));
 	TestFalse(TEXT("The character can explore both X and Y dimensions"),
 		Character->GetCharacterMovement()->bConstrainToPlane);
+	TestFalse(
+		TEXT("Character movement does not apply its extra high-force physics push to detached terrain"),
+		Character->GetCharacterMovement()->bEnablePhysicsInteraction);
 	TestFalse(TEXT("The character does not inherit controller yaw"),
 		Character->bUseControllerRotationYaw);
 	TestTrue(TEXT("The camera uses a useful three-quarter distance"),
@@ -495,6 +501,60 @@ bool FMatterFluxPlayableCharacterDefaultsTest::RunTest(const FString& Parameters
 	TestEqual(TEXT("Pixel-art rendering defaults to stable non-temporal FXAA"),
 		AntiAliasingMethod ? AntiAliasingMethod->GetInt() : -1,
 		1);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxWandHoldInputBindingsTest,
+	"MatterFlux.Playable.WandInputSupportsHeldCasting",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxWandHoldInputBindingsTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxCharacter* Character = World
+		? World->SpawnActor<AMatterFluxCharacter>()
+		: nullptr;
+	UEnhancedInputComponent* Input = Character
+		? NewObject<UEnhancedInputComponent>(Character)
+		: nullptr;
+	if (!TestNotNull(TEXT("Playable character spawns"), Character)
+		|| !TestNotNull(TEXT("Enhanced input component exists"), Input))
+	{
+		return false;
+	}
+
+	Character->SetupPlayerInputComponent(Input);
+	for (int32 Slot = 0; Slot < UGA_CastWand::EquipmentSlotCount; ++Slot)
+	{
+		const UInputAction* Action = Character->GetCastWandAction(Slot);
+		bool bHasStarted = false;
+		bool bHasCompleted = false;
+		bool bHasCanceled = false;
+		for (const TUniquePtr<FEnhancedInputActionEventBinding>& Binding
+			: Input->GetActionEventBindings())
+		{
+			if (Binding && Binding->GetAction() == Action)
+			{
+				bHasStarted |= Binding->GetTriggerEvent()
+					== ETriggerEvent::Started;
+				bHasCompleted |= Binding->GetTriggerEvent()
+					== ETriggerEvent::Completed;
+				bHasCanceled |= Binding->GetTriggerEvent()
+					== ETriggerEvent::Canceled;
+			}
+		}
+		TestTrue(
+			*FString::Printf(TEXT("Wand slot %d casts immediately on press"), Slot),
+			bHasStarted);
+		TestTrue(
+			*FString::Printf(TEXT("Wand slot %d stops repeating on release"), Slot),
+			bHasCompleted);
+		TestTrue(
+			*FString::Printf(TEXT("Wand slot %d stops repeating when input is canceled"), Slot),
+			bHasCanceled);
+	}
 	return true;
 }
 
@@ -978,10 +1038,15 @@ bool FMatterFluxVoxelDecorationWorldTest::RunTest(const FString& Parameters)
 	TestTrue(
 		TEXT("The world exposes visible merged terrain chunks"),
 		VisibleTerrainComponentCount > 0);
-	TestEqual(
-		TEXT("Player and isometric-camera terrain windows overlap to fourteen chunks"),
-		WorldActor->GetVisibleTerrainChunkCount(),
-		14);
+	const int32 TerrainWindowDiameter =
+		WorldActor->GetTerrainStreamingChunkRadius() * 2 + 1;
+	const int32 SingleTerrainWindowChunks =
+		TerrainWindowDiameter * TerrainWindowDiameter;
+	TestTrue(
+		TEXT("Player and isometric-camera terrain windows overlap without leaving the configured cache"),
+		WorldActor->GetVisibleTerrainChunkCount() > SingleTerrainWindowChunks
+		&& WorldActor->GetVisibleTerrainChunkCount()
+			<= WorldActor->GetTerrainChunkCacheLimit());
 	TestTrue(
 		TEXT("Merged terrain stays below the former per-cell instance budget"),
 		WorldActor->GetVisibleTerrainTriangleCount() > 0
@@ -1473,6 +1538,106 @@ bool FMatterFluxMaterialSimulationCatchUpBudgetTest::RunTest(
 		TEXT("A zero-delta recovery frame has no stale simulation debt"),
 		WorldActor->GetMaterialSimulationStep(),
 		StepAfterHitches);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxCombustionVisualHierarchyTest,
+	"MatterFlux.Playable.CombustionSmokeReadsAsSmokeNotGroundChunks",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxCombustionVisualHierarchyTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* WorldActor = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Playable world actor spawned"), WorldActor))
+	{
+		return false;
+	}
+
+	WorldActor->Regenerate(1337);
+	if (!TestTrue(TEXT("A tree and its ground contact ignite"),
+		WorldActor->IgniteFirstGeneratedTree(5150)))
+	{
+		return false;
+	}
+	for (int32 Step = 0; Step < 4; ++Step)
+	{
+		WorldActor->Tick(0.1f);
+	}
+
+	UInstancedStaticMeshComponent* SourceFlames = nullptr;
+	UInstancedStaticMeshComponent* SourceSmoke = nullptr;
+	UInstancedStaticMeshComponent* GroundFlames = nullptr;
+	UInstancedStaticMeshComponent* GroundSmoke = nullptr;
+	TArray<UInstancedStaticMeshComponent*> Components;
+	WorldActor->GetComponents(Components);
+	for (UInstancedStaticMeshComponent* Component : Components)
+	{
+		if (!Component)
+		{
+			continue;
+		}
+		const FName Name = Component->GetFName();
+		SourceFlames = Name == TEXT("LogicalSourceFlames")
+			? Component : SourceFlames;
+		SourceSmoke = Name == TEXT("LogicalSourceSmoke")
+			? Component : SourceSmoke;
+		GroundFlames = Name == TEXT("GroundCombustionFlames")
+			? Component : GroundFlames;
+		GroundSmoke = Name == TEXT("GroundCombustionSmoke")
+			? Component : GroundSmoke;
+	}
+	if (!TestNotNull(TEXT("Source flame visual exists"), SourceFlames)
+		|| !TestNotNull(TEXT("Source smoke visual exists"), SourceSmoke)
+		|| !TestNotNull(TEXT("Ground flame visual exists"), GroundFlames)
+		|| !TestNotNull(TEXT("Ground smoke visual exists"), GroundSmoke))
+	{
+		return false;
+	}
+
+	TestTrue(TEXT("Burning source emits visible flame voxels"),
+		SourceFlames->GetInstanceCount() > 0);
+	TestTrue(TEXT("Burning source emits visible smoke voxels"),
+		SourceSmoke->GetInstanceCount() > 0);
+	TestTrue(TEXT("Ground contact emits visible flame voxels"),
+		GroundFlames->GetInstanceCount() > 0);
+
+	const auto MaximumHorizontalScale = [](UInstancedStaticMeshComponent& Instances)
+	{
+		float Maximum = 0.0f;
+		for (int32 Index = 0; Index < Instances.GetInstanceCount(); ++Index)
+		{
+			FTransform Transform;
+			if (Instances.GetInstanceTransform(Index, Transform, false))
+			{
+				Maximum = FMath::Max(
+					Maximum,
+					FMath::Max(
+						static_cast<float>(Transform.GetScale3D().X),
+						static_cast<float>(Transform.GetScale3D().Y)));
+			}
+		}
+		return Maximum;
+	};
+	const float SourceFlameScale = MaximumHorizontalScale(*SourceFlames);
+	const float SourceSmokeScale = MaximumHorizontalScale(*SourceSmoke);
+	const float GroundFlameScale = MaximumHorizontalScale(*GroundFlames);
+	const float GroundSmokeScale = MaximumHorizontalScale(*GroundSmoke);
+	TestTrue(
+		TEXT("Source smoke pixels are subordinate wisps rather than ground-sized chunks"),
+		SourceSmokeScale > 0.0f
+			&& SourceSmokeScale <= SourceFlameScale * 0.55f);
+	if (GroundSmoke->GetInstanceCount() > 0)
+	{
+		TestTrue(
+			TEXT("Ground smoke pixels are subordinate wisps rather than ground-sized chunks"),
+			GroundSmokeScale <= GroundFlameScale * 0.55f);
+	}
 	return true;
 }
 

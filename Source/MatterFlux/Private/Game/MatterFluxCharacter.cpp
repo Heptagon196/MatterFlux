@@ -43,6 +43,12 @@ AMatterFluxCharacter::AMatterFluxCharacter()
 	Movement->bOrientRotationToMovement = true;
 	Movement->RotationRate = FRotator(0.0f, 720.0f, 0.0f);
 	Movement->bConstrainToPlane = false;
+	// CharacterMovement's explicit physics-interaction force is tuned for
+	// heavy 3D props and can inject enormous impulses into long, light voxel
+	// fragments. The capsule still blocks dynamic fragments normally; Chaos is
+	// left to resolve that contact without a second artificial push force.
+	Movement->bEnablePhysicsInteraction = false;
+	WandCastRepeatTimers.SetNum(UGA_CastWand::EquipmentSlotCount);
 
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> CharacterMesh(
 		TEXT("/Engine/BasicShapes/Cube.Cube"));
@@ -269,6 +275,10 @@ void AMatterFluxCharacter::EndPlay(
 	{
 		World->GetTimerManager().ClearTimer(CutEffectTimer);
 		World->GetTimerManager().ClearTimer(FlameEffectTimer);
+		for (FTimerHandle& Timer : WandCastRepeatTimers)
+		{
+			World->GetTimerManager().ClearTimer(Timer);
+		}
 	}
 	Super::EndPlay(EndPlayReason);
 }
@@ -329,7 +339,19 @@ void AMatterFluxCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInpu
 			CastWandActions[Slot],
 			ETriggerEvent::Started,
 			this,
-			&AMatterFluxCharacter::HandleCastWandRequested,
+			&AMatterFluxCharacter::HandleCastWandStarted,
+			Slot);
+		EnhancedInput->BindAction(
+			CastWandActions[Slot],
+			ETriggerEvent::Completed,
+			this,
+			&AMatterFluxCharacter::HandleCastWandStopped,
+			Slot);
+		EnhancedInput->BindAction(
+			CastWandActions[Slot],
+			ETriggerEvent::Canceled,
+			this,
+			&AMatterFluxCharacter::HandleCastWandStopped,
 			Slot);
 	}
 	EnhancedInput->BindAction(RegenerateAction, ETriggerEvent::Started, this, &AMatterFluxCharacter::HandleRegenerateRequested);
@@ -519,6 +541,40 @@ void AMatterFluxCharacter::HandleJumpCompleted()
 	StopJumping();
 }
 
+void AMatterFluxCharacter::HandleCastWandStarted(
+	const int32 EquipmentSlot)
+{
+	HandleCastWandRequested(EquipmentSlot);
+	if (!WandCastRepeatTimers.IsValidIndex(EquipmentSlot)
+		|| !GetWorld())
+	{
+		return;
+	}
+
+	FTimerDelegate RepeatCast;
+	RepeatCast.BindUObject(
+		this,
+		&AMatterFluxCharacter::HandleCastWandRequested,
+		EquipmentSlot);
+	GetWorld()->GetTimerManager().SetTimer(
+		WandCastRepeatTimers[EquipmentSlot],
+		RepeatCast,
+		0.05f,
+		true,
+		0.05f);
+}
+
+void AMatterFluxCharacter::HandleCastWandStopped(
+	const int32 EquipmentSlot)
+{
+	if (WandCastRepeatTimers.IsValidIndex(EquipmentSlot)
+		&& GetWorld())
+	{
+		GetWorld()->GetTimerManager().ClearTimer(
+			WandCastRepeatTimers[EquipmentSlot]);
+	}
+}
+
 void AMatterFluxCharacter::HandleCastWandRequested(
 	const int32 EquipmentSlot)
 {
@@ -642,10 +698,19 @@ void AMatterFluxCharacter::ServerRelayPlayerOperation_Implementation(
 void AMatterFluxCharacter::TryActivateWandSlot(
 	const int32 EquipmentSlot)
 {
-	UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
-	if (!ASC
-		|| EquipmentSlot < 0
+	if (EquipmentSlot < 0
 		|| EquipmentSlot >= UGA_CastWand::EquipmentSlotCount)
+	{
+		return;
+	}
+	if (!HasAuthority())
+	{
+		ServerActivateWandSlot(EquipmentSlot);
+		return;
+	}
+
+	UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
+	if (!ASC)
 	{
 		return;
 	}
@@ -659,6 +724,19 @@ void AMatterFluxCharacter::TryActivateWandSlot(
 			return;
 		}
 	}
+}
+
+bool AMatterFluxCharacter::ServerActivateWandSlot_Validate(
+	const int32 EquipmentSlot)
+{
+	return EquipmentSlot >= 0
+		&& EquipmentSlot < UGA_CastWand::EquipmentSlotCount;
+}
+
+void AMatterFluxCharacter::ServerActivateWandSlot_Implementation(
+	const int32 EquipmentSlot)
+{
+	TryActivateWandSlot(EquipmentSlot);
 }
 
 void AMatterFluxCharacter::ServerRegenerateLevel_Implementation()

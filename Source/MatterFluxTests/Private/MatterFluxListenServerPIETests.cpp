@@ -1,6 +1,7 @@
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "Fragment/Fragment2DActor.h"
 #include "Fragment/Fragment2DSourceActor.h"
 #include "Fragment/FragmentSimulationSubsystem.h"
 #include "FragmentTestActors.h"
@@ -153,6 +154,192 @@ namespace
 		}
 		return nullptr;
 	}
+
+	AFragment2DActor* FindAnyFragmentById(
+		UWorld* World,
+		const FGuid& FragmentId)
+	{
+		for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+		{
+			if (It->SpawnPayload.FragmentId == FragmentId)
+			{
+				return *It;
+			}
+		}
+		return nullptr;
+	}
+
+	FFragmentSpawnPayload MakeFallenTreePayload(
+		const FVector& WorldLocation)
+	{
+		FFragmentSpawnPayload Payload;
+		Payload.FragmentId = FGuid::NewDeterministicGuid(
+			TEXT("MatterFlux.FallenTreeCharacterContact"),
+			1);
+		Payload.Revision = 1;
+		Payload.Vertices2D = {
+			FVector2D(-260.0, -30.0),
+			FVector2D(260.0, -30.0),
+			FVector2D(260.0, 30.0),
+			FVector2D(-260.0, 30.0)
+		};
+		Payload.TriangleIndices = { 0, 1, 2, 0, 2, 3 };
+		FFragmentContour& Contour = Payload.OuterContours.AddDefaulted_GetRef();
+		Contour.Vertices = Payload.Vertices2D;
+		Payload.CollisionContours.Add(Contour);
+		Payload.Thickness = 60.0f;
+		Payload.Mass = 48.0f;
+		Payload.bEnableCollision = true;
+		Payload.InitialTransform = FTransform(WorldLocation);
+		return Payload;
+	}
+
+	class FVerifyFallenTreeCharacterContactCommand final
+		: public IAutomationLatentCommand
+	{
+	public:
+		explicit FVerifyFallenTreeCharacterContactCommand(
+			FAutomationTestBase* InTest)
+			: Test(InTest)
+			, PhaseStart(FPlatformTime::Seconds())
+		{
+		}
+
+		virtual bool Update() override
+		{
+			UWorld* Host = nullptr;
+			TArray<UWorld*> Clients;
+			FindListenPIEWorlds(Host, Clients);
+			APlayerController* HostController = Host
+				? FindLocalController(Host)
+				: nullptr;
+			AMatterFluxCharacter* Character = HostController
+				? Cast<AMatterFluxCharacter>(HostController->GetPawn())
+				: nullptr;
+			if (!Host || Clients.Num() != 1 || !Character)
+			{
+				return FailOnTimeout(
+					TEXT("Fallen-tree contact test did not create a listen host, client, and host character."));
+			}
+
+			if (!TreeId.IsValid())
+			{
+				const FVector TreeLocation = Character->GetActorLocation()
+					+ FVector(380.0f, 0.0f, -55.0f);
+				AFragment2DActor* Tree = Host->SpawnActor<AFragment2DActor>(
+					TreeLocation,
+					FRotator::ZeroRotator);
+				const FFragmentSpawnPayload Payload =
+					MakeFallenTreePayload(TreeLocation);
+				if (!Tree || !Tree->InitializeFromPayload(Payload))
+				{
+					Test->AddError(
+						TEXT("Listen host could not initialize the fallen-tree rigid body."));
+					return true;
+				}
+				Tree->bAlwaysRelevant = true;
+				Tree->ForceNetUpdate();
+				TreeId = Payload.FragmentId;
+				PreviousTreeLocation = Tree->GetActorLocation();
+				BeginNextPhase();
+				return false;
+			}
+
+			AFragment2DActor* HostTree = FindAnyFragmentById(Host, TreeId);
+			AFragment2DActor* ClientTree =
+				FindAnyFragmentById(Clients[0], TreeId);
+			if (!HostTree || !ClientTree)
+			{
+				return FailOnTimeout(
+					TEXT("Fallen tree did not replicate to the listen client."));
+			}
+			if (!bPushing)
+			{
+				if (FPlatformTime::Seconds() - PhaseStart < 1.0)
+				{
+					PreviousTreeLocation = HostTree->GetActorLocation();
+					return false;
+				}
+				bPushing = true;
+				BeginNextPhase();
+			}
+
+			if (!bFinishedPushing)
+			{
+				Character->AddMovementInput(FVector::XAxisVector, 1.0f);
+				const FVector TreeLocation = HostTree->GetActorLocation();
+				MaximumFrameDisplacement = FMath::Max(
+					MaximumFrameDisplacement,
+					static_cast<float>(FVector::Distance(
+						TreeLocation,
+						PreviousTreeLocation)));
+				PreviousTreeLocation = TreeLocation;
+				MaximumLinearSpeed = FMath::Max(
+					MaximumLinearSpeed,
+					static_cast<float>(HostTree->MeshComponent
+						->GetPhysicsLinearVelocity().Size()));
+				MaximumAngularSpeed = FMath::Max(
+					MaximumAngularSpeed,
+					static_cast<float>(HostTree->MeshComponent
+						->GetPhysicsAngularVelocityInDegrees().Size()));
+				if (FPlatformTime::Seconds() - PhaseStart < 2.0)
+				{
+					return false;
+				}
+				bFinishedPushing = true;
+				BeginNextPhase();
+				return false;
+			}
+
+			const float ClientDistance = FVector::Distance(
+				HostTree->GetActorLocation(),
+				ClientTree->GetActorLocation());
+			if (FPlatformTime::Seconds() - PhaseStart < 1.0
+				&& ClientDistance >= 100.0f)
+			{
+				return false;
+			}
+			Test->TestTrue(
+				TEXT("Character contact never teleports the fallen tree between frames"),
+				MaximumFrameDisplacement < 100.0f);
+			Test->TestTrue(
+				TEXT("Character contact keeps fallen-tree linear speed bounded"),
+				MaximumLinearSpeed < 1200.0f);
+			Test->TestTrue(
+				TEXT("Character contact respects the fallen-tree angular speed cap"),
+				MaximumAngularSpeed <= 365.0f);
+			Test->TestTrue(
+				TEXT("Listen client converges after sustained character/tree contact"),
+				ClientDistance < 100.0f);
+			return true;
+		}
+
+	private:
+		void BeginNextPhase()
+		{
+			PhaseStart = FPlatformTime::Seconds();
+		}
+
+		bool FailOnTimeout(const TCHAR* Message)
+		{
+			if (FPlatformTime::Seconds() - PhaseStart < 30.0)
+			{
+				return false;
+			}
+			Test->AddError(Message);
+			return true;
+		}
+
+		FAutomationTestBase* Test = nullptr;
+		double PhaseStart = 0.0;
+		FGuid TreeId;
+		FVector PreviousTreeLocation = FVector::ZeroVector;
+		float MaximumFrameDisplacement = 0.0f;
+		float MaximumLinearSpeed = 0.0f;
+		float MaximumAngularSpeed = 0.0f;
+		bool bPushing = false;
+		bool bFinishedPushing = false;
+	};
 
 	class FVerifyMatterFluxListenServerPIECommand final
 		: public IAutomationLatentCommand
@@ -620,6 +807,45 @@ namespace
 		ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
 		return true;
 	}
+
+	bool RunFallenTreeContactScenario(FAutomationTestBase& Test)
+	{
+		if (!Test.TestNotNull(
+			TEXT("Isolated fallen-tree contact map created"),
+			FAutomationEditorCommonUtils::CreateNewMap()))
+		{
+			return false;
+		}
+
+		Test.AddExpectedError(
+			TEXT("FNetGUIDCache::SupportsObject: Level /Temp/"),
+			EAutomationExpectedErrorFlags::Contains,
+			-1,
+			false);
+		Test.AddExpectedError(
+			TEXT("RegisterNetGUID_Client: Guid with pathname"),
+			EAutomationExpectedErrorFlags::Contains,
+			-1,
+			false);
+
+		FRequestPlaySessionParams RequestParams;
+		ULevelEditorPlaySettings* PlaySettings =
+			NewObject<ULevelEditorPlaySettings>();
+		PlaySettings->SetPlayNetMode(EPlayNetMode::PIE_ListenServer);
+		PlaySettings->SetRunUnderOneProcess(true);
+		PlaySettings->SetPlayNumberOfClients(2);
+		PlaySettings->bLaunchSeparateServer = false;
+		RequestParams.EditorPlaySettings = PlaySettings;
+		FAutomationEditorCommonUtils::SetPlaySessionStartToActiveViewport(
+			RequestParams);
+		PlaySettings->AddToRoot();
+		ADD_LATENT_AUTOMATION_COMMAND(
+			FStartPIEForAutomationCommand(RequestParams));
+		ADD_LATENT_AUTOMATION_COMMAND(
+			FVerifyFallenTreeCharacterContactCommand(&Test));
+		ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+		return true;
+	}
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -649,4 +875,16 @@ bool FMatterFluxFourPlayerListenServerPIETest::RunTest(
 		*this,
 		4,
 		TEXT("ListenHostThreeClientsAutomation"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxFallenTreeCharacterContactPIETest,
+	"MatterFlux.Fragment.Physics.FallenTreeCharacterContactIsStable",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxFallenTreeCharacterContactPIETest::RunTest(
+	const FString& Parameters)
+{
+	return RunFallenTreeContactScenario(*this);
 }

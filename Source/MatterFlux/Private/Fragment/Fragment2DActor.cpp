@@ -79,6 +79,9 @@ AFragment2DActor::AFragment2DActor()
 	MeshComponent->SetCollisionResponseToAllChannels(ECR_Block);
 	MeshComponent->SetNotifyRigidBodyCollision(true);
 	MeshComponent->bUseComplexAsSimpleCollision = false;
+	MeshComponent->SetLinearDamping(1.25f);
+	MeshComponent->SetAngularDamping(6.0f);
+	MeshComponent->BodyInstance.bUseCCD = true;
 }
 
 void AFragment2DActor::EndPlay(
@@ -111,6 +114,9 @@ bool AFragment2DActor::InitializeFromPayload(const FFragmentSpawnPayload& Payloa
 	{
 		MeshComponent->SetMassOverrideInKg(NAME_None, FMath::Max(SpawnPayload.Mass, 0.5f), true);
 		MeshComponent->SetSimulatePhysics(true);
+		MeshComponent->SetPhysicsMaxAngularVelocityInDegrees(
+			360.0f,
+			false);
 		MeshComponent->SetPhysicsLinearVelocity(SpawnPayload.InitialLinearVelocity);
 		MeshComponent->SetPhysicsAngularVelocityInDegrees(SpawnPayload.InitialAngularVelocity);
 		ForceNetUpdate();
@@ -379,6 +385,16 @@ bool AFragment2DActor::AbsorbAggregateSource(
 		return false;
 	}
 
+	const bool bWasSimulating = MeshComponent->IsSimulatingPhysics();
+	const FTransform PreservedBodyTransform = MeshComponent->GetComponentTransform();
+	const FVector PreservedLinearVelocity = bWasSimulating
+		? MeshComponent->GetPhysicsLinearVelocity()
+		: SpawnPayload.InitialLinearVelocity;
+	const FVector PreservedAngularVelocity = bWasSimulating
+		? MeshComponent->GetPhysicsAngularVelocityInDegrees()
+		: SpawnPayload.InitialAngularVelocity;
+	const float PreviousMass = FMath::Max(SpawnPayload.Mass, 0.5f);
+
 	AggregateSources.Add(Candidate);
 	if (!RebuildMeshFromPayload())
 	{
@@ -415,12 +431,14 @@ bool AFragment2DActor::AbsorbAggregateSource(
 	{
 		AddedSolidCells += Cell != 0 ? 1 : 0;
 	}
-	const float PreviousMass = FMath::Max(SpawnPayload.Mass, 0.5f);
 	SpawnPayload.Mass = FMath::Clamp(
 		PreviousMass + static_cast<float>(AddedSolidCells) * 0.05f,
 		0.5f,
 		800.0f);
-	SpawnPayload.InitialLinearVelocity *= PreviousMass / SpawnPayload.Mass;
+	const FVector PreservedMomentumVelocity =
+		PreservedLinearVelocity * PreviousMass / SpawnPayload.Mass;
+	SpawnPayload.InitialLinearVelocity = PreservedMomentumVelocity;
+	SpawnPayload.InitialAngularVelocity = PreservedAngularVelocity;
 	if (HasAuthority()
 		&& GetWorld()
 		&& GetWorld()->IsGameWorld()
@@ -430,8 +448,22 @@ bool AFragment2DActor::AbsorbAggregateSource(
 			NAME_None,
 			SpawnPayload.Mass,
 			true);
+		MeshComponent->SetWorldTransform(
+			PreservedBodyTransform,
+			false,
+			nullptr,
+			ETeleportType::TeleportPhysics);
+		if (bWasSimulating && !MeshComponent->IsSimulatingPhysics())
+		{
+			MeshComponent->SetSimulatePhysics(true);
+		}
 		MeshComponent->SetPhysicsLinearVelocity(
-			SpawnPayload.InitialLinearVelocity);
+			PreservedMomentumVelocity);
+		MeshComponent->SetPhysicsAngularVelocityInDegrees(
+			PreservedAngularVelocity);
+		MeshComponent->SetPhysicsMaxAngularVelocityInDegrees(
+			360.0f,
+			false);
 	}
 
 	SourceActor.Destroy();

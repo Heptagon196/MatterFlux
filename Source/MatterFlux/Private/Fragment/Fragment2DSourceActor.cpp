@@ -1101,15 +1101,19 @@ void AFragment2DSourceActor::EnsureCombustionVisualComponents()
 		}
 		if (!SmokeMaterialInstance)
 		{
+			const FLinearColor SmokeColor = FLinearColor::LerpUsingHSV(
+				ResolveColor(
+					Rule->SmokeMaterial,
+					FLinearColor(0.15f, 0.16f, 0.18f, 0.66f)),
+				FLinearColor(0.48f, 0.51f, 0.56f, 1.0f),
+				0.65f);
 			SmokeMaterialInstance =
 				UMaterialInstanceDynamic::Create(
 					FragmentMaterial,
 					this);
 			SmokeMaterialInstance->SetVectorParameterValue(
 				TEXT("Color"),
-				ResolveColor(
-					Rule->SmokeMaterial,
-					FLinearColor(0.15f, 0.16f, 0.18f, 0.66f)));
+				SmokeColor);
 			SmokeInstances->SetMaterial(
 				0,
 				SmokeMaterialInstance);
@@ -1182,7 +1186,7 @@ void AFragment2DSourceActor::RebuildCombustionVisualization()
 		const float LifeAlpha =
 			FMath::Clamp(Particle.RemainingLife / 1.8f, 0.0f, 1.0f);
 		const float Scale =
-			ParticleScale * FMath::Lerp(1.15f, 0.55f, LifeAlpha);
+			ParticleScale * FMath::Lerp(0.48f, 0.28f, LifeAlpha);
 		SmokeTransforms.Emplace(
 			FRotator::ZeroRotator,
 			Particle.LocalPosition,

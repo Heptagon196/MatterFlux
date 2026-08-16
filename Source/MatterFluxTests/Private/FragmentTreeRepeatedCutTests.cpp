@@ -488,6 +488,15 @@ bool FMatterFluxTreeRepeatedMultiDirectionCutTest::RunTest(
 		TEXT("Felled tree has a physical carrier"),
 		Carrier))
 	{
+		TestTrue(
+			TEXT("Felled tree uses continuous collision detection against a moving character"),
+			Carrier->MeshComponent->BodyInstance.bUseCCD);
+		TestTrue(
+			TEXT("Felled tree has enough linear damping to reject push-force velocity spikes"),
+			Carrier->MeshComponent->GetLinearDamping() >= 1.0f);
+		TestTrue(
+			TEXT("Felled tree has enough angular damping to prevent contact jitter"),
+			Carrier->MeshComponent->GetAngularDamping() >= 4.0f);
 		TestEqual(
 			TEXT("Felled carrier owns one logical leaf member"),
 			Carrier->GetAggregateMemberCount(),

@@ -3335,6 +3335,20 @@ void AMatterFluxPlayableWorldActor::EnsureGroundCombustionVisuals(
 		GroundSmokeMaterial,
 		Rule->SmokeMaterial,
 		FLinearColor(0.15f, 0.16f, 0.18f));
+	if (GroundSmokeMaterial)
+	{
+		const FMatterFluxMaterialDefinition* SmokeDefinition =
+			Registry.Materials.Find(Rule->SmokeMaterial);
+		const FLinearColor SmokeColor = SmokeDefinition
+			? SmokeDefinition->Color
+			: FLinearColor(0.15f, 0.16f, 0.18f);
+		GroundSmokeMaterial->SetVectorParameterValue(
+			TEXT("Color"),
+			FLinearColor::LerpUsingHSV(
+				SmokeColor,
+				FLinearColor(0.48f, 0.51f, 0.56f, 1.0f),
+				0.65f));
+	}
 }
 
 void AMatterFluxPlayableWorldActor::
@@ -3440,8 +3454,8 @@ void AMatterFluxPlayableWorldActor::
 		{
 			SmokeTransforms.Emplace(
 				FRotator::ZeroRotator,
-				Surface + FVector(-Jitter, Jitter, 62.0f),
-				FVector(0.22f));
+				Surface + FVector(-Jitter, Jitter, 76.0f),
+				FVector(0.10f, 0.10f, 0.16f));
 			SmokeVisualCells.Add(CellIndex);
 		}
 	}
@@ -3700,8 +3714,8 @@ void AMatterFluxPlayableWorldActor::ApplyGroundCombustionVisualChanges(
 				CellIndex,
 				FTransform(
 					FRotator::ZeroRotator,
-					Surface + FVector(-Jitter, Jitter, 62.0f),
-					FVector(0.22f)));
+					Surface + FVector(-Jitter, Jitter, 76.0f),
+					FVector(0.10f, 0.10f, 0.16f)));
 		}
 		if (GroundFlameCellByInstance.Num() >= 256
 			&& GroundSmokeCellByInstance.Num() >= 96)
@@ -4026,6 +4040,10 @@ void AMatterFluxPlayableWorldActor::
 			}
 		};
 	ConfigureMaterial(SourceFlameMaterial, SourceFlameInstances, FlameColor);
+	SmokeColor = FLinearColor::LerpUsingHSV(
+		SmokeColor,
+		FLinearColor(0.48f, 0.51f, 0.56f, 1.0f),
+		0.65f);
 	ConfigureMaterial(SourceSmokeMaterial, SourceSmokeInstances, SmokeColor);
 
 	TArray<FTransform> FlameTransforms;
@@ -4087,8 +4105,11 @@ void AMatterFluxPlayableWorldActor::
 			{
 				SmokeTransforms.Emplace(
 					VisualTransform.Rotator(),
-					Position + FVector(0.0f, 0.0f, Source->Mask.CellSize),
-					FVector(Scale * 0.8f));
+					Position + FVector(
+						0.0f,
+						0.0f,
+						Source->Mask.CellSize * 1.35f),
+					FVector(Scale * 0.42f));
 			}
 		}
 	}

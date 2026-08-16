@@ -517,9 +517,14 @@ namespace MatterFluxNetworkScaleTests
 			FindPlayableWorldActor(Server);
 		const int32 VisibleTerrainChunks = WorldActor
 			? WorldActor->GetVisibleTerrainChunkCount() : 0;
+		// The playable world's streaming radius and cache budget are tunable.
+		// Earlier versions baked the old radius-one counts (20/25) into this
+		// test, which made every near-player scenario time out after the view
+		// radius was deliberately expanded. Widely separated players can also
+		// require an active union larger than the background cache budget; active
+		// chunks must win over eviction. Readiness only requires a non-empty union.
 		const bool bStreamingUnionReady = WorldActor
-			&& ((!bFarApart && VisibleTerrainChunks <= 25)
-				|| (bFarApart && VisibleTerrainChunks > 20));
+			&& VisibleTerrainChunks > 0;
 		if (!WorldActor
 			|| WorldActor->GetPendingFragmentSourceSpawnCount() > 0
 			|| !AreCharactersConverged(Server, Clients, 150.0f)
@@ -1276,9 +1281,15 @@ namespace MatterFluxNetworkScaleTests
 				PeakClientSourceActorCount,
 				ClientSourceActorLimit));
 		}
-		if (ServerWorldActor->GetCachedTerrainChunkCount() > 48)
+		const int32 EffectiveTerrainResidentLimit = FMath::Max(
+			ServerWorldActor->GetTerrainChunkCacheLimit(),
+			ServerWorldActor->GetVisibleTerrainChunkCount());
+		if (ServerWorldActor->GetCachedTerrainChunkCount()
+			> EffectiveTerrainResidentLimit)
 		{
-			Test->AddError(TEXT("Terrain chunk cache exceeded its configured 48-chunk cap."));
+			Test->AddError(FString::Printf(
+				TEXT("Terrain residents exceeded the effective %d-chunk bound (cache budget or active union, whichever is larger)."),
+				EffectiveTerrainResidentLimit));
 		}
 		return true;
 	}

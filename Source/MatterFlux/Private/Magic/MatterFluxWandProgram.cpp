@@ -51,7 +51,14 @@ namespace MatterFluxWandProgram
 			DrawOrder.Reserve(InSlots.Num());
 			for (int32 Index = 0; Index < InSlots.Num(); ++Index)
 			{
-				DrawOrder.Add(Index);
+				// Capacity describes how many spells a wand can hold; an empty
+				// editor slot is not a blank card in the runtime deck. Including
+				// NAME_None here made every starter wand cast once and then draw
+				// several no-op slots before its spell came around again.
+				if (!InSlots[Index].IsNone())
+				{
+					DrawOrder.Add(Index);
+				}
 			}
 			if (InWand.bShuffle)
 			{
@@ -407,8 +414,9 @@ bool FMatterFluxWandProgram::Evaluate(
 	Context.Plan.RechargeTime =
 		FMath::Max(0.0f, Context.Plan.RechargeTime);
 	Context.Plan.bDeckExhausted =
-		CurrentState.DeckCursor / SpellSlots.Num()
-			!= Context.Plan.NextState.DeckCursor / SpellSlots.Num();
+		!Context.DrawOrder.IsEmpty()
+		&& CurrentState.DeckCursor / Context.DrawOrder.Num()
+			!= Context.Plan.NextState.DeckCursor / Context.DrawOrder.Num();
 	++Context.Plan.NextState.CastSerial;
 	OutPlan = MoveTemp(Context.Plan);
 	return true;

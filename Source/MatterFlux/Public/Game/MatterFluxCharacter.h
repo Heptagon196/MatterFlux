@@ -4,6 +4,7 @@
 #include "AbilitySystemInterface.h"
 #include "Game/MatterFluxPlayerOperation.h"
 #include "GameFramework/Character.h"
+#include "TimerManager.h"
 #include "MatterFluxCharacter.generated.h"
 
 class UAbilitySystemComponent;
@@ -104,6 +105,8 @@ private:
 	void HandleCameraZoom(const FInputActionValue& Value);
 	void HandleJumpStarted();
 	void HandleJumpCompleted();
+	void HandleCastWandStarted(int32 EquipmentSlot);
+	void HandleCastWandStopped(int32 EquipmentSlot);
 	void HandleCastWandRequested(int32 EquipmentSlot);
 	void HandleRegenerateRequested();
 	void TryActivateWandSlot(int32 EquipmentSlot);
@@ -128,6 +131,9 @@ private:
 		uint8 Operation,
 		FVector2D Value,
 		int32 IntegerValue);
+
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerActivateWandSlot(int32 EquipmentSlot);
 
 	UPROPERTY(Transient)
 	TObjectPtr<UInputMappingContext> PlayableMappingContext;
@@ -160,5 +166,6 @@ private:
 
 	FTimerHandle CutEffectTimer;
 	FTimerHandle FlameEffectTimer;
+	TArray<FTimerHandle> WandCastRepeatTimers;
 	double LastRegenerateRequestTime = -1.0;
 };
