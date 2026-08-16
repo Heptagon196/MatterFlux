@@ -1,4 +1,6 @@
 param(
+    [switch] $Game,
+
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]] $EditorArgs
 )
@@ -29,12 +31,17 @@ if (-not (Test-Path -LiteralPath $EditorExe)) {
     exit 1
 }
 
-Write-Host "Starting Unreal Editor:"
+$LaunchName = if ($Game) { "MatterFlux game" } else { "Unreal Editor" }
+Write-Host "Starting ${LaunchName}:"
 Write-Host "  Engine:  $EngineRoot"
 Write-Host "  Project: $ProjectFile"
 
 $Arguments = New-Object System.Collections.Generic.List[string]
 $Arguments.Add("`"$ProjectFile`"")
+
+if ($Game) {
+    $Arguments.Add("-game")
+}
 
 if ($null -ne $EditorArgs) {
     foreach ($Arg in $EditorArgs) {
