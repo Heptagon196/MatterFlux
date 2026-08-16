@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MatterFlux Lua 内容接口速查表</title>
+  <link rel="stylesheet" href="../assets/lesson.css">
+</head>
+<body>
+<main>
+  <h1>Lua 内容接口速查表</h1>
+  <p class="lead">Schema 1 · Lua 5.4 · 游戏线程 · 事务式提交</p>
+
+  <table>
+    <thead><tr><th>API</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr><td><code>set_manifest(id, revision, schema)</code></td><td>每个文件恰好调用一次；当前 schema 为 1。</td></tr>
+      <tr><td><code>register_material(id, density, hardness, r, g, b, a)</code></td><td>注册模拟/显示材质定义。</td></tr>
+      <tr><td><code>register_decorator(id, generator, material, weight, min, max[, collision])</code></td><td>选择 C++ 生成策略并配置材质、数量和碰撞；省略碰撞时为 <code>false</code>。</td></tr>
+      <tr><td><code>register_entity(id, behavior, health, speed)</code></td><td>注册敌人或可动物体的静态定义。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>当前生成策略</h2>
+  <ul>
+    <li><code>tree</code>：森林树木生成规则；碰撞配置只作用于树干，树冠无碰撞。</li>
+    <li><code>surface_scatter</code>：草、花等表面散布规则；默认无碰撞。</li>
+  </ul>
+
+  <h2>ID 规则</h2>
+  <p>1–64 个字符，只允许字母、数字、下划线、短横线、点和冒号。推荐层级命名，例如
+    <code>forest.flower.pink</code>。</p>
+
+  <h2>不可用能力</h2>
+  <p><code>os</code>、<code>io</code>、<code>package</code>、<code>debug</code>、
+    <code>dofile</code>、<code>loadfile</code>、<code>load</code>、
+    <code>collectgarbage</code>、<code>math.random</code>。</p>
+</main>
+</body>
+</html>

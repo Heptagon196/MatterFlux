@@ -1,0 +1,19 @@
+{
+  "FileVersion": 3,
+  "Version": 7,
+  "VersionName": "0.4.3",
+  "FriendlyName": "Unreal AngelScript Forge",
+  "Description": "Runtime binding and patch infrastructure for AI-driven Unreal gameplay iteration.",
+  "Category": "Scripting",
+  "CanContainContent": false,
+  "IsBetaVersion": true,
+  "Installed": false,
+  "SupportedTargetPlatforms": ["Win64"],
+  "Modules": [
+    {
+      "Name": "ForgeRuntime",
+      "Type": "Runtime",
+      "LoadingPhase": "PreDefault"
+    }
+  ]
+}

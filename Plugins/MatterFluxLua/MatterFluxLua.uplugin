@@ -1,0 +1,18 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "MatterFlux Lua",
+	"Description": "Restricted, transactional Lua content runtime for MatterFlux.",
+	"Category": "Scripting",
+	"CreatedBy": "MatterFlux",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"Modules": [
+		{
+			"Name": "MatterFluxLua",
+			"Type": "Runtime",
+			"LoadingPhase": "PreDefault"
+		}
+	]
+}

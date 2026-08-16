@@ -1,0 +1,8 @@
+content.register_reaction("water_lava_quench", "water", "lava", "steam", "stone", 1000)
+content.register_combustion("wood_burn", "wood", "fire", "smoke", "charcoal", 1000, 720, 18, 680)
+content.register_combustion("leaf_burn", "leaf", "fire", "smoke", "ash", 1000, 900, 7, 820)
+content.register_combustion("grass_burn", "grass", "fire", "smoke", "ash", 1000, 180, 5, 760)
+content.register_combustion("grassland_burn", "grassland", "fire", "smoke", "ash", 1000, 25, 8, 420)
+content.register_combustion("pink_flower_burn", "flower_pink", "fire", "smoke", "ash", 1000, 880, 6, 720)
+content.register_combustion("gold_flower_burn", "flower_gold", "fire", "smoke", "ash", 1000, 880, 6, 720)
+content.register_combustion("blue_flower_burn", "flower_blue", "fire", "smoke", "ash", 1000, 880, 6, 720)

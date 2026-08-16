@@ -1,0 +1,425 @@
+#include "UI/MatterFluxShellWidget.h"
+#include "UI/MatterFluxShellSlate.h"
+
+#include "Game/MatterFluxPlayerController.h"
+#include "InputCoreTypes.h"
+#include "Kismet/KismetSystemLibrary.h"
+#include "Save/MatterFluxSaveSubsystem.h"
+#include "Save/MatterFluxSaveGame.h"
+
+void UMatterFluxShellWidget::InitializeForPlayer(
+	AMatterFluxPlayerController* Controller)
+{
+	OwnerController = Controller;
+	bHostRestorePending = GetWorld()
+		&& GetWorld()->URL.HasOption(TEXT("MatterFluxHostSlot="));
+	SetIsFocusable(true);
+	RefreshShell();
+}
+
+AMatterFluxPlayerController* UMatterFluxShellWidget::GetMatterFluxController() const
+{
+	return OwnerController;
+}
+
+UMatterFluxSaveSubsystem* UMatterFluxShellWidget::GetSaveSubsystem() const
+{
+	return GetGameInstance()
+		? GetGameInstance()->GetSubsystem<UMatterFluxSaveSubsystem>()
+		: nullptr;
+}
+
+void UMatterFluxShellWidget::ShowStartMenu()
+{
+	SubmenuReturnView = EMatterFluxShellView::StartMenu;
+	SetView(EMatterFluxShellView::StartMenu);
+}
+
+void UMatterFluxShellWidget::ShowSinglePlayerMenu()
+{
+	SetView(EMatterFluxShellView::SinglePlayerMenu);
+}
+
+void UMatterFluxShellWidget::ShowMultiplayerMenu()
+{
+	SetView(EMatterFluxShellView::MultiplayerMenu);
+}
+
+void UMatterFluxShellWidget::ShowCreateRoomMenu()
+{
+	SelectedHostSlotIndex = INDEX_NONE;
+	SetView(EMatterFluxShellView::CreateRoomMenu);
+}
+
+void UMatterFluxShellWidget::ShowJoinRoomMenu()
+{
+	SetView(EMatterFluxShellView::JoinRoomMenu);
+}
+
+bool UMatterFluxShellWidget::IsFrontEndView() const
+{
+	return View == EMatterFluxShellView::StartMenu
+		|| View == EMatterFluxShellView::SinglePlayerMenu
+		|| View == EMatterFluxShellView::MultiplayerMenu
+		|| View == EMatterFluxShellView::CreateRoomMenu
+		|| View == EMatterFluxShellView::JoinRoomMenu;
+}
+
+void UMatterFluxShellWidget::ShowPauseMenu()
+{
+	SubmenuReturnView = EMatterFluxShellView::PauseMenu;
+	SetView(EMatterFluxShellView::PauseMenu);
+}
+
+void UMatterFluxShellWidget::ShowSettings()
+{
+	SubmenuReturnView = IsFrontEndView()
+		? View : EMatterFluxShellView::PauseMenu;
+	SetView(EMatterFluxShellView::Settings);
+}
+
+void UMatterFluxShellWidget::ShowSaveSlots()
+{
+	SubmenuReturnView = IsFrontEndView()
+		? View : EMatterFluxShellView::PauseMenu;
+	SetView(EMatterFluxShellView::SaveSlots);
+}
+
+void UMatterFluxShellWidget::ShowLoadSlots()
+{
+	SubmenuReturnView = IsFrontEndView()
+		? View : EMatterFluxShellView::PauseMenu;
+	SetView(EMatterFluxShellView::LoadSlots);
+}
+
+void UMatterFluxShellWidget::CloseMenus()
+{
+	SetView(EMatterFluxShellView::Gameplay);
+}
+
+void UMatterFluxShellWidget::SetView(const EMatterFluxShellView NewView)
+{
+	View = NewView;
+	RenamingSlotIndex = INDEX_NONE;
+	RenameDraft.Reset();
+	TransientNotice.Reset();
+	RefreshShell();
+	NotifyControllerState(false);
+}
+
+void UMatterFluxShellWidget::ReturnFromSubmenu()
+{
+	SetView(SubmenuReturnView);
+}
+
+void UMatterFluxShellWidget::RequestNewGame()
+{
+	if (UMatterFluxSaveSubsystem* Save = GetSaveSubsystem())
+	{
+		bCloseAfterSuccessfulOperation = true;
+		const bool bStarted = Save->RequestNewGame(OwnerController);
+		if (!bStarted
+			&& Save->GetOperation() == EMatterFluxSaveOperation::Failed)
+		{
+			TransientNotice = Save->GetLastResultMessage();
+			Save->AcknowledgeResult();
+			bCloseAfterSuccessfulOperation = false;
+		}
+		LastObservedOperation = Save->GetOperation();
+		RefreshShell();
+		NotifyControllerState(Save->IsBusy());
+	}
+}
+
+void UMatterFluxShellWidget::RequestContinue()
+{
+	if (UMatterFluxSaveSubsystem* Save = GetSaveSubsystem())
+	{
+		const int32 SlotIndex = Save->GetMostRecentSlotIndex();
+		if (SlotIndex != INDEX_NONE)
+		{
+			RequestSlotOperation(SlotIndex, true);
+		}
+	}
+}
+
+void UMatterFluxShellWidget::RequestHostRoom(const int32 SaveSlotIndex)
+{
+	TransientNotice.Reset();
+	if (!OwnerController)
+	{
+		TransientNotice = TEXT("找不到本地玩家控制器");
+		RefreshShell();
+		return;
+	}
+	FString Error;
+	if (!OwnerController->HostListenRoom(SaveSlotIndex, Error))
+	{
+		TransientNotice = Error.IsEmpty() ? TEXT("无法创建房间") : Error;
+		RefreshShell();
+		return;
+	}
+	TransientNotice = TEXT("正在创建房间……");
+	RefreshShell();
+}
+
+void UMatterFluxShellWidget::SelectHostSlot(const int32 SlotIndex)
+{
+	const UMatterFluxSaveSubsystem* Save = GetSaveSubsystem();
+	SelectedHostSlotIndex = Save && Save->FindSlot(SlotIndex)
+		? SlotIndex
+		: INDEX_NONE;
+	TransientNotice.Reset();
+	RefreshShell();
+}
+
+void UMatterFluxShellWidget::RequestJoinRoom()
+{
+	TransientNotice.Reset();
+	if (!OwnerController)
+	{
+		TransientNotice = TEXT("找不到本地玩家控制器");
+		RefreshShell();
+		return;
+	}
+	FString NormalizedAddress;
+	FString Error;
+	if (!OwnerController->JoinRoomByAddress(
+		JoinAddress, NormalizedAddress, Error))
+	{
+		TransientNotice = Error.IsEmpty() ? TEXT("无法加入房间") : Error;
+		RefreshShell();
+		return;
+	}
+	JoinAddress = MoveTemp(NormalizedAddress);
+	TransientNotice = TEXT("正在连接房间……");
+	RefreshShell();
+}
+
+void UMatterFluxShellWidget::RequestSlotOperation(
+	const int32 SlotIndex,
+	const bool bLoad)
+{
+	if (UMatterFluxSaveSubsystem* Save = GetSaveSubsystem())
+	{
+		bCloseAfterSuccessfulOperation = bLoad;
+		bool bStarted = false;
+		if (bLoad)
+		{
+			bStarted = Save->RequestLoad(OwnerController, SlotIndex);
+		}
+		else
+		{
+			bStarted = Save->RequestSave(OwnerController, SlotIndex);
+		}
+		if (!bStarted
+			&& Save->GetOperation() == EMatterFluxSaveOperation::Failed)
+		{
+			TransientNotice = Save->GetLastResultMessage();
+			Save->AcknowledgeResult();
+			bCloseAfterSuccessfulOperation = false;
+		}
+		LastObservedOperation = Save->GetOperation();
+		RefreshShell();
+		NotifyControllerState(Save->IsBusy());
+	}
+}
+
+void UMatterFluxShellWidget::RequestDuplicateSlot(const int32 SlotIndex)
+{
+	if (UMatterFluxSaveSubsystem* Save = GetSaveSubsystem())
+	{
+		RenamingSlotIndex = INDEX_NONE;
+		RenameDraft.Reset();
+		bCloseAfterSuccessfulOperation = false;
+		const bool bStarted = Save->RequestDuplicate(SlotIndex);
+		if (!bStarted
+			&& Save->GetOperation() == EMatterFluxSaveOperation::Failed)
+		{
+			TransientNotice = Save->GetLastResultMessage();
+			Save->AcknowledgeResult();
+		}
+		else if (!bStarted)
+		{
+			TransientNotice = TEXT("存档系统正忙");
+		}
+		LastObservedOperation = Save->GetOperation();
+		RefreshShell();
+		NotifyControllerState(Save->IsBusy());
+	}
+}
+
+void UMatterFluxShellWidget::RequestDeleteSlot(const int32 SlotIndex)
+{
+	if (UMatterFluxSaveSubsystem* Save = GetSaveSubsystem())
+	{
+		if (SelectedHostSlotIndex == SlotIndex)
+		{
+			SelectedHostSlotIndex = INDEX_NONE;
+		}
+		if (RenamingSlotIndex == SlotIndex)
+		{
+			RenamingSlotIndex = INDEX_NONE;
+			RenameDraft.Reset();
+		}
+		TransientNotice = Save->DeleteSlot(SlotIndex)
+			? TEXT("存档已删除") : TEXT("无法删除这个存档");
+		RefreshShell();
+	}
+}
+
+void UMatterFluxShellWidget::BeginRenameSlot(const int32 SlotIndex)
+{
+	const UMatterFluxSaveSubsystem* Save = GetSaveSubsystem();
+	const FMatterFluxSaveSlotInfo* SlotInfo = Save
+		? Save->FindSlot(SlotIndex)
+		: nullptr;
+	if (!SlotInfo)
+	{
+		TransientNotice = TEXT("找不到这个存档");
+		RefreshShell();
+		return;
+	}
+	RenamingSlotIndex = SlotIndex;
+	RenameDraft = MatterFluxShellUI::GetSlotDisplayName(*SlotInfo);
+	TransientNotice.Reset();
+	RefreshShell();
+}
+
+void UMatterFluxShellWidget::CommitRenameSlot()
+{
+	if (RenamingSlotIndex == INDEX_NONE)
+	{
+		return;
+	}
+	FString Error;
+	const bool bRenamed = GetSaveSubsystem()
+		&& GetSaveSubsystem()->RenameSlot(
+			RenamingSlotIndex, RenameDraft, Error);
+	RenamingSlotIndex = INDEX_NONE;
+	RenameDraft.Reset();
+	TransientNotice = bRenamed
+		? TEXT("存档已重命名")
+		: (Error.IsEmpty() ? TEXT("无法重命名这个存档") : Error);
+	RefreshShell();
+}
+
+void UMatterFluxShellWidget::CancelRenameSlot()
+{
+	RenamingSlotIndex = INDEX_NONE;
+	RenameDraft.Reset();
+	TransientNotice.Reset();
+	RefreshShell();
+}
+
+void UMatterFluxShellWidget::RequestQuit()
+{
+	UKismetSystemLibrary::QuitGame(
+		this,
+		OwnerController,
+		EQuitPreference::Quit,
+		false);
+}
+
+void UMatterFluxShellWidget::RequestMagicWorkbench()
+{
+	if (OwnerController)
+	{
+		CloseMenus();
+		OwnerController->ToggleMagicWorkbench();
+	}
+}
+
+void UMatterFluxShellWidget::NativeTick(
+	const FGeometry& MyGeometry,
+	const float InDeltaTime)
+{
+	Super::NativeTick(MyGeometry, InDeltaTime);
+	UMatterFluxSaveSubsystem* Save = GetSaveSubsystem();
+	if (!Save)
+	{
+		return;
+	}
+	const EMatterFluxSaveOperation Current = Save->GetOperation();
+	if ((Current == EMatterFluxSaveOperation::Complete
+		|| Current == EMatterFluxSaveOperation::Failed)
+		&& Current != LastObservedOperation)
+	{
+		const bool bSucceeded = Current == EMatterFluxSaveOperation::Complete;
+		TransientNotice = Save->GetLastResultMessage();
+		Save->AcknowledgeResult();
+		LastObservedOperation = Save->GetOperation();
+		if (bHostRestorePending)
+		{
+			bHostRestorePending = false;
+			if (!bSucceeded)
+			{
+				View = EMatterFluxShellView::CreateRoomMenu;
+				RefreshShell();
+				NotifyControllerState(false);
+				return;
+			}
+		}
+		if (bSucceeded && bCloseAfterSuccessfulOperation)
+		{
+			bCloseAfterSuccessfulOperation = false;
+			CloseMenus();
+		}
+		else
+		{
+			bCloseAfterSuccessfulOperation = false;
+			RefreshShell();
+			NotifyControllerState(false);
+		}
+	}
+	else
+	{
+		LastObservedOperation = Current;
+	}
+}
+
+FReply UMatterFluxShellWidget::NativeOnKeyDown(
+	const FGeometry& InGeometry,
+	const FKeyEvent& InKeyEvent)
+{
+	if (InKeyEvent.GetKey() == EKeys::Escape)
+	{
+		if (!IsStartMenuOpen())
+		{
+			IsMenuOpen() ? CloseMenus() : ShowPauseMenu();
+		}
+		return FReply::Handled();
+	}
+	return Super::NativeOnKeyDown(InGeometry, InKeyEvent);
+}
+
+TSharedRef<SWidget> UMatterFluxShellWidget::RebuildWidget()
+{
+	Shell = MatterFluxShellUI::CreateShell(this);
+	return Shell.ToSharedRef();
+}
+
+void UMatterFluxShellWidget::ReleaseSlateResources(
+	const bool bReleaseChildren)
+{
+	Super::ReleaseSlateResources(bReleaseChildren);
+	Shell.Reset();
+}
+
+void UMatterFluxShellWidget::RefreshShell()
+{
+	MatterFluxShellUI::RefreshShell(Shell);
+}
+
+void UMatterFluxShellWidget::NotifyControllerState(
+	const bool bOperationActive) const
+{
+	if (OwnerController)
+	{
+		OwnerController->HandleShellStateChanged(
+			IsMenuOpen(),
+			bOperationActive);
+	}
+}
+
+

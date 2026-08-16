@@ -1,0 +1,37 @@
+# Unreal Engine generated output
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# IDE and generated workspace files
+.vs/
+.idea/
+.vscode/
+*.VC.db
+*.VC.opendb
+*.opensdf
+*.sdf
+*.sln
+*.slnx
+*.suo
+*.user
+*.userprefs
+
+# Local build and diagnostic artifacts
+*.log
+*.pdb
+*.obj
+*.ilk
+*.exp
+
+# Codex/local dependency scratch directories
+.codex_tmp_*/
+
+# Accidental Windows environment expansion output
+%SystemDrive%/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
