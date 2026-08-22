@@ -7,6 +7,9 @@
 -- threshold, but never a smaller one.
 content.configure_fragmentation(4)
 
+local register_material_compiled = content.register_material
+content.register_material = nil
+
 -- Public spell-authoring API. Content scripts describe behavior by calling a
 -- small set of engine capabilities. The raw flat registration table is kept
 -- private because it is only the C++ compiler's wire format.
@@ -32,6 +35,98 @@ local function copy_fields(target, source, allowed, context)
 		end
 		target[key] = value
 	end
+end
+
+-- 材质作者使用命名字段；C++ 仍只接收加载时编译后的不可变表。
+-- 光学字段对所有材质都合法，但只有 liquid 阶段会走透明折射材质。
+material = {}
+
+function material.define(definition)
+	if type(definition) ~= "table" then
+		error("material.define expects a definition table", 2)
+	end
+	local compiled = {}
+	copy_fields(compiled, definition, {
+		"id", "density", "hardness",
+		"color_r", "color_g", "color_b", "color_a",
+		"phase", "mobility", "dispersion",
+		"shallow_opacity", "deep_opacity", "opacity_depth",
+		"refraction_index"
+	}, "material")
+	register_material_compiled(compiled)
+end
+
+-- 自定义地图只描述有界的确定性填充操作。Lua 不直接创建 Actor，
+-- 游戏、自动化测试和截图工具都通过同一份编译结果构建材料世界。
+local register_custom_map_compiled = content.register_custom_map
+content.register_custom_map = nil
+map = {}
+
+function map.define(metadata, build_map)
+	if type(metadata) ~= "table" then
+		error("map.define expects a metadata table", 2)
+	end
+	if type(build_map) ~= "function" then
+		error("map.define expects a builder function", 2)
+	end
+	local compiled = {
+		stamps = {}, markers = {}, scene_boxes = {}, cameras = {},
+		pour_containers = {},
+	}
+	copy_fields(compiled, metadata, {
+		"id", "name", "min_x", "min_y",
+		"max_x_exclusive", "max_y_exclusive",
+		"cell_size_cm", "material_depth_cells"
+	}, "custom map metadata")
+	local api = {}
+	function api.fill_rectangle(material_id, min_x, min_y, max_x, max_y)
+		compiled.stamps[#compiled.stamps + 1] = {
+			shape = "rectangle", material = material_id,
+			min_x = min_x, min_y = min_y, max_x = max_x, max_y = max_y,
+		}
+	end
+	function api.fill_circle(material_id, center_x, center_y, radius)
+		compiled.stamps[#compiled.stamps + 1] = {
+			shape = "circle", material = material_id,
+			center_x = center_x, center_y = center_y, radius = radius,
+		}
+	end
+	function api.marker(id, x, y)
+		compiled.markers[#compiled.markers + 1] = { id = id, x = x, y = y }
+	end
+	function api.scene_box(id, material_id, center_x, center_y, center_z,
+			size_x, size_y, size_z, collision)
+		compiled.scene_boxes[#compiled.scene_boxes + 1] = {
+			id = id, material = material_id,
+			center_x = center_x, center_y = center_y, center_z = center_z,
+			size_x = size_x, size_y = size_y, size_z = size_z,
+			collision = collision == true,
+		}
+	end
+	function api.camera(id, location_x, location_y, location_z,
+			target_x, target_y, target_z, field_of_view)
+		compiled.cameras[#compiled.cameras + 1] = {
+			id = id,
+			location_x = location_x, location_y = location_y,
+			location_z = location_z,
+			target_x = target_x, target_y = target_y, target_z = target_z,
+			field_of_view = field_of_view,
+		}
+	end
+	function api.tilting_container(definition)
+		local compiled_container = {}
+		copy_fields(compiled_container, definition, {
+			"id", "container_material", "liquid_material",
+			"center_x", "center_y", "center_z",
+			"inner_width", "inner_depth", "inner_height",
+			"start_step", "tilt_steps", "tilt_degrees",
+			"pour_cells_per_step",
+		}, "tilting container")
+		compiled.pour_containers[#compiled.pour_containers + 1] =
+			compiled_container
+	end
+	build_map(api)
+	register_custom_map_compiled(compiled)
 end
 
 local projectile_fields = {
@@ -282,4 +377,181 @@ function quest.define(metadata, build_quest)
 		error("quest program does not contain an objective", 2)
 	end
 	register_quest_compiled(compiled)
+end
+
+-- 生物脚本只负责“声明”决策树：加载时会编译成不可变数据，游戏运行时由
+-- 服务器上的 C++ 解释器按固定频率执行，不会在每个 Actor Tick 中调用 Lua。
+local register_creature_compiled = content.register_creature
+content.register_creature = nil
+creature = {}
+
+function creature.define(metadata, build_ai)
+	if type(metadata) ~= "table" or type(build_ai) ~= "function" then
+		error("creature.define expects metadata and an AI builder", 2)
+	end
+	local compiled = {}
+	copy_fields(compiled, metadata, {
+		"id", "name", "faction", "level", "health", "width", "height", "density",
+		"color_r", "color_g", "color_b", "color_a", "dialogue_id", "shop_id"
+	}, "creature metadata")
+	local behavior_defined = false -- 是否已经提交唯一的行为树。
+	local configured_actions = {} -- 当前扁平运行时格式不允许同类动作使用两套参数。
+	local api = {}
+	local function copy_mapped(source, mapping, context)
+		if source == nil then return end
+		if type(source) ~= "table" then
+			error(context .. " parameters must be a table", 4)
+		end
+		for key, value in pairs(source) do
+			local target = mapping[key]
+			if target == nil then
+				error("unknown " .. context .. " field '" .. tostring(key) .. "'", 4)
+			end
+			if compiled[target] ~= nil and compiled[target] ~= value then
+				error(context .. " conflicts with another behavior-tree node", 4)
+			end
+			compiled[target] = value
+		end
+	end
+	-- selector/sequence 都是组合节点，children 的排列顺序就是运行时优先级。
+	local function composite(kind, children)
+		if type(children) ~= "table" or #children == 0 then
+			error("behavior-tree composites require a non-empty child array", 3)
+		end
+		for index, child in ipairs(children) do
+			if type(child) ~= "table" or child.kind == nil then
+				error("behavior-tree child " .. tostring(index) .. " is not a node", 3)
+			end
+		end
+		return { kind = kind, children = children }
+	end
+	-- 条件和动作只能使用 C++ 注册过的白名单名称，不能保存 Lua 回调。
+	local function leaf(kind, name, parameters)
+		if type(name) ~= "string" or name == "" then
+			error("behavior-tree leaves require a non-empty name", 3)
+		end
+		if kind == "condition" then
+			if name == "target_too_close" then
+				copy_mapped(parameters, { distance = "retreat_range" }, name)
+			elseif name == "target_in_attack_range" then
+				copy_mapped(parameters, { distance = "attack_range" }, name)
+			elseif parameters ~= nil then
+				copy_mapped(parameters, {}, name)
+			end
+		elseif parameters ~= nil then
+			if configured_actions[name] then
+				error("behavior-tree action '" .. name .. "' is configured more than once", 3)
+			end
+			configured_actions[name] = true
+			if name == "patrol" then
+				copy_mapped(parameters, {
+					turn_seconds = "patrol_turn", pause_seconds = "patrol_pause"
+				}, name)
+			elseif name == "attack" or name == "skill" then
+				local prefix = name .. "_"
+				copy_mapped(parameters, {
+					cooldown = prefix .. "cooldown", spell = prefix .. "spell",
+					projectiles = prefix .. "projectiles", spread_degrees = prefix .. "spread",
+					projectile_interval = prefix .. "projectile_interval",
+					recovery = prefix .. "recovery", radial = prefix .. "radial",
+					horizontal_impulse = prefix .. "horizontal_impulse",
+					vertical_impulse = prefix .. "vertical_impulse",
+					color_r = prefix .. "color_r", color_g = prefix .. "color_g",
+					color_b = prefix .. "color_b", color_a = prefix .. "color_a",
+					override_color = prefix .. "override_color"
+				}, name)
+			else
+				copy_mapped(parameters, {}, name)
+			end
+		end
+		return { kind = kind, name = name }
+	end
+	function api.selector(children) return composite("selector", children) end
+	function api.sequence(children) return composite("sequence", children) end
+	function api.condition(name, parameters) return leaf("condition", name, parameters) end
+	function api.action(name, parameters) return leaf("action", name, parameters) end
+	function api.tree(definition)
+		if behavior_defined then
+			error("a creature may define only one AI behavior", 2)
+		end
+		if type(definition) ~= "table" then
+			error("ai.tree expects a behavior-tree definition", 2)
+		end
+		copy_fields({}, definition, { "sight", "locomotion", "root" }, "behavior tree")
+		copy_mapped(definition.sight, {
+			range = "perception_range", memory_seconds = "target_memory"
+		}, "behavior-tree sight")
+		copy_mapped(definition.locomotion, {
+			speed = "move_speed"
+		}, "behavior-tree locomotion")
+		local root = definition.root
+		if type(root) ~= "table" or root.kind == nil then
+			error("ai.tree requires one root behavior node", 2)
+		end
+		behavior_defined = true
+		compiled.ai = "behavior_tree"
+		compiled.behavior_tree = root
+	end
+	function api.drop(item_id, count)
+		compiled.drop_item = item_id
+		compiled.drop_count = count
+	end
+	function api.spawn_on_quest(quest_id, count, distance)
+		compiled.spawn_quest = quest_id
+		compiled.spawn_count = count
+		compiled.spawn_distance = distance
+	end
+	build_ai(api)
+	if not behavior_defined then
+		error("creature program does not contain an AI behavior", 2)
+	end
+	register_creature_compiled(compiled)
+end
+
+local register_dialogue_compiled = content.register_dialogue
+content.register_dialogue = nil
+dialogue = {}
+
+function dialogue.define(metadata, build_dialogue)
+	if type(metadata) ~= "table" or type(build_dialogue) ~= "function" then
+		error("dialogue.define expects metadata and a builder", 2)
+	end
+	local compiled = { nodes = {} }
+	copy_fields(compiled, metadata, { "id", "name", "start" }, "dialogue metadata")
+	local api = {}
+	function api.node(node)
+		if type(node) ~= "table" then
+			error("dialogue.node expects a table", 2)
+		end
+		local copy = {}
+		copy_fields(copy, node, {
+			"id", "text", "next", "shop_id", "close", "options"
+		}, "dialogue node")
+		compiled.nodes[#compiled.nodes + 1] = copy
+	end
+	build_dialogue(api)
+	register_dialogue_compiled(compiled)
+end
+
+local register_shop_compiled = content.register_shop
+content.register_shop = nil
+shop = {}
+
+function shop.define(metadata, build_shop)
+	if type(metadata) ~= "table" or type(build_shop) ~= "function" then
+		error("shop.define expects metadata and a builder", 2)
+	end
+	local compiled = { offers = {} }
+	copy_fields(compiled, metadata, { "id", "name" }, "shop metadata")
+	local api = {}
+	function api.offer(parameters)
+		local offer = {}
+		copy_fields(offer, parameters, {
+			"kind", "product_id", "product_count",
+			"cost_item", "cost_count", "limit"
+		}, "shop offer")
+		compiled.offers[#compiled.offers + 1] = offer
+	end
+	build_shop(api)
+	register_shop_compiled(compiled)
 end

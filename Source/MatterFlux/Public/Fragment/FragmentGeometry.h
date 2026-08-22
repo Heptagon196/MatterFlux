@@ -70,7 +70,9 @@ namespace MatterFlux::FragmentGeometry
 		const FVector& DamageCenterWorld,
 		float DamagePower,
 		int32 EventSeed,
-		TArray<FFragmentSpawnPayload>& OutPayloads);
+		TArray<FFragmentSpawnPayload>& OutPayloads,
+		EFragmentSourceGeometryStyle GeometryStyle =
+			EFragmentSourceGeometryStyle::ExtrudedMask);
 	MATTERFLUX_API bool BuildExtrudedMesh(
 		const TArray<FVector2D>& Vertices2D,
 		const TArray<int32>& TriangleIndices,
@@ -81,4 +83,63 @@ namespace MatterFlux::FragmentGeometry
 		TArray<int32>& OutTriangles,
 		TArray<FVector>& OutNormals,
 		TArray<FVector2D>& OutUVs);
+	/** Builds one slightly inset cube per solid cell while keeping one mesh batch. */
+	MATTERFLUX_API bool BuildVoxelBlockMeshFromMask(
+		const TArray<uint8>& Mask,
+		int32 Width,
+		int32 Height,
+		float CellSize,
+		TArray<FVector>& OutVertices,
+		TArray<int32>& OutTriangles,
+		TArray<FVector>& OutNormals,
+		TArray<FVector2D>& OutUVs,
+		int32& OutPrimaryIndexCount);
+	/**
+	 * Builds one watertight render mesh from a set of occupied 3D voxel cells.
+	 * Faces shared by adjacent cells are removed, including depth-adjacent cells
+	 * that originate from separate MatterFlux 2D source masks.
+	 */
+	MATTERFLUX_API bool BuildVoxelBlockMeshFromCells(
+		const TArray<FIntVector>& SolidCells,
+		float CellSize,
+		TArray<FVector>& OutVertices,
+		TArray<int32>& OutTriangles,
+		TArray<FVector>& OutNormals,
+		TArray<FVector2D>& OutUVs,
+		int32& OutPrimaryIndexCount);
+	/**
+	 * Builds only SurfaceCells while treating OccluderCells as occupied neighbours.
+	 * This lets independently editable material layers share one voxel surface
+	 * without emitting hidden or coincident faces at their boundaries.
+	 */
+	MATTERFLUX_API bool BuildVoxelBlockMeshFromCellsWithOccluders(
+		const TArray<FIntVector>& SurfaceCells,
+		const TArray<FIntVector>& OccluderCells,
+		float CellSize,
+		TArray<FVector>& OutVertices,
+		TArray<int32>& OutTriangles,
+		TArray<FVector>& OutNormals,
+		TArray<FVector2D>& OutUVs,
+		int32& OutPrimaryIndexCount);
+	/**
+	 * Selects burning mask cells that are exposed on the top of a voxel column.
+	 * The output uses stable mask-index order and is cleared on invalid input.
+	 */
+	MATTERFLUX_API bool GatherTopExposedBurningMaskCells(
+		const TArray<uint8>& OccupiedMask,
+		const TArray<uint8>& BurningMask,
+		int32 Width,
+		int32 Height,
+		TArray<int32>& OutCellIndices);
+	/** Builds a deterministic faceted cylinder stack from contiguous mask rows. */
+	MATTERFLUX_API bool BuildRadialColumnMeshFromMask(
+		const TArray<uint8>& Mask,
+		int32 Width,
+		int32 Height,
+		float CellSize,
+		TArray<FVector>& OutVertices,
+		TArray<int32>& OutTriangles,
+		TArray<FVector>& OutNormals,
+		TArray<FVector2D>& OutUVs,
+		int32& OutPrimaryIndexCount);
 }

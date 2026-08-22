@@ -151,6 +151,81 @@ bool FMatterFluxLineSplitTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxHorizontalWorldLineOrientationTest,
+	"MatterFlux.Fragment.Damage.HorizontalWorldLineNeverTransposesTreeCut",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxHorizontalWorldLineOrientationTest::RunTest(
+	const FString& Parameters)
+{
+	constexpr int32 Width = 8;
+	constexpr int32 Height = 12;
+	constexpr float CellSize = 18.0f;
+	for (const float SourceYaw : {0.0f, 45.0f, 90.0f, 135.0f})
+	{
+		const FTransform SourceTransform(
+			FRotator(0.0f, SourceYaw, 0.0f),
+			FVector(240.0f, -170.0f, 300.0f));
+		for (const float CutYaw : {0.0f, 45.0f, 90.0f, 135.0f})
+		{
+			TArray<uint8> Mask;
+			Mask.Init(1, Width * Height);
+			FFragmentDamageShape WorldShape;
+			WorldShape.Type = EFragmentDamageShapeType::Line;
+			WorldShape.WorldTransform = FTransform(
+				FRotator(0.0f, CutYaw, 0.0f),
+				SourceTransform.GetLocation());
+			WorldShape.Extents.X = 1200.0f;
+			WorldShape.Thickness = CellSize * 1.1f;
+			FFragmentDamageShape LocalShape = WorldShape;
+			LocalShape.WorldTransform = WorldShape.WorldTransform
+				.GetRelativeTransform(SourceTransform);
+			if (!TestTrue(
+				*FString::Printf(
+					TEXT("Horizontal world cut changes yaw %.0f source at yaw %.0f"),
+					CutYaw,
+					SourceYaw),
+				MatterFlux::FragmentGeometry::ApplyDamageShape(
+					Mask,
+					Width,
+					Height,
+					CellSize,
+					LocalShape)))
+			{
+				continue;
+			}
+			FIntPoint Minimum(MAX_int32, MAX_int32);
+			FIntPoint Maximum(MIN_int32, MIN_int32);
+			for (int32 Y = 0; Y < Height; ++Y)
+			{
+				for (int32 X = 0; X < Width; ++X)
+				{
+					if (Mask[Y * Width + X] != 0)
+					{
+						continue;
+					}
+					Minimum.X = FMath::Min(Minimum.X, X);
+					Minimum.Y = FMath::Min(Minimum.Y, Y);
+					Maximum.X = FMath::Max(Maximum.X, X);
+					Maximum.Y = FMath::Max(Maximum.Y, Y);
+				}
+			}
+			const int32 RemovedWidth = Maximum.X - Minimum.X + 1;
+			const int32 RemovedHeight = Maximum.Y - Minimum.Y + 1;
+			TestTrue(
+				*FString::Printf(
+					TEXT("Horizontal cut stays a row band (source yaw %.0f, cut yaw %.0f, span %dx%d)"),
+					SourceYaw,
+					CutYaw,
+					RemovedWidth,
+					RemovedHeight),
+				RemovedWidth >= Width - 1 && RemovedHeight <= 2);
+		}
+	}
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMatterFluxEightNeighborTest, "MatterFlux.Fragment.Components.EightNeighborConnectivity", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 
 bool FMatterFluxEightNeighborTest::RunTest(const FString& Parameters)
@@ -234,6 +309,24 @@ bool FMatterFluxDeterministicPayloadTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Linear velocity is deterministic"), A[0].InitialLinearVelocity.Equals(B[0].InitialLinearVelocity, 0.0));
 	TestTrue(TEXT("Angular velocity is deterministic"), A[0].InitialAngularVelocity.Equals(B[0].InitialAngularVelocity, 0.0));
 	TestTrue(TEXT("Outer contours are deterministic"), A[0].OuterContours.Num() == B[0].OuterContours.Num() && A[0].OuterContours[0].Vertices == B[0].OuterContours[0].Vertices);
+
+	TArray<FFragmentSpawnPayload> VoxelPayloads;
+	TestTrue(
+		TEXT("Voxel payload preserves its detached component mask"),
+		MatterFlux::FragmentGeometry::BuildSpawnPayloadsFromComponents(
+			Components, SourceId, FTransform::Identity, 2, 2, 7, 10.0f,
+			1, 16, FVector::ZeroVector, 1000.0f, 42, VoxelPayloads,
+			EFragmentSourceGeometryStyle::VoxelBlocks));
+	if (TestEqual(TEXT("One voxel payload is built"), VoxelPayloads.Num(), 1))
+	{
+		TestTrue(
+			TEXT("Detached voxel mask is valid and tightly cropped"),
+			VoxelPayloads[0].DetachedVoxelMask.IsValid()
+				&& VoxelPayloads[0].DetachedVoxelMask.Width == 2
+				&& VoxelPayloads[0].DetachedVoxelMask.Height == 2
+				&& VoxelPayloads[0].DetachedVoxelMask.SolidMask
+					== TArray<uint8>({1, 1, 1, 0}));
+	}
 
 	MatterFlux::FragmentGeometry::FFragmentComponent Left;
 	Left.Min = Left.Max = FIntPoint(0, 0);
@@ -382,6 +475,49 @@ bool FMatterFluxFragmentBudgetTest::RunTest(const FString& Parameters)
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxRadialColumnMeshTest,
+	"MatterFlux.Fragment.Geometry.RadialColumnsAreFacetedAndValid",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxRadialColumnMeshTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	const TArray<uint8> Mask = {
+		0, 1, 1, 1, 0,
+		0, 1, 1, 1, 0,
+		0, 0, 1, 0, 0,
+		0, 0, 1, 0, 0
+	};
+	TArray<FVector> Vertices;
+	TArray<int32> Triangles;
+	TArray<FVector> Normals;
+	TArray<FVector2D> UVs;
+	int32 PrimaryIndexCount = 0;
+	TestTrue(TEXT("A trunk mask builds radial geometry"),
+		MatterFlux::FragmentGeometry::BuildRadialColumnMeshFromMask(
+			Mask, 5, 4, 10.0f,
+			Vertices, Triangles, Normals, UVs, PrimaryIndexCount));
+	TestTrue(TEXT("Radial geometry separates body and cap sections"),
+		PrimaryIndexCount > 0 && PrimaryIndexCount < Triangles.Num());
+	TestEqual(TEXT("Every radial vertex has a normal"),
+		Normals.Num(), Vertices.Num());
+	TestEqual(TEXT("Every radial vertex has a UV"),
+		UVs.Num(), Vertices.Num());
+	for (const int32 Index : Triangles)
+	{
+		TestTrue(TEXT("Every radial triangle index is valid"),
+			Vertices.IsValidIndex(Index));
+	}
+	TestTrue(TEXT("The body contains normals around more than one depth plane"),
+		Normals.ContainsByPredicate([](const FVector& Normal)
+		{
+			return FMath::Abs(Normal.Y) > 0.5f;
+		}));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxSourceMaskNetSerializationTest,
 	"MatterFlux.Fragment.Network.SourceMaskUsesBoundedBitPacking",
 	EAutomationTestFlags::EditorContext
@@ -397,6 +533,7 @@ bool FMatterFluxSourceMaskNetSerializationTest::RunTest(
 	Source.MinFragmentAreaPixels = 3;
 	Source.MaxFragmentsPerBreak = 16;
 	Source.SupportMode = EFragmentSupportMode::Bottom;
+	Source.GeometryStyle = EFragmentSourceGeometryStyle::VoxelBlocks;
 	Source.SolidMask.SetNumUninitialized(
 		Source.Width * Source.Height);
 	for (int32 Index = 0; Index < Source.SolidMask.Num(); ++Index)
@@ -435,6 +572,9 @@ bool FMatterFluxSourceMaskNetSerializationTest::RunTest(
 	TestEqual(TEXT("Cell size round trips"),
 		RoundTripped.CellSize,
 		Source.CellSize);
+	TestEqual(TEXT("Geometry style round trips"),
+		RoundTripped.GeometryStyle,
+		Source.GeometryStyle);
 	TestTrue(TEXT("Solid cells round trip exactly"),
 		RoundTripped.SolidMask == Source.SolidMask);
 
@@ -452,12 +592,15 @@ bool FMatterFluxSourceMaskNetSerializationTest::RunTest(
 	int32 MaxFragments = 1;
 	uint8 SupportMode =
 		static_cast<uint8>(EFragmentSupportMode::Bottom);
+	uint8 GeometryStyle =
+		static_cast<uint8>(EFragmentSourceGeometryStyle::ExtrudedMask);
 	InvalidWriter << InvalidWidth;
 	InvalidWriter << Height;
 	InvalidWriter << CellSize;
 	InvalidWriter << MinFragmentArea;
 	InvalidWriter << MaxFragments;
 	InvalidWriter << SupportMode;
+	InvalidWriter << GeometryStyle;
 	FBitReader InvalidReader(
 		InvalidWriter.GetData(),
 		InvalidWriter.GetNumBits());
@@ -618,5 +761,199 @@ bool FMatterFluxDerivedBoundsTest::RunTest(const FString& Parameters)
 	if (!TestEqual(TEXT("One payload is produced"), Payloads.Num(), 1)) return false;
 	TestTrue(TEXT("Payload center comes from its cell coordinates"),
 		Payloads[0].InitialTransform.GetLocation().Equals(FVector(10.0, 0.0, 0.0), 0.001));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxVoxelBlockMeshTest,
+	"MatterFlux.Fragment.Geometry.VoxelBlocksBuildIndependentCubes",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxVoxelBlockMeshTest::RunTest(const FString& Parameters)
+{
+	TArray<FVector> Vertices;
+	TArray<int32> Triangles;
+	TArray<FVector> Normals;
+	TArray<FVector2D> UVs;
+	int32 PrimaryIndexCount = 0;
+	TestTrue(TEXT("Two solid cells build as one batched voxel mesh"),
+		MatterFlux::FragmentGeometry::BuildVoxelBlockMeshFromMask(
+			{ 1, 1 }, 2, 1, 10.0f,
+			Vertices, Triangles, Normals, UVs, PrimaryIndexCount));
+	TestEqual(TEXT("Adjacent cells omit their two shared internal quad faces"),
+		Vertices.Num(), 40);
+	TestEqual(TEXT("Each cell contributes twelve triangle indices per side group"),
+		PrimaryIndexCount, 24);
+	TestEqual(TEXT("Only the ten exterior quads contribute triangles"),
+		Triangles.Num(), 60);
+	TestEqual(TEXT("Every voxel vertex has a normal"),
+		Normals.Num(), Vertices.Num());
+	TestEqual(TEXT("Every voxel vertex has a UV"),
+		UVs.Num(), Vertices.Num());
+	for (const int32 Index : Triangles)
+	{
+		TestTrue(TEXT("Every voxel triangle index is valid"),
+			Vertices.IsValidIndex(Index));
+	}
+	for (int32 Index = 0; Index < Triangles.Num(); Index += 3)
+	{
+		const int32 A = Triangles[Index];
+		const int32 B = Triangles[Index + 1];
+		const int32 C = Triangles[Index + 2];
+		const FVector FacingNormal = FVector::CrossProduct(
+			Vertices[C] - Vertices[A],
+			Vertices[B] - Vertices[A]).GetSafeNormal();
+		TestTrue(
+			TEXT("Every voxel face uses UE outward-facing triangle winding"),
+			FVector::DotProduct(FacingNormal, Normals[A]) > 0.99f);
+	}
+
+	bool bHasSharedInternalSide = false;
+	for (int32 Index = 0; Index < Vertices.Num(); ++Index)
+	{
+		bHasSharedInternalSide |= FMath::IsNearlyZero(Vertices[Index].X)
+			&& FMath::Abs(Normals[Index].X) > 0.99f;
+	}
+	TestFalse(TEXT("No X-normal face remains on the shared X=0 plane"),
+		bHasSharedInternalSide);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxVoxelVolumeMeshTest,
+	"MatterFlux.Fragment.Geometry.VoxelVolumeCullsDepthInternalFaces",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxVoxelVolumeMeshTest::RunTest(const FString& Parameters)
+{
+	TArray<FVector> Vertices;
+	TArray<int32> Triangles;
+	TArray<FVector> Normals;
+	TArray<FVector2D> UVs;
+	int32 PrimaryIndexCount = 0;
+	TestTrue(TEXT("Two depth-adjacent cells build as one voxel volume"),
+		MatterFlux::FragmentGeometry::BuildVoxelBlockMeshFromCells(
+			{FIntVector(0, 0, 0), FIntVector(0, 1, 0)},
+			10.0f,
+			Vertices,
+			Triangles,
+			Normals,
+			UVs,
+			PrimaryIndexCount));
+	TestEqual(TEXT("Only the two outer depth faces remain"),
+		PrimaryIndexCount, 12);
+	TestEqual(TEXT("The shared depth plane contributes no triangles"),
+		Triangles.Num(), 60);
+	TestEqual(TEXT("Ten exposed quads contribute forty vertices"),
+		Vertices.Num(), 40);
+
+	bool bHasInternalDepthFace = false;
+	for (int32 Index = 0; Index < Vertices.Num(); ++Index)
+	{
+		bHasInternalDepthFace |= FMath::IsNearlyEqual(Vertices[Index].Y, 5.0f)
+			&& FMath::Abs(Normals[Index].Y) > 0.99f;
+	}
+	TestFalse(TEXT("No Y-normal face remains between adjacent canopy slices"),
+		bHasInternalDepthFace);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxVoxelMaterialBoundaryTest,
+	"MatterFlux.Fragment.Geometry.VoxelMaterialBoundaryCullsHiddenFaces",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxVoxelMaterialBoundaryTest::RunTest(const FString& Parameters)
+{
+	TArray<FVector> Vertices;
+	TArray<int32> Triangles;
+	TArray<FVector> Normals;
+	TArray<FVector2D> UVs;
+	int32 PrimaryIndexCount = 0;
+	TestTrue(TEXT("A leaf block can occlude a neighbouring wood block"),
+		MatterFlux::FragmentGeometry::BuildVoxelBlockMeshFromCellsWithOccluders(
+			{FIntVector(0, 0, 0)},
+			{FIntVector(1, 0, 0)},
+			10.0f,
+			Vertices,
+			Triangles,
+			Normals,
+			UVs,
+			PrimaryIndexCount));
+	TestEqual(TEXT("The material boundary removes one quad"),
+		Triangles.Num(), 30);
+	bool bHasHiddenBoundaryFace = false;
+	for (int32 Index = 0; Index < Vertices.Num(); ++Index)
+	{
+		bHasHiddenBoundaryFace |= FMath::IsNearlyEqual(Vertices[Index].X, 5.0f)
+			&& Normals[Index].X > 0.99f;
+	}
+	TestFalse(TEXT("No wood face is emitted against the leaf neighbour"),
+		bHasHiddenBoundaryFace);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxCombustionTopSurfaceTest,
+	"MatterFlux.Fragment.Geometry.CombustionUsesOnlyTopExposedVoxelCells",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxCombustionTopSurfaceTest::RunTest(const FString& Parameters)
+{
+	const TArray<uint8> Occupied = {
+		1, 1,
+		1, 1,
+		1, 0
+	};
+	const TArray<uint8> Burning = {
+		1, 1,
+		1, 1,
+		1, 0
+	};
+	TArray<int32> VisibleCells;
+	if (!TestTrue(TEXT("Valid combustion masks are accepted"),
+		MatterFlux::FragmentGeometry::GatherTopExposedBurningMaskCells(
+			Occupied, Burning, 2, 3, VisibleCells)))
+	{
+		return false;
+	}
+	TestTrue(TEXT("Only the top exposed cell of each occupied column emits flame"),
+		VisibleCells == TArray<int32>({3, 4}));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxCombustionVisibleSurfaceTest,
+	"MatterFlux.Fragment.Geometry.InternalCombustionDoesNotTeleportToSurface",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxCombustionVisibleSurfaceTest::RunTest(
+	const FString& Parameters)
+{
+	const TArray<uint8> Occupied = {
+		1, 1,
+		1, 1,
+		1, 0
+	};
+	const TArray<uint8> Burning = {
+		1, 0,
+		0, 1,
+		0, 0
+	};
+	TArray<int32> VisibleCells;
+	if (!TestTrue(
+		TEXT("Visible combustion masks are accepted"),
+		MatterFlux::FragmentGeometry::GatherTopExposedBurningMaskCells(
+			Occupied,
+			Burning,
+			2,
+			3,
+			VisibleCells)))
+	{
+		return false;
+	}
+	TestTrue(
+		TEXT("Internal fire does not create disconnected flame pixels on distant surface voxels"),
+		VisibleCells == TArray<int32>({3}));
 	return true;
 }

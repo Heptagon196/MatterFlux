@@ -24,17 +24,21 @@ public:
 		float TargetRadius,
 		float CutThickness,
 		float DamagePower,
-		int32 EventSeed);
+		int32 EventSeed,
+		int32 MaxAffectedSources = 4);
 
 protected:
 	UPROPERTY(EditDefaultsOnly, Category = "Player Ability|Cut")
-	float Range = 900.0f;
+	float Range = 520.0f;
 
 	UPROPERTY(EditDefaultsOnly, Category = "Player Ability|Cut")
-	float TargetRadius = 160.0f;
+	float TargetRadius = 60.0f;
 
 	UPROPERTY(EditDefaultsOnly, Category = "Player Ability|Cut")
-	float CutThickness = 45.0f;
+	float CutThickness = 30.0f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player Ability|Cut")
+	int32 MaxAffectedSources = 4;
 
 	UPROPERTY(EditDefaultsOnly, Category = "Player Ability|Cut")
 	float DamagePower = 1200.0f;

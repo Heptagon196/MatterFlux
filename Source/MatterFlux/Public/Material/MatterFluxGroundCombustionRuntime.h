@@ -55,7 +55,7 @@ namespace MatterFlux::Combustion
 		bool Initialize(
 			const FGroundRuntimeSettings& Settings,
 			const FFragmentSourceMask& GroundMask,
-			const FMatterFluxCombustionDefinition& Rule,
+			const FMatterFluxReactionDefinition& Rule,
 			int32 Seed,
 			FString& OutError);
 		void Reset();
@@ -76,7 +76,7 @@ namespace MatterFlux::Combustion
 		bool RestoreState(
 			const FGroundRuntimeSettings& Settings,
 			const FGroundRuntimeSnapshot& State,
-			const FMatterFluxCombustionDefinition& Rule,
+			const FMatterFluxReactionDefinition& Rule,
 			FString& OutError);
 
 		bool HasPendingReplication() const
@@ -99,7 +99,7 @@ namespace MatterFlux::Combustion
 		int32 GetRevision() const { return Revision; }
 		const TArray<uint8>& GetResidueMask() const { return VisibleResidueMask; }
 		const TArray<uint8>& GetBurningMask() const { return VisibleBurningMask; }
-		const FMatterFluxCombustionDefinition* GetRule() const
+		const FMatterFluxReactionDefinition* GetRule() const
 		{
 			return Simulation ? &Simulation->GetRule() : nullptr;
 		}

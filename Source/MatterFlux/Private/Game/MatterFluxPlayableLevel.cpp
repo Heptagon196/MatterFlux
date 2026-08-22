@@ -120,6 +120,31 @@ namespace MatterFlux::PlayableLevel
 				return SurfaceAtCell(ToCellX(X), ToCellY(Y));
 			}
 
+			bool IsFlatFootprint(
+				const float X,
+				const float Y,
+				const float HalfExtent) const
+			{
+				const int32 MinX = ToCellX(X - HalfExtent);
+				const int32 MaxX = ToCellX(X + HalfExtent);
+				const int32 MinY = ToCellY(Y - HalfExtent);
+				const int32 MaxY = ToCellY(Y + HalfExtent);
+				const float ReferenceHeight = SurfaceAtCell(MinX, MinY);
+				for (int32 CellY = MinY; CellY <= MaxY; ++CellY)
+				{
+					for (int32 CellX = MinX; CellX <= MaxX; ++CellX)
+					{
+						if (!FMath::IsNearlyEqual(
+							SurfaceAtCell(CellX, CellY),
+							ReferenceHeight))
+						{
+							return false;
+						}
+					}
+				}
+				return true;
+			}
+
 			float StreamXAt(const float Y) const
 			{
 				const int32 Row = ToCellY(Y);
@@ -132,11 +157,28 @@ namespace MatterFlux::PlayableLevel
 				return FMath::Abs(X - StreamXAt(Y)) < Margin;
 			}
 
+			bool IsInsideLake(
+				const float X,
+				const float Y,
+				const float Margin = 0.0f) const
+			{
+				const float RadiusX = FMath::Max(LakeRadius.X + Margin, 1.0f);
+				const float RadiusY = FMath::Max(LakeRadius.Y + Margin, 1.0f);
+				const float NormalizedX = (X - LakeCenter.X) / RadiusX;
+				const float NormalizedY = (Y - LakeCenter.Y) / RadiusY;
+				return NormalizedX * NormalizedX
+					+ NormalizedY * NormalizedY <= 1.0f;
+			}
+
 			int32 Seed;
 			const FMatterFluxContentRegistry* Content = nullptr;
 			FVector2D NoiseOffset = FVector2D::ZeroVector;
 			TArray<float> SurfaceHeights;
 			TArray<int32> StreamColumns;
+			FVector2D LakeCenter = FVector2D::ZeroVector;
+			FVector2D LakeRadius = FVector2D(360.0f, 260.0f);
+			float LakeSurfaceZ = 100.0f;
+			FVector2D HouseCenter = FVector2D::ZeroVector;
 			TMap<FName, int32> SourceOrdinals;
 		};
 
@@ -290,6 +332,16 @@ namespace MatterFlux::PlayableLevel
 				Context,
 				TEXT("grassland"),
 				FLinearColor(0.018f, 0.18f, 0.035f));
+			const auto ScaleBackdropColor = [](
+				const FLinearColor& Color,
+				const float Scale)
+			{
+				return FLinearColor(
+					FMath::Clamp(Color.R * Scale, 0.0f, 1.0f),
+					FMath::Clamp(Color.G * Scale, 0.0f, 1.0f),
+					FMath::Clamp(Color.B * Scale, 0.0f, 1.0f),
+					1.0f);
+			};
 			Layout.Terrain.Seed = Context.Seed;
 			Layout.Terrain.bInfinite = true;
 			Layout.Terrain.Width = TerrainCellsX;
@@ -299,24 +351,114 @@ namespace MatterFlux::PlayableLevel
 			Layout.Terrain.FirstCellCenter =
 				FVector2D(TerrainOriginX, TerrainOriginY);
 
-			// The playable terrain is finite, but the isometric camera can see
-			// beyond an edge when a player explores near it. A single non-colliding
-			// voxel slab replaces the black void with a dark forest floor without
-			// extending simulation, streaming, navigation, or collision bounds.
+			// The real terrain is streamed at full resolution around players only.
+			// A deterministic coarse underlay fills distant holes in an isometric
+			// view without extending simulation, collision, replication, or the
+			// terrain-chunk working set.
 			FLevelLayer& Backdrop = AddLayer(
 				Layout,
 				TEXT("Backdrop"),
 				ELayerPrimitive::Cube,
-				GrassColor * 0.55f,
+				ScaleBackdropColor(GrassColor, 0.82f),
 				false,
-				ELevelLayerRenderMode::VoxelLit);
-			Backdrop.Instances.Emplace(
+				ELevelLayerRenderMode::VoxelUnlit);
+			constexpr float BackdropCellSize = 400.0f;
+			constexpr int32 BackdropCellsX = 32;
+			constexpr int32 BackdropCellsY = 24;
+			constexpr float BackdropOverlapScale = 1.01f;
+			constexpr float BackdropClearance = TerrainCellSize;
+			Backdrop.Instances.Reserve(BackdropCellsX * BackdropCellsY);
+			for (int32 Y = 0; Y < BackdropCellsY; ++Y)
+			{
+				for (int32 X = 0; X < BackdropCellsX; ++X)
+				{
+					const float WorldX =
+						(static_cast<float>(X) + 0.5f
+							- static_cast<float>(BackdropCellsX) * 0.5f)
+						* BackdropCellSize;
+					const float WorldY =
+						(static_cast<float>(Y) + 0.5f
+							- static_cast<float>(BackdropCellsY) * 0.5f)
+						* BackdropCellSize;
+					// 远景块只是一层无碰撞伪装，绝不能穿过真实流式地形。
+					// 旧代码只采样 400 cm 方块中心；块内的柏林噪声低谷会
+					// 露出这张粗平面，斜视时就成为明显的深绿色三角形。
+					// 按真实 8 cm 地形晶格扫描整个渲染覆盖区（含 1% 接缝
+					// 重叠），以最低地形高度为上限，再下沉一个格消除共面。
+					const float RenderedHalfSize =
+						BackdropCellSize * BackdropOverlapScale * 0.5f;
+					const int64 MinimumCellX = FMath::FloorToInt64(
+						(WorldX - RenderedHalfSize - TerrainOriginX)
+						/ TerrainCellSize);
+					const int64 MaximumCellX = FMath::CeilToInt64(
+						(WorldX + RenderedHalfSize - TerrainOriginX)
+						/ TerrainCellSize);
+					const int64 MinimumCellY = FMath::FloorToInt64(
+						(WorldY - RenderedHalfSize - TerrainOriginY)
+						/ TerrainCellSize);
+					const int64 MaximumCellY = FMath::CeilToInt64(
+						(WorldY + RenderedHalfSize - TerrainOriginY)
+						/ TerrainCellSize);
+					float MinimumTerrainHeight =
+						TNumericLimits<float>::Max();
+					for (int64 CellY = MinimumCellY;
+						CellY <= MaximumCellY;
+						++CellY)
+					{
+						for (int64 CellX = MinimumCellX;
+							CellX <= MaximumCellX;
+							++CellX)
+						{
+							MinimumTerrainHeight = FMath::Min(
+								MinimumTerrainHeight,
+								SampleTerrainHeight(
+									TerrainOriginX
+										+ static_cast<double>(CellX)
+											* TerrainCellSize,
+									TerrainOriginY
+										+ static_cast<double>(CellY)
+											* TerrainCellSize,
+									Context.NoiseOffset));
+						}
+					}
+					const float TopZ = MinimumTerrainHeight
+						- BackdropClearance;
+					constexpr float BackdropThickness = 24.0f;
+					Backdrop.Instances.Emplace(
+						FRotator::ZeroRotator,
+						FVector(
+							WorldX,
+							WorldY,
+							TopZ - BackdropThickness * 0.5f),
+						FVector(
+							BackdropCellSize * BackdropOverlapScale / 100.0f,
+							BackdropCellSize * BackdropOverlapScale / 100.0f,
+							BackdropThickness / 100.0f));
+				}
+			}
+
+			// The coarse field is intentionally finite. A single still-cheaper
+			// floor below the lowest real terrain hides its remote edge, so no
+			// camera angle can reveal the renderer's black clear color.
+			FLevelLayer& HorizonFloor = AddLayer(
+				Layout,
+				TEXT("HorizonFloor"),
+				ELayerPrimitive::Cube,
+				ScaleBackdropColor(GrassColor, 0.68f),
+				false,
+				ELevelLayerRenderMode::VoxelUnlit);
+			constexpr float HorizonTopZ = 24.0f;
+			constexpr float HorizonBottomZ = -320.0f;
+			HorizonFloor.Instances.Emplace(
 				FRotator::ZeroRotator,
-				FVector(0.0f, 0.0f, -130.0f),
 				FVector(
-					MapSizeX * 2.0f / 100.0f,
-					MapSizeY * 2.0f / 100.0f,
-					0.4f));
+					0.0f,
+					0.0f,
+					(HorizonTopZ + HorizonBottomZ) * 0.5f),
+				FVector(
+					400.0f,
+					400.0f,
+					(HorizonTopZ - HorizonBottomZ) / 100.0f));
 
 			FLevelLayer& Soil = AddLayer(
 				Layout,
@@ -326,7 +468,8 @@ namespace MatterFlux::PlayableLevel
 					Context,
 					TEXT("soil"),
 					FLinearColor(0.16f, 0.045f, 0.012f)),
-				true);
+				true,
+				ELevelLayerRenderMode::CollisionOnly);
 			Soil.Instances.Emplace(
 				FRotator::ZeroRotator,
 				FVector(0.0f, 0.0f, -55.0f),
@@ -389,6 +532,151 @@ namespace MatterFlux::PlayableLevel
 				Context.StreamColumns.Add(Column);
 				PreviousColumn = Column;
 			}
+
+			// 固定候选区附近生成一个 seed 可重复的大湖。先从原始柏林
+			// 地形取得岸线最低点，再用连续权重压出碗形湖床；边缘权重为
+			// 0，因此不会产生一圈突然断开的悬崖。
+			FRandomStream LakeRandom = Context.MakeRuleStream(0x4c414b45u);
+			Context.LakeCenter = FVector2D(
+				-120.0f + LakeRandom.FRandRange(-90.0f, 90.0f),
+				140.0f + LakeRandom.FRandRange(-70.0f, 70.0f));
+			Context.LakeRadius = FVector2D(
+				LakeRandom.FRandRange(350.0f, 410.0f),
+				LakeRandom.FRandRange(250.0f, 300.0f));
+			float MinimumRimHeight = TNumericLimits<float>::Max();
+			for (int32 Y = 0; Y < TerrainCellsY; ++Y)
+			{
+				for (int32 X = 0; X < TerrainCellsX; ++X)
+				{
+					const float WorldX = TerrainOriginX
+						+ static_cast<float>(X) * TerrainCellSize;
+					const float WorldY = TerrainOriginY
+						+ static_cast<float>(Y) * TerrainCellSize;
+					const float NX = (WorldX - Context.LakeCenter.X)
+						/ Context.LakeRadius.X;
+					const float NY = (WorldY - Context.LakeCenter.Y)
+						/ Context.LakeRadius.Y;
+					const float Radius = FMath::Sqrt(NX * NX + NY * NY);
+					if (Radius >= 0.92f && Radius <= 1.08f)
+					{
+						MinimumRimHeight = FMath::Min(
+							MinimumRimHeight,
+							Context.SurfaceAtCell(X, Y));
+					}
+				}
+			}
+			Context.LakeSurfaceZ = FMath::GridSnap(
+				MinimumRimHeight - TerrainCellSize,
+				TerrainCellSize);
+			for (int32 Y = 0; Y < TerrainCellsY; ++Y)
+			{
+				for (int32 X = 0; X < TerrainCellsX; ++X)
+				{
+					const float WorldX = TerrainOriginX
+						+ static_cast<float>(X) * TerrainCellSize;
+					const float WorldY = TerrainOriginY
+						+ static_cast<float>(Y) * TerrainCellSize;
+					const float NX = (WorldX - Context.LakeCenter.X)
+						/ Context.LakeRadius.X;
+					const float NY = (WorldY - Context.LakeCenter.Y)
+						/ Context.LakeRadius.Y;
+					const float Radius = FMath::Sqrt(NX * NX + NY * NY);
+					if (Radius >= 1.0f)
+					{
+						continue;
+					}
+					const float Interior = FMath::Clamp(
+						(1.0f - Radius) / 0.72f,
+						0.0f,
+						1.0f);
+					const float SmoothInterior = Interior * Interior
+						* (3.0f - 2.0f * Interior);
+					const float TargetDepth = FMath::Lerp(
+						8.0f,
+						128.0f,
+						SmoothInterior);
+					const float TargetBed = Context.LakeSurfaceZ - TargetDepth;
+					const int32 Index = Y * TerrainCellsX + X;
+					const float BlendWeight = FMath::Clamp(
+						(1.0f - Radius) / 0.82f,
+						0.0f,
+						1.0f);
+					Context.SurfaceHeights[Index] = FMath::GridSnap(
+						FMath::Lerp(
+							Context.SurfaceHeights[Index],
+							FMath::Min(Context.SurfaceHeights[Index], TargetBed),
+							BlendWeight),
+						TerrainCellSize);
+				}
+			}
+			Layout.Terrain.Heights = Context.SurfaceHeights;
+			for (int32 Index = 0; Index < Context.SurfaceHeights.Num(); ++Index)
+			{
+				Layout.Terrain.ColorBands[Index] =
+					SelectTerrainColorBand(Context.SurfaceHeights[Index]);
+			}
+
+			// Backdrop 最初按未雕刻地形放置。湖床降低后再收紧与湖相交
+			// 的粗块上表面，保证远景代理永远在真实流式地形之下。
+			for (FTransform& Instance : Backdrop.Instances)
+			{
+				const FVector Scale = Instance.GetScale3D();
+				const FVector Location = Instance.GetLocation();
+				const float HalfX = Scale.X * 50.0f;
+				const float HalfY = Scale.Y * 50.0f;
+				if (FMath::Abs(Location.X - Context.LakeCenter.X)
+						> HalfX + Context.LakeRadius.X
+					|| FMath::Abs(Location.Y - Context.LakeCenter.Y)
+						> HalfY + Context.LakeRadius.Y)
+				{
+					continue;
+				}
+				const int32 MinX = Context.ToCellX(Location.X - HalfX);
+				const int32 MaxX = Context.ToCellX(Location.X + HalfX);
+				const int32 MinY = Context.ToCellY(Location.Y - HalfY);
+				const int32 MaxY = Context.ToCellY(Location.Y + HalfY);
+				float MinimumHeight = TNumericLimits<float>::Max();
+				for (int32 CellY = MinY; CellY <= MaxY; ++CellY)
+				{
+					for (int32 CellX = MinX; CellX <= MaxX; ++CellX)
+					{
+						MinimumHeight = FMath::Min(
+							MinimumHeight,
+							Context.SurfaceAtCell(CellX, CellY));
+					}
+				}
+				const float CurrentTop = Location.Z + Scale.Z * 50.0f;
+				const float SafeTop = FMath::Min(
+					CurrentTop,
+					MinimumHeight - TerrainCellSize);
+				Instance.SetLocation(FVector(
+					Location.X,
+					Location.Y,
+					SafeTop - Scale.Z * 50.0f));
+			}
+
+			// 溪流形状由 seed 决定。按固定候选顺序挑选第一块远离溪流
+			// 的地面，使所有联机端可独立得到同一个房屋预留区。
+			const FVector2D HouseCandidates[] = {
+				FVector2D(650.0f, -720.0f),
+				FVector2D(920.0f, 260.0f),
+				FVector2D(-120.0f, 920.0f),
+				FVector2D(-1050.0f, 180.0f)
+			};
+			FVector2D HouseCenter = HouseCandidates[0];
+			for (const FVector2D Candidate : HouseCandidates)
+			{
+				if (!Context.IsNearStream(
+						Candidate.X, Candidate.Y, 760.0f)
+					&& !Context.IsInsideLake(
+						Candidate.X, Candidate.Y, 760.0f))
+				{
+					HouseCenter = Candidate;
+					break;
+				}
+			}
+			Context.HouseCenter = HouseCenter;
+			Layout.HouseLocation = FVector(HouseCenter, 0.0f);
 		}
 
 		void GenerateStream(FGenerationContext& Context, FLevelLayout& Layout)
@@ -402,7 +690,8 @@ namespace MatterFlux::PlayableLevel
 					TEXT("water"),
 					FLinearColor(0.015f, 0.24f, 0.78f)),
 				false,
-				ELevelLayerRenderMode::VoxelLit);
+				ELevelLayerRenderMode::Liquid);
+			Stream.MaterialId = TEXT("water");
 			Stream.Instances.Reserve(TerrainCellsY * 6);
 			for (int32 Y = 0; Y < TerrainCellsY; ++Y)
 			{
@@ -422,6 +711,49 @@ namespace MatterFlux::PlayableLevel
 							TerrainCellSize * 1.004f / 100.0f,
 							TerrainCellSize * 1.004f / 100.0f,
 							0.07f));
+				}
+			}
+		}
+
+		void GenerateLake(FGenerationContext& Context, FLevelLayout& Layout)
+		{
+			FLevelLayer& Lake = AddLayer(
+				Layout,
+				TEXT("Lake"),
+				ELayerPrimitive::Cube,
+				ResolveMaterialColor(
+					Context,
+					TEXT("water"),
+					FLinearColor(0.06f, 0.34f, 0.72f, 0.82f)),
+				false,
+				ELevelLayerRenderMode::Liquid);
+			Lake.MaterialId = TEXT("water");
+			for (int32 Y = 0; Y < TerrainCellsY; ++Y)
+			{
+				for (int32 X = 0; X < TerrainCellsX; ++X)
+				{
+					const float WorldX = TerrainOriginX
+						+ static_cast<float>(X) * TerrainCellSize;
+					const float WorldY = TerrainOriginY
+						+ static_cast<float>(Y) * TerrainCellSize;
+					if (!Context.IsInsideLake(WorldX, WorldY)
+						|| Context.LakeSurfaceZ
+							- Context.SurfaceAtCell(X, Y) < 4.0f)
+					{
+						continue;
+					}
+					constexpr float SurfaceThickness = 8.0f;
+					Lake.Instances.Emplace(
+						FRotator::ZeroRotator,
+						FVector(
+							WorldX,
+							WorldY,
+							Context.LakeSurfaceZ
+								- SurfaceThickness * 0.5f),
+						FVector(
+							TerrainCellSize * 1.004f / 100.0f,
+							TerrainCellSize * 1.004f / 100.0f,
+							SurfaceThickness / 100.0f));
 				}
 			}
 		}
@@ -462,7 +794,12 @@ namespace MatterFlux::PlayableLevel
 						>= (bReserveCameraCorridor ? 280.0f : 120.0f)
 					&& (!bReserveCameraCorridor
 						|| !bInsideCameraCorridor);
+				const bool bClearOfHouse =
+					FMath::Abs(X - Context.HouseCenter.X) > 850.0f
+					|| FMath::Abs(Y - Context.HouseCenter.Y) > 710.0f;
 				if (bClearOfDefaultSpawn
+					&& bClearOfHouse
+					&& !Context.IsInsideLake(X, Y, 90.0f)
 					&& (StreamMargin <= 0.0f
 						|| !Context.IsNearStream(X, Y, StreamMargin)))
 				{
@@ -491,7 +828,7 @@ namespace MatterFlux::PlayableLevel
 				0x524f434bu);
 			for (int32 Index = 0; Index < Count; ++Index)
 			{
-				FVector Location;
+				FVector Location = FVector::ZeroVector;
 				if (!FindScatterLocation(
 					Context,
 					Random,
@@ -558,54 +895,91 @@ namespace MatterFlux::PlayableLevel
 				Context,
 				TEXT("leaf"),
 				FLinearColor(0.07f, 0.42f, 0.10f));
-			const auto ScaleRgb = [](const FLinearColor& Color, const float Scale)
-			{
-				return FLinearColor(
-					FMath::Clamp(Color.R * Scale, 0.0f, 1.0f),
-					FMath::Clamp(Color.G * Scale, 0.0f, 1.0f),
-					FMath::Clamp(Color.B * Scale, 0.0f, 1.0f),
-					Color.A);
-			};
-			const FLinearColor CanopyBackColor = ScaleRgb(CanopyColor, 0.82f);
-			const FLinearColor CanopyFrontColor = ScaleRgb(CanopyColor, 1.12f);
-			const FQuat FacingRotation =
-				FRotator(0.0f, DecorationFacingYaw - 12.0f, 0.0f).Quaternion();
-			const FVector DepthAxis =
-				FacingRotation.RotateVector(FVector::YAxisVector);
-			const FVector CrownRightAxis =
-				FacingRotation.RotateVector(FVector::XAxisVector);
 			FRandomStream Random = Context.MakeRuleStream(0x54524545u);
 			const int32 Count = ResolveDecoratorCount(
 				Context,
 				Definition,
 				42,
 				0x54524545u);
+			// 所有树部件共用一个方块尺寸。除了让轮廓接近 Minecraft，
+			// 也让区块代理只需少量材质/尺寸分组。
+			constexpr float BlockSize = 18.0f;
+			// 七格树冠直径为 126。斜视投影会把前后距离压缩，因此留出
+			// 另一整个树冠的间隔，避免近处树干叠到远处叶面上，视觉上
+			// 被误读为“树干穿叶”。
+			constexpr float MinimumTreeSpacing = BlockSize * 14.0f;
+			TArray<FVector2D> PlacedTreeLocations;
+			PlacedTreeLocations.Reserve(Count);
 			for (int32 Index = 0; Index < Count; ++Index)
 			{
-				FVector Location;
-				if (!FindScatterLocation(
-					Context,
-					Random,
-					310.0f,
-					true,
-					Location))
+				FVector Location = FVector::ZeroVector;
+				bool bFoundFlatTreeLocation = false;
+				// 树干是方柱，不能像圆形装饰那样插进阶梯地形。
+				// 只接受整个一格树干占地都处于同一高度的平台；否则地形
+				// 会斜切侧面，在根部留下用户能看到的三角形棕色尖角。
+				for (int32 Attempt = 0;
+					Attempt < 16 && !bFoundFlatTreeLocation;
+					++Attempt)
+				{
+					if (!FindScatterLocation(
+						Context,
+						Random,
+						310.0f,
+						true,
+						Location))
+					{
+						break;
+					}
+					const FVector2D Candidate(Location.X, Location.Y);
+					const bool bClearOfOtherTrees =
+						!PlacedTreeLocations.ContainsByPredicate(
+							[Candidate](const FVector2D Existing)
+							{
+								return FVector2D::Distance(Candidate, Existing)
+									< MinimumTreeSpacing;
+							});
+					bFoundFlatTreeLocation = bClearOfOtherTrees
+						&& Context.IsFlatFootprint(
+						Location.X,
+						Location.Y,
+						// 2x2 树干旋转 45 度后的世界轴外接半径。
+						BlockSize * FMath::Sqrt(2.0f));
+				}
+				if (!bFoundFlatTreeLocation)
 				{
 					continue;
 				}
-				constexpr float CellSize = 12.0f;
-				const FVector TrunkDepthOffset = -DepthAxis * 36.0f;
+				PlacedTreeLocations.Emplace(Location.X, Location.Y);
+				// 2x2 的方块截面仍保持 Minecraft 比例，同时避免斜视时每个
+				// 可见面只有树冠的 1/7 宽、被误读成两张薄片。
+				constexpr int32 TrunkWidthBlocks = 2;
+				constexpr int32 TrunkDepthSlices = 2;
 				FVector TreeSurfaceLocation = Location;
-				// The trunk is deliberately behind the crown in view depth. Sample
-				// terrain at that actual XY instead of the scatter anchor; otherwise
-				// a trunk crossing an eight-centimetre terrain step can still leave
-				// its bottom face coplanar with the higher cell.
-				TreeSurfaceLocation.Z = Context.SurfaceAt(
-					Location.X + TrunkDepthOffset.X,
-					Location.Y + TrunkDepthOffset.Y);
-				const FVector GroundedLocation =
-					EmbedGroundAttachment(TreeSurfaceLocation, CellSize);
-				const int32 TrunkCells = Random.RandRange(13, 20);
-				const float TrunkHeight = static_cast<float>(TrunkCells) * CellSize;
+				TreeSurfaceLocation.Z = Context.SurfaceAt(Location.X, Location.Y);
+				// 树根下沉一个完整体素。斜俯视时，如果第一格完整露在地面上，
+				// 方柱的近角与两条底边会投影成向内收的 V，看起来像两张
+				// 薄片张开。地下根体素使地面切过连续侧面，底面永远不会
+				// 进入视野；树、枝、叶继续共享同一个整数体素格。
+				const FVector GroundedLocation = TreeSurfaceLocation
+					- FVector(0.0f, 0.0f, BlockSize);
+				// 2.5D 镜头沿世界对角线观察。若树仍按世界轴摆放，镜头正对
+				// 立方体近角，树冠底边会投影成向内收的 V。整棵树统一旋转
+				// 45 度，让一个方形正面朝向镜头；逻辑 mask 与碰撞也使用
+				// 同一朝向，而不是只在材质或顶点阶段伪造透视。
+				const FQuat TreeRotation = FRotator(
+					0.0f,
+					DecorationFacingYaw,
+					0.0f).Quaternion();
+				// 偶数宽树干的格心位于半整数坐标；奇数宽树冠和单格枝条
+				// 整体偏移半格，确保所有部件仍落在同一三维体素晶格。
+				const FVector HalfCellLatticeOffset =
+					TreeRotation.RotateVector(FVector(
+						BlockSize * 0.5f,
+						BlockSize * 0.5f,
+						0.0f));
+				// 普通林木保留足够的可砍高度，但不再使用远高于叶冠的细长
+				// 电线杆比例。地下根格不计入玩家看到的树干高度。
+				const int32 TrunkBlocks = Random.RandRange(10, 13);
 				const FGuid TreeAggregateId =
 					FGuid::NewDeterministicGuid(
 						FString::Printf(
@@ -615,135 +989,216 @@ namespace MatterFlux::PlayableLevel
 						static_cast<uint64>(
 							static_cast<uint32>(Context.Seed)));
 
-				FFragmentSourceMask TrunkMask =
-					MakeEmptyMask(7, TrunkCells + 1, CellSize, 2);
-				for (int32 Y = 0; Y < TrunkCells; ++Y)
+				for (int32 DepthSlice = 0;
+					DepthSlice < TrunkDepthSlices;
+					++DepthSlice)
 				{
-					const int32 HalfWidth =
-						Y < TrunkCells / 3 && (Index & 1) == 0 ? 2 : 1;
-					for (int32 X = 3 - HalfWidth; X <= 3 + HalfWidth; ++X)
+					FFragmentSourceMask TrunkMask =
+						MakeEmptyMask(
+							TrunkWidthBlocks + 2,
+							TrunkBlocks,
+							BlockSize,
+							2);
+					TrunkMask.GeometryStyle =
+						EFragmentSourceGeometryStyle::VoxelBlocks;
+					for (int32 Y = 0; Y < TrunkBlocks; ++Y)
 					{
-						SetSolid(TrunkMask, X, Y);
+						for (int32 X = 1; X <= TrunkWidthBlocks; ++X)
+						{
+							SetSolid(TrunkMask, X, Y);
+						}
 					}
+					const float DepthOffset =
+						(static_cast<float>(DepthSlice) - 0.5f) * BlockSize;
+					AddFragmentSource(
+						Context,
+						Layout,
+						TEXT("TreeTrunk"),
+						Definition
+							? Definition->MaterialId
+							: FName(TEXT("wood")),
+						TrunkColor,
+						FTransform(
+							TreeRotation,
+							GroundedLocation
+								+ TreeRotation.RotateVector(FVector(
+									0.0f,
+									DepthOffset,
+									0.0f))
+								+ FVector(
+									0.0f,
+									0.0f,
+									static_cast<float>(TrunkMask.Height)
+										* BlockSize * 0.5f),
+							FVector::OneVector),
+						MoveTemp(TrunkMask),
+						Definition ? Definition->bEnableCollision : true,
+						TreeAggregateId,
+						DepthSlice == 0);
 				}
-				AddFragmentSource(
-					Context,
-					Layout,
-					TEXT("TreeTrunk"),
-					Definition
-						? Definition->MaterialId
-						: FName(TEXT("wood")),
-					TrunkColor,
-					FTransform(
-						FacingRotation,
-						GroundedLocation + FVector(
+
+				// 两根短枝只沿世界方格的四个主方向生长，并埋在树冠最厚的
+				// 中层。最多两格长，外面至少保留一层叶体素，避免正面出现
+				// 棕色 L 形木板。逻辑上仍是独立 mask，砍倒后会和树干、
+				// 树冠一起进入动态 aggregate。
+				constexpr int32 BranchCount = 2;
+				const int32 FirstBranchDirection = Random.RandRange(0, 3);
+				for (int32 BranchIndex = 0;
+					BranchIndex < BranchCount;
+					++BranchIndex)
+				{
+					const int32 DirectionIndex =
+						(FirstBranchDirection + BranchIndex) % 4;
+					const float BranchYaw =
+						static_cast<float>(DirectionIndex) * 90.0f;
+					const FVector LocalBranchDirection(
+						FMath::Cos(FMath::DegreesToRadians(BranchYaw)),
+						FMath::Sin(FMath::DegreesToRadians(BranchYaw)),
+						0.0f);
+					const FVector BranchDirection =
+						TreeRotation.RotateVector(LocalBranchDirection);
+					// 枝条保留随机方向，但只占一格：两格枝条在削角后的
+					// 树冠外表偶尔会露成棕色方块，看起来像贴在叶面上。
+					constexpr int32 BranchBlocks = 1;
+					const int32 AttachmentBlock =
+						TrunkBlocks - 3 + BranchIndex;
+					const FVector BranchStart = GroundedLocation
+						+ FVector(
 							0.0f,
 							0.0f,
-							static_cast<float>(TrunkMask.Height) * CellSize * 0.5f)
-							+ TrunkDepthOffset,
-						FVector(1.0f, 1.5f, 1.0f)),
-					MoveTemp(TrunkMask),
-					Definition ? Definition->bEnableCollision : true,
-					TreeAggregateId,
-					true);
-
-				const FVector CanopyCenter =
-					GroundedLocation
-					+ FVector(0.0f, 0.0f, TrunkHeight + 30.0f);
-				FFragmentSourceMask CanopyBackMask =
-					MakeEmptyMask(19, 13, CellSize, 4);
-				for (int32 Y = 0; Y < 12; ++Y)
-				{
-					const int32 DistanceFromMiddle = FMath::Abs(Y - 5);
-					const int32 HalfWidth = FMath::Clamp(
-						8 - DistanceFromMiddle,
-						4,
-						8);
-					for (int32 X = 9 - HalfWidth; X <= 9 + HalfWidth; ++X)
+							(static_cast<float>(AttachmentBlock) + 0.5f)
+								* BlockSize);
+					// mask 左右各有一格 padding，所以实体格的局部中心
+					// 关于 0 对称。要让第一格从主干相邻的整数格开始，
+					// 整个 mask 中心必须位于 (格数 + 1) / 2，而不是旧的
+					// 格数 / 2；旧公式会把每根枝条错开半个体素。
+					const FVector BranchCenter = BranchStart
+						+ HalfCellLatticeOffset
+						+ BranchDirection
+							* (static_cast<float>(BranchBlocks + 1)
+								* BlockSize * 0.5f);
+					FFragmentSourceMask BranchMask =
+						MakeEmptyMask(BranchBlocks + 2, 3, BlockSize, 2);
+					BranchMask.SupportMode = EFragmentSupportMode::None;
+					BranchMask.GeometryStyle =
+						EFragmentSourceGeometryStyle::VoxelBlocks;
+					for (int32 X = 1; X <= BranchBlocks; ++X)
 					{
-						SetSolid(CanopyBackMask, X, Y);
+						SetSolid(BranchMask, X, 1);
 					}
+					AddFragmentSource(
+						Context,
+						Layout,
+						TEXT("TreeBranch"),
+						Definition
+							? Definition->MaterialId
+							: FName(TEXT("wood")),
+						TrunkColor * 0.92f,
+						FTransform(
+							FRotator(
+								0.0f,
+								DecorationFacingYaw + BranchYaw,
+								0.0f),
+							BranchCenter),
+						MoveTemp(BranchMask),
+						false,
+						TreeAggregateId);
 				}
-				AddFragmentSource(
-					Context,
-					Layout,
-					TEXT("TreeCanopyBack"),
-					TEXT("leaf"),
-					CanopyBackColor,
-					FTransform(
-						FacingRotation,
-						CanopyCenter
-							- DepthAxis * 12.0f
-							- CrownRightAxis * 12.0f
-							+ FVector(0.0f, 0.0f, 8.0f),
-						FVector(1.0f, 1.5f, 1.0f)),
-					MoveTemp(CanopyBackMask),
-					false,
-					TreeAggregateId);
 
-				FFragmentSourceMask CanopyMask =
-					MakeEmptyMask(17, 13, CellSize, 4);
-				for (int32 Y = 0; Y < 12; ++Y)
+				// 方块树冠不是一个被贪心网格合并后的 7x7x7 实心盒子。
+				// 使用五层、五格宽的离散叶簇：下三层是缺角方块，中上层
+				// 收成 3x3 与十字形。每个 Y 切片仍是独立 MatterFlux mask，
+				// 因而可切割、燃烧并随整棵树脱离；渲染层只合并相邻外表面。
+				constexpr int32 CanopyDepthSlices = 5;
+				constexpr int32 CanopyHeightBlocks = 5;
+				constexpr int32 MaximumCanopyRadius = 2;
+				const float CanopyBottomBlock =
+					static_cast<float>(TrunkBlocks - 4);
+				for (int32 SliceIndex = 0;
+					SliceIndex < CanopyDepthSlices;
+					++SliceIndex)
 				{
-					const int32 DistanceFromMiddle = FMath::Abs(Y - 5);
-					const int32 HalfWidth = FMath::Clamp(7 - DistanceFromMiddle, 3, 7);
-					const int32 WindOffset =
-						(Index % 3 == 0 && Y > 6) ? 1 : 0;
-					for (int32 X = 8 - HalfWidth + WindOffset;
-						X <= 8 + HalfWidth + WindOffset;
-						++X)
+					const int32 DepthBlock = SliceIndex - CanopyDepthSlices / 2;
+					constexpr int32 MaskPadding = 1;
+					FFragmentSourceMask LeafMask =
+						MakeEmptyMask(
+							MaximumCanopyRadius * 2 + 1 + MaskPadding * 2,
+							CanopyHeightBlocks + MaskPadding * 2,
+							BlockSize,
+							3);
+					LeafMask.SupportMode = EFragmentSupportMode::None;
+					LeafMask.GeometryStyle =
+						EFragmentSourceGeometryStyle::VoxelBlocks;
+					for (int32 HeightBlock = 0;
+						HeightBlock < CanopyHeightBlocks;
+						++HeightBlock)
 					{
-						SetSolid(CanopyMask, X, Y);
+						for (int32 HorizontalBlock = -MaximumCanopyRadius;
+							HorizontalBlock <= MaximumCanopyRadius;
+							++HorizontalBlock)
+						{
+							const int32 AbsX = FMath::Abs(HorizontalBlock);
+							const int32 AbsY = FMath::Abs(DepthBlock);
+							bool bLeafCell = false;
+							if (HeightBlock <= 2)
+							{
+								// 5x5 的主体削去四角，轮廓仍由完整方块组成，
+								// 但不会再次退化成一整个塑料立方体。
+								bLeafCell = AbsX <= 2 && AbsY <= 2
+									&& !(AbsX == 2 && AbsY == 2);
+								if (bLeafCell && HeightBlock == 2)
+								{
+									// 每棵树在上部外沿留下一个确定性缺口，
+									// 增加随机感而不产生悬空叶块。
+									const int32 Notch =
+										(Index * 17 + Context.Seed) & 3;
+									bLeafCell = !(
+										(Notch == 0 && HorizontalBlock == 0 && DepthBlock == -2)
+										|| (Notch == 1 && HorizontalBlock == 2 && DepthBlock == 0)
+										|| (Notch == 2 && HorizontalBlock == 0 && DepthBlock == 2)
+										|| (Notch == 3 && HorizontalBlock == -2 && DepthBlock == 0));
+								}
+							}
+							else if (HeightBlock == 3)
+							{
+								bLeafCell = AbsX <= 1 && AbsY <= 1;
+							}
+							else
+							{
+								// 最上层沿格轴形成 +，避免平顶大盒子，也不
+								// 使用斜面、圆球或薄片冒充体素。
+								bLeafCell = AbsX + AbsY <= 1;
+							}
+							if (bLeafCell)
+							{
+								SetSolid(
+									LeafMask,
+									HorizontalBlock + MaximumCanopyRadius
+										+ MaskPadding,
+									HeightBlock + MaskPadding);
+							}
+						}
 					}
+					AddFragmentSource(
+						Context,
+						Layout,
+						TEXT("TreeLeaves"),
+						TEXT("leaf"),
+						CanopyColor,
+						FTransform(
+							TreeRotation,
+							GroundedLocation
+								+ HalfCellLatticeOffset
+								+ TreeRotation.RotateVector(FVector(
+								0.0f,
+								static_cast<float>(DepthBlock) * BlockSize,
+								(CanopyBottomBlock
+									+ CanopyHeightBlocks * 0.5f) * BlockSize)),
+							FVector::OneVector),
+						MoveTemp(LeafMask),
+						false,
+						TreeAggregateId);
 				}
-				AddFragmentSource(
-					Context,
-					Layout,
-					TEXT("TreeCanopy"),
-					TEXT("leaf"),
-					CanopyColor,
-					FTransform(
-						FacingRotation,
-						CanopyCenter + DepthAxis * 10.0f,
-						FVector(1.0f, 1.5f, 1.0f)),
-					MoveTemp(CanopyMask),
-					false,
-					TreeAggregateId);
-
-				FFragmentSourceMask CanopyFrontMask =
-					MakeEmptyMask(11, 9, CellSize, 2);
-				for (int32 Y = 0; Y < 8; ++Y)
-				{
-					const int32 DistanceFromMiddle = FMath::Abs(Y - 3);
-					const int32 HalfWidth = FMath::Clamp(
-						4 - DistanceFromMiddle,
-						2,
-						4);
-					const int32 WindOffset =
-						(Index % 3 == 1 && Y > 4) ? 1 : 0;
-					for (int32 X = 5 - HalfWidth + WindOffset;
-						X <= 5 + HalfWidth + WindOffset;
-						++X)
-					{
-						SetSolid(CanopyFrontMask, X, Y);
-					}
-				}
-				AddFragmentSource(
-					Context,
-					Layout,
-					TEXT("TreeCanopyFront"),
-					TEXT("leaf"),
-					CanopyFrontColor,
-					FTransform(
-						FacingRotation,
-						CanopyCenter
-							+ DepthAxis * 32.0f
-							+ CrownRightAxis * 14.0f
-							- FVector(0.0f, 0.0f, 7.0f),
-						FVector(1.0f, 1.5f, 1.0f)),
-					MoveTemp(CanopyFrontMask),
-					false,
-					TreeAggregateId);
 			}
 		}
 
@@ -929,6 +1384,7 @@ namespace MatterFlux::PlayableLevel
 
 		using FRuleGenerator = void(*)(FGenerationContext&, FLevelLayout&);
 		constexpr FRuleGenerator RegisteredRules[] = {
+			&GenerateLake,
 			&GenerateStream,
 			&GenerateRocks,
 			&GenerateTrees,

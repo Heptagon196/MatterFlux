@@ -34,13 +34,17 @@ public:
 
 	void Configure(
 		USceneComponent* InAttachParent,
-		UMaterialInterface* InMaterialTemplate);
+		UMaterialInterface* InMaterialTemplate,
+		UMaterialInterface* InLeafMaterialTemplate = nullptr,
+		UMaterialInterface* InWoodMaterialTemplate = nullptr);
 	void SetSourceChunks(const TMap<
 		FIntPoint,
 		TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>>& InChunks);
 	void PrepareSourceChunks(int32 MaximumPreparedChunkCount);
 	void SetVisibleChunks(const TSet<FIntPoint>& InVisibleChunks);
 	void SetSourceMaterialized(const FGuid& SourceId, bool bMaterialized);
+	/** Visual-QA only: when valid, merged rendering is restricted to one aggregate. */
+	void SetDebugIsolatedAggregate(const FGuid& AggregateId);
 	void FlushDeferredCombustionChanges();
 	EMatterFluxFragmentSourceProxyApplyResult ApplySourceState(
 		const FGuid& SourceId,
@@ -97,6 +101,7 @@ private:
 	TSet<FIntPoint> VisibleChunks;
 	TSet<FIntPoint> CollisionChunks;
 	TSet<FGuid> MaterializedSourceIds;
+	FGuid DebugIsolatedAggregateId;
 	TSet<FGuid> CombustingSourceIds;
 	TSet<FIntPoint> DirtyChunks;
 	TSet<FIntPoint> DeferredCombustionChunks;
@@ -115,4 +120,10 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInterface> MaterialTemplate;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInterface> LeafMaterialTemplate;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInterface> WoodMaterialTemplate;
 };

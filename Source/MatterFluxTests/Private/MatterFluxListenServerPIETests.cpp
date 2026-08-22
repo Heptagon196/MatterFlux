@@ -303,6 +303,9 @@ namespace
 				TEXT("Character contact never teleports the fallen tree between frames"),
 				MaximumFrameDisplacement < 100.0f);
 			Test->TestTrue(
+				TEXT("Sustained character contact actually pushes the fallen tree"),
+				MaximumLinearSpeed > 5.0f);
+			Test->TestTrue(
 				TEXT("Character contact keeps fallen-tree linear speed bounded"),
 				MaximumLinearSpeed < 1200.0f);
 			Test->TestTrue(

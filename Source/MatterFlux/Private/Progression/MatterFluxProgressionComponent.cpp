@@ -751,6 +751,134 @@ bool UMatterFluxProgressionComponent::AddItemAuthority(
 	return true;
 }
 
+bool UMatterFluxProgressionComponent::PurchaseOfferAuthority(
+	const FMatterFluxShopOfferDefinition& Offer,
+	const FName OfferKey,
+	const int32 ExpectedRevision,
+	int32& OutRemainingPurchases,
+	FString& OutError)
+{
+	OutRemainingPurchases = INDEX_NONE;
+	OutError.Reset();
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		OutError = TEXT("shop purchases require authority");
+		return false;
+	}
+	if (bApplyingEffects)
+	{
+		OutError = TEXT("shop purchases cannot re-enter progression effects");
+		return false;
+	}
+	if (ExpectedRevision != Revision)
+	{
+		OutError = FString::Printf(
+			TEXT("stale progression revision %d; expected %d"),
+			ExpectedRevision, Revision);
+		return false;
+	}
+	if (OfferKey.IsNone() || Offer.ProductId.IsNone() || Offer.ProductCount <= 0
+		|| Offer.CostItemId.IsNone() || Offer.CostCount <= 0)
+	{
+		OutError = TEXT("shop offer is invalid");
+		return false;
+	}
+	const int32 PreviousPurchaseCount = ShopPurchaseCounts.FindRef(OfferKey);
+	if (Offer.PurchaseLimit >= 0
+		&& PreviousPurchaseCount >= Offer.PurchaseLimit)
+	{
+		OutRemainingPurchases = 0;
+		OutError = TEXT("this offer has reached its purchase limit");
+		return false;
+	}
+
+	const FMatterFluxContentRegistryPtr Registry =
+		IMatterFluxScriptRuntime::Get().GetActiveRegistry();
+	if (!Registry.IsValid())
+	{
+		OutError = TEXT("progression content registry is unavailable");
+		return false;
+	}
+
+	TArray<FMatterFluxItemStack> NextItems = ItemStacks.Items;
+	TArray<FMatterFluxQuestState> NextQuests = QuestStates.Items;
+	FName NextSelection = SelectedQuest;
+	int32 PreviousCostCount = 0;
+	int32 NewCostCount = 0;
+	if (!FMatterFluxProgressionRules::AddItem(
+		*Registry, NextItems, Offer.CostItemId, -Offer.CostCount,
+		PreviousCostCount, NewCostCount, OutError))
+	{
+		return false;
+	}
+
+	FMatterFluxProgressionEffects Effects;
+	if (Offer.ProductKind == EMatterFluxShopProductKind::Item)
+	{
+		int32 IgnoredPrevious = 0;
+		int32 IgnoredCurrent = 0;
+		if (!FMatterFluxProgressionRules::AddItem(
+			*Registry, NextItems, Offer.ProductId, Offer.ProductCount,
+			IgnoredPrevious, IgnoredCurrent, OutError))
+		{
+			return false;
+		}
+	}
+	else
+	{
+		FMatterFluxQuestRewardDefinition ProductReward;
+		ProductReward.Kind = Offer.ProductKind == EMatterFluxShopProductKind::Spell
+			? EMatterFluxQuestRewardKind::Spell
+			: EMatterFluxQuestRewardKind::Wand;
+		ProductReward.ContentId = Offer.ProductId;
+		ProductReward.Quantity = Offer.ProductCount;
+		Effects.Rewards.Add(ProductReward);
+	}
+
+	FMatterFluxQuestEvent PurchaseEvent;
+	PurchaseEvent.Type = EMatterFluxQuestEventType::ItemChanged;
+	PurchaseEvent.SubjectId = Offer.CostItemId;
+	PurchaseEvent.PreviousItemCount = PreviousCostCount;
+	PurchaseEvent.NewItemCount = NewCostCount;
+	FMatterFluxProgressionEffects QuestEffects;
+	if (!FMatterFluxProgressionRules::NotifyEvent(
+		*Registry, BuildEvaluationContext(), NextItems, NextQuests,
+		NextSelection, PurchaseEvent, QuestEffects, OutError))
+	{
+		return false;
+	}
+	Effects.Rewards.Append(QuestEffects.Rewards);
+	for (const FMatterFluxQuestRewardDefinition& Reward : Effects.Rewards)
+	{
+		if (Reward.Kind != EMatterFluxQuestRewardKind::Item) continue;
+		int32 IgnoredPrevious = 0;
+		int32 IgnoredCurrent = 0;
+		if (!FMatterFluxProgressionRules::AddItem(
+			*Registry, NextItems, Reward.ContentId, Reward.Quantity,
+			IgnoredPrevious, IgnoredCurrent, OutError))
+		{
+			return false;
+		}
+	}
+
+	if (!ApplyEffectsAuthority(Effects, OutError))
+	{
+		return false;
+	}
+	ItemStacks.Items = MoveTemp(NextItems);
+	QuestStates.Items = MoveTemp(NextQuests);
+	SelectedQuest = NextSelection;
+	ShopPurchaseCounts.Add(OfferKey, PreviousPurchaseCount + 1);
+	OutRemainingPurchases = Offer.PurchaseLimit >= 0
+		? Offer.PurchaseLimit - PreviousPurchaseCount - 1
+		: INDEX_NONE;
+	++Revision;
+	MarkAllDirty();
+	ProgressionChanged.Broadcast();
+	GetOwner()->ForceNetUpdate();
+	return true;
+}
+
 bool UMatterFluxProgressionComponent::UseItemAuthority(
 	const FName ItemId, const int32 ExpectedRevision, FString& OutError)
 {
@@ -989,6 +1117,7 @@ bool UMatterFluxProgressionComponent::ResetToStarterStateAuthority(
 	ItemStacks.Items = MoveTemp(NextItems);
 	QuestStates.Items = MoveTemp(NextQuests);
 	SelectedQuest = NextSelection;
+	ShopPurchaseCounts.Reset();
 	Revision = FMath::Max(Revision + 1, 1);
 	MarkAllDirty();
 	ProgressionChanged.Broadcast();
@@ -1023,6 +1152,16 @@ bool UMatterFluxProgressionComponent::CaptureSaveState(
 		Saved.bCompletionRewardsGranted = State.bCompletionRewardsGranted;
 	}
 	OutState.SelectedQuest = SelectedQuest;
+	TArray<FName> PurchaseKeys;
+	ShopPurchaseCounts.GenerateKeyArray(PurchaseKeys);
+	PurchaseKeys.Sort(FNameLexicalLess());
+	for (const FName OfferKey : PurchaseKeys)
+	{
+		FMatterFluxSavedShopPurchase& Saved =
+			OutState.ShopPurchases.AddDefaulted_GetRef();
+		Saved.OfferKey = OfferKey;
+		Saved.PurchaseCount = ShopPurchaseCounts.FindChecked(OfferKey);
+	}
 	OutState.Revision = FMath::Max(Revision, 1);
 	return true;
 }
@@ -1042,7 +1181,7 @@ bool UMatterFluxProgressionComponent::RestoreSaveStateAuthority(
 		return false;
 	}
 	if (State.Revision == 0 && State.Items.IsEmpty()
-		&& State.Quests.IsEmpty())
+		&& State.Quests.IsEmpty() && State.ShopPurchases.IsEmpty())
 	{
 		return ResetToStarterStateAuthority(OutError);
 	}
@@ -1051,8 +1190,10 @@ bool UMatterFluxProgressionComponent::RestoreSaveStateAuthority(
 	if (!Registry.IsValid() || State.Revision < 0
 		|| (State.Revision == 0
 			&& (!State.Items.IsEmpty() || !State.Quests.IsEmpty()
+				|| !State.ShopPurchases.IsEmpty()
 				|| !State.SelectedQuest.IsNone()))
-		|| State.Items.Num() > 512 || State.Quests.Num() > 512)
+		|| State.Items.Num() > 512 || State.Quests.Num() > 512
+		|| State.ShopPurchases.Num() > 512)
 	{
 		OutError = TEXT("saved progression metadata is invalid");
 		return false;
@@ -1093,6 +1234,17 @@ bool UMatterFluxProgressionComponent::RestoreSaveStateAuthority(
 		Quest.bActivationRewardsGranted = Saved.bActivationRewardsGranted;
 		Quest.bCompletionRewardsGranted = Saved.bCompletionRewardsGranted;
 	}
+	TMap<FName, int32> CandidateShopPurchases;
+	for (const FMatterFluxSavedShopPurchase& Saved : State.ShopPurchases)
+	{
+		if (Saved.OfferKey.IsNone() || Saved.PurchaseCount <= 0
+			|| CandidateShopPurchases.Contains(Saved.OfferKey))
+		{
+			OutError = TEXT("saved progression contains an invalid shop purchase");
+			return false;
+		}
+		CandidateShopPurchases.Add(Saved.OfferKey, Saved.PurchaseCount);
+	}
 	if (!State.SelectedQuest.IsNone())
 	{
 		const FMatterFluxQuestState* Selected = CandidateQuests.FindByPredicate(
@@ -1117,6 +1269,7 @@ bool UMatterFluxProgressionComponent::RestoreSaveStateAuthority(
 	});
 	ItemStacks.Items = MoveTemp(CandidateItems);
 	QuestStates.Items = MoveTemp(CandidateQuests);
+	ShopPurchaseCounts = MoveTemp(CandidateShopPurchases);
 	SelectedQuest = State.SelectedQuest;
 	Revision = FMath::Max(State.Revision, 1);
 	ItemStacks.Owner = this;

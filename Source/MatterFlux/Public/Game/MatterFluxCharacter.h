@@ -15,6 +15,7 @@ class UInstancedStaticMeshComponent;
 class ULocalPlayer;
 class UMaterialInstanceDynamic;
 class UMaterialInterface;
+class UMatterFluxBuoyancyComponent;
 class USpringArmComponent;
 class UStaticMeshComponent;
 struct FInputActionValue;
@@ -95,6 +96,10 @@ public:
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Playable|Ability")
 	TObjectPtr<UInstancedStaticMeshComponent> FlameEffectInstances;
+
+	/** 主角使用的统一材质液体浮力组件。 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Playable|Liquid")
+	TObjectPtr<UMatterFluxBuoyancyComponent> BuoyancyComponent;
 
 private:
 	void InitAbilityActorInfo();

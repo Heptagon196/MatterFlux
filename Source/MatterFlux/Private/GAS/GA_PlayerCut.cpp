@@ -55,7 +55,8 @@ void UGA_PlayerCut::ActivateAbility(
 		TargetRadius,
 		CutThickness,
 		DamagePower,
-		EventSeed);
+		EventSeed,
+		MaxAffectedSources);
 	UE_LOG(
 		LogMatterFlux,
 		Verbose,
@@ -78,7 +79,8 @@ int32 UGA_PlayerCut::ExecuteForwardCut(
 	const float TargetRadius,
 	const float CutThickness,
 	const float DamagePower,
-	const int32 EventSeed)
+	const int32 EventSeed,
+	const int32 MaxAffectedSources)
 {
 	UWorld* World = Avatar.GetWorld();
 	if (!World
@@ -90,7 +92,8 @@ int32 UGA_PlayerCut::ExecuteForwardCut(
 		|| Range <= 0.0f
 		|| TargetRadius <= 0.0f
 		|| CutThickness <= 0.0f
-		|| DamagePower < 0.0f)
+		|| DamagePower < 0.0f
+		|| MaxAffectedSources <= 0)
 	{
 		return 0;
 	}
@@ -116,6 +119,7 @@ int32 UGA_PlayerCut::ExecuteForwardCut(
 	Request.DamagePower = DamagePower;
 	Request.EventSeed = EventSeed;
 	Request.TargetPadding = TargetRadius;
+	Request.MaxAffectedSources = MaxAffectedSources;
 	if (UFragmentSimulationSubsystem* Subsystem =
 		World->GetSubsystem<UFragmentSimulationSubsystem>())
 	{

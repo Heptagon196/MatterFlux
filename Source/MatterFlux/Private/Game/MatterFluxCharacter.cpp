@@ -12,6 +12,7 @@
 #include "EngineUtils.h"
 #include "Game/MatterFluxPlayableWorldActor.h"
 #include "Game/MatterFluxPlayerState.h"
+#include "Game/MatterFluxCharacterPhysicsInteraction.h"
 #include "GAS/GA_CastWand.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/PlayerController.h"
@@ -23,6 +24,7 @@
 #include "InputModifiers.h"
 #include "MatterFluxLog.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "Material/MatterFluxBuoyancyComponent.h"
 #include "TimerManager.h"
 #include "UObject/ConstructorHelpers.h"
 
@@ -43,11 +45,10 @@ AMatterFluxCharacter::AMatterFluxCharacter()
 	Movement->bOrientRotationToMovement = true;
 	Movement->RotationRate = FRotator(0.0f, 720.0f, 0.0f);
 	Movement->bConstrainToPlane = false;
-	// CharacterMovement's explicit physics-interaction force is tuned for
-	// heavy 3D props and can inject enormous impulses into long, light voxel
-	// fragments. The capsule still blocks dynamic fragments normally; Chaos is
-	// left to resolve that contact without a second artificial push force.
-	Movement->bEnablePhysicsInteraction = false;
+	MatterFlux::CharacterPhysics::ConfigurePhysicsInteraction(*Movement);
+	BuoyancyComponent = CreateDefaultSubobject<UMatterFluxBuoyancyComponent>(
+		TEXT("BuoyancyComponent"));
+	BuoyancyComponent->SetBodyDensity(0.65f);
 	WandCastRepeatTimers.SetNum(UGA_CastWand::EquipmentSlotCount);
 
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> CharacterMesh(
@@ -159,6 +160,9 @@ AMatterFluxCharacter::AMatterFluxCharacter()
 	FollowCamera = CreateDefaultSubobject<UCameraComponent>(TEXT("FollowCamera"));
 	FollowCamera->SetupAttachment(CameraBoom, USpringArmComponent::SocketName);
 	FollowCamera->bUsePawnControlRotation = false;
+	// 2.5D 指固定的斜俯视构图，不等于正交投影。保留受控的透视缩短，
+	// 才能让树、房屋和地形具有正确的近大远小与体积层次。
+	FollowCamera->ProjectionMode = ECameraProjectionMode::Perspective;
 	FollowCamera->FieldOfView = 48.0f;
 	FollowCamera->PostProcessSettings.bOverride_AutoExposureMethod = true;
 	FollowCamera->PostProcessSettings.AutoExposureMethod = AEM_Manual;

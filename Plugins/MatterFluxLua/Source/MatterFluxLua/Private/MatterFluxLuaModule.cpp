@@ -5,6 +5,7 @@
 #include "HAL/PlatformFileManager.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "Misc/ScopeExit.h"
 #include "Misc/SecureHash.h"
 
 THIRD_PARTY_INCLUDES_START
@@ -27,6 +28,14 @@ namespace MatterFluxLua
 	constexpr int32 HookInterval = 1'000;
 	constexpr int32 MaximumDefinitionsPerCategory = 1'024;
 	constexpr int32 MaximumDecoratorCount = 4'096;
+	constexpr int32 MaximumCreatureBehaviorNodes = 64;
+	constexpr int32 MaximumCreatureBehaviorDepth = 8;
+	constexpr int32 MaximumCreatureBehaviorChildren = 16;
+	constexpr int32 MaximumCustomMapStamps = 256;
+	constexpr int32 MaximumCustomMapMarkers = 64;
+	constexpr int32 MaximumCustomMapSceneBoxes = 64;
+	constexpr int32 MaximumCustomMapCameras = 8;
+	constexpr int32 MaximumCustomMapPourContainers = 8;
 	constexpr size_t MaximumContentStringUtf8Bytes = 256;
 
 	struct FMemoryContext
@@ -52,14 +61,20 @@ namespace MatterFluxLua
 		bool AddReaction(
 			const FMatterFluxReactionDefinition& Definition,
 			FString& OutError);
-		bool AddCombustion(
-			const FMatterFluxCombustionDefinition& Definition,
-			FString& OutError);
 		bool AddDecorator(
 			const FMatterFluxDecoratorDefinition& Definition,
 			FString& OutError);
 		bool AddEntity(
 			const FMatterFluxEntityDefinition& Definition,
+			FString& OutError);
+		bool AddCreature(
+			const FMatterFluxCreatureDefinition& Definition,
+			FString& OutError);
+		bool AddDialogue(
+			const FMatterFluxDialogueDefinition& Definition,
+			FString& OutError);
+		bool AddShop(
+			const FMatterFluxShopDefinition& Definition,
 			FString& OutError);
 		bool AddSpell(
 			const FMatterFluxSpellDefinition& Definition,
@@ -72,6 +87,9 @@ namespace MatterFluxLua
 			FString& OutError);
 		bool AddQuest(
 			const FMatterFluxQuestDefinition& Definition,
+			FString& OutError);
+		bool AddCustomMap(
+			const FMatterFluxCustomMapDefinition& Definition,
 			FString& OutError);
 		bool SetFragmentationSettings(
 			int32 MinDetachedAreaPixels,
@@ -110,6 +128,257 @@ namespace MatterFluxLua
 	static bool IsFiniteNonNegative(const double Value)
 	{
 		return FMath::IsFinite(Value) && Value >= 0.0;
+	}
+
+	enum class ECreatureBehaviorSubtreeShape : uint8
+	{
+		Predicate,
+		Action
+	};
+
+	static int32 AddCreatureBehaviorNode(
+		FMatterFluxCreatureBehaviorProgramDefinition& Program,
+		const EMatterFluxCreatureBehaviorNodeKind Kind)
+	{
+		FMatterFluxCreatureBehaviorNodeDefinition& Node =
+			Program.Nodes.AddDefaulted_GetRef();
+		Node.Kind = Kind;
+		return Program.Nodes.Num() - 1;
+	}
+
+	static int32 AddCreatureCondition(
+		FMatterFluxCreatureBehaviorProgramDefinition& Program,
+		const EMatterFluxCreatureBehaviorCondition Condition)
+	{
+		const int32 Index = AddCreatureBehaviorNode(
+			Program, EMatterFluxCreatureBehaviorNodeKind::Condition);
+		Program.Nodes[Index].Condition = Condition;
+		return Index;
+	}
+
+	static int32 AddCreatureAction(
+		FMatterFluxCreatureBehaviorProgramDefinition& Program,
+		const EMatterFluxCreatureBehaviorAction Action)
+	{
+		const int32 Index = AddCreatureBehaviorNode(
+			Program, EMatterFluxCreatureBehaviorNodeKind::Action);
+		Program.Nodes[Index].Action = Action;
+		return Index;
+	}
+
+	static int32 AddCreatureSequence(
+		FMatterFluxCreatureBehaviorProgramDefinition& Program,
+		TArray<int32>&& Children)
+	{
+		const int32 Index = AddCreatureBehaviorNode(
+			Program, EMatterFluxCreatureBehaviorNodeKind::Sequence);
+		Program.Nodes[Index].Children = MoveTemp(Children);
+		return Index;
+	}
+
+	static void BuildLegacyCreatureBehaviorProgram(
+		const EMatterFluxCreatureAiMode Mode,
+		FMatterFluxCreatureBehaviorProgramDefinition& OutProgram)
+	{
+		OutProgram = {};
+		if (Mode == EMatterFluxCreatureAiMode::Passive)
+		{
+			OutProgram.RootNodeIndex = AddCreatureAction(
+				OutProgram, EMatterFluxCreatureBehaviorAction::Passive);
+			return;
+		}
+
+		TArray<int32> Branches;
+		Branches.Add(AddCreatureSequence(OutProgram, {
+			AddCreatureCondition(
+				OutProgram,
+				EMatterFluxCreatureBehaviorCondition::TargetTooClose),
+			AddCreatureAction(
+				OutProgram,
+				EMatterFluxCreatureBehaviorAction::Retreat)
+		}));
+		if (Mode == EMatterFluxCreatureAiMode::Boss)
+		{
+			Branches.Add(AddCreatureSequence(OutProgram, {
+				AddCreatureCondition(
+					OutProgram,
+					EMatterFluxCreatureBehaviorCondition::TargetInAttackRange),
+				AddCreatureCondition(
+					OutProgram,
+					EMatterFluxCreatureBehaviorCondition::SkillReady),
+				AddCreatureAction(
+					OutProgram,
+					EMatterFluxCreatureBehaviorAction::Skill)
+			}));
+		}
+		Branches.Add(AddCreatureSequence(OutProgram, {
+			AddCreatureCondition(
+				OutProgram,
+				EMatterFluxCreatureBehaviorCondition::TargetInAttackRange),
+			AddCreatureCondition(
+				OutProgram,
+				EMatterFluxCreatureBehaviorCondition::AttackReady),
+			AddCreatureAction(
+				OutProgram,
+				EMatterFluxCreatureBehaviorAction::Attack)
+		}));
+		Branches.Add(AddCreatureSequence(OutProgram, {
+			AddCreatureCondition(
+				OutProgram,
+				EMatterFluxCreatureBehaviorCondition::HasTarget),
+			AddCreatureAction(
+				OutProgram,
+				EMatterFluxCreatureBehaviorAction::Chase)
+		}));
+		Branches.Add(AddCreatureAction(
+			OutProgram, EMatterFluxCreatureBehaviorAction::Patrol));
+		OutProgram.RootNodeIndex = AddCreatureBehaviorNode(
+			OutProgram, EMatterFluxCreatureBehaviorNodeKind::Selector);
+		OutProgram.Nodes[OutProgram.RootNodeIndex].Children =
+			MoveTemp(Branches);
+	}
+
+	static bool ValidateCreatureBehaviorNode(
+		const FMatterFluxCreatureBehaviorProgramDefinition& Program,
+		const int32 NodeIndex,
+		const int32 Depth,
+		TSet<int32>& Visited,
+		ECreatureBehaviorSubtreeShape& OutShape,
+		FString& OutError)
+	{
+		if (Depth > MaximumCreatureBehaviorDepth
+			|| !Program.Nodes.IsValidIndex(NodeIndex)
+			|| Visited.Contains(NodeIndex))
+		{
+			OutError = TEXT("creature behavior tree contains a cycle, duplicate node, or invalid index");
+			return false;
+		}
+		Visited.Add(NodeIndex);
+		const FMatterFluxCreatureBehaviorNodeDefinition& Node =
+			Program.Nodes[NodeIndex];
+		if (Node.Children.Num() > MaximumCreatureBehaviorChildren)
+		{
+			OutError = TEXT("creature behavior node has too many children");
+			return false;
+		}
+
+		switch (Node.Kind)
+		{
+		case EMatterFluxCreatureBehaviorNodeKind::Condition:
+			if (!Node.Children.IsEmpty())
+			{
+				OutError = TEXT("creature behavior condition may not have children");
+				return false;
+			}
+			OutShape = ECreatureBehaviorSubtreeShape::Predicate;
+			return true;
+
+		case EMatterFluxCreatureBehaviorNodeKind::Action:
+			if (!Node.Children.IsEmpty())
+			{
+				OutError = TEXT("creature behavior action may not have children");
+				return false;
+			}
+			OutShape = ECreatureBehaviorSubtreeShape::Action;
+			return true;
+
+		case EMatterFluxCreatureBehaviorNodeKind::Sequence:
+			if (Node.Children.IsEmpty())
+			{
+				OutError = TEXT("creature behavior sequence must contain children");
+				return false;
+			}
+			for (int32 ChildOffset = 0;
+				ChildOffset < Node.Children.Num(); ++ChildOffset)
+			{
+				ECreatureBehaviorSubtreeShape ChildShape;
+				if (!ValidateCreatureBehaviorNode(
+					Program,
+					Node.Children[ChildOffset],
+					Depth + 1,
+					Visited,
+					ChildShape,
+					OutError))
+				{
+					return false;
+				}
+				const bool bLast = ChildOffset + 1 == Node.Children.Num();
+				if ((!bLast
+						&& ChildShape != ECreatureBehaviorSubtreeShape::Predicate)
+					|| (bLast
+						&& ChildShape != ECreatureBehaviorSubtreeShape::Action))
+				{
+					OutError = TEXT("creature behavior sequence must end in one action after its conditions");
+					return false;
+				}
+			}
+			OutShape = ECreatureBehaviorSubtreeShape::Action;
+			return true;
+
+		case EMatterFluxCreatureBehaviorNodeKind::Selector:
+			if (Node.Children.IsEmpty())
+			{
+				OutError = TEXT("creature behavior selector must contain children");
+				return false;
+			}
+			for (const int32 ChildIndex : Node.Children)
+			{
+				ECreatureBehaviorSubtreeShape ChildShape;
+				if (!ValidateCreatureBehaviorNode(
+					Program,
+					ChildIndex,
+					Depth + 1,
+					Visited,
+					ChildShape,
+					OutError))
+				{
+					return false;
+				}
+				if (ChildShape != ECreatureBehaviorSubtreeShape::Action)
+				{
+					OutError = TEXT("creature behavior selector children must select actions");
+					return false;
+				}
+			}
+			OutShape = ECreatureBehaviorSubtreeShape::Action;
+			return true;
+
+		default:
+			OutError = TEXT("creature behavior tree contains an unknown node kind");
+			return false;
+		}
+	}
+
+	static bool ValidateCreatureBehaviorProgram(
+		const FMatterFluxCreatureBehaviorProgramDefinition& Program,
+		FString& OutError)
+	{
+		if (Program.Nodes.IsEmpty()
+			|| Program.Nodes.Num() > MaximumCreatureBehaviorNodes
+			|| !Program.Nodes.IsValidIndex(Program.RootNodeIndex))
+		{
+			OutError = TEXT("creature behavior tree must contain a valid bounded root");
+			return false;
+		}
+		TSet<int32> Visited;
+		ECreatureBehaviorSubtreeShape RootShape;
+		if (!ValidateCreatureBehaviorNode(
+			Program,
+			Program.RootNodeIndex,
+			0,
+			Visited,
+			RootShape,
+			OutError))
+		{
+			return false;
+		}
+		if (RootShape != ECreatureBehaviorSubtreeShape::Action
+			|| Visited.Num() != Program.Nodes.Num())
+		{
+			OutError = TEXT("creature behavior tree contains unreachable nodes or no action");
+			return false;
+		}
+		return true;
 	}
 
 	struct FDefaultSourceFile
@@ -174,7 +443,11 @@ namespace MatterFluxLua
 			TEXT("Spells"),
 			TEXT("Wands"),
 			TEXT("Items"),
-			TEXT("Quests")
+			TEXT("Quests"),
+			TEXT("Creatures"),
+			TEXT("Dialogues"),
+			TEXT("Shops"),
+			TEXT("Maps")
 		};
 		for (const TCHAR* DirectoryName : ModuleDirectories)
 		{
@@ -338,6 +611,17 @@ namespace MatterFluxLua
 			|| !FMath::IsFinite(Definition.Color.G)
 			|| !FMath::IsFinite(Definition.Color.B)
 			|| !FMath::IsFinite(Definition.Color.A)
+			|| !FMath::IsFinite(Definition.ShallowOpacity)
+			|| Definition.ShallowOpacity < 0.0f
+			|| Definition.ShallowOpacity > 1.0f
+			|| !FMath::IsFinite(Definition.DeepOpacity)
+			|| Definition.DeepOpacity < Definition.ShallowOpacity
+			|| Definition.DeepOpacity > 1.0f
+			|| !FMath::IsFinite(Definition.OpacityDepth)
+			|| Definition.OpacityDepth <= 0.0f
+			|| !FMath::IsFinite(Definition.RefractionIndex)
+			|| Definition.RefractionIndex < 1.0f
+			|| Definition.RefractionIndex > 2.5f
 			|| !bValidPhase)
 		{
 			OutError = FString::Printf(
@@ -361,19 +645,34 @@ namespace MatterFluxLua
 		FString& OutError)
 	{
 		const FString Id = Definition.Id.ToString();
+		const bool bPropagating = Definition.Kind
+			== FMatterFluxReactionDefinition::EKind::Propagating;
 		const bool bValidOutputA =
 			Definition.OutputA == TEXT("empty")
 			|| IsValidContentId(Definition.OutputA.ToString());
 		const bool bValidOutputB =
 			Definition.OutputB == TEXT("empty")
 			|| IsValidContentId(Definition.OutputB.ToString());
+		const bool bValidEmission =
+			Definition.EmissionMaterial == TEXT("empty")
+				? Definition.EmissionChancePermille == 0
+				: IsValidContentId(
+					Definition.EmissionMaterial.ToString());
 		if (!IsValidContentId(Id)
 			|| !IsValidContentId(Definition.InputA.ToString())
 			|| !IsValidContentId(Definition.InputB.ToString())
 			|| !bValidOutputA
 			|| !bValidOutputB
 			|| Definition.ChancePermille < 0
-			|| Definition.ChancePermille > 1000)
+			|| Definition.ChancePermille > 1000
+			|| (bPropagating
+				&& (!bValidEmission
+					|| Definition.PropagationChancePermille < 0
+					|| Definition.PropagationChancePermille > 1000
+					|| Definition.DurationSteps < 1
+					|| Definition.DurationSteps > 255
+					|| Definition.EmissionChancePermille < 0
+					|| Definition.EmissionChancePermille > 1000)))
 		{
 			OutError = FString::Printf(
 				TEXT("reaction '%s' contains invalid data"),
@@ -390,6 +689,10 @@ namespace MatterFluxLua
 		for (const TPair<FName, FMatterFluxReactionDefinition>& Pair
 			: Registry.Reactions)
 		{
+			if (Pair.Value.Kind != Definition.Kind)
+			{
+				continue;
+			}
 			const bool bSameInputPair =
 				(Pair.Value.InputA == Definition.InputA
 					&& Pair.Value.InputB == Definition.InputB)
@@ -405,52 +708,6 @@ namespace MatterFluxLua
 			}
 		}
 		Registry.Reactions.Add(Definition.Id, Definition);
-		return true;
-	}
-
-	bool FRegistryBuilder::AddCombustion(
-		const FMatterFluxCombustionDefinition& Definition,
-		FString& OutError)
-	{
-		const FString Id = Definition.Id.ToString();
-		if (!IsValidContentId(Id)
-			|| !IsValidContentId(Definition.FuelMaterial.ToString())
-			|| !IsValidContentId(Definition.FlameMaterial.ToString())
-			|| !IsValidContentId(Definition.SmokeMaterial.ToString())
-			|| !IsValidContentId(Definition.ResidueMaterial.ToString())
-			|| Definition.IgnitionChancePermille < 0
-			|| Definition.IgnitionChancePermille > 1000
-			|| Definition.SpreadChancePermille < 0
-			|| Definition.SpreadChancePermille > 1000
-			|| Definition.BurnDurationSteps < 1
-			|| Definition.BurnDurationSteps > 255
-			|| Definition.SmokeChancePermille < 0
-			|| Definition.SmokeChancePermille > 1000)
-		{
-			OutError = FString::Printf(
-				TEXT("combustion '%s' contains invalid data"),
-				*Id);
-			return false;
-		}
-		if (Registry.Combustions.Contains(Definition.Id))
-		{
-			OutError = FString::Printf(
-				TEXT("duplicate combustion id '%s'"),
-				*Id);
-			return false;
-		}
-		for (const TPair<FName, FMatterFluxCombustionDefinition>& Pair
-			: Registry.Combustions)
-		{
-			if (Pair.Value.FuelMaterial == Definition.FuelMaterial)
-			{
-				OutError = FString::Printf(
-					TEXT("fuel material '%s' already has a combustion rule"),
-					*Definition.FuelMaterial.ToString());
-				return false;
-			}
-		}
-		Registry.Combustions.Add(Definition.Id, Definition);
 		return true;
 	}
 
@@ -511,6 +768,201 @@ namespace MatterFluxLua
 			return false;
 		}
 		Registry.Entities.Add(Definition.Id, Definition);
+		return true;
+	}
+
+	bool FRegistryBuilder::AddCreature(
+		const FMatterFluxCreatureDefinition& Definition,
+		FString& OutError)
+	{
+		const FString Id = Definition.Id.ToString();
+		if (!ValidateCreatureBehaviorProgram(
+			Definition.BehaviorProgram, OutError))
+		{
+			OutError = FString::Printf(
+				TEXT("creature '%s' has an invalid behavior tree: %s"),
+				*Id,
+				*OutError);
+			return false;
+		}
+		const auto IsValidCastProgram = [](
+			const FMatterFluxCreatureCastProgramDefinition& Program)
+		{
+			return Program.ProjectileCount >= 1
+				&& Program.ProjectileCount <= 32
+				&& FMath::IsFinite(Program.SpreadDegrees)
+				&& Program.SpreadDegrees >= 0.0f
+				&& Program.SpreadDegrees <= 180.0f
+				&& IsFiniteNonNegative(Program.ProjectileInterval)
+				&& IsFiniteNonNegative(Program.RecoverySeconds)
+				&& IsFiniteNonNegative(Program.HorizontalImpulse)
+				&& IsFiniteNonNegative(Program.VerticalImpulse)
+				&& FMath::IsFinite(Program.Color.R)
+				&& FMath::IsFinite(Program.Color.G)
+				&& FMath::IsFinite(Program.Color.B)
+				&& FMath::IsFinite(Program.Color.A);
+		};
+		const bool bFinite =
+			IsFiniteNonNegative(Definition.MaxHealth)
+			&& IsFiniteNonNegative(Definition.Width)
+			&& IsFiniteNonNegative(Definition.Height)
+			&& IsFiniteNonNegative(Definition.Density)
+			&& IsFiniteNonNegative(Definition.MoveSpeed)
+			&& IsFiniteNonNegative(Definition.PerceptionRange)
+			&& IsFiniteNonNegative(Definition.AttackRange)
+			&& IsFiniteNonNegative(Definition.RetreatRange)
+			&& IsFiniteNonNegative(Definition.TargetMemorySeconds)
+			&& IsFiniteNonNegative(Definition.PatrolTurnSeconds)
+			&& IsFiniteNonNegative(Definition.PatrolPauseSeconds)
+			&& IsFiniteNonNegative(Definition.AttackCooldown)
+			&& IsFiniteNonNegative(Definition.SkillCooldown)
+			&& IsFiniteNonNegative(Definition.SpawnDistance)
+			&& FMath::IsFinite(Definition.Color.R)
+			&& FMath::IsFinite(Definition.Color.G)
+			&& FMath::IsFinite(Definition.Color.B)
+			&& FMath::IsFinite(Definition.Color.A)
+			&& IsValidCastProgram(Definition.AttackProgram)
+			&& IsValidCastProgram(Definition.SkillProgram);
+		const bool bUsesAttackRange = Definition.BehaviorProgram.Nodes.ContainsByPredicate(
+			[](const FMatterFluxCreatureBehaviorNodeDefinition& Node)
+			{
+				return Node.Kind == EMatterFluxCreatureBehaviorNodeKind::Condition
+					&& Node.Condition
+						== EMatterFluxCreatureBehaviorCondition::TargetInAttackRange;
+			});
+		const bool bUsesRetreatRange = Definition.BehaviorProgram.Nodes.ContainsByPredicate(
+			[](const FMatterFluxCreatureBehaviorNodeDefinition& Node)
+			{
+				return Node.Kind == EMatterFluxCreatureBehaviorNodeKind::Condition
+					&& Node.Condition
+						== EMatterFluxCreatureBehaviorCondition::TargetTooClose;
+			});
+		if (!IsValidContentId(Id)
+			|| Definition.DisplayName.IsEmpty()
+			|| Definition.DisplayName.Len() > 96
+			|| !bFinite
+			|| Definition.MaxHealth <= 0.0f
+			|| Definition.Width < 20.0f || Definition.Width > 400.0f
+			|| Definition.Height < 20.0f || Definition.Height > 500.0f
+			|| Definition.Density < 0.05f || Definition.Density > 20.0f
+			|| Definition.MoveSpeed > 2000.0f
+			|| Definition.PerceptionRange > 10000.0f
+			|| (bUsesAttackRange
+				&& Definition.AttackRange > Definition.PerceptionRange)
+			|| (bUsesRetreatRange
+				&& Definition.RetreatRange > Definition.PerceptionRange)
+			|| Definition.DropItemCount < 0
+			|| Definition.DropItemCount > 999999
+			|| Definition.SpawnCount < 0
+			|| Definition.SpawnCount > 64
+			|| Definition.SpawnDistance > 10000.0f)
+		{
+			OutError = FString::Printf(
+				TEXT("creature '%s' contains invalid data"), *Id);
+			return false;
+		}
+		if (Registry.Creatures.Contains(Definition.Id))
+		{
+			OutError = FString::Printf(
+				TEXT("duplicate creature id '%s'"), *Id);
+			return false;
+		}
+		Registry.Creatures.Add(Definition.Id, Definition);
+		return true;
+	}
+
+	bool FRegistryBuilder::AddDialogue(
+		const FMatterFluxDialogueDefinition& Definition,
+		FString& OutError)
+	{
+		const FString Id = Definition.Id.ToString();
+		if (!IsValidContentId(Id)
+			|| Definition.DisplayName.IsEmpty()
+			|| Definition.DisplayName.Len() > 96
+			|| Definition.StartNodeId.IsNone()
+			|| Definition.Nodes.IsEmpty()
+			|| Definition.Nodes.Num() > 64)
+		{
+			OutError = FString::Printf(
+				TEXT("dialogue '%s' contains invalid data"), *Id);
+			return false;
+		}
+		TSet<FName> NodeIds;
+		for (const FMatterFluxDialogueNodeDefinition& Node : Definition.Nodes)
+		{
+			if (Node.Id.IsNone()
+				|| Node.Text.IsEmpty()
+				|| Node.Text.Len() > 512
+				|| Node.Options.Num() > 8
+				|| NodeIds.Contains(Node.Id))
+			{
+				OutError = FString::Printf(
+					TEXT("dialogue '%s' contains an invalid node"), *Id);
+				return false;
+			}
+			NodeIds.Add(Node.Id);
+			for (const FMatterFluxDialogueOptionDefinition& Option : Node.Options)
+			{
+				if (Option.Text.IsEmpty() || Option.Text.Len() > 128)
+				{
+					OutError = FString::Printf(
+						TEXT("dialogue '%s' contains an invalid option"), *Id);
+					return false;
+				}
+			}
+		}
+		if (!NodeIds.Contains(Definition.StartNodeId))
+		{
+			OutError = FString::Printf(
+				TEXT("dialogue '%s' start node is missing"), *Id);
+			return false;
+		}
+		if (Registry.Dialogues.Contains(Definition.Id))
+		{
+			OutError = FString::Printf(
+				TEXT("duplicate dialogue id '%s'"), *Id);
+			return false;
+		}
+		Registry.Dialogues.Add(Definition.Id, Definition);
+		return true;
+	}
+
+	bool FRegistryBuilder::AddShop(
+		const FMatterFluxShopDefinition& Definition,
+		FString& OutError)
+	{
+		const FString Id = Definition.Id.ToString();
+		if (!IsValidContentId(Id)
+			|| Definition.DisplayName.IsEmpty()
+			|| Definition.DisplayName.Len() > 96
+			|| Definition.Offers.IsEmpty()
+			|| Definition.Offers.Num() > 64)
+		{
+			OutError = FString::Printf(
+				TEXT("shop '%s' contains invalid data"), *Id);
+			return false;
+		}
+		for (const FMatterFluxShopOfferDefinition& Offer : Definition.Offers)
+		{
+			if (Offer.ProductId.IsNone()
+				|| Offer.ProductCount < 1 || Offer.ProductCount > 999999
+				|| Offer.CostItemId.IsNone()
+				|| Offer.CostCount < 1 || Offer.CostCount > 999999
+				|| Offer.PurchaseLimit < INDEX_NONE
+				|| Offer.PurchaseLimit > 999999)
+			{
+				OutError = FString::Printf(
+					TEXT("shop '%s' contains an invalid offer"), *Id);
+				return false;
+			}
+		}
+		if (Registry.Shops.Contains(Definition.Id))
+		{
+			OutError = FString::Printf(
+				TEXT("duplicate shop id '%s'"), *Id);
+			return false;
+		}
+		Registry.Shops.Add(Definition.Id, Definition);
 		return true;
 	}
 
@@ -674,6 +1126,8 @@ namespace MatterFluxLua
 			|| !IsFiniteNonNegative(Definition.ManaRechargePerSecond)
 			|| !FMath::IsFinite(Definition.Spread)
 			|| Definition.ManaMax <= 0.0f
+			|| Definition.StarterCount < 0
+			|| Definition.StarterCount > 16
 			|| Definition.StarterEquipmentSlot < -1
 			|| Definition.StarterEquipmentSlot >= 4
 			|| Definition.StarterDeck.Num() > Definition.Capacity)
@@ -807,6 +1261,178 @@ namespace MatterFluxLua
 		return true;
 	}
 
+	bool FRegistryBuilder::AddCustomMap(
+		const FMatterFluxCustomMapDefinition& Definition,
+		FString& OutError)
+	{
+		const FString Id = Definition.Id.ToString();
+		const int64 Width = static_cast<int64>(Definition.MaximumCellExclusive.X)
+			- Definition.MinimumCell.X;
+		const int64 Height = static_cast<int64>(Definition.MaximumCellExclusive.Y)
+			- Definition.MinimumCell.Y;
+		constexpr int32 MaximumAbsoluteCustomMapCoordinate = 1000000;
+		const auto IsSafeCoordinate = [](const FIntPoint Cell)
+		{
+			return FMath::Abs(static_cast<int64>(Cell.X))
+					<= MaximumAbsoluteCustomMapCoordinate
+				&& FMath::Abs(static_cast<int64>(Cell.Y))
+					<= MaximumAbsoluteCustomMapCoordinate;
+		};
+		if (!IsValidContentId(Id)
+			|| Definition.DisplayName.IsEmpty()
+			|| !IsSafeCoordinate(Definition.MinimumCell)
+			|| !IsSafeCoordinate(Definition.MaximumCellExclusive)
+			|| Width < 1 || Width > 512
+			|| Height < 1 || Height > 512
+			|| (Definition.Stamps.IsEmpty()
+				&& Definition.PourContainers.IsEmpty())
+			|| Definition.Stamps.Num() > MaximumCustomMapStamps
+			|| Definition.Markers.Num() > MaximumCustomMapMarkers
+			|| Definition.SceneBoxes.Num() > MaximumCustomMapSceneBoxes
+			|| Definition.Cameras.Num() > MaximumCustomMapCameras
+			|| Definition.PourContainers.Num()
+				> MaximumCustomMapPourContainers
+			|| !FMath::IsFinite(Definition.CellSizeCentimeters)
+			|| Definition.CellSizeCentimeters < 1.0f
+			|| Definition.CellSizeCentimeters > 1000.0f
+			|| !FMath::IsFinite(Definition.MaterialDepthCells)
+			|| Definition.MaterialDepthCells < 0.1f
+			|| Definition.MaterialDepthCells > 64.0f)
+		{
+			OutError = FString::Printf(
+				TEXT("custom map '%s' contains invalid bounds or counts"), *Id);
+			return false;
+		}
+		const auto IsInside = [&Definition](const FIntPoint Cell)
+		{
+			return Cell.X >= Definition.MinimumCell.X
+				&& Cell.Y >= Definition.MinimumCell.Y
+				&& Cell.X < Definition.MaximumCellExclusive.X
+				&& Cell.Y < Definition.MaximumCellExclusive.Y;
+		};
+		for (const FMatterFluxCustomMapStampDefinition& Stamp : Definition.Stamps)
+		{
+			const bool bValidRectangle =
+				Stamp.Shape == EMatterFluxCustomMapStampShape::Rectangle
+				&& Stamp.MinimumCell.X <= Stamp.MaximumCellInclusive.X
+				&& Stamp.MinimumCell.Y <= Stamp.MaximumCellInclusive.Y
+				&& IsInside(Stamp.MinimumCell)
+				&& IsInside(Stamp.MaximumCellInclusive);
+			const FIntPoint Radius(Stamp.RadiusCells, Stamp.RadiusCells);
+			const bool bValidCircle =
+				Stamp.Shape == EMatterFluxCustomMapStampShape::Circle
+				&& Stamp.RadiusCells >= 1
+				&& Stamp.RadiusCells <= 128
+				&& IsSafeCoordinate(Stamp.CenterCell)
+				&& IsInside(Stamp.CenterCell - Radius)
+				&& IsInside(Stamp.CenterCell + Radius);
+			if (!IsValidContentId(Stamp.MaterialId.ToString())
+				|| (!bValidRectangle && !bValidCircle))
+			{
+				OutError = FString::Printf(
+					TEXT("custom map '%s' contains an invalid stamp"), *Id);
+				return false;
+			}
+		}
+		TSet<FName> MarkerIds;
+		for (const FMatterFluxCustomMapMarkerDefinition& Marker : Definition.Markers)
+		{
+			if (!IsValidContentId(Marker.Id.ToString())
+				|| MarkerIds.Contains(Marker.Id)
+				|| !IsInside(Marker.Cell))
+			{
+				OutError = FString::Printf(
+					TEXT("custom map '%s' contains an invalid marker"), *Id);
+				return false;
+			}
+			MarkerIds.Add(Marker.Id);
+		}
+		const auto IsFiniteVector = [](const FVector& Value)
+		{
+			return FMath::IsFinite(Value.X)
+				&& FMath::IsFinite(Value.Y)
+				&& FMath::IsFinite(Value.Z);
+		};
+		TSet<FName> SceneBoxIds;
+		for (const FMatterFluxCustomMapSceneBoxDefinition& Box
+			: Definition.SceneBoxes)
+		{
+			if (!IsValidContentId(Box.Id.ToString())
+				|| !IsValidContentId(Box.MaterialId.ToString())
+				|| SceneBoxIds.Contains(Box.Id)
+				|| !IsFiniteVector(Box.CenterCells)
+				|| !IsFiniteVector(Box.SizeCells)
+				|| Box.CenterCells.GetAbsMax() > 2048.0
+				|| Box.SizeCells.GetMin() <= 0.0
+				|| Box.SizeCells.GetAbsMax() > 1024.0)
+			{
+				OutError = FString::Printf(
+					TEXT("custom map '%s' contains an invalid 3D scene box"), *Id);
+				return false;
+			}
+			SceneBoxIds.Add(Box.Id);
+		}
+		TSet<FName> CameraIds;
+		for (const FMatterFluxCustomMapCameraDefinition& Camera
+			: Definition.Cameras)
+		{
+			if (!IsValidContentId(Camera.Id.ToString())
+				|| CameraIds.Contains(Camera.Id)
+				|| !IsFiniteVector(Camera.LocationCells)
+				|| !IsFiniteVector(Camera.TargetCells)
+				|| Camera.LocationCells.GetAbsMax() > 4096.0
+				|| Camera.TargetCells.GetAbsMax() > 4096.0
+				|| Camera.LocationCells.Equals(Camera.TargetCells, 0.01)
+				|| !FMath::IsFinite(Camera.FieldOfViewDegrees)
+				|| Camera.FieldOfViewDegrees < 20.0f
+				|| Camera.FieldOfViewDegrees > 120.0f)
+			{
+				OutError = FString::Printf(
+					TEXT("custom map '%s' contains an invalid 3D camera"), *Id);
+				return false;
+			}
+			CameraIds.Add(Camera.Id);
+		}
+		TSet<FName> PourContainerIds;
+		for (const FMatterFluxCustomMapPourContainerDefinition& Container
+			: Definition.PourContainers)
+		{
+			if (!IsValidContentId(Container.Id.ToString())
+				|| !IsValidContentId(Container.ContainerMaterialId.ToString())
+				|| !IsValidContentId(Container.LiquidMaterialId.ToString())
+				|| PourContainerIds.Contains(Container.Id)
+				|| !IsFiniteVector(Container.CenterCells)
+				|| Container.CenterCells.GetAbsMax() > 2048.0
+				|| Container.InteriorSizeCells.X < 2
+				|| Container.InteriorSizeCells.Y < 2
+				|| Container.InteriorSizeCells.Z < 2
+				|| Container.InteriorSizeCells.GetMax() > 16
+				|| Container.StartStep < 0
+				|| Container.StartStep > 10000
+				|| Container.TiltDurationSteps < 1
+				|| Container.TiltDurationSteps > 1000
+				|| !FMath::IsFinite(Container.TiltDegrees)
+				|| Container.TiltDegrees < 1.0f
+				|| Container.TiltDegrees > 89.0f
+				|| Container.PourCellsPerStep < 1
+				|| Container.PourCellsPerStep > 512)
+			{
+				OutError = FString::Printf(
+					TEXT("custom map '%s' contains an invalid tilting container"),
+					*Id);
+				return false;
+			}
+			PourContainerIds.Add(Container.Id);
+		}
+		if (Registry.CustomMaps.Contains(Definition.Id))
+		{
+			OutError = FString::Printf(TEXT("duplicate custom map id '%s'"), *Id);
+			return false;
+		}
+		Registry.CustomMaps.Add(Definition.Id, Definition);
+		return true;
+	}
+
 	bool FRegistryBuilder::SetFragmentationSettings(
 		const int32 MinDetachedAreaPixels,
 		FString& OutError)
@@ -849,6 +1475,46 @@ namespace MatterFluxLua
 				return false;
 			}
 		}
+		for (const TPair<FName, FMatterFluxCustomMapDefinition>& Pair
+			: Registry.CustomMaps)
+		{
+			for (const FMatterFluxCustomMapStampDefinition& Stamp
+				: Pair.Value.Stamps)
+			{
+				if (!Registry.Materials.Contains(Stamp.MaterialId))
+				{
+					OutError = FString::Printf(
+						TEXT("custom map '%s' references missing material '%s'"),
+						*Pair.Key.ToString(),
+						*Stamp.MaterialId.ToString());
+					return false;
+				}
+			}
+			for (const FMatterFluxCustomMapSceneBoxDefinition& Box
+				: Pair.Value.SceneBoxes)
+			{
+				if (!Registry.Materials.Contains(Box.MaterialId))
+				{
+					OutError = FString::Printf(
+						TEXT("custom map '%s' scene box references missing material '%s'"),
+						*Pair.Key.ToString(),
+						*Box.MaterialId.ToString());
+					return false;
+				}
+			}
+			for (const FMatterFluxCustomMapPourContainerDefinition& Container
+				: Pair.Value.PourContainers)
+			{
+				if (!Registry.Materials.Contains(Container.ContainerMaterialId)
+					|| !Registry.Materials.Contains(Container.LiquidMaterialId))
+				{
+					OutError = FString::Printf(
+						TEXT("custom map '%s' tilting container references a missing material"),
+						*Pair.Key.ToString());
+					return false;
+				}
+			}
+		}
 		for (const TPair<FName, FMatterFluxReactionDefinition>& Pair
 			: Registry.Reactions)
 		{
@@ -860,24 +1526,15 @@ namespace MatterFluxLua
 			if (!Registry.Materials.Contains(Pair.Value.InputA)
 				|| !Registry.Materials.Contains(Pair.Value.InputB)
 				|| !IsKnownOutput(Pair.Value.OutputA)
-				|| !IsKnownOutput(Pair.Value.OutputB))
+				|| !IsKnownOutput(Pair.Value.OutputB)
+				|| (Pair.Value.Kind
+						== FMatterFluxReactionDefinition::EKind::Propagating
+					&& Pair.Value.EmissionMaterial != TEXT("empty")
+					&& !Registry.Materials.Contains(
+						Pair.Value.EmissionMaterial)))
 			{
 				OutError = FString::Printf(
 					TEXT("reaction '%s' references a missing material"),
-					*Pair.Key.ToString());
-				return false;
-			}
-		}
-		for (const TPair<FName, FMatterFluxCombustionDefinition>& Pair
-			: Registry.Combustions)
-		{
-			if (!Registry.Materials.Contains(Pair.Value.FuelMaterial)
-				|| !Registry.Materials.Contains(Pair.Value.FlameMaterial)
-				|| !Registry.Materials.Contains(Pair.Value.SmokeMaterial)
-				|| !Registry.Materials.Contains(Pair.Value.ResidueMaterial))
-			{
-				OutError = FString::Printf(
-					TEXT("combustion '%s' references a missing material"),
 					*Pair.Key.ToString());
 				return false;
 			}
@@ -922,6 +1579,94 @@ namespace MatterFluxLua
 						*SpellId.ToString());
 					return false;
 				}
+			}
+		}
+		for (const TPair<FName, FMatterFluxShopDefinition>& Pair
+			: Registry.Shops)
+		{
+			for (const FMatterFluxShopOfferDefinition& Offer
+				: Pair.Value.Offers)
+			{
+				const bool bProductExists =
+					(Offer.ProductKind == EMatterFluxShopProductKind::Item
+						&& Registry.Items.Contains(Offer.ProductId))
+					|| (Offer.ProductKind == EMatterFluxShopProductKind::Spell
+						&& Registry.Spells.Contains(Offer.ProductId))
+					|| (Offer.ProductKind == EMatterFluxShopProductKind::Wand
+						&& Registry.Wands.Contains(Offer.ProductId));
+				if (!bProductExists
+					|| !Registry.Items.Contains(Offer.CostItemId))
+				{
+					OutError = FString::Printf(
+						TEXT("shop '%s' references missing product or currency"),
+						*Pair.Key.ToString());
+					return false;
+				}
+			}
+		}
+		for (const TPair<FName, FMatterFluxDialogueDefinition>& Pair
+			: Registry.Dialogues)
+		{
+			TSet<FName> NodeIds;
+			for (const FMatterFluxDialogueNodeDefinition& Node
+				: Pair.Value.Nodes)
+			{
+				NodeIds.Add(Node.Id);
+			}
+			const auto ValidateDestination =
+				[this, &NodeIds, &OutError, &Pair](
+					const FName NextNodeId,
+					const FName ShopId)
+				{
+					if ((!NextNodeId.IsNone() && !NodeIds.Contains(NextNodeId))
+						|| (!ShopId.IsNone() && !Registry.Shops.Contains(ShopId)))
+					{
+						OutError = FString::Printf(
+							TEXT("dialogue '%s' references a missing node or shop"),
+							*Pair.Key.ToString());
+						return false;
+					}
+					return true;
+				};
+			for (const FMatterFluxDialogueNodeDefinition& Node
+				: Pair.Value.Nodes)
+			{
+				if (!ValidateDestination(Node.NextNodeId, Node.ShopId))
+				{
+					return false;
+				}
+				for (const FMatterFluxDialogueOptionDefinition& Option
+					: Node.Options)
+				{
+					if (!ValidateDestination(
+						Option.NextNodeId, Option.ShopId))
+					{
+						return false;
+					}
+				}
+			}
+		}
+		for (const TPair<FName, FMatterFluxCreatureDefinition>& Pair
+			: Registry.Creatures)
+		{
+			const FMatterFluxCreatureDefinition& Creature = Pair.Value;
+			if ((!Creature.AttackProgram.SpellId.IsNone()
+					&& !Registry.Spells.Contains(Creature.AttackProgram.SpellId))
+				|| (!Creature.SkillProgram.SpellId.IsNone()
+					&& !Registry.Spells.Contains(Creature.SkillProgram.SpellId))
+				|| (!Creature.DialogueId.IsNone()
+					&& !Registry.Dialogues.Contains(Creature.DialogueId))
+				|| (!Creature.ShopId.IsNone()
+					&& !Registry.Shops.Contains(Creature.ShopId))
+				|| (!Creature.DropItemId.IsNone()
+					&& !Registry.Items.Contains(Creature.DropItemId))
+				|| (!Creature.SpawnQuestId.IsNone()
+					&& !Registry.Quests.Contains(Creature.SpawnQuestId)))
+			{
+				OutError = FString::Printf(
+					TEXT("creature '%s' references missing content"),
+					*Pair.Key.ToString());
+				return false;
 			}
 		}
 		const auto ValidateRewardReferences = [this, &OutError](
@@ -986,7 +1731,8 @@ namespace MatterFluxLua
 				|| (Quest.Objective == EMatterFluxQuestObjectiveKind::EquipSpell
 					&& Registry.Spells.Contains(Quest.TargetId))
 				|| (Quest.Objective == EMatterFluxQuestObjectiveKind::KillEnemies
-					&& Registry.Entities.Contains(Quest.TargetId))
+					&& (Registry.Entities.Contains(Quest.TargetId)
+						|| Registry.Creatures.Contains(Quest.TargetId)))
 				|| (Quest.Objective == EMatterFluxQuestObjectiveKind::SpendItem
 					&& Registry.Items.Contains(Quest.TargetId));
 			if (!bTargetExists)
@@ -1349,6 +2095,34 @@ namespace MatterFluxLua
 		return true;
 	}
 
+	template<typename NumberType>
+	static bool ReadRequiredTableNumberField(
+		lua_State* State,
+		const int32 TableIndex,
+		const char* Field,
+		NumberType& OutValue,
+		FString& OutError)
+	{
+		lua_getfield(State, TableIndex, Field);
+		if (lua_type(State, -1) != LUA_TNUMBER)
+		{
+			lua_pop(State, 1);
+			OutError = FString::Printf(
+				TEXT("field '%s' must be a number"), UTF8_TO_TCHAR(Field));
+			return false;
+		}
+		const double Value = lua_tonumber(State, -1);
+		lua_pop(State, 1);
+		if (!FMath::IsFinite(Value))
+		{
+			OutError = FString::Printf(
+				TEXT("field '%s' must be finite"), UTF8_TO_TCHAR(Field));
+			return false;
+		}
+		OutValue = static_cast<NumberType>(Value);
+		return true;
+	}
+
 	static bool ReadTableIntegerField(
 		lua_State* State,
 		const int32 TableIndex,
@@ -1362,6 +2136,35 @@ namespace MatterFluxLua
 			lua_pop(State, 1);
 			return true;
 		}
+		if (!lua_isinteger(State, -1))
+		{
+			lua_pop(State, 1);
+			OutError = FString::Printf(
+				TEXT("field '%s' must be an integer"),
+				UTF8_TO_TCHAR(Field));
+			return false;
+		}
+		const lua_Integer Value = lua_tointeger(State, -1);
+		lua_pop(State, 1);
+		if (Value < MIN_int32 || Value > MAX_int32)
+		{
+			OutError = FString::Printf(
+				TEXT("field '%s' is out of range"),
+				UTF8_TO_TCHAR(Field));
+			return false;
+		}
+		OutValue = static_cast<int32>(Value);
+		return true;
+	}
+
+	static bool ReadRequiredTableIntegerField(
+		lua_State* State,
+		const int32 TableIndex,
+		const char* Field,
+		int32& OutValue,
+		FString& OutError)
+	{
+		lua_getfield(State, TableIndex, Field);
 		if (!lua_isinteger(State, -1))
 		{
 			lua_pop(State, 1);
@@ -1665,33 +2468,118 @@ namespace MatterFluxLua
 		{
 			return FailLuaCall(State, Error);
 		}
-		FString Id;
-		double Values[6] = {};
-		EMatterFluxMaterialPhase Phase =
-			EMatterFluxMaterialPhase::StaticSolid;
+		const int32 ArgumentCount = lua_gettop(State);
+		FMatterFluxMaterialDefinition Definition;
 		int32 Mobility = 255;
 		int32 Dispersion = 128;
-		const int32 ArgumentCount = lua_gettop(State);
-		if ((ArgumentCount != 7 && ArgumentCount != 10)
-			|| !ReadContentId(State, 1, Id, Error))
+		if (ArgumentCount == 1 && lua_istable(State, 1))
 		{
-			return FailLuaCall(State, Error.IsEmpty()
-				? TEXT("register_material expects 7 or 10 arguments")
-				: Error);
-		}
-		for (int32 Index = 0; Index < 6; ++Index)
-		{
-			if (!ReadNumber(State, Index + 2, Values[Index], Error))
+			// Lua 作者只面对命名字段。C++ 在这一条深模块接口后完成
+			// 默认值、类型、范围和阶段解析，避免位置参数继续膨胀。
+			const int32 TableIndex = lua_absindex(State, 1);
+			FString Id;
+			FString Phase = TEXT("static");
+			float Density = std::numeric_limits<float>::quiet_NaN();
+			float Hardness = std::numeric_limits<float>::quiet_NaN();
+			float ColorR = std::numeric_limits<float>::quiet_NaN();
+			float ColorG = std::numeric_limits<float>::quiet_NaN();
+			float ColorB = std::numeric_limits<float>::quiet_NaN();
+			float ColorA = std::numeric_limits<float>::quiet_NaN();
+			if (!ReadTableStringField(
+					State, TableIndex, "id", Id, true, Error)
+				|| !ReadTableNumberField(
+					State, TableIndex, "density", Density, Error)
+				|| !ReadTableNumberField(
+					State, TableIndex, "hardness", Hardness, Error)
+				|| !ReadTableNumberField(
+					State, TableIndex, "color_r", ColorR, Error)
+				|| !ReadTableNumberField(
+					State, TableIndex, "color_g", ColorG, Error)
+				|| !ReadTableNumberField(
+					State, TableIndex, "color_b", ColorB, Error)
+				|| !ReadTableNumberField(
+					State, TableIndex, "color_a", ColorA, Error)
+				|| !ReadTableStringField(
+					State, TableIndex, "phase", Phase, false, Error)
+				|| !ReadTableIntegerField(
+					State, TableIndex, "mobility", Mobility, Error)
+				|| !ReadTableIntegerField(
+					State, TableIndex, "dispersion", Dispersion, Error)
+				|| !ReadTableNumberField(
+					State, TableIndex, "shallow_opacity",
+					Definition.ShallowOpacity, Error)
+				|| !ReadTableNumberField(
+					State, TableIndex, "deep_opacity",
+					Definition.DeepOpacity, Error)
+				|| !ReadTableNumberField(
+					State, TableIndex, "opacity_depth",
+					Definition.OpacityDepth, Error)
+				|| !ReadTableNumberField(
+					State, TableIndex, "refraction_index",
+					Definition.RefractionIndex, Error))
 			{
 				return FailLuaCall(State, Error);
 			}
+			Definition.Id = FName(*Id);
+			Definition.Density = Density;
+			Definition.Hardness = Hardness;
+			Definition.Color = FLinearColor(ColorR, ColorG, ColorB, ColorA);
+			if (Phase == TEXT("static"))
+			{
+				Definition.Phase = EMatterFluxMaterialPhase::StaticSolid;
+			}
+			else if (Phase == TEXT("powder"))
+			{
+				Definition.Phase = EMatterFluxMaterialPhase::Powder;
+			}
+			else if (Phase == TEXT("liquid"))
+			{
+				Definition.Phase = EMatterFluxMaterialPhase::Liquid;
+			}
+			else if (Phase == TEXT("gas"))
+			{
+				Definition.Phase = EMatterFluxMaterialPhase::Gas;
+			}
+			else
+			{
+				return FailLuaCall(
+					State,
+					TEXT("material phase must be static, powder, liquid, or gas"));
+			}
 		}
-		if (ArgumentCount == 10
-			&& (!ReadMaterialPhase(State, 8, Phase, Error)
-				|| !ReadInteger(State, 9, Mobility, Error)
-				|| !ReadInteger(State, 10, Dispersion, Error)))
+		else
 		{
-			return FailLuaCall(State, Error);
+			FString Id;
+			double Values[6] = {};
+			if ((ArgumentCount != 7 && ArgumentCount != 10)
+				|| !ReadContentId(State, 1, Id, Error))
+			{
+				return FailLuaCall(State, Error.IsEmpty()
+					? TEXT("register_material expects one table, 7 arguments, or 10 arguments")
+					: Error);
+			}
+			for (int32 Index = 0; Index < 6; ++Index)
+			{
+				if (!ReadNumber(State, Index + 2, Values[Index], Error))
+				{
+					return FailLuaCall(State, Error);
+				}
+			}
+			Definition.Id = FName(*Id);
+			Definition.Density = static_cast<float>(Values[0]);
+			Definition.Hardness = static_cast<float>(Values[1]);
+			Definition.Color = FLinearColor(
+				static_cast<float>(Values[2]),
+				static_cast<float>(Values[3]),
+				static_cast<float>(Values[4]),
+				static_cast<float>(Values[5]));
+			if (ArgumentCount == 10
+				&& (!ReadMaterialPhase(State, 8, Definition.Phase, Error)
+					|| !ReadInteger(State, 9, Mobility, Error)
+					|| !ReadInteger(State, 10, Dispersion, Error)))
+			{
+				return FailLuaCall(State, Error);
+			}
 		}
 		if (Mobility < 0
 			|| Mobility > 255
@@ -1702,17 +2590,6 @@ namespace MatterFluxLua
 				State,
 				TEXT("material mobility and dispersion must be between 0 and 255"));
 		}
-
-		FMatterFluxMaterialDefinition Definition;
-		Definition.Id = FName(*Id);
-		Definition.Density = static_cast<float>(Values[0]);
-		Definition.Hardness = static_cast<float>(Values[1]);
-		Definition.Color = FLinearColor(
-			static_cast<float>(Values[2]),
-			static_cast<float>(Values[3]),
-			static_cast<float>(Values[4]),
-			static_cast<float>(Values[5]));
-		Definition.Phase = Phase;
 		Definition.Mobility = static_cast<uint8>(Mobility);
 		Definition.Dispersion = static_cast<uint8>(Dispersion);
 		if (!GetExecutionContext(State).Builder->AddMaterial(Definition, Error))
@@ -1736,91 +2613,100 @@ namespace MatterFluxLua
 		{
 			return FailLuaCall(State, Error);
 		}
-		FString Id;
-		FString InputA;
-		FString InputB;
-		FString OutputA;
-		FString OutputB;
-		int32 ChancePermille = 0;
-		if (lua_gettop(State) != 6
-			|| !ReadContentId(State, 1, Id, Error)
-			|| !ReadContentId(State, 2, InputA, Error)
-			|| !ReadContentId(State, 3, InputB, Error)
-			|| !ReadContentId(State, 4, OutputA, Error)
-			|| !ReadContentId(State, 5, OutputB, Error)
-			|| !ReadInteger(State, 6, ChancePermille, Error))
-		{
-			return FailLuaCall(State, Error.IsEmpty()
-				? TEXT("register_reaction expects 6 arguments")
-				: Error);
-		}
-
 		FMatterFluxReactionDefinition Definition;
-		Definition.Id = FName(*Id);
-		Definition.InputA = FName(*InputA);
-		Definition.InputB = FName(*InputB);
-		Definition.OutputA = FName(*OutputA);
-		Definition.OutputB = FName(*OutputB);
-		Definition.ChancePermille = ChancePermille;
+		if (lua_gettop(State) == 1 && lua_istable(State, 1))
+		{
+			const int32 TableIndex = lua_absindex(State, 1);
+			const auto ReadIdField = [State, TableIndex, &Error](
+				const char* Field, FString& OutValue)
+			{
+				lua_getfield(State, TableIndex, Field);
+				const bool bRead = ReadContentId(State, -1, OutValue, Error);
+				lua_pop(State, 1);
+				return bRead;
+			};
+			const auto ReadIntegerField = [State, TableIndex, &Error](
+				const char* Field, int32& OutValue)
+			{
+				lua_getfield(State, TableIndex, Field);
+				const bool bRead = ReadInteger(State, -1, OutValue, Error);
+				lua_pop(State, 1);
+				return bRead;
+			};
+
+			FString Id;
+			FString Kind;
+			FString InputA;
+			FString InputB;
+			FString OutputA;
+			FString OutputB;
+			FString Emission;
+			if (!ReadIdField("id", Id)
+				|| !ReadIdField("kind", Kind)
+				|| !ReadIdField("input_a", InputA)
+				|| !ReadIdField("input_b", InputB)
+				|| !ReadIdField("output_a", OutputA)
+				|| !ReadIdField("output_b", OutputB)
+				|| !ReadIntegerField(
+					"chance_permille", Definition.ChancePermille))
+			{
+				return FailLuaCall(State, Error);
+			}
+			Definition.Id = FName(*Id);
+			Definition.InputA = FName(*InputA);
+			Definition.InputB = FName(*InputB);
+			Definition.OutputA = FName(*OutputA);
+			Definition.OutputB = FName(*OutputB);
+			if (Kind == TEXT("contact"))
+			{
+				Definition.Kind = FMatterFluxReactionDefinition::EKind::Contact;
+			}
+			else if (Kind == TEXT("propagating"))
+			{
+				Definition.Kind = FMatterFluxReactionDefinition::EKind::Propagating;
+				if (!ReadIdField("emission_material", Emission)
+					|| !ReadIntegerField("propagation_permille",
+						Definition.PropagationChancePermille)
+					|| !ReadIntegerField("duration_steps", Definition.DurationSteps)
+					|| !ReadIntegerField("emission_permille",
+						Definition.EmissionChancePermille))
+				{
+					return FailLuaCall(State, Error);
+				}
+				Definition.EmissionMaterial = FName(*Emission);
+			}
+			else
+			{
+				return FailLuaCall(State,
+					TEXT("reaction kind must be 'contact' or 'propagating'"));
+			}
+		}
+		else
+		{
+			FString Id;
+			FString InputA;
+			FString InputB;
+			FString OutputA;
+			FString OutputB;
+			if (lua_gettop(State) != 6
+				|| !ReadContentId(State, 1, Id, Error)
+				|| !ReadContentId(State, 2, InputA, Error)
+				|| !ReadContentId(State, 3, InputB, Error)
+				|| !ReadContentId(State, 4, OutputA, Error)
+				|| !ReadContentId(State, 5, OutputB, Error)
+				|| !ReadInteger(State, 6, Definition.ChancePermille, Error))
+			{
+				return FailLuaCall(State, Error.IsEmpty()
+					? TEXT("register_reaction expects a definition table or 6 arguments")
+					: Error);
+			}
+			Definition.Id = FName(*Id);
+			Definition.InputA = FName(*InputA);
+			Definition.InputB = FName(*InputB);
+			Definition.OutputA = FName(*OutputA);
+			Definition.OutputB = FName(*OutputB);
+		}
 		if (!GetExecutionContext(State).Builder->AddReaction(Definition, Error))
-		{
-			return FailLuaCall(State, Error);
-		}
-		return 0;
-	}
-
-	static int32 RegisterCombustion(lua_State* State)
-	{
-		if (!GetExecutionContext(State).Error.IsEmpty())
-		{
-			return 0;
-		}
-		FString Error;
-		if (!CheckDefinitionBudget(
-			GetExecutionContext(State).Builder->Registry.Combustions.Num(),
-			TEXT("combustion"),
-			Error))
-		{
-			return FailLuaCall(State, Error);
-		}
-		FString Id;
-		FString Fuel;
-		FString Flame;
-		FString Smoke;
-		FString Residue;
-		int32 IgnitionChance = 0;
-		int32 SpreadChance = 0;
-		int32 BurnDuration = 0;
-		int32 SmokeChance = 0;
-		if (lua_gettop(State) != 9
-			|| !ReadContentId(State, 1, Id, Error)
-			|| !ReadContentId(State, 2, Fuel, Error)
-			|| !ReadContentId(State, 3, Flame, Error)
-			|| !ReadContentId(State, 4, Smoke, Error)
-			|| !ReadContentId(State, 5, Residue, Error)
-			|| !ReadInteger(State, 6, IgnitionChance, Error)
-			|| !ReadInteger(State, 7, SpreadChance, Error)
-			|| !ReadInteger(State, 8, BurnDuration, Error)
-			|| !ReadInteger(State, 9, SmokeChance, Error))
-		{
-			return FailLuaCall(State, Error.IsEmpty()
-				? TEXT("register_combustion expects 9 arguments")
-				: Error);
-		}
-
-		FMatterFluxCombustionDefinition Definition;
-		Definition.Id = FName(*Id);
-		Definition.FuelMaterial = FName(*Fuel);
-		Definition.FlameMaterial = FName(*Flame);
-		Definition.SmokeMaterial = FName(*Smoke);
-		Definition.ResidueMaterial = FName(*Residue);
-		Definition.IgnitionChancePermille = IgnitionChance;
-		Definition.SpreadChancePermille = SpreadChance;
-		Definition.BurnDurationSteps = BurnDuration;
-		Definition.SmokeChancePermille = SmokeChance;
-		if (!GetExecutionContext(State).Builder->AddCombustion(
-			Definition,
-			Error))
 		{
 			return FailLuaCall(State, Error);
 		}
@@ -1879,6 +2765,485 @@ namespace MatterFluxLua
 		return 0;
 	}
 
+	static bool ParseCreatureFaction(
+		const FString& Value,
+		EMatterFluxCreatureFaction& OutFaction,
+		FString& OutError)
+	{
+		if (Value == TEXT("friendly"))
+		{
+			OutFaction = EMatterFluxCreatureFaction::Friendly;
+		}
+		else if (Value == TEXT("hostile"))
+		{
+			OutFaction = EMatterFluxCreatureFaction::Hostile;
+		}
+		else if (Value == TEXT("neutral"))
+		{
+			OutFaction = EMatterFluxCreatureFaction::Neutral;
+		}
+		else
+		{
+			OutError = TEXT("creature faction must be friendly, hostile, or neutral");
+			return false;
+		}
+		return true;
+	}
+
+	static bool ParseCreatureLevel(
+		const FString& Value,
+		EMatterFluxCreatureLevel& OutLevel,
+		FString& OutError)
+	{
+		if (Value == TEXT("normal")) OutLevel = EMatterFluxCreatureLevel::Normal;
+		else if (Value == TEXT("elite")) OutLevel = EMatterFluxCreatureLevel::Elite;
+		else if (Value == TEXT("boss")) OutLevel = EMatterFluxCreatureLevel::Boss;
+		else
+		{
+			OutError = TEXT("creature level must be normal, elite, or boss");
+			return false;
+		}
+		return true;
+	}
+
+	static bool ParseCreatureAiMode(
+		const FString& Value,
+		EMatterFluxCreatureAiMode& OutMode,
+		FString& OutError)
+	{
+		if (Value == TEXT("passive")) OutMode = EMatterFluxCreatureAiMode::Passive;
+		else if (Value == TEXT("patrol")) OutMode = EMatterFluxCreatureAiMode::Patrol;
+		else if (Value == TEXT("skirmisher")) OutMode = EMatterFluxCreatureAiMode::Skirmisher;
+		else if (Value == TEXT("boss")) OutMode = EMatterFluxCreatureAiMode::Boss;
+		else if (Value == TEXT("behavior_tree")) OutMode = EMatterFluxCreatureAiMode::BehaviorTree;
+		else
+		{
+			OutError = TEXT("creature ai must be passive, patrol, skirmisher, boss, or behavior_tree");
+			return false;
+		}
+		return true;
+	}
+
+	static bool ParseCreatureBehaviorCondition(
+		const FString& Name,
+		EMatterFluxCreatureBehaviorCondition& OutCondition,
+		FString& OutError)
+	{
+		if (Name == TEXT("has_visible_target"))
+			OutCondition = EMatterFluxCreatureBehaviorCondition::HasVisibleTarget;
+		else if (Name == TEXT("has_target"))
+			OutCondition = EMatterFluxCreatureBehaviorCondition::HasTarget;
+		else if (Name == TEXT("target_too_close"))
+			OutCondition = EMatterFluxCreatureBehaviorCondition::TargetTooClose;
+		else if (Name == TEXT("target_in_attack_range"))
+			OutCondition = EMatterFluxCreatureBehaviorCondition::TargetInAttackRange;
+		else if (Name == TEXT("attack_ready"))
+			OutCondition = EMatterFluxCreatureBehaviorCondition::AttackReady;
+		else if (Name == TEXT("skill_ready"))
+			OutCondition = EMatterFluxCreatureBehaviorCondition::SkillReady;
+		else
+		{
+			OutError = FString::Printf(
+				TEXT("unknown creature behavior condition '%s'"), *Name);
+			return false;
+		}
+		return true;
+	}
+
+	static bool ParseCreatureBehaviorAction(
+		const FString& Name,
+		EMatterFluxCreatureBehaviorAction& OutAction,
+		FString& OutError)
+	{
+		if (Name == TEXT("passive"))
+			OutAction = EMatterFluxCreatureBehaviorAction::Passive;
+		else if (Name == TEXT("patrol"))
+			OutAction = EMatterFluxCreatureBehaviorAction::Patrol;
+		else if (Name == TEXT("chase"))
+			OutAction = EMatterFluxCreatureBehaviorAction::Chase;
+		else if (Name == TEXT("retreat"))
+			OutAction = EMatterFluxCreatureBehaviorAction::Retreat;
+		else if (Name == TEXT("attack"))
+			OutAction = EMatterFluxCreatureBehaviorAction::Attack;
+		else if (Name == TEXT("skill"))
+			OutAction = EMatterFluxCreatureBehaviorAction::Skill;
+		else
+		{
+			OutError = FString::Printf(
+				TEXT("unknown creature behavior action '%s'"), *Name);
+			return false;
+		}
+		return true;
+	}
+
+	static bool ReadCreatureBehaviorNode(
+		lua_State* State,
+		const int32 TableIndex,
+		const int32 Depth,
+		FMatterFluxCreatureBehaviorProgramDefinition& OutProgram,
+		TSet<const void*>& ActiveTables,
+		int32& OutNodeIndex,
+		FString& OutError)
+	{
+		const int32 AbsoluteIndex = lua_absindex(State, TableIndex);
+		if (lua_type(State, AbsoluteIndex) != LUA_TTABLE)
+		{
+			OutError = TEXT("creature behavior node must be a table");
+			return false;
+		}
+		if (Depth > MaximumCreatureBehaviorDepth
+			|| OutProgram.Nodes.Num() >= MaximumCreatureBehaviorNodes)
+		{
+			OutError = TEXT("creature behavior tree exceeds its node or depth budget");
+			return false;
+		}
+		const void* TableIdentity = lua_topointer(State, AbsoluteIndex);
+		if (!TableIdentity || ActiveTables.Contains(TableIdentity))
+		{
+			OutError = TEXT("creature behavior tree contains a table cycle");
+			return false;
+		}
+		ActiveTables.Add(TableIdentity);
+		ON_SCOPE_EXIT
+		{
+			ActiveTables.Remove(TableIdentity);
+		};
+
+		FString Kind;
+		if (!ReadTableStringField(
+			State, AbsoluteIndex, "kind", Kind, true, OutError))
+		{
+			return false;
+		}
+		if (Kind == TEXT("condition") || Kind == TEXT("action"))
+		{
+			FString Name;
+			if (!ReadTableStringField(
+				State, AbsoluteIndex, "name", Name, true, OutError))
+			{
+				return false;
+			}
+			const bool bCondition = Kind == TEXT("condition");
+			OutNodeIndex = AddCreatureBehaviorNode(
+				OutProgram,
+				bCondition
+					? EMatterFluxCreatureBehaviorNodeKind::Condition
+					: EMatterFluxCreatureBehaviorNodeKind::Action);
+			return bCondition
+				? ParseCreatureBehaviorCondition(
+					Name,
+					OutProgram.Nodes[OutNodeIndex].Condition,
+					OutError)
+				: ParseCreatureBehaviorAction(
+					Name,
+					OutProgram.Nodes[OutNodeIndex].Action,
+					OutError);
+		}
+
+		EMatterFluxCreatureBehaviorNodeKind NodeKind;
+		if (Kind == TEXT("selector"))
+		{
+			NodeKind = EMatterFluxCreatureBehaviorNodeKind::Selector;
+		}
+		else if (Kind == TEXT("sequence"))
+		{
+			NodeKind = EMatterFluxCreatureBehaviorNodeKind::Sequence;
+		}
+		else
+		{
+			OutError = FString::Printf(
+				TEXT("unknown creature behavior node kind '%s'"), *Kind);
+			return false;
+		}
+
+		lua_getfield(State, AbsoluteIndex, "children");
+		if (lua_type(State, -1) != LUA_TTABLE)
+		{
+			lua_pop(State, 1);
+			OutError = TEXT("creature behavior composite children must be an array");
+			return false;
+		}
+		const int32 ChildrenIndex = lua_absindex(State, -1);
+		const size_t ChildCount = lua_rawlen(State, ChildrenIndex);
+		if (ChildCount == 0
+			|| ChildCount > MaximumCreatureBehaviorChildren)
+		{
+			lua_pop(State, 1);
+			OutError = TEXT("creature behavior composite has an invalid child count");
+			return false;
+		}
+
+		OutNodeIndex = AddCreatureBehaviorNode(OutProgram, NodeKind);
+		TArray<int32> ChildIndices;
+		ChildIndices.Reserve(static_cast<int32>(ChildCount));
+		for (size_t ChildOffset = 1; ChildOffset <= ChildCount; ++ChildOffset)
+		{
+			lua_rawgeti(
+				State, ChildrenIndex, static_cast<lua_Integer>(ChildOffset));
+			int32 ChildNodeIndex = INDEX_NONE;
+			if (!ReadCreatureBehaviorNode(
+				State,
+				-1,
+				Depth + 1,
+				OutProgram,
+				ActiveTables,
+				ChildNodeIndex,
+				OutError))
+			{
+				lua_pop(State, 2);
+				return false;
+			}
+			ChildIndices.Add(ChildNodeIndex);
+			lua_pop(State, 1);
+		}
+		lua_pop(State, 1);
+		OutProgram.Nodes[OutNodeIndex].Children = MoveTemp(ChildIndices);
+		return true;
+	}
+
+	static bool ReadCreatureBehaviorProgram(
+		lua_State* State,
+		const int32 DefinitionIndex,
+		const EMatterFluxCreatureAiMode Mode,
+		FMatterFluxCreatureBehaviorProgramDefinition& OutProgram,
+		FString& OutError)
+	{
+		OutProgram = {};
+		lua_getfield(State, DefinitionIndex, "behavior_tree");
+		if (lua_type(State, -1) == LUA_TNIL)
+		{
+			lua_pop(State, 1);
+			if (Mode == EMatterFluxCreatureAiMode::BehaviorTree)
+			{
+				OutError = TEXT("behavior_tree AI requires a behavior_tree root");
+				return false;
+			}
+			BuildLegacyCreatureBehaviorProgram(Mode, OutProgram);
+			return true;
+		}
+		if (Mode != EMatterFluxCreatureAiMode::BehaviorTree)
+		{
+			lua_pop(State, 1);
+			OutError = TEXT("behavior_tree field requires ai='behavior_tree'");
+			return false;
+		}
+		if (lua_type(State, -1) != LUA_TTABLE)
+		{
+			lua_pop(State, 1);
+			OutError = TEXT("behavior_tree root must be a table");
+			return false;
+		}
+		TSet<const void*> ActiveTables;
+		int32 RootNodeIndex = INDEX_NONE;
+		const bool bRead = ReadCreatureBehaviorNode(
+			State,
+			-1,
+			0,
+			OutProgram,
+			ActiveTables,
+			RootNodeIndex,
+			OutError);
+		lua_pop(State, 1);
+		if (!bRead)
+		{
+			return false;
+		}
+		OutProgram.RootNodeIndex = RootNodeIndex;
+		return ValidateCreatureBehaviorProgram(OutProgram, OutError);
+	}
+
+	static bool ParseShopProductKind(
+		const FString& Value,
+		EMatterFluxShopProductKind& OutKind,
+		FString& OutError)
+	{
+		if (Value == TEXT("item")) OutKind = EMatterFluxShopProductKind::Item;
+		else if (Value == TEXT("spell")) OutKind = EMatterFluxShopProductKind::Spell;
+		else if (Value == TEXT("wand")) OutKind = EMatterFluxShopProductKind::Wand;
+		else
+		{
+			OutError = TEXT("shop product kind must be item, spell, or wand");
+			return false;
+		}
+		return true;
+	}
+
+	static bool ReadDialogueOptions(
+		lua_State* State,
+		const int32 NodeIndex,
+		TArray<FMatterFluxDialogueOptionDefinition>& OutOptions,
+		FString& OutError)
+	{
+		OutOptions.Reset();
+		lua_getfield(State, NodeIndex, "options");
+		if (lua_type(State, -1) == LUA_TNIL)
+		{
+			lua_pop(State, 1);
+			return true;
+		}
+		if (lua_type(State, -1) != LUA_TTABLE)
+		{
+			lua_pop(State, 1);
+			OutError = TEXT("dialogue options must be an array");
+			return false;
+		}
+		const int32 OptionsIndex = lua_absindex(State, -1);
+		const size_t Count = lua_rawlen(State, OptionsIndex);
+		if (Count > 8)
+		{
+			lua_pop(State, 1);
+			OutError = TEXT("a dialogue node may contain at most 8 options");
+			return false;
+		}
+		for (size_t Index = 1; Index <= Count; ++Index)
+		{
+			lua_rawgeti(State, OptionsIndex, static_cast<lua_Integer>(Index));
+			if (lua_type(State, -1) != LUA_TTABLE)
+			{
+				lua_pop(State, 2);
+				OutError = TEXT("dialogue option must be a table");
+				return false;
+			}
+			const int32 OptionIndex = lua_absindex(State, -1);
+			FMatterFluxDialogueOptionDefinition Option;
+			FString NextNode;
+			FString ShopId;
+			if (!ReadTableStringField(State, OptionIndex, "text", Option.Text, true, OutError)
+				|| !ReadTableStringField(State, OptionIndex, "next", NextNode, false, OutError)
+				|| !ReadTableStringField(State, OptionIndex, "shop_id", ShopId, false, OutError)
+				|| !ReadTableBooleanField(State, OptionIndex, "close", Option.bClose, OutError)
+				|| (!NextNode.IsEmpty() && !IsValidContentId(NextNode))
+				|| (!ShopId.IsEmpty() && !IsValidContentId(ShopId)))
+			{
+				lua_pop(State, 2);
+				return false;
+			}
+			Option.NextNodeId = NextNode.IsEmpty() ? NAME_None : FName(*NextNode);
+			Option.ShopId = ShopId.IsEmpty() ? NAME_None : FName(*ShopId);
+			OutOptions.Add(MoveTemp(Option));
+			lua_pop(State, 1);
+		}
+		lua_pop(State, 1);
+		return true;
+	}
+
+	static bool ReadDialogueNodes(
+		lua_State* State,
+		const int32 DefinitionIndex,
+		TArray<FMatterFluxDialogueNodeDefinition>& OutNodes,
+		FString& OutError)
+	{
+		OutNodes.Reset();
+		lua_getfield(State, DefinitionIndex, "nodes");
+		if (lua_type(State, -1) != LUA_TTABLE)
+		{
+			lua_pop(State, 1);
+			OutError = TEXT("dialogue nodes must be an array");
+			return false;
+		}
+		const int32 NodesIndex = lua_absindex(State, -1);
+		const size_t Count = lua_rawlen(State, NodesIndex);
+		if (Count == 0 || Count > 64)
+		{
+			lua_pop(State, 1);
+			OutError = TEXT("dialogue must contain between 1 and 64 nodes");
+			return false;
+		}
+		for (size_t Index = 1; Index <= Count; ++Index)
+		{
+			lua_rawgeti(State, NodesIndex, static_cast<lua_Integer>(Index));
+			if (lua_type(State, -1) != LUA_TTABLE)
+			{
+				lua_pop(State, 2);
+				OutError = TEXT("dialogue node must be a table");
+				return false;
+			}
+			const int32 NodeIndex = lua_absindex(State, -1);
+			FMatterFluxDialogueNodeDefinition Node;
+			FString Id;
+			FString NextNode;
+			FString ShopId;
+			if (!ReadTableStringField(State, NodeIndex, "id", Id, true, OutError)
+				|| !ReadTableStringField(State, NodeIndex, "text", Node.Text, true, OutError)
+				|| !ReadTableStringField(State, NodeIndex, "next", NextNode, false, OutError)
+				|| !ReadTableStringField(State, NodeIndex, "shop_id", ShopId, false, OutError)
+				|| !ReadTableBooleanField(State, NodeIndex, "close", Node.bClose, OutError)
+				|| !ReadDialogueOptions(State, NodeIndex, Node.Options, OutError)
+				|| !IsValidContentId(Id)
+				|| (!NextNode.IsEmpty() && !IsValidContentId(NextNode))
+				|| (!ShopId.IsEmpty() && !IsValidContentId(ShopId)))
+			{
+				lua_pop(State, 2);
+				return false;
+			}
+			Node.Id = FName(*Id);
+			Node.NextNodeId = NextNode.IsEmpty() ? NAME_None : FName(*NextNode);
+			Node.ShopId = ShopId.IsEmpty() ? NAME_None : FName(*ShopId);
+			OutNodes.Add(MoveTemp(Node));
+			lua_pop(State, 1);
+		}
+		lua_pop(State, 1);
+		return true;
+	}
+
+	static bool ReadShopOffers(
+		lua_State* State,
+		const int32 DefinitionIndex,
+		TArray<FMatterFluxShopOfferDefinition>& OutOffers,
+		FString& OutError)
+	{
+		OutOffers.Reset();
+		lua_getfield(State, DefinitionIndex, "offers");
+		if (lua_type(State, -1) != LUA_TTABLE)
+		{
+			lua_pop(State, 1);
+			OutError = TEXT("shop offers must be an array");
+			return false;
+		}
+		const int32 OffersIndex = lua_absindex(State, -1);
+		const size_t Count = lua_rawlen(State, OffersIndex);
+		if (Count == 0 || Count > 64)
+		{
+			lua_pop(State, 1);
+			OutError = TEXT("shop must contain between 1 and 64 offers");
+			return false;
+		}
+		for (size_t Index = 1; Index <= Count; ++Index)
+		{
+			lua_rawgeti(State, OffersIndex, static_cast<lua_Integer>(Index));
+			if (lua_type(State, -1) != LUA_TTABLE)
+			{
+				lua_pop(State, 2);
+				OutError = TEXT("shop offer must be a table");
+				return false;
+			}
+			const int32 OfferIndex = lua_absindex(State, -1);
+			FMatterFluxShopOfferDefinition Offer;
+			FString Kind;
+			FString ProductId;
+			FString CostItemId;
+			if (!ReadTableStringField(State, OfferIndex, "kind", Kind, true, OutError)
+				|| !ReadTableStringField(State, OfferIndex, "product_id", ProductId, true, OutError)
+				|| !ReadTableIntegerField(State, OfferIndex, "product_count", Offer.ProductCount, OutError)
+				|| !ReadTableStringField(State, OfferIndex, "cost_item", CostItemId, true, OutError)
+				|| !ReadTableIntegerField(State, OfferIndex, "cost_count", Offer.CostCount, OutError)
+				|| !ReadTableIntegerField(State, OfferIndex, "limit", Offer.PurchaseLimit, OutError)
+				|| !ParseShopProductKind(Kind, Offer.ProductKind, OutError)
+				|| !IsValidContentId(ProductId)
+				|| !IsValidContentId(CostItemId))
+			{
+				lua_pop(State, 2);
+				return false;
+			}
+			Offer.ProductId = FName(*ProductId);
+			Offer.CostItemId = FName(*CostItemId);
+			OutOffers.Add(MoveTemp(Offer));
+			lua_pop(State, 1);
+		}
+		lua_pop(State, 1);
+		return true;
+	}
+
 	static int32 RegisterEntity(lua_State* State)
 	{
 		if (!GetExecutionContext(State).Error.IsEmpty())
@@ -1914,6 +3279,194 @@ namespace MatterFluxLua
 		Definition.MaxHealth = static_cast<float>(MaxHealth);
 		Definition.MoveSpeed = static_cast<float>(MoveSpeed);
 		if (!GetExecutionContext(State).Builder->AddEntity(Definition, Error))
+		{
+			return FailLuaCall(State, Error);
+		}
+		return 0;
+	}
+
+	static int32 RegisterCreature(lua_State* State)
+	{
+		FExecutionContext& Context = GetExecutionContext(State);
+		if (!Context.Error.IsEmpty()) return 0;
+		FString Error;
+		if (lua_gettop(State) != 1 || lua_type(State, 1) != LUA_TTABLE)
+		{
+			return FailLuaCall(State, TEXT("register_creature expects one definition table"));
+		}
+		if (!CheckDefinitionBudget(
+			Context.Builder->Registry.Creatures.Num(), TEXT("creature"), Error))
+		{
+			return FailLuaCall(State, Error);
+		}
+
+		FMatterFluxCreatureDefinition Definition;
+		FString Id;
+		FString Faction = TEXT("neutral");
+		FString Level = TEXT("normal");
+		FString AiMode = TEXT("passive");
+		FString AttackSpell;
+		FString SkillSpell;
+		FString DialogueId;
+		FString ShopId;
+		FString DropItemId;
+		FString SpawnQuestId;
+		if (!ReadTableStringField(State, 1, "id", Id, true, Error)
+			|| !ReadTableStringField(State, 1, "name", Definition.DisplayName, true, Error)
+			|| !ReadTableStringField(State, 1, "faction", Faction, true, Error)
+			|| !ReadTableStringField(State, 1, "level", Level, true, Error)
+			|| !ReadTableStringField(State, 1, "ai", AiMode, true, Error)
+			|| !ReadTableNumberField(State, 1, "health", Definition.MaxHealth, Error)
+			|| !ReadTableNumberField(State, 1, "width", Definition.Width, Error)
+			|| !ReadTableNumberField(State, 1, "height", Definition.Height, Error)
+			|| !ReadTableNumberField(State, 1, "density", Definition.Density, Error)
+			|| !ReadTableNumberField(State, 1, "move_speed", Definition.MoveSpeed, Error)
+			|| !ReadTableNumberField(State, 1, "perception_range", Definition.PerceptionRange, Error)
+			|| !ReadTableNumberField(State, 1, "attack_range", Definition.AttackRange, Error)
+			|| !ReadTableNumberField(State, 1, "retreat_range", Definition.RetreatRange, Error)
+			|| !ReadTableNumberField(State, 1, "target_memory", Definition.TargetMemorySeconds, Error)
+			|| !ReadTableNumberField(State, 1, "patrol_turn", Definition.PatrolTurnSeconds, Error)
+			|| !ReadTableNumberField(State, 1, "patrol_pause", Definition.PatrolPauseSeconds, Error)
+			|| !ReadTableNumberField(State, 1, "attack_cooldown", Definition.AttackCooldown, Error)
+			|| !ReadTableNumberField(State, 1, "skill_cooldown", Definition.SkillCooldown, Error)
+			|| !ReadTableStringField(State, 1, "attack_spell", AttackSpell, false, Error)
+			|| !ReadTableStringField(State, 1, "skill_spell", SkillSpell, false, Error)
+			|| !ReadTableIntegerField(State, 1, "attack_projectiles", Definition.AttackProgram.ProjectileCount, Error)
+			|| !ReadTableNumberField(State, 1, "attack_spread", Definition.AttackProgram.SpreadDegrees, Error)
+			|| !ReadTableNumberField(State, 1, "attack_projectile_interval", Definition.AttackProgram.ProjectileInterval, Error)
+			|| !ReadTableNumberField(State, 1, "attack_recovery", Definition.AttackProgram.RecoverySeconds, Error)
+			|| !ReadTableBooleanField(State, 1, "attack_radial", Definition.AttackProgram.bRadial, Error)
+			|| !ReadTableNumberField(State, 1, "attack_horizontal_impulse", Definition.AttackProgram.HorizontalImpulse, Error)
+			|| !ReadTableNumberField(State, 1, "attack_vertical_impulse", Definition.AttackProgram.VerticalImpulse, Error)
+			|| !ReadTableBooleanField(State, 1, "attack_override_color", Definition.AttackProgram.bOverrideColor, Error)
+			|| !ReadTableNumberField(State, 1, "attack_color_r", Definition.AttackProgram.Color.R, Error)
+			|| !ReadTableNumberField(State, 1, "attack_color_g", Definition.AttackProgram.Color.G, Error)
+			|| !ReadTableNumberField(State, 1, "attack_color_b", Definition.AttackProgram.Color.B, Error)
+			|| !ReadTableNumberField(State, 1, "attack_color_a", Definition.AttackProgram.Color.A, Error)
+			|| !ReadTableIntegerField(State, 1, "skill_projectiles", Definition.SkillProgram.ProjectileCount, Error)
+			|| !ReadTableNumberField(State, 1, "skill_spread", Definition.SkillProgram.SpreadDegrees, Error)
+			|| !ReadTableNumberField(State, 1, "skill_projectile_interval", Definition.SkillProgram.ProjectileInterval, Error)
+			|| !ReadTableNumberField(State, 1, "skill_recovery", Definition.SkillProgram.RecoverySeconds, Error)
+			|| !ReadTableBooleanField(State, 1, "skill_radial", Definition.SkillProgram.bRadial, Error)
+			|| !ReadTableNumberField(State, 1, "skill_horizontal_impulse", Definition.SkillProgram.HorizontalImpulse, Error)
+			|| !ReadTableNumberField(State, 1, "skill_vertical_impulse", Definition.SkillProgram.VerticalImpulse, Error)
+			|| !ReadTableBooleanField(State, 1, "skill_override_color", Definition.SkillProgram.bOverrideColor, Error)
+			|| !ReadTableNumberField(State, 1, "skill_color_r", Definition.SkillProgram.Color.R, Error)
+			|| !ReadTableNumberField(State, 1, "skill_color_g", Definition.SkillProgram.Color.G, Error)
+			|| !ReadTableNumberField(State, 1, "skill_color_b", Definition.SkillProgram.Color.B, Error)
+			|| !ReadTableNumberField(State, 1, "skill_color_a", Definition.SkillProgram.Color.A, Error)
+			|| !ReadTableStringField(State, 1, "dialogue_id", DialogueId, false, Error)
+			|| !ReadTableStringField(State, 1, "shop_id", ShopId, false, Error)
+			|| !ReadTableStringField(State, 1, "drop_item", DropItemId, false, Error)
+			|| !ReadTableIntegerField(State, 1, "drop_count", Definition.DropItemCount, Error)
+			|| !ReadTableStringField(State, 1, "spawn_quest", SpawnQuestId, false, Error)
+			|| !ReadTableIntegerField(State, 1, "spawn_count", Definition.SpawnCount, Error)
+			|| !ReadTableNumberField(State, 1, "spawn_distance", Definition.SpawnDistance, Error)
+			|| !ReadTableNumberField(State, 1, "color_r", Definition.Color.R, Error)
+			|| !ReadTableNumberField(State, 1, "color_g", Definition.Color.G, Error)
+			|| !ReadTableNumberField(State, 1, "color_b", Definition.Color.B, Error)
+			|| !ReadTableNumberField(State, 1, "color_a", Definition.Color.A, Error)
+			|| !ParseCreatureFaction(Faction, Definition.Faction, Error)
+			|| !ParseCreatureLevel(Level, Definition.Level, Error)
+			|| !ParseCreatureAiMode(AiMode, Definition.AiMode, Error)
+			|| !ReadCreatureBehaviorProgram(
+				State,
+				1,
+				Definition.AiMode,
+				Definition.BehaviorProgram,
+				Error)
+			|| !IsValidContentId(Id))
+		{
+			return FailLuaCall(State, Error.IsEmpty()
+				? TEXT("creature definition contains an invalid id") : Error);
+		}
+		const auto ParseOptionalId = [&Error](
+			const FString& Value, FName& OutValue)
+		{
+			if (!Value.IsEmpty() && !IsValidContentId(Value))
+			{
+				Error = TEXT("creature definition contains an invalid content reference");
+				return false;
+			}
+			OutValue = Value.IsEmpty() ? NAME_None : FName(*Value);
+			return true;
+		};
+		Definition.Id = FName(*Id);
+		if (!ParseOptionalId(AttackSpell, Definition.AttackProgram.SpellId)
+			|| !ParseOptionalId(SkillSpell, Definition.SkillProgram.SpellId)
+			|| !ParseOptionalId(DialogueId, Definition.DialogueId)
+			|| !ParseOptionalId(ShopId, Definition.ShopId)
+			|| !ParseOptionalId(DropItemId, Definition.DropItemId)
+			|| !ParseOptionalId(SpawnQuestId, Definition.SpawnQuestId)
+			|| !Context.Builder->AddCreature(Definition, Error))
+		{
+			return FailLuaCall(State, Error);
+		}
+		return 0;
+	}
+
+	static int32 RegisterDialogue(lua_State* State)
+	{
+		FExecutionContext& Context = GetExecutionContext(State);
+		if (!Context.Error.IsEmpty()) return 0;
+		FString Error;
+		if (lua_gettop(State) != 1 || lua_type(State, 1) != LUA_TTABLE)
+		{
+			return FailLuaCall(State, TEXT("register_dialogue expects one definition table"));
+		}
+		if (!CheckDefinitionBudget(
+			Context.Builder->Registry.Dialogues.Num(), TEXT("dialogue"), Error))
+		{
+			return FailLuaCall(State, Error);
+		}
+		FMatterFluxDialogueDefinition Definition;
+		FString Id;
+		FString StartNode;
+		if (!ReadTableStringField(State, 1, "id", Id, true, Error)
+			|| !ReadTableStringField(State, 1, "name", Definition.DisplayName, true, Error)
+			|| !ReadTableStringField(State, 1, "start", StartNode, true, Error)
+			|| !ReadDialogueNodes(State, 1, Definition.Nodes, Error)
+			|| !IsValidContentId(Id)
+			|| !IsValidContentId(StartNode))
+		{
+			return FailLuaCall(State, Error.IsEmpty()
+				? TEXT("dialogue definition contains an invalid id") : Error);
+		}
+		Definition.Id = FName(*Id);
+		Definition.StartNodeId = FName(*StartNode);
+		if (!Context.Builder->AddDialogue(Definition, Error))
+		{
+			return FailLuaCall(State, Error);
+		}
+		return 0;
+	}
+
+	static int32 RegisterShop(lua_State* State)
+	{
+		FExecutionContext& Context = GetExecutionContext(State);
+		if (!Context.Error.IsEmpty()) return 0;
+		FString Error;
+		if (lua_gettop(State) != 1 || lua_type(State, 1) != LUA_TTABLE)
+		{
+			return FailLuaCall(State, TEXT("register_shop expects one definition table"));
+		}
+		if (!CheckDefinitionBudget(
+			Context.Builder->Registry.Shops.Num(), TEXT("shop"), Error))
+		{
+			return FailLuaCall(State, Error);
+		}
+		FMatterFluxShopDefinition Definition;
+		FString Id;
+		if (!ReadTableStringField(State, 1, "id", Id, true, Error)
+			|| !ReadTableStringField(State, 1, "name", Definition.DisplayName, true, Error)
+			|| !ReadShopOffers(State, 1, Definition.Offers, Error)
+			|| !IsValidContentId(Id))
+		{
+			return FailLuaCall(State, Error.IsEmpty()
+				? TEXT("shop definition contains an invalid id") : Error);
+		}
+		Definition.Id = FName(*Id);
+		if (!Context.Builder->AddShop(Definition, Error))
 		{
 			return FailLuaCall(State, Error);
 		}
@@ -2148,6 +3701,8 @@ namespace MatterFluxLua
 			|| !ReadTableNumberField(
 				State, 1, "spread", Definition.Spread, Error)
 			|| !ReadTableIntegerField(
+				State, 1, "starter_count", Definition.StarterCount, Error)
+			|| !ReadTableIntegerField(
 				State, 1, "starter_slot", Definition.StarterEquipmentSlot, Error)
 			|| !ReadTableContentIdArrayField(
 				State, 1, "starter_deck", Definition.StarterDeck, Error))
@@ -2338,6 +3893,358 @@ namespace MatterFluxLua
 		return 0;
 	}
 
+	static int RegisterCustomMap(lua_State* State)
+	{
+		FExecutionContext& Context = GetExecutionContext(State);
+		if (lua_gettop(State) != 1 || lua_type(State, 1) != LUA_TTABLE)
+		{
+			return FailLuaCall(
+				State,
+				TEXT("register_custom_map expects one compiled definition table"));
+		}
+
+		FMatterFluxCustomMapDefinition Definition;
+		FString Id;
+		FString Error;
+		if (!ReadTableStringField(State, 1, "id", Id, true, Error)
+			|| !ReadTableStringField(
+				State, 1, "name", Definition.DisplayName, true, Error)
+			|| !ReadRequiredTableIntegerField(
+				State, 1, "min_x", Definition.MinimumCell.X, Error)
+			|| !ReadRequiredTableIntegerField(
+				State, 1, "min_y", Definition.MinimumCell.Y, Error)
+			|| !ReadRequiredTableIntegerField(
+				State, 1, "max_x_exclusive", Definition.MaximumCellExclusive.X, Error)
+			|| !ReadRequiredTableIntegerField(
+				State, 1, "max_y_exclusive", Definition.MaximumCellExclusive.Y, Error)
+			|| !ReadTableNumberField(
+				State, 1, "cell_size_cm", Definition.CellSizeCentimeters, Error)
+			|| !ReadTableNumberField(
+				State, 1, "material_depth_cells", Definition.MaterialDepthCells, Error)
+			|| !IsValidContentId(Id))
+		{
+			return FailLuaCall(
+				State,
+				Error.IsEmpty() ? TEXT("custom map id is invalid") : Error);
+		}
+		Definition.Id = FName(*Id);
+
+		lua_getfield(State, 1, "stamps");
+		if (lua_type(State, -1) != LUA_TTABLE)
+		{
+			lua_pop(State, 1);
+			return FailLuaCall(State, TEXT("custom map stamps must be an array"));
+		}
+		const int32 StampsIndex = lua_absindex(State, -1);
+		const size_t StampCount = lua_rawlen(State, StampsIndex);
+		if (StampCount > MaximumCustomMapStamps)
+		{
+			lua_pop(State, 1);
+			return FailLuaCall(State, TEXT("custom map stamp count is out of range"));
+		}
+		Definition.Stamps.Reserve(static_cast<int32>(StampCount));
+		for (size_t Index = 1; Index <= StampCount; ++Index)
+		{
+			lua_rawgeti(State, StampsIndex, static_cast<lua_Integer>(Index));
+			const int32 StampIndex = lua_absindex(State, -1);
+			if (lua_type(State, StampIndex) != LUA_TTABLE)
+			{
+				lua_pop(State, 2);
+				return FailLuaCall(State, TEXT("custom map stamp must be a table"));
+			}
+			FMatterFluxCustomMapStampDefinition Stamp;
+			FString Shape;
+			FString MaterialId;
+			if (!ReadTableStringField(State, StampIndex, "shape", Shape, true, Error)
+				|| !ReadTableStringField(
+					State, StampIndex, "material", MaterialId, true, Error)
+				|| !IsValidContentId(MaterialId))
+			{
+				lua_pop(State, 2);
+				return FailLuaCall(
+					State,
+					Error.IsEmpty() ? TEXT("custom map stamp material is invalid") : Error);
+			}
+			Stamp.MaterialId = FName(*MaterialId);
+			if (Shape == TEXT("rectangle"))
+			{
+				Stamp.Shape = EMatterFluxCustomMapStampShape::Rectangle;
+				if (!ReadRequiredTableIntegerField(
+						State, StampIndex, "min_x", Stamp.MinimumCell.X, Error)
+					|| !ReadRequiredTableIntegerField(
+						State, StampIndex, "min_y", Stamp.MinimumCell.Y, Error)
+					|| !ReadRequiredTableIntegerField(
+						State, StampIndex, "max_x", Stamp.MaximumCellInclusive.X, Error)
+					|| !ReadRequiredTableIntegerField(
+						State, StampIndex, "max_y", Stamp.MaximumCellInclusive.Y, Error))
+				{
+					lua_pop(State, 2);
+					return FailLuaCall(State, Error);
+				}
+			}
+			else if (Shape == TEXT("circle"))
+			{
+				Stamp.Shape = EMatterFluxCustomMapStampShape::Circle;
+				if (!ReadRequiredTableIntegerField(
+						State, StampIndex, "center_x", Stamp.CenterCell.X, Error)
+					|| !ReadRequiredTableIntegerField(
+						State, StampIndex, "center_y", Stamp.CenterCell.Y, Error)
+					|| !ReadRequiredTableIntegerField(
+						State, StampIndex, "radius", Stamp.RadiusCells, Error))
+				{
+					lua_pop(State, 2);
+					return FailLuaCall(State, Error);
+				}
+			}
+			else
+			{
+				lua_pop(State, 2);
+				return FailLuaCall(
+					State,
+					TEXT("custom map stamp shape must be rectangle or circle"));
+			}
+			Definition.Stamps.Add(Stamp);
+			lua_pop(State, 1);
+		}
+		lua_pop(State, 1);
+
+		lua_getfield(State, 1, "markers");
+		if (lua_type(State, -1) != LUA_TTABLE)
+		{
+			lua_pop(State, 1);
+			return FailLuaCall(State, TEXT("custom map markers must be an array"));
+		}
+		const int32 MarkersIndex = lua_absindex(State, -1);
+		const size_t MarkerCount = lua_rawlen(State, MarkersIndex);
+		if (MarkerCount > MaximumCustomMapMarkers)
+		{
+			lua_pop(State, 1);
+			return FailLuaCall(State, TEXT("custom map marker count is out of range"));
+		}
+		Definition.Markers.Reserve(static_cast<int32>(MarkerCount));
+		for (size_t Index = 1; Index <= MarkerCount; ++Index)
+		{
+			lua_rawgeti(State, MarkersIndex, static_cast<lua_Integer>(Index));
+			const int32 MarkerIndex = lua_absindex(State, -1);
+			FMatterFluxCustomMapMarkerDefinition Marker;
+			FString MarkerId;
+			if (lua_type(State, MarkerIndex) != LUA_TTABLE
+				|| !ReadTableStringField(
+					State, MarkerIndex, "id", MarkerId, true, Error)
+				|| !IsValidContentId(MarkerId)
+				|| !ReadRequiredTableIntegerField(
+					State, MarkerIndex, "x", Marker.Cell.X, Error)
+				|| !ReadRequiredTableIntegerField(
+					State, MarkerIndex, "y", Marker.Cell.Y, Error))
+			{
+				lua_pop(State, 2);
+				return FailLuaCall(
+					State,
+					Error.IsEmpty() ? TEXT("custom map marker is invalid") : Error);
+			}
+			Marker.Id = FName(*MarkerId);
+			Definition.Markers.Add(Marker);
+			lua_pop(State, 1);
+		}
+		lua_pop(State, 1);
+
+		lua_getfield(State, 1, "scene_boxes");
+		if (lua_type(State, -1) != LUA_TTABLE)
+		{
+			lua_pop(State, 1);
+			return FailLuaCall(State, TEXT("custom map scene_boxes must be an array"));
+		}
+		const int32 SceneBoxesIndex = lua_absindex(State, -1);
+		const size_t SceneBoxCount = lua_rawlen(State, SceneBoxesIndex);
+		if (SceneBoxCount > MaximumCustomMapSceneBoxes)
+		{
+			lua_pop(State, 1);
+			return FailLuaCall(State, TEXT("custom map 3D scene box count is out of range"));
+		}
+		Definition.SceneBoxes.Reserve(static_cast<int32>(SceneBoxCount));
+		for (size_t Index = 1; Index <= SceneBoxCount; ++Index)
+		{
+			lua_rawgeti(State, SceneBoxesIndex, static_cast<lua_Integer>(Index));
+			const int32 BoxIndex = lua_absindex(State, -1);
+			FMatterFluxCustomMapSceneBoxDefinition Box;
+			FString BoxId;
+			FString MaterialId;
+			if (lua_type(State, BoxIndex) != LUA_TTABLE
+				|| !ReadTableStringField(State, BoxIndex, "id", BoxId, true, Error)
+				|| !ReadTableStringField(
+					State, BoxIndex, "material", MaterialId, true, Error)
+				|| !ReadRequiredTableNumberField(
+					State, BoxIndex, "center_x", Box.CenterCells.X, Error)
+				|| !ReadRequiredTableNumberField(
+					State, BoxIndex, "center_y", Box.CenterCells.Y, Error)
+				|| !ReadRequiredTableNumberField(
+					State, BoxIndex, "center_z", Box.CenterCells.Z, Error)
+				|| !ReadRequiredTableNumberField(
+					State, BoxIndex, "size_x", Box.SizeCells.X, Error)
+				|| !ReadRequiredTableNumberField(
+					State, BoxIndex, "size_y", Box.SizeCells.Y, Error)
+				|| !ReadRequiredTableNumberField(
+					State, BoxIndex, "size_z", Box.SizeCells.Z, Error)
+				|| !ReadTableBooleanField(
+					State, BoxIndex, "collision", Box.bCollision, Error)
+				|| !IsValidContentId(BoxId)
+				|| !IsValidContentId(MaterialId))
+			{
+				lua_pop(State, 2);
+				return FailLuaCall(State,
+					Error.IsEmpty()
+						? TEXT("custom map 3D scene box is invalid")
+						: Error);
+			}
+			Box.Id = FName(*BoxId);
+			Box.MaterialId = FName(*MaterialId);
+			Definition.SceneBoxes.Add(Box);
+			lua_pop(State, 1);
+		}
+		lua_pop(State, 1);
+
+		lua_getfield(State, 1, "cameras");
+		if (lua_type(State, -1) != LUA_TTABLE)
+		{
+			lua_pop(State, 1);
+			return FailLuaCall(State, TEXT("custom map cameras must be an array"));
+		}
+		const int32 CamerasIndex = lua_absindex(State, -1);
+		const size_t CameraCount = lua_rawlen(State, CamerasIndex);
+		if (CameraCount > MaximumCustomMapCameras)
+		{
+			lua_pop(State, 1);
+			return FailLuaCall(State, TEXT("custom map 3D camera count is out of range"));
+		}
+		Definition.Cameras.Reserve(static_cast<int32>(CameraCount));
+		for (size_t Index = 1; Index <= CameraCount; ++Index)
+		{
+			lua_rawgeti(State, CamerasIndex, static_cast<lua_Integer>(Index));
+			const int32 CameraIndex = lua_absindex(State, -1);
+			FMatterFluxCustomMapCameraDefinition Camera;
+			FString CameraId;
+			if (lua_type(State, CameraIndex) != LUA_TTABLE
+				|| !ReadTableStringField(
+					State, CameraIndex, "id", CameraId, true, Error)
+				|| !ReadRequiredTableNumberField(
+					State, CameraIndex, "location_x", Camera.LocationCells.X, Error)
+				|| !ReadRequiredTableNumberField(
+					State, CameraIndex, "location_y", Camera.LocationCells.Y, Error)
+				|| !ReadRequiredTableNumberField(
+					State, CameraIndex, "location_z", Camera.LocationCells.Z, Error)
+				|| !ReadRequiredTableNumberField(
+					State, CameraIndex, "target_x", Camera.TargetCells.X, Error)
+				|| !ReadRequiredTableNumberField(
+					State, CameraIndex, "target_y", Camera.TargetCells.Y, Error)
+				|| !ReadRequiredTableNumberField(
+					State, CameraIndex, "target_z", Camera.TargetCells.Z, Error)
+				|| !ReadRequiredTableNumberField(
+					State, CameraIndex, "field_of_view", Camera.FieldOfViewDegrees, Error)
+				|| !IsValidContentId(CameraId))
+			{
+				lua_pop(State, 2);
+				return FailLuaCall(State,
+					Error.IsEmpty()
+						? TEXT("custom map 3D camera is invalid")
+						: Error);
+			}
+			Camera.Id = FName(*CameraId);
+			Definition.Cameras.Add(Camera);
+			lua_pop(State, 1);
+		}
+		lua_pop(State, 1);
+
+		lua_getfield(State, 1, "pour_containers");
+		if (lua_type(State, -1) != LUA_TTABLE)
+		{
+			lua_pop(State, 1);
+			return FailLuaCall(
+				State,
+				TEXT("custom map pour_containers must be an array"));
+		}
+		const int32 PourContainersIndex = lua_absindex(State, -1);
+		const size_t PourContainerCount = lua_rawlen(State, PourContainersIndex);
+		if (PourContainerCount > MaximumCustomMapPourContainers)
+		{
+			lua_pop(State, 1);
+			return FailLuaCall(
+				State,
+				TEXT("custom map tilting container count is out of range"));
+		}
+		Definition.PourContainers.Reserve(
+			static_cast<int32>(PourContainerCount));
+		for (size_t Index = 1; Index <= PourContainerCount; ++Index)
+		{
+			lua_rawgeti(
+				State,
+				PourContainersIndex,
+				static_cast<lua_Integer>(Index));
+			const int32 ContainerIndex = lua_absindex(State, -1);
+			FMatterFluxCustomMapPourContainerDefinition Container;
+			FString ContainerId;
+			FString ContainerMaterialId;
+			FString LiquidMaterialId;
+			if (lua_type(State, ContainerIndex) != LUA_TTABLE
+				|| !ReadTableStringField(
+					State, ContainerIndex, "id", ContainerId, true, Error)
+				|| !ReadTableStringField(
+					State, ContainerIndex, "container_material",
+					ContainerMaterialId, true, Error)
+				|| !ReadTableStringField(
+					State, ContainerIndex, "liquid_material",
+					LiquidMaterialId, true, Error)
+				|| !ReadRequiredTableNumberField(
+					State, ContainerIndex, "center_x", Container.CenterCells.X, Error)
+				|| !ReadRequiredTableNumberField(
+					State, ContainerIndex, "center_y", Container.CenterCells.Y, Error)
+				|| !ReadRequiredTableNumberField(
+					State, ContainerIndex, "center_z", Container.CenterCells.Z, Error)
+				|| !ReadRequiredTableIntegerField(
+					State, ContainerIndex, "inner_width",
+					Container.InteriorSizeCells.X, Error)
+				|| !ReadRequiredTableIntegerField(
+					State, ContainerIndex, "inner_depth",
+					Container.InteriorSizeCells.Y, Error)
+				|| !ReadRequiredTableIntegerField(
+					State, ContainerIndex, "inner_height",
+					Container.InteriorSizeCells.Z, Error)
+				|| !ReadRequiredTableIntegerField(
+					State, ContainerIndex, "start_step", Container.StartStep, Error)
+				|| !ReadRequiredTableIntegerField(
+					State, ContainerIndex, "tilt_steps",
+					Container.TiltDurationSteps, Error)
+				|| !ReadRequiredTableNumberField(
+					State, ContainerIndex, "tilt_degrees",
+					Container.TiltDegrees, Error)
+				|| !ReadRequiredTableIntegerField(
+					State, ContainerIndex, "pour_cells_per_step",
+					Container.PourCellsPerStep, Error)
+				|| !IsValidContentId(ContainerId)
+				|| !IsValidContentId(ContainerMaterialId)
+				|| !IsValidContentId(LiquidMaterialId))
+			{
+				lua_pop(State, 2);
+				return FailLuaCall(
+					State,
+					Error.IsEmpty()
+						? TEXT("custom map tilting container is invalid")
+						: Error);
+			}
+			Container.Id = FName(*ContainerId);
+			Container.ContainerMaterialId = FName(*ContainerMaterialId);
+			Container.LiquidMaterialId = FName(*LiquidMaterialId);
+			Definition.PourContainers.Add(Container);
+			lua_pop(State, 1);
+		}
+		lua_pop(State, 1);
+
+		if (!Context.Builder->AddCustomMap(Definition, Error))
+		{
+			return FailLuaCall(State, Error);
+		}
+		return 0;
+	}
+
 	static void RemoveGlobal(lua_State* State, const char* Name)
 	{
 		lua_pushnil(State);
@@ -2381,12 +4288,16 @@ namespace MatterFluxLua
 		lua_setfield(State, -2, "register_material");
 		lua_pushcfunction(State, RegisterReaction);
 		lua_setfield(State, -2, "register_reaction");
-		lua_pushcfunction(State, RegisterCombustion);
-		lua_setfield(State, -2, "register_combustion");
 		lua_pushcfunction(State, RegisterDecorator);
 		lua_setfield(State, -2, "register_decorator");
 		lua_pushcfunction(State, RegisterEntity);
 		lua_setfield(State, -2, "register_entity");
+		lua_pushcfunction(State, RegisterCreature);
+		lua_setfield(State, -2, "register_creature");
+		lua_pushcfunction(State, RegisterDialogue);
+		lua_setfield(State, -2, "register_dialogue");
+		lua_pushcfunction(State, RegisterShop);
+		lua_setfield(State, -2, "register_shop");
 		lua_pushcfunction(State, RegisterSpell);
 		lua_setfield(State, -2, "register_spell");
 		lua_pushcfunction(State, RegisterWand);
@@ -2395,6 +4306,8 @@ namespace MatterFluxLua
 		lua_setfield(State, -2, "register_item");
 		lua_pushcfunction(State, RegisterQuest);
 		lua_setfield(State, -2, "register_quest");
+		lua_pushcfunction(State, RegisterCustomMap);
+		lua_setfield(State, -2, "register_custom_map");
 		lua_setglobal(State, "content");
 	}
 

@@ -4,6 +4,8 @@
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
 #include "Engine/Engine.h"
+#include "EngineUtils.h"
+#include "Creatures/MatterFluxCreatureActor.h"
 #include "Game/MatterFluxPlayerState.h"
 #include "GAS/GA_FragmentDebugDamage.h"
 #include "InputAction.h"
@@ -18,6 +20,7 @@
 #include "Misc/Parse.h"
 #include "Settings/MatterFluxGameUserSettings.h"
 #include "UI/MatterFluxShellWidget.h"
+#include "UI/MatterFluxInteractionWidget.h"
 #include "Progression/MatterFluxQuestTrackerWidget.h"
 #include "Save/MatterFluxSaveSubsystem.h"
 
@@ -38,6 +41,7 @@ void AMatterFluxPlayerController::BeginPlay()
 	CreateShell();
 	CreateMagicWorkbench();
 	CreateQuestTracker();
+	CreateInteractionWidget();
 	if (ShellWidget
 		&& HasAuthority()
 		&& GetNetMode() != NM_DedicatedServer
@@ -97,6 +101,11 @@ void AMatterFluxPlayerController::EndPlay(
 	{
 		QuestTracker->RemoveFromParent();
 		QuestTracker = nullptr;
+	}
+	if (InteractionWidget)
+	{
+		InteractionWidget->RemoveFromParent();
+		InteractionWidget = nullptr;
 	}
 	if (AppliedDebugMappingContext)
 	{
@@ -172,6 +181,11 @@ void AMatterFluxPlayerController::SetupInputComponent()
 		IE_Pressed,
 		this,
 		&AMatterFluxPlayerController::ToggleQuestJournal);
+	InputComponent->BindKey(
+		EKeys::E,
+		IE_Pressed,
+		this,
+		&AMatterFluxPlayerController::TryInteract);
 	InputComponent->BindKey(
 		EKeys::Escape,
 		IE_Pressed,
@@ -254,6 +268,142 @@ void AMatterFluxPlayerController::CreateQuestTracker()
 	}
 	QuestTracker->InitializeForPlayer(this);
 	QuestTracker->AddToPlayerScreen(5);
+}
+
+void AMatterFluxPlayerController::CreateInteractionWidget()
+{
+	if (!IsLocalController() || InteractionWidget) return;
+	InteractionWidget = CreateWidget<UMatterFluxInteractionWidget>(
+		this, UMatterFluxInteractionWidget::StaticClass());
+	if (!InteractionWidget)
+	{
+		UE_LOG(LogMatterFlux, Error, TEXT("Failed to create NPC interaction widget."));
+		return;
+	}
+	InteractionWidget->InitializeForPlayer(this);
+	InteractionWidget->AddToPlayerScreen(30);
+	InteractionWidget->SetVisibility(ESlateVisibility::Collapsed);
+}
+
+void AMatterFluxPlayerController::TryInteract()
+{
+	if (!IsLocalController() || IsShellMenuOpen() || IsMagicWorkbenchOpen()
+		|| (InteractionWidget && InteractionWidget->IsInteractionOpen()))
+	{
+		return;
+	}
+	APawn* Interactor = GetPawn();
+	if (!Interactor || !GetWorld()) return;
+	AMatterFluxCreatureActor* Nearest = nullptr;
+	float NearestDistanceSquared = FMath::Square(360.0f);
+	for (TActorIterator<AMatterFluxCreatureActor> It(GetWorld()); It; ++It)
+	{
+		AMatterFluxCreatureActor* Candidate = *It;
+		if (!Candidate || !Candidate->CanInteract(*Interactor)) continue;
+		const float DistanceSquared = FVector::DistSquared(
+			Candidate->GetActorLocation(), Interactor->GetActorLocation());
+		if (DistanceSquared <= NearestDistanceSquared)
+		{
+			Nearest = Candidate;
+			NearestDistanceSquared = DistanceSquared;
+		}
+	}
+	if (Nearest) ServerInteract(Nearest);
+}
+
+bool AMatterFluxPlayerController::ServerInteract_Validate(
+	AMatterFluxCreatureActor* Creature)
+{
+	return Creature != nullptr;
+}
+
+void AMatterFluxPlayerController::ServerInteract_Implementation(
+	AMatterFluxCreatureActor* Creature)
+{
+	APawn* Interactor = GetPawn();
+	if (!Creature || !Interactor || !Creature->CanInteract(*Interactor)) return;
+	const FMatterFluxCreatureDefinition* Definition = Creature->ResolveDefinition();
+	if (Definition) ClientOpenCreatureInteraction(Creature, Definition->DialogueId);
+}
+
+void AMatterFluxPlayerController::ClientOpenCreatureInteraction_Implementation(
+	AMatterFluxCreatureActor* Creature,
+	const FName DialogueId)
+{
+	if (!InteractionWidget) CreateInteractionWidget();
+	if (!InteractionWidget || !Creature) return;
+	if (ShellWidget && ShellWidget->IsMenuOpen()) ShellWidget->CloseMenus();
+	if (IsMagicWorkbenchOpen()) CloseMagicWorkbench();
+	InteractionWidget->OpenInteraction(Creature, DialogueId);
+	FInputModeUIOnly InputMode;
+	InputMode.SetWidgetToFocus(InteractionWidget->TakeWidget());
+	InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+	SetInputMode(InputMode);
+	bShowMouseCursor = true;
+}
+
+void AMatterFluxPlayerController::RequestCreaturePurchase(
+	AMatterFluxCreatureActor* Creature,
+	const int32 OfferIndex,
+	const int32 ExpectedProgressionRevision)
+{
+	if (Creature)
+	{
+		ServerPurchaseCreatureOffer(
+			Creature, OfferIndex, ExpectedProgressionRevision);
+	}
+}
+
+bool AMatterFluxPlayerController::ServerPurchaseCreatureOffer_Validate(
+	AMatterFluxCreatureActor* Creature,
+	const int32 OfferIndex,
+	const int32 ExpectedProgressionRevision)
+{
+	return Creature != nullptr && OfferIndex >= 0 && OfferIndex < 1024
+		&& ExpectedProgressionRevision >= 0;
+}
+
+void AMatterFluxPlayerController::ServerPurchaseCreatureOffer_Implementation(
+	AMatterFluxCreatureActor* Creature,
+	const int32 OfferIndex,
+	const int32 ExpectedProgressionRevision)
+{
+	APawn* Interactor = GetPawn();
+	AMatterFluxPlayerState* Buyer = GetPlayerState<AMatterFluxPlayerState>();
+	FString Error;
+	int32 Remaining = INDEX_NONE;
+	const bool bSuccess = Creature && Interactor && Buyer
+		&& Creature->CanInteract(*Interactor)
+		&& Creature->PurchaseOfferAuthority(
+			*Buyer, OfferIndex, ExpectedProgressionRevision, Remaining, Error);
+	if (!bSuccess && Error.IsEmpty())
+	{
+		Error = TEXT("player is no longer close enough to the merchant");
+	}
+	ClientCreaturePurchaseResult(bSuccess, OfferIndex, Remaining, Error);
+}
+
+void AMatterFluxPlayerController::ClientCreaturePurchaseResult_Implementation(
+	const bool bSuccess,
+	const int32 OfferIndex,
+	const int32 RemainingPurchases,
+	const FString& Message)
+{
+	if (InteractionWidget)
+	{
+		InteractionWidget->HandlePurchaseResult(
+			bSuccess, OfferIndex, RemainingPurchases, Message);
+	}
+}
+
+void AMatterFluxPlayerController::CloseCreatureInteraction()
+{
+	if (InteractionWidget)
+	{
+		InteractionWidget->SetVisibility(ESlateVisibility::Collapsed);
+	}
+	SetInputMode(FInputModeGameOnly());
+	bShowMouseCursor = false;
 }
 
 bool AMatterFluxPlayerController::IsMagicWorkbenchOpen() const
@@ -340,6 +490,10 @@ bool AMatterFluxPlayerController::SelectMagicWorkbenchEquipmentSlot(
 
 void AMatterFluxPlayerController::ToggleMagicWorkbench()
 {
+	if (InteractionWidget && InteractionWidget->IsInteractionOpen())
+	{
+		CloseCreatureInteraction();
+	}
 	if (!MagicWorkbench)
 	{
 		CreateMagicWorkbench();
@@ -417,6 +571,11 @@ bool AMatterFluxPlayerController::IsShellMenuOpen() const
 
 void AMatterFluxPlayerController::TogglePauseMenu()
 {
+	if (InteractionWidget && InteractionWidget->IsInteractionOpen())
+	{
+		CloseCreatureInteraction();
+		return;
+	}
 	if (!ShellWidget)
 	{
 		CreateShell();
@@ -635,6 +794,38 @@ void AMatterFluxPlayerController::CloseShellMenu()
 	if (ShellWidget) ShellWidget->CloseMenus();
 }
 
+void AMatterFluxPlayerController::EnterGameplayForVisualCapture()
+{
+	if (!ShellWidget)
+	{
+		CreateShell();
+	}
+	if (ShellWidget)
+	{
+		ShellWidget->EnterGameplayAfterSuccessfulOperation();
+	}
+}
+
+void AMatterFluxPlayerController::HideUIForVisualCapture()
+{
+	if (ShellWidget)
+	{
+		ShellWidget->SetVisibility(ESlateVisibility::Collapsed);
+	}
+	if (QuestTracker)
+	{
+		QuestTracker->SetVisibility(ESlateVisibility::Collapsed);
+	}
+	if (MagicWorkbench)
+	{
+		MagicWorkbench->SetVisibility(ESlateVisibility::Collapsed);
+	}
+	if (InteractionWidget)
+	{
+		InteractionWidget->SetVisibility(ESlateVisibility::Collapsed);
+	}
+}
+
 void AMatterFluxPlayerController::HandleShellStateChanged(
 	const bool bMenuOpen,
 	const bool bOperationActive)
@@ -643,12 +834,21 @@ void AMatterFluxPlayerController::HandleShellStateChanged(
 	{
 		return;
 	}
+	if (QuestTracker)
+	{
+		QuestTracker->SetSuppressedByFrontEnd(
+			ShellWidget && ShellWidget->IsStartMenuOpen());
+	}
 	if (GetNetMode() == NM_Standalone)
 	{
 		SetPause(bMenuOpen && !bOperationActive);
 	}
 	if (bMenuOpen)
 	{
+		if (InteractionWidget && InteractionWidget->IsInteractionOpen())
+		{
+			CloseCreatureInteraction();
+		}
 		if (GEngine)
 		{
 			if (APawn* ControlledPawn = GetPawn())

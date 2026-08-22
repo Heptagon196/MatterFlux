@@ -96,6 +96,18 @@ struct MATTERFLUX_API FMatterFluxSavedQuestState
 	bool bCompletionRewardsGranted = false;
 };
 
+USTRUCT(BlueprintType)
+struct MATTERFLUX_API FMatterFluxSavedShopPurchase
+{
+	GENERATED_BODY()
+
+	UPROPERTY(SaveGame)
+	FName OfferKey = NAME_None;
+
+	UPROPERTY(SaveGame)
+	int32 PurchaseCount = 0;
+};
+
 /** Versioned player progression snapshot independent of Lua VM state. */
 USTRUCT(BlueprintType)
 struct MATTERFLUX_API FMatterFluxProgressionSaveState
@@ -107,6 +119,9 @@ struct MATTERFLUX_API FMatterFluxProgressionSaveState
 
 	UPROPERTY(SaveGame)
 	TArray<FMatterFluxSavedQuestState> Quests;
+
+	UPROPERTY(SaveGame)
+	TArray<FMatterFluxSavedShopPurchase> ShopPurchases;
 
 	UPROPERTY(SaveGame)
 	FName SelectedQuest = NAME_None;

@@ -41,7 +41,10 @@ public:
 	void ShowLoadSlots();
 	void CloseMenus();
 	bool IsMenuOpen() const { return View != EMatterFluxShellView::Gameplay; }
-	bool IsStartMenuOpen() const { return IsFrontEndView(); }
+	bool IsStartMenuOpen() const
+	{
+		return bFrontEndContext && IsMenuOpen();
+	}
 	bool IsFrontEndView() const;
 	EMatterFluxShellView GetView() const { return View; }
 	AMatterFluxPlayerController* GetMatterFluxController() const;
@@ -87,7 +90,12 @@ protected:
 	virtual void ReleaseSlateResources(bool bReleaseChildren) override;
 
 private:
+	// PlayerController owns the only project-internal visual-capture bypass;
+	// ordinary UI callers must still complete a real save/session operation.
+	friend class AMatterFluxPlayerController;
+	void CancelPendingJoinForSinglePlayer();
 	void SetView(EMatterFluxShellView NewView);
+	void EnterGameplayAfterSuccessfulOperation();
 	void NotifyControllerState(bool bOperationActive = false) const;
 
 	UPROPERTY(Transient)
@@ -99,6 +107,7 @@ private:
 		static_cast<EMatterFluxSaveOperation>(0);
 	bool bCloseAfterSuccessfulOperation = false;
 	bool bHostRestorePending = false;
+	bool bFrontEndContext = false;
 	int32 RenamingSlotIndex = INDEX_NONE;
 	int32 SelectedHostSlotIndex = INDEX_NONE;
 	FString RenameDraft;

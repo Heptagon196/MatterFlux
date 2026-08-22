@@ -1,6 +1,6 @@
 # MatterFlux Noita 风格材质模拟：UE 初学者指南
 
-这份文档对应当前仓库中的真实实现，介绍 Lua 可配置化学反应、燃烧、液体、气体、
+这份文档对应当前仓库中的真实实现，介绍 Lua 可配置通用物质反应、燃烧、液体、气体、
 粉末、限高和分块加载。它是一个可运行的第一阶段，不等于已经复制了 Noita 的全部
 引擎。
 
@@ -9,19 +9,27 @@
 ```mermaid
 flowchart LR
     Lua["Lua 材质/反应定义"] --> Registry["只读 Content Registry"]
+    Registry --> Reaction["FMaterialReactionEngine"]
     Registry --> Core["FChunkedMaterialWorld"]
+    Reaction --> Core
+    Reaction --> Adapter["Source / Ground 运行时适配器"]
     Core --> Chunks["64×64 活动/休眠分块"]
-    Core --> Snapshot["排序后的活动格快照"]
-    Server["服务器固定步进"] --> Core
+    Server["服务器固定步进"] --> Reaction
+    Server --> Core
     Server --> State["复制带版本的权威活动区状态"]
     State --> Client["客户端原子导入，不重放历史"]
-    Snapshot --> ISM["每种材质一个 ISM 体素层"]
+    Core --> ISM["动态材质的批量 ISM 体素层"]
+    Core --> Liquid["静态水体的连续顶面网格"]
+    Adapter --> VFX["火焰 / 烟雾等批量表现"]
 ```
 
 - Lua 只描述材质和反应，不直接操作 UE 世界。
-- `FChunkedMaterialWorld` 是不依赖 Actor 的纯 C++ 深模块，负责所有格子规则。
+- `FMaterialReactionEngine` 是不依赖 Actor 的纯 C++ 深模块，统一执行接触反应与持续
+  传播反应；火焰、酸蚀、冻结不需要各写一套状态转移算法。
+- `FChunkedMaterialWorld` 负责分块、相态移动，并调用同一个引擎处理接触反应。
 - `AMatterFluxPlayableWorldActor` 是 UE 适配层，负责生命周期、复制和可视化。
-- ISM 只是当前显示方式，以后可替换为每分块动态纹理或合并网格，而不改模拟接口。
+- 动态材质目前按材质使用 ISM；确定性溪流和湖泊已经使用连续合并顶面。两者都是可替换
+  的表现适配器，不改变模拟接口。
 
 ## 2. 从哪里开始读代码
 
@@ -34,18 +42,28 @@ flowchart LR
    模拟模块的窄接口。
 5. `Source/MatterFlux/Private/Material/MatterFluxMaterialWorld.cpp`：
    分块、反应和移动规则。
-6. `Source/MatterFlux/Private/Game/MatterFluxPlayableWorldActor.cpp`：
-   固定步进、复制焦点和 ISM 显示。
-7. `Source/MatterFluxTests/Private/MatterFluxMaterialWorldTests.cpp`：
+6. `Source/MatterFlux/Public/Material/MatterFluxMaterialReactionEngine.h`：
+   接触与传播反应共用的窄接口。
+7. `Source/MatterFlux/Private/Game/MatterFluxPlayableWorldActor.cpp`：
+   固定步进、复制焦点、动态 ISM 和静态连续液面显示。
+8. `Source/MatterFluxTests/Private/MatterFluxMaterialReactionEngineTests.cpp`：
+   水/熔岩、火焰传播和非火焰酸蚀的统一行为规格。
+9. `Source/MatterFluxTests/Private/MatterFluxMaterialWorldTests.cpp`：
    最短、最可信的行为规格。
+
+可复现的液体与化学场景放在 `Content/Lua/Maps`，由
+`BuildCustomMap` 同时构建材料世界与三维验收场景。具体写法见
+`docs/MatterFlux_Custom_Maps_Beginner_Guide.md`。
 
 ## 3. 一格里保存什么
 
-每格只保存三个整数：
+每格只保存四个整数：
 
 - `MaterialIndex`：0 是空，其余索引指向初始化时稳定排序的材质表。
 - `LastUpdatedTick`：防止同一格在一次 fixed step 中移动两次。
 - `SupportHeight`：地表模式下该 XY 格的地形顶面世界高度。
+- `Amount`：格内物质量。液体使用 `1..255` 表示局部液量，空格为 0；其他相态通常为
+  255。它让液体可以“分一部分给邻格”，而不是把整个方块随机搬走。
 
 材质密度在加载时乘 1000 并转为整数。随机选择也来自
 `seed + cell coordinate + tick` 的整数 hash，因此相同输入能得到相同结果，避免把
@@ -58,14 +76,17 @@ flowchart LR
 - **竖直剖面模式**：格子坐标表示水平 X 和竖直 Y。重力沿负 Y，液体下落、气体
   上升，适合 Noita 式洞穴或侧视关卡。
 - **地表高度场模式**：格子坐标表示世界 X/Y，每格另存 `SupportHeight`。液体比较
-  八邻域地表高度，优先流向最低的空格；粉末只向更低地表滚落；气体在地面上按
-  八邻域扩散，并在可视化时抬到地表上方。当前森林演示使用此模式。
+  八邻域地表高度，优先流向最低的空格；如果低处已是较轻液体，较重液体会与它
+  交换，让轻液体回到较高格；粉末只向更低地表滚落；气体在地面上按八邻域扩散，
+  并在可视化时抬到地表上方。当前森林演示使用此模式。
 
 `bUseSurfaceTopology` 只切换邻居与重力策略，Lua 材质、反应、分块归档和确定性顺序
 完全复用。这样不会为了“能在地上流”复制一套模拟器。
 
-当前地表液体是一格一种材质的离散覆盖，不是带连续水深、压力和体积的浅水方程；
-它适合像素/体素风格溪流、漫流和反应，不会形成真实波浪。
+当前地表液体是“单层高度场 + 每格液量”的简化浅水模型。它有守恒体积和局部液面
+均衡，但没有 Navier–Stokes 速度场、惯性波浪或同一 XY 柱内的多层材质。它适合
+像素/体素风格溪流、漫流、沿坡分层和化学反应。真正的同柱多层液体仍需把格子扩展为
+稀疏 Z 层，不能靠反复交换同高度整格来伪造，否则会产生抖动。
 
 ### “沿垂直面流”和“在地上流”分别是什么意思
 
@@ -94,8 +115,8 @@ flowchart LR
 
 ### 液体
 
-`liquid` 依次尝试下方、下对角和横向。目标是另一种可移动材质时会比较密度，较重
-液体可以向下置换较轻材质。
+竖直剖面中的 `liquid` 依次尝试下方、下对角和横向。目标是另一种可移动材质时会
+比较密度，较重液体可以向下置换较轻材质。
 
 ### 气体
 
@@ -106,27 +127,24 @@ flowchart LR
 一侧偏移。当前核心是单线程确定性版本；未来并行时只能把纯格子数据交给 worker，
 UObject 和 HISM 更新仍必须回到 Game Thread。
 
-在地表模式中，“下方”改为八邻域里支撑高度最低的位置；平地上的液体按
-`dispersion` 确定性横向摊开。竖直剖面模式仍使用下面所述的下落/上升规则。
+在地表模式中，“下方”改为八邻域里支撑高度最低的位置，并始终优先处理低地；平地
+上的液体比较源格与目标格的 `Amount`，每步只转移有上限的一部分液量。空白边缘必须
+跨过由 `world seed + 目标坐标 + 材质` 派生的表面张力阈值，所以同一 seed 完全
+确定，不同位置的边缘又会有轻微不规则。每步只对活动液体做一次连通域扫描；若液滩
+长轴明显大于短轴，长轴方向提高表面张力、短轴方向降低，接近等宽后偏置自动归零。
+低液量、低邻接的孤立毛刺会把液量守恒地并回主体。这样长方形初态会逐步松弛成近圆
+的像素水洼，而不是整格随机游走或棋盘空洞。
 
 ## 6. 化学反应怎样配置
 
 ```lua
-content.register_material(
-    "water", 1.00, 0.05,
-    0.12, 0.46, 0.78, 0.82,
-    "liquid", 255, 220)
-
-content.register_material(
-    "steam", 0.10, 0.00,
-    0.82, 0.88, 0.92, 0.52,
-    "gas", 255, 255)
-
-content.register_reaction(
-    "water_lava_quench",
-    "water", "lava",
-    "steam", "stone",
-    1000)
+reaction.define {
+    id = "water_lava_quench",
+    trigger = "contact",
+    inputs = { "water", "lava" },
+    outputs = { "steam", "stone" },
+    chance = 1.0,
+}
 ```
 
 每步先检测右邻和上邻，避免一对格子重复检测。命中反应后，两个输出格在本步被标记
@@ -136,17 +154,72 @@ content.register_reaction(
 Lua 热重载仍是事务式：新脚本的所有材质、输入/输出引用和概率全部合法后，才替换
 活动 registry；失败时保留旧版本。
 
-## 7. 燃烧怎样工作
+默认酸液在 `Content/Lua/Materials/Default.lua` 中定义，密度为 `1.22`，高于水的
+`1.00`。`Content/Lua/World/Chemistry.lua` 使用同一个接触反应 DSL 声明腐蚀：
 
-燃烧不是把每个火苗做成 Actor。`FMaskCombustion` 只保存三张与 source 同尺寸的紧凑
-数组：
+```lua
+reaction.define {
+    id = "acid_wood_corrosion",
+    trigger = "contact",
+    inputs = { "acid", "wood" },
+    outputs = { "acid", "acid_gas" },
+    chance = 1.0,
+}
+```
+
+输出中的酸仍留在原格，被腐蚀的木格变成会按气体规则扩散的 `acid_gas`。木、叶、草、
+`grassland` 和三种花都从同一个 Lua 辅助函数展开规则。脚本故意没有声明
+`acid + water`：两者会按密度发生物理置换，但 `ReactedPairs` 保持为零，不产生化学
+产物。这两个概念必须分开测试。
+
+### 动态材料怎样腐蚀树和其他可切割物体
+
+树、房屋等整体物体使用 Source mask，而流体使用材料格，二者不能靠相邻数组元素
+自动相遇。`AMatterFluxPlayableWorldActor::ApplyMaterialSourceContactReactions` 是它们
+之间唯一的适配层：它只挑出“液体 + 静态固体”的 Lua contact 规则，查询液柱包围盒
+内的 Source，按稳定规则 ID 和 Source GUID 顺序执行一次小圆形 mask 损伤，再把气体
+输出写回相邻材料格。C++ 不检查 `acid` 名称，因此以后新增碱液、溶剂或冻结液时只需
+配置相同接口。
+
+这个桥接默认每帧最多提交 8 次 Source 反应，避免大面积泄漏同时物理化大量树木。
+法术、容器和测试通过 `SetSimulatedMaterialAtWorldLocation` 共用世界坐标到材料格的
+换算入口；客户端不能用它改权威状态。
+
+## 7. 通用传播反应怎样工作
+
+燃烧已经不再拥有一套独立的反应算法。Lua 的 `reaction.define` 同时描述接触反应和
+传播反应；C++ 将它们编译成同一种 `FMatterFluxReactionDefinition`，再交给
+`FMaterialReactionEngine`。例如酸蚀可以不产生任何副产物：
+
+```lua
+reaction.define {
+    id = "metal_acid_corrosion",
+    trigger = "propagating",
+    inputs = { "metal", "acid" },
+    outputs = { "empty", "acid" },
+    chance = 1.0,
+    duration_steps = 10,
+    propagation = { chance = 0.35 },
+}
+```
+
+传播规则中的第一种输入是被转换的物质，第二种输入是激活物。活跃格经过固定步数后
+转为第一种输出，同时按四邻域传播。`emission` 是可选的表现/副产物事件；不填写就
+不会为了凑接口而生成假烟雾。完整字段说明见
+[`MatterFlux_Material_Reaction_Engine_Beginner_Guide.md`](MatterFlux_Material_Reaction_Engine_Beginner_Guide.md)。
+
+### 为什么代码里还看得到 Combustion
+
+`FMaskCombustion` 现在只是向旧存档、网络字段和火焰 VFX 提供兼容名称的薄适配器，
+内部没有蔓延算法；所有 `Initialize/Activate/Step/Capture/Restore` 都委托给通用反应
+引擎。它对外仍映射三张与 source 同尺寸的紧凑数组：
 
 - `FuelMask`：仍存在的可燃像素；
 - `BurningMask`：每格剩余燃烧步数；
 - `ResidueMask`：木炭或灰等固体残留。
 
-Lua 的 `register_combustion` 为一种燃料声明火焰、烟雾、残留物、点燃概率、蔓延
-概率、持续步数和产烟概率。C++ 以确定性整数 hash 执行规则。树干使用 `wood`，
+Lua 的传播规则为一种输入物声明激活物、排放物、输出物、触发概率、蔓延概率、持续
+步数和排放概率。C++ 以确定性整数 hash 执行规则。树干使用 `wood`，
 树冠使用 `leaf`，草、花和 `grassland` 分别有自己的规则；树干燃尽形成
 `charcoal`，叶片与小型植物形成 `ash`。
 
@@ -248,8 +321,9 @@ Noita 公开资料还描述了 dirty rectangle 和避免相邻块并发写冲突
 
 客户端用同一 Lua registry 和 seed 构造静态地表，但不再调用材质世界的 `Step()`。
 服务器把活动块中的非空格按稳定的“块坐标、格索引”顺序编码；包内使用固定小端
-字节序，并带 magic、版本、块大小、活动半径、focus 列表、step 和 tick。v2 快照会
-记录全部活动焦点；导入器仍接受旧 v1 单焦点格式。客户端先完整
+字节序，并带 magic、版本、块大小、活动半径、focus 列表、step 和 tick。v3 快照
+额外复制精确液量，并用区块内格索引增量 varint、承托高度 ZigZag 增量 varint，
+满液量 255 则不额外写字节；导入器仍接受旧 v1 单焦点与 v2 多焦点格式。客户端先完整
 检查尺寸、排序、材质索引、重复块、截断和尾随数据，全部合法后才一次替换活动区。
 
 因此晚加入客户端不需要从第 0 步重放；漏掉旧 focus 或旧 step 也只会暂时显示上一
@@ -264,6 +338,7 @@ Noita 公开资料还描述了 dirty rectangle 和避免相邻块并发写冲突
 - 沿河床分布、向低处流动的水
 - 高地上的沙
 - 河边的熔岩和水/熔岩反应产物
+- 比水更重的紫红色酸液、酸水惰性接触，以及酸对木/草地小样的腐蚀产气
 - 地表上方扩散的蒸汽
 - 少量静态石头
 
@@ -295,9 +370,11 @@ Automation RunTests MatterFlux.Lua
 Automation RunTests MatterFlux.Playable
 ```
 
-当前自动化覆盖液体守恒、地表高度场下坡流动、粉末斜落堆叠、气体上升/限高删除、
-Lua 反应、跨活动块移动、未加载边界冻结、休眠块归档恢复、多焦点公平预算、输入顺序
-确定性和无历史快照恢复，以及可玩场景真正生成并推进材质层。
+当前自动化覆盖液体守恒、竖直液柱密度分层、地表高度场中的密度置换与下坡流动、
+酸水不反应、酸腐蚀木/草地产生气体、酸接触真实树木后提交 Source mask revision、
+粉末斜落堆叠、气体上升/限高删除、Lua 反应、跨活动块移动、未加载边界冻结、休眠块
+归档恢复、多焦点公平预算、输入顺序确定性和无历史快照恢复，以及可玩场景真正生成并
+推进材质层。
 `MatterFlux.Combustion` 还覆盖燃料蔓延、烟雾、固体残留、树干到树冠传播、地表
 焦痕、damage/燃烧并发一致性，以及地表 dirty chunk 批处理、坏包原子拒绝、重复包
 幂等和存档 fixed-step 时间债恢复。
@@ -318,8 +395,12 @@ Lua 反应、跨活动块移动、未加载边界冻结、休眠块归档恢复�
 3. 在数据所有权明确后，实现 Noita 风格四轮无相邻写冲突调度并用 TaskGraph 并行。
 4. 用“稀疏竖直表面块 + 地表高度场交接”增加 3D 悬崖瀑布，而不是创建致密 3D
    流体体素。
-5. 把目前独立但共享 material-id 的地表、装饰 mask、燃烧和动态材质格逐步统一为
-   可交换物质的世界；下一阶段再加入温度、氧气、熄灭和腐蚀条件。
+5. 反应定义与状态转移已经统一；下一步是把目前仍分开存储的地表、装饰 mask 和动态
+   材质格统一成可交换物质的世界，再加入温度、氧气和压力等通用条件通道。
+
+生物与动态物体现在已经能按 Lua 材质密度在液体中漂浮或下沉。浮力公式、角色与
+Chaos 的接入方式、组合物体体积加权以及联机职责划分见
+[`MatterFlux_Liquid_Buoyancy_Beginner_Guide.md`](MatterFlux_Liquid_Buoyancy_Beginner_Guide.md)。
 
 当前 512×384 压力地图还采用“完整确定性布局缓存 + 邻近块实例化”，不是无限世界。
 它已经证明地图可以远大于 3×3 活动窗口；若继续扩大到数千格，应把 Perlin 地形和

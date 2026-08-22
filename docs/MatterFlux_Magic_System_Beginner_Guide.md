@@ -144,6 +144,7 @@ content.register_wand({
 - `shuffle = false` 时按槽位顺序抽牌，并保存 `DeckCursor`。
 - `shuffle = true` 时根据事件 seed、法杖 ID 和施法序号确定性洗牌。
 - `starter_slot = 0..3` 表示新玩家出生时把这根法杖绑定到哪个输入槽。
+- `starter_count` 表示新玩家初始拥有但不自动绑定的数量；适合鞋型施法器或备用法杖。
 - `starter_deck` 是初始法术程序，长度不能超过 `capacity`，每个 ID 必须存在。
 - 每个初始槽只能被一根法杖占用；当前默认四槽是左键、右键、`Q`、`E`。
 
@@ -164,6 +165,12 @@ content.register_wand({
 | `std.jump` | 跳跃 | 服务器设置 600 cm/s 向上速度并进入 Falling |
 
 项目内嵌的 Lua 运行时没有开放文件、网络、系统命令和 UObject 反射。脚本先在新的临时 registry 中完整执行；所有 ID、数值、材质引用和唯一性通过后才一次替换活动 registry。因此错误热更不会留下“半份配置”。
+
+敌人的法术同样复用这些只读定义。`creature.define` 把弹数、散射、径向排列、
+发射间隔、收招、起跳冲量和颜色覆盖直接写在行为树的 `attack`/`skill` 动作旁；C++ 先用
+`FMatterFluxCreatureCastPlanner` 生成确定性射击计划，再由 Creature Actor 的服务器
+TimerManager 执行。Boss 因而能表达 PaperMagic 的双发攻击和分时环形技能，而不用
+在 Actor 中写一个只服务于 Boss 的硬编码分支。
 
 ## 6. 确定性法术编译器
 

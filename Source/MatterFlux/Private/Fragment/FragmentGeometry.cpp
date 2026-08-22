@@ -687,6 +687,17 @@ namespace MatterFlux::FragmentGeometry
 		{
 			return false;
 		}
+		const bool bHasDetachedVoxelMask =
+			Payload.DetachedVoxelMask.Width != 0
+			|| Payload.DetachedVoxelMask.Height != 0
+			|| !Payload.DetachedVoxelMask.SolidMask.IsEmpty();
+		if (bHasDetachedVoxelMask
+			&& (!Payload.DetachedVoxelMask.IsValid()
+				|| Payload.DetachedVoxelMask.GeometryStyle
+					!= EFragmentSourceGeometryStyle::VoxelBlocks))
+		{
+			return false;
+		}
 
 		int64 ContourVertexCount = 0;
 		auto AccumulateContours = [&ContourVertexCount](const TArray<FFragmentContour>& Contours)
@@ -714,12 +725,17 @@ namespace MatterFlux::FragmentGeometry
 		const TArray<FFragmentComponent>& Components, const FGuid& SourceId, const FTransform& SourceTransform,
 		const int32 MaskWidth, const int32 MaskHeight, const int32 Revision, const float CellSize,
 		const int32 MinAreaPixels, const int32 MaxFragments, const FVector& DamageCenterWorld,
-		const float DamagePower, const int32 EventSeed, TArray<FFragmentSpawnPayload>& OutPayloads)
+		const float DamagePower, const int32 EventSeed,
+		TArray<FFragmentSpawnPayload>& OutPayloads,
+		const EFragmentSourceGeometryStyle GeometryStyle)
 	{
 		OutPayloads.Reset();
 		if (!SourceId.IsValid() || !SourceTransform.IsValid() || MaskWidth <= 0 || MaskHeight <= 0
 			|| static_cast<int64>(MaskWidth) * static_cast<int64>(MaskHeight) > MAX_int32
 			|| !FMath::IsFinite(CellSize) || CellSize <= 0.0f || !FMath::IsFinite(DamagePower) || DamagePower < 0.0f
+			|| (GeometryStyle != EFragmentSourceGeometryStyle::ExtrudedMask
+				&& GeometryStyle != EFragmentSourceGeometryStyle::RadialColumn
+				&& GeometryStyle != EFragmentSourceGeometryStyle::VoxelBlocks)
 			|| !FMath::IsFinite(DamageCenterWorld.X) || !FMath::IsFinite(DamageCenterWorld.Y) || !FMath::IsFinite(DamageCenterWorld.Z)) return false;
 
 		struct FValidatedComponent
@@ -729,6 +745,7 @@ namespace MatterFlux::FragmentGeometry
 			FIntPoint Max = FIntPoint(MIN_int32, MIN_int32);
 		};
 		TArray<FValidatedComponent> SortedComponents;
+		TArray<FValidatedComponent> TinyComponents;
 		const int32 MinimumArea = FMath::Max(MinAreaPixels, 1);
 		for (const FFragmentComponent& Component : Components)
 		{
@@ -746,10 +763,16 @@ namespace MatterFlux::FragmentGeometry
 				Validated.Max.X = FMath::Max(Validated.Max.X, Cell.X);
 				Validated.Max.Y = FMath::Max(Validated.Max.Y, Cell.Y);
 			}
-			if (Validated.Cells.Num() < MinimumArea) continue;
-			SortedComponents.Add(MoveTemp(Validated));
+			if (Validated.Cells.Num() < MinimumArea)
+			{
+				TinyComponents.Add(MoveTemp(Validated));
+			}
+			else
+			{
+				SortedComponents.Add(MoveTemp(Validated));
+			}
 		}
-		SortedComponents.Sort([](const FValidatedComponent& A, const FValidatedComponent& B)
+		const auto ComponentLess = [](const FValidatedComponent& A, const FValidatedComponent& B)
 		{
 			if (A.Cells.Num() != B.Cells.Num()) return A.Cells.Num() > B.Cells.Num();
 			if (A.Min != B.Min) return LexicographicLess(A.Min, B.Min);
@@ -762,16 +785,18 @@ namespace MatterFlux::FragmentGeometry
 				}
 			}
 			return false;
-		});
+		};
+		SortedComponents.Sort(ComponentLess);
+		TinyComponents.Sort(ComponentLess);
 		const int32 KeepCount = FMath::Min3(
 			FMath::Max(MaxFragments, 1),
 			MaximumFragmentCount,
 			SortedComponents.Num());
 		TArray<FFragmentSpawnPayload> BuiltPayloads;
-		BuiltPayloads.Reserve(KeepCount);
-		for (int32 ComponentIndex = 0; ComponentIndex < KeepCount; ++ComponentIndex)
+		BuiltPayloads.Reserve(FMath::Min(KeepCount + 1, MaximumFragmentCount));
+		const auto BuildPayload = [&](const FValidatedComponent& Component,
+			const int32 ComponentIndex, const float FadeOutDuration)
 		{
-			const FValidatedComponent& Component = SortedComponents[ComponentIndex];
 			TArray<uint8> ComponentMask;
 			ComponentMask.Init(0, MaskWidth * MaskHeight);
 			for (const FIntPoint& Cell : Component.Cells)
@@ -810,8 +835,36 @@ namespace MatterFlux::FragmentGeometry
 			Payload.OuterContours = MoveTemp(Geometry.OuterContours);
 			Payload.HoleContours = MoveTemp(Geometry.HoleContours);
 			Payload.CollisionContours = MoveTemp(Geometry.CollisionContours);
+			if (GeometryStyle == EFragmentSourceGeometryStyle::VoxelBlocks)
+			{
+				FFragmentSourceMask& VoxelMask = Payload.DetachedVoxelMask;
+				VoxelMask.Width = Component.Max.X - Component.Min.X + 1;
+				VoxelMask.Height = Component.Max.Y - Component.Min.Y + 1;
+				VoxelMask.CellSize = CellSize;
+				VoxelMask.MinFragmentAreaPixels = 1;
+				VoxelMask.MaxFragmentsPerBreak = MaximumFragmentCount;
+				VoxelMask.SupportMode = EFragmentSupportMode::None;
+				VoxelMask.GeometryStyle =
+					EFragmentSourceGeometryStyle::VoxelBlocks;
+				VoxelMask.SolidMask.Init(
+					0,
+					VoxelMask.Width * VoxelMask.Height);
+				for (const FIntPoint& Cell : Component.Cells)
+				{
+					const int32 LocalX = Cell.X - Component.Min.X;
+					const int32 LocalY = Cell.Y - Component.Min.Y;
+					VoxelMask.SolidMask[
+						LocalY * VoxelMask.Width + LocalX] = 1;
+				}
+			}
+			Payload.FadeOutDuration = FadeOutDuration;
+			Payload.bEnableCollision = FadeOutDuration <= 0.0f;
 			Payload.Thickness = CellSize;
-			Payload.InitialTransform = FTransform(SourceTransform.GetRotation(), SourceTransform.TransformPosition(FVector(LocalCenter.X, 0.0f, LocalCenter.Y)), SourceTransform.GetScale3D());
+			Payload.InitialTransform = FTransform(
+				SourceTransform.GetRotation(),
+				SourceTransform.TransformPosition(
+					FVector(LocalCenter.X, 0.0f, LocalCenter.Y)),
+				SourceTransform.GetScale3D());
 			Payload.Mass = FMath::Clamp(static_cast<float>(Component.Cells.Num()) * 0.05f, 0.5f, 50.0f);
 			FRandomStream Random(HashCombineFast(EventSeed, ComponentIndex));
 			const FVector FragmentCenterWorld = Payload.InitialTransform.GetLocation();
@@ -833,6 +886,58 @@ namespace MatterFlux::FragmentGeometry
 				return false;
 			}
 			BuiltPayloads.Add(MoveTemp(Payload));
+			return true;
+		};
+		for (int32 ComponentIndex = 0; ComponentIndex < KeepCount; ++ComponentIndex)
+		{
+			if (!BuildPayload(SortedComponents[ComponentIndex], ComponentIndex, 0.0f))
+			{
+				return false;
+			}
+		}
+
+		// Sub-threshold debris gets one short-lived render carrier per damaged
+		// source. Keeping this bounded avoids replacing one disappearing pixel
+		// with a burst of tiny replicated Actors.
+		if (!TinyComponents.IsEmpty()
+			&& BuiltPayloads.Num() < FMath::Min(
+				FMath::Max(MaxFragments, 1),
+				MaximumFragmentCount))
+		{
+			constexpr int32 MaximumFadingComponents = 64;
+			constexpr int32 MaximumFadingCells = 192;
+			FValidatedComponent Combined;
+			int32 CombinedComponentCount = 0;
+			for (const FValidatedComponent& Tiny : TinyComponents)
+			{
+				if (Combined.Cells.Num() + Tiny.Cells.Num() > MaximumFadingCells
+					|| CombinedComponentCount >= MaximumFadingComponents)
+				{
+					break;
+				}
+				Combined.Cells.Append(Tiny.Cells);
+				++CombinedComponentCount;
+				Combined.Min.X = FMath::Min(Combined.Min.X, Tiny.Min.X);
+				Combined.Min.Y = FMath::Min(Combined.Min.Y, Tiny.Min.Y);
+				Combined.Max.X = FMath::Max(Combined.Max.X, Tiny.Max.X);
+				Combined.Max.Y = FMath::Max(Combined.Max.Y, Tiny.Max.Y);
+			}
+			Combined.Cells.Sort([](const FIntPoint& A, const FIntPoint& B)
+			{
+				return LexicographicLess(A, B);
+			});
+			for (int32 Index = 1; Index < Combined.Cells.Num(); ++Index)
+			{
+				if (Combined.Cells[Index] == Combined.Cells[Index - 1])
+				{
+					return false;
+				}
+			}
+			if (!Combined.Cells.IsEmpty()
+				&& !BuildPayload(Combined, KeepCount, 0.45f))
+			{
+				return false;
+			}
 		}
 		OutPayloads = MoveTemp(BuiltPayloads);
 		return true;
@@ -933,6 +1038,555 @@ namespace MatterFlux::FragmentGeometry
 		if (OutVertices.Num() != OutNormals.Num() || OutVertices.Num() != OutUVs.Num())
 		{
 			ResetOutputs();
+			return false;
+		}
+		return true;
+	}
+
+	bool BuildVoxelBlockMeshFromCells(
+		const TArray<FIntVector>& SolidCells,
+		const float CellSize,
+		TArray<FVector>& OutVertices,
+		TArray<int32>& OutTriangles,
+		TArray<FVector>& OutNormals,
+		TArray<FVector2D>& OutUVs,
+		int32& OutPrimaryIndexCount)
+	{
+		return BuildVoxelBlockMeshFromCellsWithOccluders(
+			SolidCells,
+			{},
+			CellSize,
+			OutVertices,
+			OutTriangles,
+			OutNormals,
+			OutUVs,
+			OutPrimaryIndexCount);
+	}
+
+	bool BuildVoxelBlockMeshFromCellsWithOccluders(
+		const TArray<FIntVector>& SurfaceCells,
+		const TArray<FIntVector>& OccluderCells,
+		const float CellSize,
+		TArray<FVector>& OutVertices,
+		TArray<int32>& OutTriangles,
+		TArray<FVector>& OutNormals,
+		TArray<FVector2D>& OutUVs,
+		int32& OutPrimaryIndexCount)
+	{
+		OutVertices.Reset();
+		OutTriangles.Reset();
+		OutNormals.Reset();
+		OutUVs.Reset();
+		OutPrimaryIndexCount = 0;
+		if (SurfaceCells.IsEmpty()
+			|| SurfaceCells.Num() > 1024 * 1024
+			|| OccluderCells.Num() > 1024 * 1024
+			|| static_cast<int64>(SurfaceCells.Num()) + OccluderCells.Num()
+				> 1024 * 1024
+			|| !FMath::IsFinite(CellSize)
+			|| CellSize <= 0.0f)
+		{
+			return false;
+		}
+
+		TSet<FIntVector> OccupiedCells;
+		OccupiedCells.Reserve(SurfaceCells.Num() + OccluderCells.Num());
+		for (const FIntVector& Cell : SurfaceCells)
+		{
+			OccupiedCells.Add(Cell);
+		}
+		for (const FIntVector& Cell : OccluderCells)
+		{
+			OccupiedCells.Add(Cell);
+		}
+		TSet<FIntVector> UniqueSurfaceCells;
+		UniqueSurfaceCells.Reserve(SurfaceCells.Num());
+		for (const FIntVector& Cell : SurfaceCells)
+		{
+			UniqueSurfaceCells.Add(Cell);
+		}
+		TArray<FIntVector> OrderedCells = UniqueSurfaceCells.Array();
+		OrderedCells.Sort([](const FIntVector& Left, const FIntVector& Right)
+		{
+			if (Left.Z != Right.Z)
+			{
+				return Left.Z < Right.Z;
+			}
+			if (Left.Y != Right.Y)
+			{
+				return Left.Y < Right.Y;
+			}
+			return Left.X < Right.X;
+		});
+
+		TArray<int32> PrimaryTriangles;
+		TArray<int32> SideTriangles;
+		OutVertices.Reserve(OrderedCells.Num() * 24);
+		OutNormals.Reserve(OrderedCells.Num() * 24);
+		OutUVs.Reserve(OrderedCells.Num() * 24);
+		PrimaryTriangles.Reserve(OrderedCells.Num() * 12);
+		SideTriangles.Reserve(OrderedCells.Num() * 24);
+		const float HalfBlock = CellSize * 0.5f;
+		const TArray<FVector2D> QuadUVs = {
+			FVector2D(0.0f, 0.0f), FVector2D(1.0f, 0.0f),
+			FVector2D(1.0f, 1.0f), FVector2D(0.0f, 1.0f) };
+		auto AddQuad = [&OutVertices, &OutNormals, &OutUVs, &QuadUVs](
+			TArray<int32>& TargetTriangles,
+			const FVector& P0,
+			const FVector& P1,
+			const FVector& P2,
+			const FVector& P3,
+			const FVector& Normal)
+		{
+			const int32 Base = OutVertices.Num();
+			OutVertices.Append({P0, P1, P2, P3});
+			OutNormals.Append({Normal, Normal, Normal, Normal});
+			OutUVs.Append(QuadUVs);
+			TargetTriangles.Append({
+				Base, Base + 2, Base + 1,
+				Base, Base + 3, Base + 2 });
+		};
+
+		for (const FIntVector& Cell : OrderedCells)
+		{
+			const FVector Center(Cell.X * CellSize, Cell.Y * CellSize,
+				Cell.Z * CellSize);
+			const float MinX = Center.X - HalfBlock;
+			const float MaxX = Center.X + HalfBlock;
+			const float MinY = Center.Y - HalfBlock;
+			const float MaxY = Center.Y + HalfBlock;
+			const float MinZ = Center.Z - HalfBlock;
+			const float MaxZ = Center.Z + HalfBlock;
+			if (!OccupiedCells.Contains(Cell + FIntVector(0, 1, 0)))
+			{
+				AddQuad(PrimaryTriangles,
+					FVector(MinX, MaxY, MinZ), FVector(MinX, MaxY, MaxZ),
+					FVector(MaxX, MaxY, MaxZ), FVector(MaxX, MaxY, MinZ),
+					FVector::YAxisVector);
+			}
+			if (!OccupiedCells.Contains(Cell + FIntVector(0, -1, 0)))
+			{
+				AddQuad(PrimaryTriangles,
+					FVector(MinX, MinY, MinZ), FVector(MaxX, MinY, MinZ),
+					FVector(MaxX, MinY, MaxZ), FVector(MinX, MinY, MaxZ),
+					-FVector::YAxisVector);
+			}
+			if (!OccupiedCells.Contains(Cell + FIntVector(1, 0, 0)))
+			{
+				AddQuad(SideTriangles,
+					FVector(MaxX, MinY, MinZ), FVector(MaxX, MaxY, MinZ),
+					FVector(MaxX, MaxY, MaxZ), FVector(MaxX, MinY, MaxZ),
+					FVector::XAxisVector);
+			}
+			if (!OccupiedCells.Contains(Cell + FIntVector(-1, 0, 0)))
+			{
+				AddQuad(SideTriangles,
+					FVector(MinX, MaxY, MinZ), FVector(MinX, MinY, MinZ),
+					FVector(MinX, MinY, MaxZ), FVector(MinX, MaxY, MaxZ),
+					-FVector::XAxisVector);
+			}
+			if (!OccupiedCells.Contains(Cell + FIntVector(0, 0, 1)))
+			{
+				AddQuad(SideTriangles,
+					FVector(MinX, MinY, MaxZ), FVector(MaxX, MinY, MaxZ),
+					FVector(MaxX, MaxY, MaxZ), FVector(MinX, MaxY, MaxZ),
+					FVector::ZAxisVector);
+			}
+			if (!OccupiedCells.Contains(Cell + FIntVector(0, 0, -1)))
+			{
+				AddQuad(SideTriangles,
+					FVector(MinX, MaxY, MinZ), FVector(MaxX, MaxY, MinZ),
+					FVector(MaxX, MinY, MinZ), FVector(MinX, MinY, MinZ),
+					-FVector::ZAxisVector);
+			}
+		}
+
+		OutPrimaryIndexCount = PrimaryTriangles.Num();
+		OutTriangles = MoveTemp(PrimaryTriangles);
+		OutTriangles.Append(SideTriangles);
+		if (OutTriangles.IsEmpty()
+			|| OutVertices.Num() != OutNormals.Num()
+			|| OutVertices.Num() != OutUVs.Num())
+		{
+			OutVertices.Reset();
+			OutTriangles.Reset();
+			OutNormals.Reset();
+			OutUVs.Reset();
+			OutPrimaryIndexCount = 0;
+			return false;
+		}
+		return true;
+	}
+
+	bool BuildVoxelBlockMeshFromMask(
+		const TArray<uint8>& Mask,
+		const int32 Width,
+		const int32 Height,
+		const float CellSize,
+		TArray<FVector>& OutVertices,
+		TArray<int32>& OutTriangles,
+		TArray<FVector>& OutNormals,
+		TArray<FVector2D>& OutUVs,
+		int32& OutPrimaryIndexCount)
+	{
+		OutVertices.Reset();
+		OutTriangles.Reset();
+		OutNormals.Reset();
+		OutUVs.Reset();
+		OutPrimaryIndexCount = 0;
+		const int64 CellCount = static_cast<int64>(Width) * Height;
+		if (Width <= 0 || Height <= 0 || Width > 256 || Height > 256
+			|| CellCount != Mask.Num()
+			|| !FMath::IsFinite(CellSize) || CellSize <= 0.0f)
+		{
+			return false;
+		}
+		int32 SolidCount = 0;
+		for (const uint8 Cell : Mask)
+		{
+			if (Cell > 1)
+			{
+				return false;
+			}
+			SolidCount += Cell != 0 ? 1 : 0;
+		}
+		if (SolidCount == 0)
+		{
+			return false;
+		}
+
+		OutVertices.Reserve(SolidCount * 24);
+		OutNormals.Reserve(SolidCount * 24);
+		OutUVs.Reserve(SolidCount * 24);
+		TArray<int32> PrimaryTriangles;
+		TArray<int32> SideTriangles;
+		PrimaryTriangles.Reserve(SolidCount * 12);
+		SideTriangles.Reserve(SolidCount * 24);
+		// 相邻体素必须严丝合缝。块间人为留缝会让树冠读成珠串，
+		// 叶片的细碎边缘由专用 masked 像素材质负责。
+		const float HalfBlock = CellSize * 0.5f;
+		const TArray<FVector2D> QuadUVs = {
+			FVector2D(0.0f, 0.0f), FVector2D(1.0f, 0.0f),
+			FVector2D(1.0f, 1.0f), FVector2D(0.0f, 1.0f) };
+		auto AddQuad = [&OutVertices, &OutNormals, &OutUVs, &QuadUVs](
+			TArray<int32>& TargetTriangles,
+			const FVector& P0,
+			const FVector& P1,
+			const FVector& P2,
+			const FVector& P3,
+			const FVector& Normal)
+		{
+			const int32 Base = OutVertices.Num();
+			OutVertices.Append({ P0, P1, P2, P3 });
+			OutNormals.Append({ Normal, Normal, Normal, Normal });
+			OutUVs.Append(QuadUVs);
+			TargetTriangles.Append({
+				Base, Base + 2, Base + 1,
+				Base, Base + 3, Base + 2 });
+		};
+
+		for (int32 Y = 0; Y < Height; ++Y)
+		{
+			for (int32 X = 0; X < Width; ++X)
+			{
+				if (Mask[Y * Width + X] == 0)
+				{
+					continue;
+				}
+				const float CenterX =
+					(static_cast<float>(X) + 0.5f
+						- static_cast<float>(Width) * 0.5f) * CellSize;
+				const float CenterZ =
+					(static_cast<float>(Y) + 0.5f
+						- static_cast<float>(Height) * 0.5f) * CellSize;
+				const float MinX = CenterX - HalfBlock;
+				const float MaxX = CenterX + HalfBlock;
+				const float MinY = -HalfBlock;
+				const float MaxY = HalfBlock;
+				const float MinZ = CenterZ - HalfBlock;
+				const float MaxZ = CenterZ + HalfBlock;
+
+				// 正反面先写入 primary 索引，保持现有 face/side 材质分区。
+				AddQuad(
+					PrimaryTriangles,
+					FVector(MinX, MaxY, MinZ), FVector(MinX, MaxY, MaxZ),
+					FVector(MaxX, MaxY, MaxZ), FVector(MaxX, MaxY, MinZ),
+					FVector::YAxisVector);
+				AddQuad(
+					PrimaryTriangles,
+					FVector(MinX, MinY, MinZ), FVector(MaxX, MinY, MinZ),
+					FVector(MaxX, MinY, MaxZ), FVector(MinX, MinY, MaxZ),
+					-FVector::YAxisVector);
+				// 同一切片内相邻方块共享的面必须剔除。保留这些内部面会
+				// 在 masked 叶片孔洞后重复绘制，并在块边界产生亮缝。
+				if (X + 1 >= Width || Mask[Y * Width + X + 1] == 0)
+				{
+					AddQuad(
+						SideTriangles,
+						FVector(MaxX, MinY, MinZ), FVector(MaxX, MaxY, MinZ),
+						FVector(MaxX, MaxY, MaxZ), FVector(MaxX, MinY, MaxZ),
+						FVector::XAxisVector);
+				}
+				if (X == 0 || Mask[Y * Width + X - 1] == 0)
+				{
+					AddQuad(
+						SideTriangles,
+						FVector(MinX, MaxY, MinZ), FVector(MinX, MinY, MinZ),
+						FVector(MinX, MinY, MaxZ), FVector(MinX, MaxY, MaxZ),
+						-FVector::XAxisVector);
+				}
+				if (Y + 1 >= Height || Mask[(Y + 1) * Width + X] == 0)
+				{
+					AddQuad(
+						SideTriangles,
+						FVector(MinX, MinY, MaxZ), FVector(MaxX, MinY, MaxZ),
+						FVector(MaxX, MaxY, MaxZ), FVector(MinX, MaxY, MaxZ),
+						FVector::ZAxisVector);
+				}
+				if (Y == 0 || Mask[(Y - 1) * Width + X] == 0)
+				{
+					AddQuad(
+						SideTriangles,
+						FVector(MinX, MaxY, MinZ), FVector(MaxX, MaxY, MinZ),
+						FVector(MaxX, MinY, MinZ), FVector(MinX, MinY, MinZ),
+						-FVector::ZAxisVector);
+				}
+			}
+		}
+
+		OutPrimaryIndexCount = PrimaryTriangles.Num();
+		OutTriangles = MoveTemp(PrimaryTriangles);
+		OutTriangles.Append(SideTriangles);
+		if (OutPrimaryIndexCount <= 0
+			|| OutPrimaryIndexCount >= OutTriangles.Num()
+			|| OutVertices.Num() != OutNormals.Num()
+			|| OutVertices.Num() != OutUVs.Num())
+		{
+			OutVertices.Reset();
+			OutTriangles.Reset();
+			OutNormals.Reset();
+			OutUVs.Reset();
+			OutPrimaryIndexCount = 0;
+			return false;
+		}
+		for (const int32 Index : OutTriangles)
+		{
+			if (!OutVertices.IsValidIndex(Index))
+			{
+				OutVertices.Reset();
+				OutTriangles.Reset();
+				OutNormals.Reset();
+				OutUVs.Reset();
+				OutPrimaryIndexCount = 0;
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool GatherTopExposedBurningMaskCells(
+		const TArray<uint8>& OccupiedMask,
+		const TArray<uint8>& BurningMask,
+		const int32 Width,
+		const int32 Height,
+		TArray<int32>& OutCellIndices)
+	{
+		OutCellIndices.Reset();
+		const int64 CellCount = static_cast<int64>(Width) * Height;
+		if (Width <= 0 || Height <= 0
+			|| CellCount != OccupiedMask.Num()
+			|| CellCount != BurningMask.Num())
+		{
+			return false;
+		}
+		for (int32 Index = 0; Index < BurningMask.Num(); ++Index)
+		{
+			if (BurningMask[Index] == 0 || OccupiedMask[Index] == 0)
+			{
+				continue;
+			}
+			const int32 Y = Index / Width;
+			const int32 AboveIndex = Index + Width;
+			if (Y + 1 >= Height || OccupiedMask[AboveIndex] == 0)
+			{
+				OutCellIndices.Add(Index);
+			}
+		}
+		return true;
+	}
+
+	bool BuildRadialColumnMeshFromMask(
+		const TArray<uint8>& Mask,
+		const int32 Width,
+		const int32 Height,
+		const float CellSize,
+		TArray<FVector>& OutVertices,
+		TArray<int32>& OutTriangles,
+		TArray<FVector>& OutNormals,
+		TArray<FVector2D>& OutUVs,
+		int32& OutPrimaryIndexCount)
+	{
+		OutVertices.Reset();
+		OutTriangles.Reset();
+		OutNormals.Reset();
+		OutUVs.Reset();
+		OutPrimaryIndexCount = 0;
+		const int64 CellCount = static_cast<int64>(Width) * Height;
+		if (Width <= 0 || Height <= 0 || Width > 256 || Height > 256
+			|| CellCount != Mask.Num()
+			|| !FMath::IsFinite(CellSize) || CellSize <= 0.0f)
+		{
+			return false;
+		}
+		for (const uint8 Cell : Mask)
+		{
+			if (Cell > 1)
+			{
+				return false;
+			}
+		}
+
+		struct FColumnSpan
+		{
+			int32 MinX = 0;
+			int32 MaxX = 0;
+			int32 StartY = 0;
+			int32 EndY = 0;
+		};
+		TMap<int32, FColumnSpan> ActiveSpans;
+		TArray<FColumnSpan> CompletedSpans;
+		for (int32 Y = 0; Y < Height; ++Y)
+		{
+			TSet<int32> RowKeys;
+			for (int32 X = 0; X < Width;)
+			{
+				if (Mask[Y * Width + X] == 0)
+				{
+					++X;
+					continue;
+				}
+				const int32 MinX = X;
+				while (X + 1 < Width && Mask[Y * Width + X + 1] != 0)
+				{
+					++X;
+				}
+				const int32 MaxX = X++;
+				const int32 Key = MinX * 256 + MaxX;
+				RowKeys.Add(Key);
+				if (FColumnSpan* Existing = ActiveSpans.Find(Key))
+				{
+					Existing->EndY = Y;
+				}
+				else
+				{
+					ActiveSpans.Add(Key, { MinX, MaxX, Y, Y });
+				}
+			}
+
+			TArray<int32> FinishedKeys;
+			for (const TPair<int32, FColumnSpan>& Pair : ActiveSpans)
+			{
+				if (!RowKeys.Contains(Pair.Key))
+				{
+					CompletedSpans.Add(Pair.Value);
+					FinishedKeys.Add(Pair.Key);
+				}
+			}
+			for (const int32 Key : FinishedKeys)
+			{
+				ActiveSpans.Remove(Key);
+			}
+		}
+		for (const TPair<int32, FColumnSpan>& Pair : ActiveSpans)
+		{
+			CompletedSpans.Add(Pair.Value);
+		}
+		CompletedSpans.Sort([](const FColumnSpan& A, const FColumnSpan& B)
+		{
+			if (A.StartY != B.StartY) return A.StartY < B.StartY;
+			if (A.MinX != B.MinX) return A.MinX < B.MinX;
+			if (A.EndY != B.EndY) return A.EndY < B.EndY;
+			return A.MaxX < B.MaxX;
+		});
+		if (CompletedSpans.IsEmpty())
+		{
+			return false;
+		}
+
+		constexpr int32 SideCount = 8;
+		TArray<int32> PrimaryTriangles;
+		TArray<int32> CapTriangles;
+		for (const FColumnSpan& Span : CompletedSpans)
+		{
+			const float CenterX =
+				(static_cast<float>(Span.MinX + Span.MaxX + 1) * 0.5f
+					- static_cast<float>(Width) * 0.5f) * CellSize;
+			const float Radius = FMath::Max(
+				CellSize * 0.45f,
+				static_cast<float>(Span.MaxX - Span.MinX + 1)
+					* CellSize * 0.5f);
+			const float BottomZ =
+				(static_cast<float>(Span.StartY)
+					- static_cast<float>(Height) * 0.5f) * CellSize;
+			const float TopZ =
+				(static_cast<float>(Span.EndY + 1)
+					- static_cast<float>(Height) * 0.5f) * CellSize;
+			const float HeightUv = (TopZ - BottomZ) * 0.01f;
+
+			for (int32 Side = 0; Side < SideCount; ++Side)
+			{
+				const float A0 = 2.0f * PI * static_cast<float>(Side)
+					/ static_cast<float>(SideCount);
+				const float A1 = 2.0f * PI * static_cast<float>(Side + 1)
+					/ static_cast<float>(SideCount);
+				const FVector N0(FMath::Cos(A0), FMath::Sin(A0), 0.0f);
+				const FVector N1(FMath::Cos(A1), FMath::Sin(A1), 0.0f);
+				const FVector FacetNormal = (N0 + N1).GetSafeNormal();
+				const FVector P0(CenterX + N0.X * Radius, N0.Y * Radius, BottomZ);
+				const FVector P1(CenterX + N1.X * Radius, N1.Y * Radius, BottomZ);
+				const FVector P2(CenterX + N1.X * Radius, N1.Y * Radius, TopZ);
+				const FVector P3(CenterX + N0.X * Radius, N0.Y * Radius, TopZ);
+				const int32 Base = OutVertices.Num();
+				OutVertices.Append({ P0, P1, P2, P3 });
+				OutNormals.Append({ FacetNormal, FacetNormal, FacetNormal, FacetNormal });
+				OutUVs.Append({
+					FVector2D(0.0f, 0.0f), FVector2D(1.0f, 0.0f),
+					FVector2D(1.0f, HeightUv), FVector2D(0.0f, HeightUv) });
+				PrimaryTriangles.Append({
+					Base, Base + 1, Base + 2,
+					Base, Base + 2, Base + 3 });
+
+				const int32 CapBase = OutVertices.Num();
+				OutVertices.Append({
+					FVector(CenterX, 0.0f, BottomZ), P1, P0,
+					FVector(CenterX, 0.0f, TopZ), P3, P2 });
+				OutNormals.Append({
+					-FVector::ZAxisVector, -FVector::ZAxisVector,
+					-FVector::ZAxisVector, FVector::ZAxisVector,
+					FVector::ZAxisVector, FVector::ZAxisVector });
+				OutUVs.Append({
+					FVector2D(0.5f, 0.5f), FVector2D(N1.X, N1.Y),
+					FVector2D(N0.X, N0.Y), FVector2D(0.5f, 0.5f),
+					FVector2D(N0.X, N0.Y), FVector2D(N1.X, N1.Y) });
+				CapTriangles.Append({
+					CapBase, CapBase + 1, CapBase + 2,
+					CapBase + 3, CapBase + 4, CapBase + 5 });
+			}
+		}
+
+		OutPrimaryIndexCount = PrimaryTriangles.Num();
+		OutTriangles = MoveTemp(PrimaryTriangles);
+		OutTriangles.Append(CapTriangles);
+		if (OutPrimaryIndexCount <= 0
+			|| OutPrimaryIndexCount >= OutTriangles.Num()
+			|| OutVertices.Num() != OutNormals.Num()
+			|| OutVertices.Num() != OutUVs.Num())
+		{
+			OutVertices.Reset();
+			OutTriangles.Reset();
+			OutNormals.Reset();
+			OutUVs.Reset();
+			OutPrimaryIndexCount = 0;
 			return false;
 		}
 		return true;

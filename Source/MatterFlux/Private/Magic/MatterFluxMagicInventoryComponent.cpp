@@ -1034,8 +1034,9 @@ void UMatterFluxMagicInventoryComponent::InitializeStarterLoadout()
 	WandIds = WandIds.FilterByPredicate(
 		[&Registry](const FName Id)
 		{
-			return Registry->Wands.FindChecked(Id)
-				.StarterEquipmentSlot >= 0;
+			const FMatterFluxWandDefinition& Wand =
+				Registry->Wands.FindChecked(Id);
+			return Wand.StarterEquipmentSlot >= 0 || Wand.StarterCount > 0;
 		});
 	if (WandIds.IsEmpty())
 	{
@@ -1063,29 +1064,43 @@ void UMatterFluxMagicInventoryComponent::InitializeStarterLoadout()
 	{
 		const FMatterFluxWandDefinition& StarterWand =
 			Registry->Wands.FindChecked(WandId);
-		FMatterFluxOwnedWand& Wand =
-			OwnedWands.Items.AddDefaulted_GetRef();
-		Wand.InstanceId = FGuid::NewDeterministicGuid(
-			FString::Printf(
-				TEXT("MatterFlux.Starter.%s.Slot%d"),
-				*StarterWand.Id.ToString(),
-				StarterWand.StarterEquipmentSlot),
-			PlayerSeed);
-		Wand.DefinitionId = StarterWand.Id;
-		Wand.SpellSlots.Init(NAME_None, StarterWand.Capacity);
-		for (int32 DeckIndex = 0;
-			DeckIndex < StarterWand.StarterDeck.Num();
-			++DeckIndex)
+		const int32 Copies = FMath::Max(
+			StarterWand.StarterCount,
+			StarterWand.StarterEquipmentSlot >= 0 ? 1 : 0);
+		for (int32 CopyIndex = 0; CopyIndex < Copies; ++CopyIndex)
 		{
-			Wand.SpellSlots[DeckIndex] =
-				StarterWand.StarterDeck[DeckIndex];
+			FMatterFluxOwnedWand& Wand =
+				OwnedWands.Items.AddDefaulted_GetRef();
+			const FString GuidKey = StarterWand.StarterEquipmentSlot >= 0
+				&& CopyIndex == 0
+				? FString::Printf(
+					TEXT("MatterFlux.Starter.%s.Slot%d"),
+					*StarterWand.Id.ToString(),
+					StarterWand.StarterEquipmentSlot)
+				: FString::Printf(
+					TEXT("MatterFlux.Starter.%s.Owned.Copy%d"),
+					*StarterWand.Id.ToString(), CopyIndex);
+			Wand.InstanceId =
+				FGuid::NewDeterministicGuid(GuidKey, PlayerSeed);
+			Wand.DefinitionId = StarterWand.Id;
+			Wand.SpellSlots.Init(NAME_None, StarterWand.Capacity);
+			for (int32 DeckIndex = 0;
+				DeckIndex < StarterWand.StarterDeck.Num();
+				++DeckIndex)
+			{
+				Wand.SpellSlots[DeckIndex] =
+					StarterWand.StarterDeck[DeckIndex];
+			}
+			Wand.Mana = StarterWand.ManaMax;
+			Wand.LastManaUpdateServerTime = GetWorld()
+				? GetWorld()->GetTimeSeconds()
+				: 0.0;
+			if (CopyIndex == 0 && StarterWand.StarterEquipmentSlot >= 0)
+			{
+				EquippedWands[StarterWand.StarterEquipmentSlot] =
+					Wand.InstanceId;
+			}
 		}
-		Wand.Mana = StarterWand.ManaMax;
-		Wand.LastManaUpdateServerTime = GetWorld()
-			? GetWorld()->GetTimeSeconds()
-			: 0.0;
-		EquippedWands[StarterWand.StarterEquipmentSlot] =
-			Wand.InstanceId;
 	}
 	ActiveEquipmentSlot = 0;
 	InventoryRevision = 1;

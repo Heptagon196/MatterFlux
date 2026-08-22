@@ -20,6 +20,17 @@ enum class EFragmentSupportMode : uint8
 	Bottom
 };
 
+/** Controls how a 2D material mask is presented before it becomes debris. */
+UENUM(BlueprintType)
+enum class EFragmentSourceGeometryStyle : uint8
+{
+	ExtrudedMask,
+	/** Consecutive mask rows become faceted cylinders around local Z. */
+	RadialColumn,
+	/** Each solid mask cell becomes a small independent cube for block foliage. */
+	VoxelBlocks
+};
+
 USTRUCT(BlueprintType)
 struct MATTERFLUX_API FFragmentDamageShape
 {
@@ -58,6 +69,13 @@ struct MATTERFLUX_API FFragmentDamageEvent
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Fragment")
 	float DamagePower = 1000.0f;
 
+	/**
+	 * 化学溶解等非切割破坏仍提交 mask/revision，但不把被移除的
+	 * 物质重新生成成实体碎片；视觉反馈由反应产物（例如酸雾）承担。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Fragment")
+	bool bDissolveDetachedFragments = false;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Fragment")
 	int32 EventSeed = 1337;
 };
@@ -80,6 +98,10 @@ struct MATTERFLUX_API FFragmentWorldCutRequest
 	// the cells removed from a source.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Fragment")
 	float TargetPadding = 0.0f;
+
+	/** Zero keeps the generic service unlimited; player-facing cuts set a cap. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Fragment")
+	int32 MaxAffectedSources = 0;
 };
 
 USTRUCT(BlueprintType)
@@ -116,6 +138,10 @@ struct MATTERFLUX_API FFragmentSourceMask
 		EFragmentSupportMode::Bottom;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Fragment")
+	EFragmentSourceGeometryStyle GeometryStyle =
+		EFragmentSourceGeometryStyle::ExtrudedMask;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Fragment")
 	TArray<uint8> SolidMask;
 
 	bool NetSerialize(
@@ -132,6 +158,9 @@ struct MATTERFLUX_API FFragmentSourceMask
 			|| MaxFragmentsPerBreak <= 0 || MaxFragmentsPerBreak > 16
 			|| (SupportMode != EFragmentSupportMode::None
 				&& SupportMode != EFragmentSupportMode::Bottom)
+			|| (GeometryStyle != EFragmentSourceGeometryStyle::ExtrudedMask
+				&& GeometryStyle != EFragmentSourceGeometryStyle::RadialColumn
+				&& GeometryStyle != EFragmentSourceGeometryStyle::VoxelBlocks)
 			|| static_cast<int64>(SolidMask.Num())
 				!= static_cast<int64>(Width) * static_cast<int64>(Height))
 		{
@@ -191,12 +220,31 @@ struct MATTERFLUX_API FFragmentSpawnPayload
 	TArray<FFragmentContour> CollisionContours;
 
 	/**
+	 * 可选的、已经裁剪并以碎片原点为中心的体素 mask。
+	 * VoxelBlocks 碎片用它和同一 aggregate 的枝叶共同建立一份三维占用，
+	 * 从根源上避免树干与树叶各画一遍后互相穿透。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Fragment")
+	FFragmentSourceMask DetachedVoxelMask;
+
+	/** 体素碎片在整体物体编译器中的材质语义，例如 wood / leaf。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Fragment")
+	FName MaterialId = NAME_None;
+
+	/**
 	 * Preserves the source's collision policy after detachment. Decorative
 	 * sources can still produce visible debris without synchronously cooking a
 	 * Chaos body or unexpectedly becoming gameplay blockers.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Fragment")
 	bool bEnableCollision = true;
+
+	/**
+	 * Positive values mark bounded, render-only debris that dissolves instead
+	 * of disappearing when it falls below the source's area threshold.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Fragment")
+	float FadeOutDuration = 0.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Fragment")
 	float Thickness = 10.0f;

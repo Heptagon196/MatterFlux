@@ -6,10 +6,15 @@
 #include "Game/MatterFluxPlayableWorldActor.h"
 #include "IMatterFluxScriptRuntime.h"
 #include "MatterFluxLog.h"
+#include "Material/MatterFluxSourceCombustionRuntime.h"
+#include "Material/MatterFluxBuoyancyComponent.h"
+#include "UObject/ConstructorHelpers.h"
 #include "EngineUtils.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Net/UnrealNetwork.h"
 #include "ProceduralMeshComponent.h"
+#include "Rendering/MatterFluxVoxelMaterialStyle.h"
+#include "Rendering/MatterFluxWholeObjectGeometry.h"
 
 namespace
 {
@@ -20,18 +25,78 @@ namespace
 
 	bool IsPayloadStateValid(const FFragmentSpawnPayload& Payload)
 	{
+		const bool bHasDetachedVoxelMask =
+			Payload.DetachedVoxelMask.Width != 0
+			|| Payload.DetachedVoxelMask.Height != 0
+			|| !Payload.DetachedVoxelMask.SolidMask.IsEmpty();
 		return MatterFlux::FragmentGeometry::IsSpawnPayloadWithinReplicationBudget(Payload)
 			&& Payload.InitialTransform.IsValid()
 			&& IsFiniteVector(Payload.InitialLinearVelocity)
 			&& IsFiniteVector(Payload.InitialAngularVelocity)
 			&& FMath::IsFinite(Payload.Mass)
-			&& Payload.Mass > 0.0f;
+			&& Payload.Mass > 0.0f
+			&& FMath::IsFinite(Payload.FadeOutDuration)
+			&& Payload.FadeOutDuration >= 0.0f
+			&& (!bHasDetachedVoxelMask
+				|| (!Payload.MaterialId.IsNone()
+					&& Payload.DetachedVoxelMask.IsValid()
+					&& Payload.DetachedVoxelMask.GeometryStyle
+						== EFragmentSourceGeometryStyle::VoxelBlocks));
+	}
+
+	float ComputeVisualDepthOffset(const FGuid& FragmentId)
+	{
+		const uint32 Hash = HashCombineFast(
+			HashCombineFast(FragmentId.A, FragmentId.B),
+			HashCombineFast(FragmentId.C, FragmentId.D));
+		const uint32 LaneIndex = Hash % 16u;
+		const int32 SignedLane = LaneIndex < 8u
+			? static_cast<int32>(LaneIndex) - 8
+			: static_cast<int32>(LaneIndex) - 7;
+		return static_cast<float>(SignedLane) * 0.2f;
+	}
+
+	FBox BuildMaskWorldBounds(
+		const FFragmentSourceMask& Mask,
+		const FTransform& WorldTransform)
+	{
+		if (!Mask.IsValid() || !WorldTransform.IsValid())
+		{
+			return FBox(ForceInit);
+		}
+		const FVector HalfExtent(
+			Mask.Width * Mask.CellSize * 0.5f,
+			Mask.CellSize * 0.5f,
+			Mask.Height * Mask.CellSize * 0.5f);
+		return FBox(-HalfExtent, HalfExtent).TransformBy(
+			WorldTransform.ToMatrixWithScale());
+	}
+
+	const FMatterFluxReactionDefinition* FindCombustionRule(
+		const FMatterFluxContentRegistry& Registry,
+		const FName FuelMaterial,
+		const FName FlameMaterial)
+	{
+		return MatterFlux::Reaction::FMaterialReactionEngine::
+			FindPropagatingRule(
+				Registry, FuelMaterial, FlameMaterial);
+	}
+
+	int32 CountSetCells(const TArray<uint8>& Mask)
+	{
+		int32 Count = 0;
+		for (const uint8 Value : Mask)
+		{
+			Count += Value != 0 ? 1 : 0;
+		}
+		return Count;
 	}
 }
 
 bool FFragmentAggregateSourceState::IsValid() const
 {
 	return SourceId.IsValid()
+		&& (DefinitionSourceId.IsValid() || bOwnsLogicalSource)
 		&& Revision >= 0
 		&& SourceMask.HasValidLayout()
 		&& (SourceMask.SolidMask.Contains(1)
@@ -62,6 +127,8 @@ bool FFragmentAggregateSourceState::IsValid() const
 
 AFragment2DActor::AFragment2DActor()
 {
+	PrimaryActorTick.bCanEverTick = true;
+	PrimaryActorTick.bStartWithTickEnabled = false;
 	bReplicates = true;
 	bAlwaysRelevant = false;
 	SetNetCullDistanceSquared(FMath::Square(1400.0f));
@@ -77,11 +144,60 @@ AFragment2DActor::AFragment2DActor()
 	MeshComponent->SetCollisionObjectType(ECC_PhysicsBody);
 	MeshComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 	MeshComponent->SetCollisionResponseToAllChannels(ECR_Block);
+	MeshComponent->SetCollisionResponseToChannel(ECC_PhysicsBody, ECR_Ignore);
 	MeshComponent->SetNotifyRigidBodyCollision(true);
 	MeshComponent->bUseComplexAsSimpleCollision = false;
 	MeshComponent->SetLinearDamping(1.25f);
-	MeshComponent->SetAngularDamping(6.0f);
+	MeshComponent->SetAngularDamping(4.0f);
 	MeshComponent->BodyInstance.bUseCCD = true;
+	MeshComponent->BodyInstance.SleepFamily = ESleepFamily::Custom;
+	MeshComponent->BodyInstance.CustomSleepThresholdMultiplier = 2.5f;
+	MeshComponent->BodyInstance.StabilizationThresholdMultiplier = 2.0f;
+	MeshComponent->SetConstraintMode(EDOFMode::XZPlane);
+	BuoyancyComponent = CreateDefaultSubobject<UMatterFluxBuoyancyComponent>(
+		TEXT("BuoyancyComponent"));
+	BuoyancyComponent->SetTargetPrimitive(MeshComponent);
+
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface>
+		FadeMaterialFinder(
+			TEXT("/Game/MatterFlux/Materials/M_VoxelGas.M_VoxelGas"));
+	TransientFadeMaterial = FadeMaterialFinder.Object;
+}
+
+AFragment2DActor::~AFragment2DActor() = default;
+
+void AFragment2DActor::BeginPlay()
+{
+	Super::BeginPlay();
+	ConfigureTransientFade();
+}
+
+void AFragment2DActor::Tick(const float DeltaSeconds)
+{
+	Super::Tick(DeltaSeconds);
+	AdvanceRootCombustion(DeltaSeconds);
+	AdvanceDetachedAggregateCombustion(DeltaSeconds);
+	if (SpawnPayload.FadeOutDuration <= 0.0f)
+	{
+		SetActorTickEnabled(
+			IsRootCombusting()
+			|| !DetachedAggregateCombustionRuntimes.IsEmpty());
+		return;
+	}
+
+	TransientFadeElapsed = FMath::Clamp(
+		TransientFadeElapsed + FMath::Max(DeltaSeconds, 0.0f),
+		0.0f,
+		SpawnPayload.FadeOutDuration);
+	const float LinearAlpha = 1.0f
+		- TransientFadeElapsed / SpawnPayload.FadeOutDuration;
+	TransientFadeAlpha = FMath::SmoothStep(0.0f, 1.0f, LinearAlpha);
+	ApplyTransientFadeAlpha();
+	if (TransientFadeElapsed >= SpawnPayload.FadeOutDuration)
+	{
+		SetActorTickEnabled(false);
+		Destroy();
+	}
 }
 
 void AFragment2DActor::EndPlay(
@@ -100,10 +216,13 @@ void AFragment2DActor::EndPlay(
 bool AFragment2DActor::InitializeFromPayload(const FFragmentSpawnPayload& Payload)
 {
 	SpawnPayload = Payload;
+	InitializeRootCombustionState();
+	RefreshBuoyancyDensity();
 	const bool bReady = RebuildMeshFromPayload();
 	if (bReady)
 	{
 		SetActorTransform(Payload.InitialTransform);
+		ConfigureTransientFade();
 	}
 
 	if (bReady
@@ -132,22 +251,41 @@ void AFragment2DActor::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out
 	DOREPLIFETIME_CONDITION(AFragment2DActor, FragmentMaterial, COND_InitialOnly);
 	DOREPLIFETIME_CONDITION(AFragment2DActor, FragmentColor, COND_InitialOnly);
 	DOREPLIFETIME(AFragment2DActor, AggregateSources);
+	DOREPLIFETIME(AFragment2DActor, RootCombustionState);
 }
 
 void AFragment2DActor::OnRep_SpawnPayload()
 {
+	InitializeRootCombustionState();
+	RefreshBuoyancyDensity();
 	RebuildMeshFromPayload();
+	ConfigureTransientFade();
 }
 
 void AFragment2DActor::OnRep_FragmentMaterial()
 {
+	if (RootCombustionState.SourceId == SpawnPayload.FragmentId)
+	{
+		RootCombustionState.Material = FragmentMaterial;
+		RootCombustionState.Color = FragmentColor;
+	}
 	RebuildMeshFromPayload();
 }
 
 void AFragment2DActor::OnRep_AggregateSources()
 {
+	RefreshBuoyancyDensity();
 	RebuildMeshFromPayload();
 	NotifyWorldOfAggregateSources();
+	MarkCombustionVisualizationDirty();
+}
+
+void AFragment2DActor::OnRep_RootCombustionState()
+{
+	RebuildMeshFromPayload();
+	SetActorTickEnabled(
+		SpawnPayload.FadeOutDuration > 0.0f || IsRootCombusting());
+	MarkCombustionVisualizationDirty();
 }
 
 bool AFragment2DActor::ContainsAggregateSource(const FGuid& SourceId) const
@@ -189,14 +327,518 @@ bool AFragment2DActor::GetAggregateSourceWorldTransform(
 	return OutWorldTransform.IsValid();
 }
 
+bool AFragment2DActor::GetAggregateSourceState(
+	const FGuid& SourceId,
+	FFragmentAggregateSourceState& OutState) const
+{
+	const FFragmentAggregateSourceState* Source =
+		AggregateSources.FindByPredicate(
+			[&SourceId](const FFragmentAggregateSourceState& Candidate)
+			{
+				return Candidate.SourceId == SourceId;
+			});
+	if (!Source || !Source->IsValid())
+	{
+		return false;
+	}
+	OutState = *Source;
+	return true;
+}
+
+bool AFragment2DActor::IsRootCombusting() const
+{
+	return RootCombustionState.bHasCombustionState
+		&& RootCombustionState.BurningMask.SolidMask.Contains(1);
+}
+
+bool AFragment2DActor::IsAggregateSourceCombusting(
+	const FGuid& SourceId) const
+{
+	const FFragmentAggregateSourceState* Source =
+		AggregateSources.FindByPredicate(
+			[&SourceId](const FFragmentAggregateSourceState& Candidate)
+			{
+				return Candidate.SourceId == SourceId;
+			});
+	return Source
+		&& Source->bHasCombustionState
+		&& Source->BurningMask.SolidMask.Contains(1);
+}
+
+bool AFragment2DActor::IsAnyAggregateMaterialCombusting(
+	const FName MaterialId) const
+{
+	return AggregateSources.ContainsByPredicate(
+		[MaterialId](const FFragmentAggregateSourceState& Source)
+		{
+			return Source.MaterialId == MaterialId
+				&& Source.bHasCombustionState
+				&& Source.BurningMask.SolidMask.Contains(1);
+		});
+}
+
+int32 AFragment2DActor::GetRootCombustionResidueCellCount() const
+{
+	return RootCombustionState.bHasCombustionState
+		? CountSetCells(RootCombustionState.ResidueMask.SolidMask)
+		: 0;
+}
+
+FBox AFragment2DActor::GetCombustibleWorldBounds() const
+{
+	FBox Bounds(ForceInit);
+	if (RootCombustionState.IsValid())
+	{
+		Bounds += BuildMaskWorldBounds(
+			RootCombustionState.SourceMask,
+			GetActorTransform());
+	}
+	for (const FFragmentAggregateSourceState& Source : AggregateSources)
+	{
+		if (Source.IsValid())
+		{
+			Bounds += BuildMaskWorldBounds(
+				Source.SourceMask,
+				Source.LocalTransform * GetActorTransform());
+		}
+	}
+	return Bounds;
+}
+
+void AFragment2DActor::InitializeRootCombustionState()
+{
+	const bool bSupportsCombustion = SpawnPayload.FragmentId.IsValid()
+		&& !SpawnPayload.MaterialId.IsNone()
+		&& SpawnPayload.DetachedVoxelMask.IsValid()
+		&& SpawnPayload.DetachedVoxelMask.GeometryStyle
+			== EFragmentSourceGeometryStyle::VoxelBlocks;
+	if (!bSupportsCombustion)
+	{
+		RootCombustionState = FFragmentAggregateSourceState();
+		RootCombustionRuntime.Reset();
+		return;
+	}
+	if (RootCombustionState.SourceId == SpawnPayload.FragmentId
+		&& RootCombustionState.SourceMask.HasValidLayout())
+	{
+		RootCombustionState.Material = FragmentMaterial;
+		RootCombustionState.Color = FragmentColor;
+		return;
+	}
+
+	RootCombustionState = FFragmentAggregateSourceState();
+	RootCombustionState.SourceId = SpawnPayload.FragmentId;
+	RootCombustionState.DefinitionSourceId = SpawnPayload.FragmentId;
+	RootCombustionState.bOwnsLogicalSource = false;
+	RootCombustionState.Revision = SpawnPayload.Revision;
+	RootCombustionState.SourceMask = SpawnPayload.DetachedVoxelMask;
+	RootCombustionState.LocalTransform = FTransform::Identity;
+	RootCombustionState.Material = FragmentMaterial;
+	RootCombustionState.MaterialId = SpawnPayload.MaterialId;
+	RootCombustionState.Color = FragmentColor;
+	RootCombustionState.bEnableCollision = SpawnPayload.bEnableCollision;
+	RootCombustionState.ResidueMask = SpawnPayload.DetachedVoxelMask;
+	RootCombustionState.ResidueMask.SolidMask.Init(
+		0,
+		SpawnPayload.DetachedVoxelMask.SolidMask.Num());
+	RootCombustionState.BurningMask = SpawnPayload.DetachedVoxelMask;
+	RootCombustionState.BurningMask.SolidMask.Init(
+		0,
+		SpawnPayload.DetachedVoxelMask.SolidMask.Num());
+	RootCombustionRuntime.Reset();
+}
+
+bool AFragment2DActor::IgniteRootAtWorldLocation(
+	const FVector& WorldLocation,
+	const FName FlameMaterial,
+	const int32 EventSeed)
+{
+	if (!HasAuthority()
+		|| WorldLocation.ContainsNaN()
+		|| FlameMaterial.IsNone()
+		|| !RootCombustionState.IsValid()
+		|| IsRootCombusting())
+	{
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry =
+		IMatterFluxScriptRuntime::IsAvailable()
+			? IMatterFluxScriptRuntime::Get().GetActiveRegistry()
+			: nullptr;
+	if (!Registry.IsValid())
+	{
+		return false;
+	}
+	const FMatterFluxReactionDefinition* Rule = FindCombustionRule(
+		*Registry,
+		RootCombustionState.MaterialId,
+		FlameMaterial);
+	if (!Rule)
+	{
+		return false;
+	}
+
+	TUniquePtr<MatterFlux::Combustion::FSourceCombustionRuntime> Candidate =
+		MakeUnique<MatterFlux::Combustion::FSourceCombustionRuntime>();
+	FString Error;
+	if (!Candidate->Initialize(
+		MatterFlux::Combustion::FSourceRuntimeSettings(),
+		RootCombustionState.SourceMask,
+		*Rule,
+		EventSeed,
+		Error))
+	{
+		UE_LOG(
+			LogMatterFlux,
+			Error,
+			TEXT("Detached fragment combustion initialization failed: %s"),
+			*Error);
+		return false;
+	}
+	const FVector Local = GetActorTransform().InverseTransformPosition(
+		WorldLocation);
+	const FFragmentSourceMask& Mask = RootCombustionState.SourceMask;
+	const FIntPoint RequestedCell(
+		FMath::FloorToInt(
+			Local.X / Mask.CellSize
+				+ static_cast<double>(Mask.Width) * 0.5),
+		FMath::FloorToInt(
+			Local.Z / Mask.CellSize
+				+ static_cast<double>(Mask.Height) * 0.5));
+	if (!Candidate->IgniteNearest(RequestedCell, FlameMaterial))
+	{
+		return false;
+	}
+	RootCombustionRuntime = MoveTemp(Candidate);
+	if (!SynchronizeRootCombustionState())
+	{
+		RootCombustionRuntime.Reset();
+		return false;
+	}
+	RootCombustionPropagationAccumulator = 0.0f;
+	SetActorTickEnabled(true);
+	ForceNetUpdate();
+	MarkCombustionVisualizationDirty();
+	return true;
+}
+
+bool AFragment2DActor::IgniteAtWorldLocation(
+	const FVector& WorldLocation,
+	const FName FlameMaterial,
+	const int32 EventSeed)
+{
+	if (!HasAuthority()
+		|| WorldLocation.ContainsNaN()
+		|| FlameMaterial.IsNone())
+	{
+		return false;
+	}
+	struct FCandidate
+	{
+		FGuid SourceId;
+		double DistanceSquared = TNumericLimits<double>::Max();
+		bool bRoot = false;
+	};
+	TArray<FCandidate, TInlineAllocator<17>> Candidates;
+	if (RootCombustionState.IsValid()
+		&& RootCombustionState.SourceMask.SolidMask.Contains(1)
+		&& !IsRootCombusting())
+	{
+		const FBox Bounds = BuildMaskWorldBounds(
+			RootCombustionState.SourceMask,
+			GetActorTransform());
+		if (Bounds.IsValid)
+		{
+			Candidates.Add({
+				RootCombustionState.SourceId,
+				Bounds.ComputeSquaredDistanceToPoint(WorldLocation),
+				true});
+		}
+	}
+	for (const FFragmentAggregateSourceState& Source : AggregateSources)
+	{
+		if (!Source.IsValid()
+			|| !Source.SourceMask.SolidMask.Contains(1)
+			|| IsAggregateSourceCombusting(Source.SourceId))
+		{
+			continue;
+		}
+		const FBox Bounds = BuildMaskWorldBounds(
+			Source.SourceMask,
+			Source.LocalTransform * GetActorTransform());
+		if (Bounds.IsValid)
+		{
+			Candidates.Add({
+				Source.SourceId,
+				Bounds.ComputeSquaredDistanceToPoint(WorldLocation),
+				false});
+		}
+	}
+	Candidates.Sort([](const FCandidate& A, const FCandidate& B)
+	{
+		if (!FMath::IsNearlyEqual(A.DistanceSquared, B.DistanceSquared))
+		{
+			return A.DistanceSquared < B.DistanceSquared;
+		}
+		if (A.bRoot != B.bRoot)
+		{
+			return A.bRoot;
+		}
+		return A.SourceId.ToString(EGuidFormats::Digits)
+			< B.SourceId.ToString(EGuidFormats::Digits);
+	});
+	if (Candidates.IsEmpty())
+	{
+		return false;
+	}
+	if (Candidates[0].bRoot)
+	{
+		return IgniteRootAtWorldLocation(
+			WorldLocation,
+			FlameMaterial,
+			EventSeed);
+	}
+	return IgniteAggregateSourceAtWorldLocation(
+		Candidates[0].SourceId,
+		WorldLocation,
+		FlameMaterial,
+		EventSeed);
+}
+
+bool AFragment2DActor::IgniteAggregateSourceAtWorldLocation(
+	const FGuid& SourceId,
+	const FVector& WorldLocation,
+	const FName FlameMaterial,
+	const int32 EventSeed)
+{
+	if (!HasAuthority()
+		|| !SourceId.IsValid()
+		|| WorldLocation.ContainsNaN()
+		|| FlameMaterial.IsNone())
+	{
+		return false;
+	}
+	const FFragmentAggregateSourceState* Layer =
+		AggregateSources.FindByPredicate(
+			[&SourceId](const FFragmentAggregateSourceState& Candidate)
+			{
+				return Candidate.SourceId == SourceId;
+			});
+	if (!Layer || !Layer->IsValid())
+	{
+		return false;
+	}
+	if (!Layer->bOwnsLogicalSource)
+	{
+		return IgniteDetachedAggregateAtWorldLocation(
+			SourceId,
+			WorldLocation,
+			FlameMaterial,
+			EventSeed);
+	}
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return false;
+	}
+	if (AMatterFluxPlayableWorldActor* OwnerWorld =
+		Cast<AMatterFluxPlayableWorldActor>(GetOwner()))
+	{
+		return OwnerWorld->IgniteDynamicAggregateSource(
+			*this,
+			SourceId,
+			WorldLocation,
+			FlameMaterial,
+			EventSeed);
+	}
+	for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
+	{
+		if (It->IgniteDynamicAggregateSource(
+			*this,
+			SourceId,
+			WorldLocation,
+			FlameMaterial,
+			EventSeed))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+bool AFragment2DActor::IgniteInCone(
+	const FVector& Start,
+	const FVector& Direction,
+	const float Range,
+	const float StartRadius,
+	const float EndRadius,
+	const FName FlameMaterial,
+	const int32 EventSeed)
+{
+	const FVector Forward = Direction.GetSafeNormal();
+	if (!HasAuthority()
+		|| Start.ContainsNaN()
+		|| Forward.IsNearlyZero()
+		|| !FMath::IsFinite(Range)
+		|| !FMath::IsFinite(StartRadius)
+		|| !FMath::IsFinite(EndRadius)
+		|| Range <= 0.0f
+		|| StartRadius <= 0.0f
+		|| EndRadius < StartRadius
+		|| FlameMaterial.IsNone())
+	{
+		return false;
+	}
+	struct FConeCandidate
+	{
+		FGuid SourceId;
+		FVector Contact = FVector::ZeroVector;
+		double Score = TNumericLimits<double>::Max();
+		bool bRoot = false;
+	};
+	TArray<FConeCandidate, TInlineAllocator<17>> Candidates;
+	const auto AddCandidate = [
+		&Candidates,
+		&Start,
+		&Forward,
+		Range,
+		StartRadius,
+		EndRadius](
+			const FGuid& SourceId,
+			const FFragmentSourceMask& Mask,
+			const FTransform& WorldTransform,
+			const bool bRoot)
+	{
+		const FBox Bounds = BuildMaskWorldBounds(Mask, WorldTransform);
+		if (!Bounds.IsValid)
+		{
+			return;
+		}
+		constexpr int32 SampleCount = 24;
+		double BestScore = TNumericLimits<double>::Max();
+		FVector BestContact = FVector::ZeroVector;
+		for (int32 SampleIndex = 0;
+			SampleIndex <= SampleCount;
+			++SampleIndex)
+		{
+			const float Alpha = static_cast<float>(SampleIndex)
+				/ static_cast<float>(SampleCount);
+			const FVector Centerline = Start + Forward * (Range * Alpha);
+			const float Radius = FMath::Lerp(StartRadius, EndRadius, Alpha);
+			const double DistanceSquared =
+				Bounds.ComputeSquaredDistanceToPoint(Centerline);
+			const double Score = DistanceSquared
+				/ FMath::Max(
+					static_cast<double>(Radius) * Radius,
+					UE_DOUBLE_SMALL_NUMBER);
+			if (Score < BestScore)
+			{
+				BestScore = Score;
+				BestContact = Bounds.GetClosestPointTo(Centerline);
+			}
+		}
+		if (BestScore <= 1.0 + UE_DOUBLE_SMALL_NUMBER)
+		{
+			Candidates.Add({SourceId, BestContact, BestScore, bRoot});
+		}
+	};
+	if (RootCombustionState.IsValid()
+		&& RootCombustionState.SourceMask.SolidMask.Contains(1)
+		&& !IsRootCombusting())
+	{
+		AddCandidate(
+			RootCombustionState.SourceId,
+			RootCombustionState.SourceMask,
+			GetActorTransform(),
+			true);
+	}
+	for (const FFragmentAggregateSourceState& Source : AggregateSources)
+	{
+		if (Source.IsValid()
+			&& Source.SourceMask.SolidMask.Contains(1)
+			&& !IsAggregateSourceCombusting(Source.SourceId))
+		{
+			AddCandidate(
+				Source.SourceId,
+				Source.SourceMask,
+				Source.LocalTransform * GetActorTransform(),
+				false);
+		}
+	}
+	Candidates.Sort([](const FConeCandidate& A, const FConeCandidate& B)
+	{
+		if (!FMath::IsNearlyEqual(A.Score, B.Score))
+		{
+			return A.Score < B.Score;
+		}
+		if (A.bRoot != B.bRoot)
+		{
+			return A.bRoot;
+		}
+		return A.SourceId.ToString(EGuidFormats::Digits)
+			< B.SourceId.ToString(EGuidFormats::Digits);
+	});
+	if (Candidates.IsEmpty())
+	{
+		return false;
+	}
+	const FConeCandidate& Best = Candidates[0];
+	if (Best.bRoot)
+	{
+		return IgniteRootAtWorldLocation(
+			Best.Contact,
+			FlameMaterial,
+			EventSeed);
+	}
+	if (const FFragmentAggregateSourceState* DetachedLayer =
+		AggregateSources.FindByPredicate(
+			[&Best](const FFragmentAggregateSourceState& Source)
+			{
+				return Source.SourceId == Best.SourceId;
+			});
+		DetachedLayer && !DetachedLayer->bOwnsLogicalSource)
+	{
+		return IgniteDetachedAggregateAtWorldLocation(
+			DetachedLayer->SourceId,
+			Best.Contact,
+			FlameMaterial,
+			EventSeed);
+	}
+	if (AMatterFluxPlayableWorldActor* OwnerWorld =
+		Cast<AMatterFluxPlayableWorldActor>(GetOwner()))
+	{
+		return OwnerWorld->IgniteDynamicAggregateSource(
+			*this,
+			Best.SourceId,
+			Best.Contact,
+			FlameMaterial,
+			EventSeed);
+	}
+	if (UWorld* World = GetWorld())
+	{
+		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
+		{
+			if (It->IgniteDynamicAggregateSource(
+				*this,
+				Best.SourceId,
+				Best.Contact,
+				FlameMaterial,
+				EventSeed))
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 bool AFragment2DActor::ApplyAggregateSourceStreamingState(
 	const FGuid& SourceId,
 	const FFragment2DSourceStreamingState& State,
 	const FName InResidueMaterialId,
 	const FLinearColor& InResidueColor)
 {
-	if ((GetWorld() && GetWorld()->IsGameWorld() && !HasAuthority())
-		|| !SourceId.IsValid())
+	if (!SourceId.IsValid())
 	{
 		return false;
 	}
@@ -248,7 +890,658 @@ bool AFragment2DActor::ApplyAggregateSourceStreamingState(
 		return false;
 	}
 	ForceNetUpdate();
+	MarkCombustionVisualizationDirty();
 	return true;
+}
+
+bool AFragment2DActor::SynchronizeRootCombustionState()
+{
+	if (!RootCombustionRuntime || !RootCombustionRuntime->IsInitialized())
+	{
+		return false;
+	}
+	MatterFlux::Combustion::FSourceRuntimeSnapshot Snapshot;
+	if (!RootCombustionRuntime->CaptureState(Snapshot))
+	{
+		return false;
+	}
+	RootCombustionState.SourceMask.SolidMask =
+		MoveTemp(Snapshot.CombustionState.FuelMask);
+	RootCombustionState.ResidueMask = RootCombustionState.SourceMask;
+	RootCombustionState.ResidueMask.SolidMask =
+		MoveTemp(Snapshot.CombustionState.ResidueMask);
+	RootCombustionState.BurningMask = RootCombustionState.SourceMask;
+	RootCombustionState.BurningMask.SolidMask =
+		MoveTemp(Snapshot.CombustionState.BurningMask);
+	for (uint8& Value : RootCombustionState.BurningMask.SolidMask)
+	{
+		Value = Value != 0 ? 1 : 0;
+	}
+	RootCombustionState.bHasCombustionState = true;
+	RootCombustionState.CombustionRuleId = Snapshot.CombustionState.RuleId;
+	RootCombustionState.CombustionSeed = Snapshot.CombustionState.Seed;
+	RootCombustionState.CombustionTick = Snapshot.CombustionState.Tick;
+	RootCombustionState.CombustionAccumulator =
+		Snapshot.CombustionAccumulator;
+	RootCombustionState.TotalSmokeEmissionCount =
+		Snapshot.TotalSmokeEmissionCount;
+	if (const FMatterFluxReactionDefinition* Rule =
+		RootCombustionRuntime->GetRule())
+	{
+		RootCombustionState.ResidueMaterialId = Rule->OutputA;
+		const FMatterFluxContentRegistryPtr Registry =
+			IMatterFluxScriptRuntime::IsAvailable()
+				? IMatterFluxScriptRuntime::Get().GetActiveRegistry()
+				: nullptr;
+		if (Registry.IsValid())
+		{
+			if (const FMatterFluxMaterialDefinition* Residue =
+				Registry->Materials.Find(Rule->OutputA))
+			{
+				RootCombustionState.ResidueColor = Residue->Color;
+			}
+		}
+	}
+	if (!RootCombustionState.IsValid() || !RebuildMeshFromPayload())
+	{
+		UE_LOG(
+			LogMatterFlux,
+			Error,
+			TEXT("Detached fragment rejected its combustion mesh update"));
+		return false;
+	}
+	ForceNetUpdate();
+	MarkCombustionVisualizationDirty();
+	return true;
+}
+
+void AFragment2DActor::AdvanceRootCombustion(const float DeltaSeconds)
+{
+	if (!HasAuthority()
+		|| !RootCombustionRuntime
+		|| !RootCombustionRuntime->IsBurning())
+	{
+		return;
+	}
+	const float ClampedDelta = FMath::Clamp(DeltaSeconds, 0.0f, 0.25f);
+	const MatterFlux::Combustion::FSourceAdvanceResult Result =
+		RootCombustionRuntime->AdvanceAuthority(ClampedDelta);
+	if (Result.Steps > 0)
+	{
+		SynchronizeRootCombustionState();
+	}
+
+	RootCombustionPropagationAccumulator += ClampedDelta;
+	if (RootCombustionRuntime->IsBurning()
+		&& RootCombustionPropagationAccumulator >= 0.2f)
+	{
+		RootCombustionPropagationAccumulator = FMath::Fmod(
+			RootCombustionPropagationAccumulator,
+			0.2f);
+		const FMatterFluxReactionDefinition* Rule =
+			RootCombustionRuntime->GetRule();
+		if (Rule)
+		{
+			const int32 Seed = RootCombustionState.CombustionSeed
+				^ static_cast<int32>(RootCombustionState.CombustionTick)
+				^ static_cast<int32>(GetTypeHash(SpawnPayload.FragmentId));
+			PropagateCombustionToAdjacentLayer(
+				RootCombustionState,
+				GetActorTransform(),
+				Rule->InputB,
+				Seed);
+		}
+	}
+	if (!RootCombustionRuntime->IsBurning())
+	{
+		RootCombustionRuntime.Reset();
+		SetActorTickEnabled(SpawnPayload.FadeOutDuration > 0.0f);
+	}
+}
+
+bool AFragment2DActor::IgniteDetachedAggregateAtWorldLocation(
+	const FGuid& SourceId,
+	const FVector& WorldLocation,
+	const FName FlameMaterial,
+	const int32 EventSeed)
+{
+	FFragmentAggregateSourceState* Source = AggregateSources.FindByPredicate(
+		[&SourceId](const FFragmentAggregateSourceState& Candidate)
+		{
+			return Candidate.SourceId == SourceId;
+		});
+	if (!HasAuthority()
+		|| WorldLocation.ContainsNaN()
+		|| FlameMaterial.IsNone()
+		|| !Source
+		|| Source->bOwnsLogicalSource
+		|| !Source->IsValid()
+		|| IsAggregateSourceCombusting(SourceId))
+	{
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry =
+		IMatterFluxScriptRuntime::IsAvailable()
+			? IMatterFluxScriptRuntime::Get().GetActiveRegistry()
+			: nullptr;
+	if (!Registry.IsValid())
+	{
+		return false;
+	}
+	const FMatterFluxReactionDefinition* Rule = FindCombustionRule(
+		*Registry,
+		Source->MaterialId,
+		FlameMaterial);
+	if (!Rule)
+	{
+		return false;
+	}
+
+	TUniquePtr<MatterFlux::Combustion::FSourceCombustionRuntime> Runtime =
+		MakeUnique<MatterFlux::Combustion::FSourceCombustionRuntime>();
+	FString Error;
+	if (!Runtime->Initialize(
+		MatterFlux::Combustion::FSourceRuntimeSettings(),
+		Source->SourceMask,
+		*Rule,
+		EventSeed,
+		Error))
+	{
+		UE_LOG(
+			LogMatterFlux,
+			Error,
+			TEXT("Detached aggregate layer combustion initialization failed: %s"),
+			*Error);
+		return false;
+	}
+	const FTransform WorldTransform =
+		Source->LocalTransform * GetActorTransform();
+	const FVector Local = WorldTransform.InverseTransformPosition(
+		WorldLocation);
+	const FIntPoint RequestedCell(
+		FMath::FloorToInt(
+			Local.X / Source->SourceMask.CellSize
+				+ static_cast<double>(Source->SourceMask.Width) * 0.5),
+		FMath::FloorToInt(
+			Local.Z / Source->SourceMask.CellSize
+				+ static_cast<double>(Source->SourceMask.Height) * 0.5));
+	if (!Runtime->IgniteNearest(RequestedCell, FlameMaterial))
+	{
+		return false;
+	}
+	DetachedAggregateCombustionRuntimes.Add(
+		SourceId,
+		MoveTemp(Runtime));
+	if (!SynchronizeDetachedAggregateCombustionState(SourceId))
+	{
+		DetachedAggregateCombustionRuntimes.Remove(SourceId);
+		return false;
+	}
+	DetachedAggregateCombustionPropagationAccumulator = 0.0f;
+	SetActorTickEnabled(true);
+	return true;
+}
+
+bool AFragment2DActor::SynchronizeDetachedAggregateCombustionState(
+	const FGuid& SourceId)
+{
+	TUniquePtr<MatterFlux::Combustion::FSourceCombustionRuntime>* RuntimePtr =
+		DetachedAggregateCombustionRuntimes.Find(SourceId);
+	FFragmentAggregateSourceState* Source = AggregateSources.FindByPredicate(
+		[&SourceId](const FFragmentAggregateSourceState& Candidate)
+		{
+			return Candidate.SourceId == SourceId;
+		});
+	if (!RuntimePtr || !RuntimePtr->Get() || !Source)
+	{
+		return false;
+	}
+	MatterFlux::Combustion::FSourceRuntimeSnapshot Snapshot;
+	if (!(*RuntimePtr)->CaptureState(Snapshot))
+	{
+		return false;
+	}
+	Source->SourceMask.SolidMask = MoveTemp(
+		Snapshot.CombustionState.FuelMask);
+	Source->ResidueMask = Source->SourceMask;
+	Source->ResidueMask.SolidMask = MoveTemp(
+		Snapshot.CombustionState.ResidueMask);
+	Source->BurningMask = Source->SourceMask;
+	Source->BurningMask.SolidMask = MoveTemp(
+		Snapshot.CombustionState.BurningMask);
+	for (uint8& Value : Source->BurningMask.SolidMask)
+	{
+		Value = Value != 0 ? 1 : 0;
+	}
+	Source->bHasCombustionState = true;
+	Source->CombustionRuleId = Snapshot.CombustionState.RuleId;
+	Source->CombustionSeed = Snapshot.CombustionState.Seed;
+	Source->CombustionTick = Snapshot.CombustionState.Tick;
+	Source->CombustionAccumulator = Snapshot.CombustionAccumulator;
+	Source->TotalSmokeEmissionCount = Snapshot.TotalSmokeEmissionCount;
+	if (const FMatterFluxReactionDefinition* Rule =
+		(*RuntimePtr)->GetRule())
+	{
+		Source->ResidueMaterialId = Rule->OutputA;
+		const FMatterFluxContentRegistryPtr Registry =
+			IMatterFluxScriptRuntime::IsAvailable()
+				? IMatterFluxScriptRuntime::Get().GetActiveRegistry()
+				: nullptr;
+		if (Registry.IsValid())
+		{
+			if (const FMatterFluxMaterialDefinition* Residue =
+				Registry->Materials.Find(Rule->OutputA))
+			{
+				Source->ResidueColor = Residue->Color;
+			}
+		}
+	}
+	if (!Source->IsValid() || !RebuildMeshFromPayload())
+	{
+		return false;
+	}
+	ForceNetUpdate();
+	MarkCombustionVisualizationDirty();
+	return true;
+}
+
+void AFragment2DActor::AdvanceDetachedAggregateCombustion(
+	const float DeltaSeconds)
+{
+	if (!HasAuthority() || DetachedAggregateCombustionRuntimes.IsEmpty())
+	{
+		return;
+	}
+	const float ClampedDelta = FMath::Clamp(DeltaSeconds, 0.0f, 0.25f);
+	TArray<FGuid> Completed;
+	TArray<FGuid> BurningIds;
+	DetachedAggregateCombustionRuntimes.GetKeys(BurningIds);
+	BurningIds.Sort([](const FGuid& A, const FGuid& B)
+	{
+		return A.ToString(EGuidFormats::Digits)
+			< B.ToString(EGuidFormats::Digits);
+	});
+	for (const FGuid& SourceId : BurningIds)
+	{
+		TUniquePtr<MatterFlux::Combustion::FSourceCombustionRuntime>* Runtime =
+			DetachedAggregateCombustionRuntimes.Find(SourceId);
+		if (!Runtime || !Runtime->Get())
+		{
+			Completed.Add(SourceId);
+			continue;
+		}
+		const MatterFlux::Combustion::FSourceAdvanceResult Result =
+			(*Runtime)->AdvanceAuthority(ClampedDelta);
+		if (Result.Steps > 0)
+		{
+			SynchronizeDetachedAggregateCombustionState(SourceId);
+		}
+		if (!(*Runtime)->IsBurning())
+		{
+			Completed.Add(SourceId);
+		}
+	}
+	for (const FGuid& SourceId : Completed)
+	{
+		DetachedAggregateCombustionRuntimes.Remove(SourceId);
+	}
+
+	DetachedAggregateCombustionPropagationAccumulator += ClampedDelta;
+	if (!DetachedAggregateCombustionRuntimes.IsEmpty()
+		&& DetachedAggregateCombustionPropagationAccumulator >= 0.2f)
+	{
+		DetachedAggregateCombustionPropagationAccumulator = FMath::Fmod(
+			DetachedAggregateCombustionPropagationAccumulator,
+			0.2f);
+		for (const FGuid& SourceId : BurningIds)
+		{
+			const TUniquePtr<
+				MatterFlux::Combustion::FSourceCombustionRuntime>* Runtime =
+				DetachedAggregateCombustionRuntimes.Find(SourceId);
+			const FFragmentAggregateSourceState* Source =
+				AggregateSources.FindByPredicate(
+					[&SourceId](const FFragmentAggregateSourceState& Candidate)
+					{
+						return Candidate.SourceId == SourceId;
+					});
+			if (!Runtime || !Runtime->Get() || !Source)
+			{
+				continue;
+			}
+			const FMatterFluxReactionDefinition* Rule = (*Runtime)->GetRule();
+			if (Rule)
+			{
+				PropagateCombustionToAdjacentLayer(
+					*Source,
+					Source->LocalTransform * GetActorTransform(),
+					Rule->InputB,
+					Source->CombustionSeed
+						^ static_cast<int32>(Source->CombustionTick));
+				break;
+			}
+		}
+	}
+}
+
+bool AFragment2DActor::PropagateCombustionToAdjacentLayer(
+	const FFragmentAggregateSourceState& BurningSource,
+	const FTransform& BurningWorldTransform,
+	const FName FlameMaterial,
+	const int32 EventSeed)
+{
+	if (!HasAuthority()
+		|| !BurningSource.IsValid()
+		|| !BurningSource.bHasCombustionState
+		|| FlameMaterial.IsNone()
+		|| !BurningWorldTransform.IsValid())
+	{
+		return false;
+	}
+	TArray<FVector, TInlineAllocator<64>> BurningCellCenters;
+	for (int32 Index = 0;
+		Index < BurningSource.BurningMask.SolidMask.Num();
+		++Index)
+	{
+		if (BurningSource.BurningMask.SolidMask[Index] == 0)
+		{
+			continue;
+		}
+		const int32 X = Index % BurningSource.SourceMask.Width;
+		const int32 Y = Index / BurningSource.SourceMask.Width;
+		BurningCellCenters.Add(BurningWorldTransform.TransformPosition(FVector(
+			(static_cast<float>(X) + 0.5f
+				- BurningSource.SourceMask.Width * 0.5f)
+				* BurningSource.SourceMask.CellSize,
+			0.0f,
+			(static_cast<float>(Y) + 0.5f
+				- BurningSource.SourceMask.Height * 0.5f)
+				* BurningSource.SourceMask.CellSize)));
+	}
+	if (BurningCellCenters.IsEmpty())
+	{
+		return false;
+	}
+
+	struct FAdjacentLayerContact
+	{
+		const FFragmentAggregateSourceState* Source = nullptr;
+		FTransform WorldTransform = FTransform::Identity;
+		FVector WorldLocation = FVector::ZeroVector;
+		double DistanceSquared = TNumericLimits<double>::Max();
+		int32 CellIndex = INDEX_NONE;
+		bool bRoot = false;
+	};
+	FAdjacentLayerContact Best;
+	const auto ConsiderLayer = [
+		&Best,
+		&BurningCellCenters,
+		&BurningSource](
+			const FFragmentAggregateSourceState& Candidate,
+			const FTransform& CandidateWorldTransform,
+			const bool bRoot)
+	{
+		if (Candidate.SourceId == BurningSource.SourceId
+			|| !Candidate.IsValid()
+			|| Candidate.bHasCombustionState
+				&& Candidate.BurningMask.SolidMask.Contains(1))
+		{
+			return;
+		}
+		const double MaximumDistanceSquared = FMath::Square(
+			FMath::Max(
+				BurningSource.SourceMask.CellSize,
+				Candidate.SourceMask.CellSize) * 1.05);
+		for (int32 Index = 0;
+			Index < Candidate.SourceMask.SolidMask.Num();
+			++Index)
+		{
+			if (Candidate.SourceMask.SolidMask[Index] == 0)
+			{
+				continue;
+			}
+			const int32 X = Index % Candidate.SourceMask.Width;
+			const int32 Y = Index / Candidate.SourceMask.Width;
+			const FVector CandidateCenter =
+				CandidateWorldTransform.TransformPosition(FVector(
+					(static_cast<float>(X) + 0.5f
+						- Candidate.SourceMask.Width * 0.5f)
+						* Candidate.SourceMask.CellSize,
+					0.0f,
+					(static_cast<float>(Y) + 0.5f
+						- Candidate.SourceMask.Height * 0.5f)
+						* Candidate.SourceMask.CellSize));
+			for (const FVector& BurningCenter : BurningCellCenters)
+			{
+				const double DistanceSquared = FVector::DistSquared(
+					BurningCenter,
+					CandidateCenter);
+				if (DistanceSquared > MaximumDistanceSquared)
+				{
+					continue;
+				}
+				const bool bStableTieBreak = FMath::IsNearlyEqual(
+					DistanceSquared,
+					Best.DistanceSquared)
+					&& (!Best.Source
+						|| Candidate.SourceId.ToString(EGuidFormats::Digits)
+							< Best.Source->SourceId.ToString(EGuidFormats::Digits)
+						|| (Candidate.SourceId == Best.Source->SourceId
+							&& Index < Best.CellIndex));
+				if (!Best.Source
+					|| DistanceSquared < Best.DistanceSquared
+					|| bStableTieBreak)
+				{
+					Best.Source = &Candidate;
+					Best.WorldTransform = CandidateWorldTransform;
+					Best.WorldLocation = CandidateCenter;
+					Best.DistanceSquared = DistanceSquared;
+					Best.CellIndex = Index;
+					Best.bRoot = bRoot;
+				}
+			}
+		}
+	};
+	if (RootCombustionState.IsValid())
+	{
+		ConsiderLayer(
+			RootCombustionState,
+			GetActorTransform(),
+			true);
+	}
+	for (const FFragmentAggregateSourceState& Candidate : AggregateSources)
+	{
+		ConsiderLayer(
+			Candidate,
+			Candidate.LocalTransform * GetActorTransform(),
+			false);
+	}
+	if (!Best.Source)
+	{
+		return false;
+	}
+	if (Best.bRoot)
+	{
+		return IgniteRootAtWorldLocation(
+			Best.WorldLocation,
+			FlameMaterial,
+			EventSeed);
+	}
+	if (!Best.Source->bOwnsLogicalSource)
+	{
+		return IgniteDetachedAggregateAtWorldLocation(
+			Best.Source->SourceId,
+			Best.WorldLocation,
+			FlameMaterial,
+			EventSeed);
+	}
+	if (AMatterFluxPlayableWorldActor* WorldOwner =
+		Cast<AMatterFluxPlayableWorldActor>(GetOwner()))
+	{
+		return WorldOwner->IgniteDynamicAggregateSource(
+			*this,
+			Best.Source->SourceId,
+			Best.WorldLocation,
+			FlameMaterial,
+			EventSeed);
+	}
+	if (UWorld* World = GetWorld())
+	{
+		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
+		{
+			if (It->IgniteDynamicAggregateSource(
+				*this,
+				Best.Source->SourceId,
+				Best.WorldLocation,
+				FlameMaterial,
+				EventSeed))
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+void AFragment2DActor::GatherRootCombustionVisualTransforms(
+	TArray<FTransform>& OutFlameTransforms,
+	TArray<MatterFlux::Rendering::FSmokeEmissionAnchor>& OutSmokeAnchors,
+	const int32 MaxVisualInstances) const
+{
+	if (MaxVisualInstances <= 0)
+	{
+		return;
+	}
+	const FMatterFluxContentRegistryPtr Registry =
+		IMatterFluxScriptRuntime::IsAvailable()
+			? IMatterFluxScriptRuntime::Get().GetActiveRegistry()
+			: nullptr;
+	const auto AppendState = [
+		this,
+		&OutFlameTransforms,
+		&OutSmokeAnchors,
+		&Registry,
+		MaxVisualInstances](
+			const FFragmentAggregateSourceState& State,
+			const FTransform& VisualTransform)
+	{
+		if (!State.IsValid()
+			|| !State.bHasCombustionState
+			|| !State.BurningMask.SolidMask.Contains(1))
+		{
+			return;
+		}
+		TArray<uint8> Occupied = State.SourceMask.SolidMask;
+		if (State.ResidueMask.SolidMask.Num() == Occupied.Num())
+		{
+			for (int32 Index = 0; Index < Occupied.Num(); ++Index)
+			{
+				Occupied[Index] = Occupied[Index] != 0
+					|| State.ResidueMask.SolidMask[Index] != 0;
+			}
+		}
+		TArray<int32> VisibleBurningCells;
+		for (int32 Index = 0;
+			Index < State.BurningMask.SolidMask.Num();
+			++Index)
+		{
+			if (State.BurningMask.SolidMask[Index] != 0)
+			{
+				VisibleBurningCells.Add(Index);
+			}
+		}
+		TArray<int32> SmokeSourceCells;
+		MatterFlux::FragmentGeometry::GatherTopExposedBurningMaskCells(
+			Occupied,
+			State.BurningMask.SolidMask,
+			State.SourceMask.Width,
+			State.SourceMask.Height,
+			SmokeSourceCells);
+		TSet<int32> SmokeSourceCellSet;
+		for (const int32 SmokeSourceCell : SmokeSourceCells)
+		{
+			SmokeSourceCellSet.Add(SmokeSourceCell);
+		}
+		const FFragmentSourceMask& Mask = State.SourceMask;
+		for (const int32 Index : VisibleBurningCells)
+		{
+			if (OutFlameTransforms.Num() >= MaxVisualInstances)
+			{
+				break;
+			}
+			const int32 X = Index % Mask.Width;
+			const int32 Y = Index / Mask.Width;
+			const FVector LocalPosition(
+				(static_cast<float>(X) + 0.5f
+					- static_cast<float>(Mask.Width) * 0.5f)
+					* Mask.CellSize,
+				VisualDepthOffset,
+				(static_cast<float>(Y) + 0.62f
+					- static_cast<float>(Mask.Height) * 0.5f)
+					* Mask.CellSize);
+			const FVector Position = VisualTransform.TransformPosition(
+				LocalPosition);
+			const float BaseScale = Mask.CellSize / 100.0f;
+			const FVector FlameScale(
+				BaseScale * 1.06f,
+				BaseScale * 1.06f,
+				BaseScale * 1.18f);
+			OutFlameTransforms.Emplace(
+				VisualTransform.Rotator(),
+				Position,
+				FlameScale);
+			if (SmokeSourceCellSet.Contains(Index)
+				&& OutSmokeAnchors.Num() < MaxVisualInstances)
+			{
+				float SmokeProbability = 0.7f;
+				if (Registry.IsValid())
+				{
+					if (const FMatterFluxReactionDefinition* Rule =
+						Registry->Reactions.Find(State.CombustionRuleId))
+					{
+						SmokeProbability = FMath::Clamp(
+							static_cast<float>(Rule->EmissionChancePermille)
+								/ 1000.0f,
+							0.0f,
+							1.0f);
+					}
+				}
+				MatterFlux::Rendering::FSmokeEmissionAnchor& Anchor =
+					OutSmokeAnchors.AddDefaulted_GetRef();
+				Anchor.WorldPosition = Position + FVector(
+					0.0f,
+					0.0f,
+					Mask.CellSize * 1.05f);
+				Anchor.CellSize = Mask.CellSize;
+				Anchor.EmissionProbability = SmokeProbability;
+				Anchor.Seed = GetTypeHash(State.SourceId)
+					^ static_cast<uint32>(Index) * 0x9e3779b9u;
+			}
+		}
+	};
+	if (IsRootCombusting())
+	{
+		AppendState(RootCombustionState, GetActorTransform());
+	}
+	for (const FFragmentAggregateSourceState& Source : AggregateSources)
+	{
+		if (!Source.bOwnsLogicalSource)
+		{
+			AppendState(
+				Source,
+				Source.LocalTransform * GetActorTransform());
+		}
+	}
+}
+
+void AFragment2DActor::MarkCombustionVisualizationDirty() const
+{
+	if (UWorld* World = GetWorld())
+	{
+		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
+		{
+			It->MarkSourceCombustionVisualizationDirty();
+		}
+	}
 }
 
 bool AFragment2DActor::RebuildAggregateVisualSectionsOnly()
@@ -256,6 +1549,12 @@ bool AFragment2DActor::RebuildAggregateVisualSectionsOnly()
 	if (!MeshComponent)
 	{
 		return false;
+	}
+	// 体素根碎片与枝叶必须共用一套占用。这里只清 aggregate section
+	// 会保留旧的独立树干网格，再次造成木材穿叶，因此统一重建。
+	if (SpawnPayload.DetachedVoxelMask.IsValid())
+	{
+		return RebuildMeshFromPayload();
 	}
 	const int32 PreviousSectionCount = MeshComponent->GetNumSections();
 	for (int32 SectionIndex = 2;
@@ -309,6 +1608,8 @@ bool AFragment2DActor::AbsorbAggregateSource(
 
 	FFragmentAggregateSourceState Candidate;
 	Candidate.SourceId = SourceActor.SourceId;
+	Candidate.DefinitionSourceId = SourceActor.SourceId;
+	Candidate.bOwnsLogicalSource = true;
 	Candidate.Revision = SourceActor.Revision;
 	Candidate.SourceMask = SourceActor.ProceduralSource;
 	Candidate.SourceMask.SolidMask = StreamingState.GetRuntimeMask();
@@ -353,18 +1654,63 @@ bool AFragment2DActor::AbsorbAggregateSource(
 				: nullptr;
 		if (Registry.IsValid())
 		{
-			if (const FMatterFluxCombustionDefinition* Rule =
-				Registry->Combustions.Find(Candidate.CombustionRuleId))
+			if (const FMatterFluxReactionDefinition* Rule =
+				Registry->Reactions.Find(Candidate.CombustionRuleId))
 			{
-				Candidate.ResidueMaterialId = Rule->ResidueMaterial;
+				Candidate.ResidueMaterialId = Rule->OutputA;
 				if (const FMatterFluxMaterialDefinition* Material =
-					Registry->Materials.Find(Rule->ResidueMaterial))
+					Registry->Materials.Find(Rule->OutputA))
 				{
 					Candidate.ResidueColor = Material->Color;
 				}
 			}
 		}
 	}
+	return AddAggregateSourceState(MoveTemp(Candidate), &SourceActor);
+}
+
+bool AFragment2DActor::AbsorbAggregateSourceFragment(
+	const AFragment2DSourceActor& SourceActor,
+	const FFragmentSpawnPayload& Payload)
+{
+	if ((GetWorld() && GetWorld()->IsGameWorld() && !HasAuthority())
+		|| SourceActor.GetWorld() != GetWorld()
+		|| !Payload.FragmentId.IsValid()
+		|| !Payload.DetachedVoxelMask.IsValid()
+		|| Payload.MaterialId.IsNone()
+		|| ContainsAggregateSource(Payload.FragmentId)
+		|| AggregateSources.Num() >= 16)
+	{
+		return false;
+	}
+
+	FFragmentAggregateSourceState Candidate;
+	Candidate.SourceId = Payload.FragmentId;
+	Candidate.DefinitionSourceId = SourceActor.SourceId;
+	Candidate.bOwnsLogicalSource = false;
+	Candidate.Revision = Payload.Revision;
+	Candidate.SourceMask = Payload.DetachedVoxelMask;
+	Candidate.LocalTransform = Payload.InitialTransform
+		.GetRelativeTransform(GetActorTransform());
+	Candidate.Material = SourceActor.FragmentMaterial;
+	Candidate.MaterialId = Payload.MaterialId;
+	Candidate.Color = SourceActor.FragmentColor;
+	Candidate.bEnableCollision = Payload.bEnableCollision;
+	Candidate.ResidueMask = Candidate.SourceMask;
+	Candidate.ResidueMask.SolidMask.Init(
+		0,
+		Candidate.SourceMask.SolidMask.Num());
+	Candidate.BurningMask = Candidate.SourceMask;
+	Candidate.BurningMask.SolidMask.Init(
+		0,
+		Candidate.SourceMask.SolidMask.Num());
+	return AddAggregateSourceState(MoveTemp(Candidate), nullptr);
+}
+
+bool AFragment2DActor::AddAggregateSourceState(
+	FFragmentAggregateSourceState&& Candidate,
+	AFragment2DSourceActor* RetiredSource)
+{
 	if (!Candidate.IsValid())
 	{
 		UE_LOG(
@@ -395,48 +1741,55 @@ bool AFragment2DActor::AbsorbAggregateSource(
 		: SpawnPayload.InitialAngularVelocity;
 	const float PreviousMass = FMath::Max(SpawnPayload.Mass, 0.5f);
 
-	AggregateSources.Add(Candidate);
+	const FGuid CandidateId = Candidate.SourceId;
+	const bool bOwnsLogicalSource = Candidate.bOwnsLogicalSource;
+	const int32 AddedSolidCells = CountSetCells(
+		Candidate.SourceMask.SolidMask);
+	AggregateSources.Add(MoveTemp(Candidate));
+	RefreshBuoyancyDensity();
 	if (!RebuildMeshFromPayload())
 	{
 		UE_LOG(
 			LogMatterFlux,
 			Error,
 			TEXT("Aggregate carrier mesh rejected source %s"),
-			*Candidate.SourceId.ToString());
+			*CandidateId.ToString());
 		AggregateSources.Pop(EAllowShrinking::No);
+		RefreshBuoyancyDensity();
 		RebuildMeshFromPayload();
 		return false;
 	}
 
-	if (AMatterFluxPlayableWorldActor* WorldOwner =
-		Cast<AMatterFluxPlayableWorldActor>(SourceActor.GetOwner()))
+	if (RetiredSource)
 	{
-		if (!WorldOwner->RetireFragmentSourceIntoDynamicAggregate(
-			SourceActor,
-			*this))
+		if (AMatterFluxPlayableWorldActor* WorldOwner =
+			Cast<AMatterFluxPlayableWorldActor>(RetiredSource->GetOwner());
+			WorldOwner
+			&& !WorldOwner->RetireFragmentSourceIntoDynamicAggregate(
+				*RetiredSource,
+				*this))
 		{
 			UE_LOG(
 				LogMatterFlux,
 				Error,
 				TEXT("Playable world rejected aggregate source handoff %s"),
-				*Candidate.SourceId.ToString());
+				*CandidateId.ToString());
 			AggregateSources.Pop(EAllowShrinking::No);
+			RefreshBuoyancyDensity();
 			RebuildMeshFromPayload();
 			return false;
 		}
 	}
 
-	int32 AddedSolidCells = 0;
-	for (const uint8 Cell : Candidate.SourceMask.SolidMask)
-	{
-		AddedSolidCells += Cell != 0 ? 1 : 0;
-	}
 	SpawnPayload.Mass = FMath::Clamp(
 		PreviousMass + static_cast<float>(AddedSolidCells) * 0.05f,
 		0.5f,
 		800.0f);
-	const FVector PreservedMomentumVelocity =
-		PreservedLinearVelocity * PreviousMass / SpawnPayload.Mass;
+	// Aggregate members were already parts of the same static object before the
+	// handoff. Absorbing their render/collision layers must not repeatedly divide
+	// the felling velocity by the growing mass, otherwise a full tree loses almost
+	// all sideways motion before the first physics frame and restacks upright.
+	const FVector PreservedMomentumVelocity = PreservedLinearVelocity;
 	SpawnPayload.InitialLinearVelocity = PreservedMomentumVelocity;
 	SpawnPayload.InitialAngularVelocity = PreservedAngularVelocity;
 	if (HasAuthority()
@@ -466,15 +1819,118 @@ bool AFragment2DActor::AbsorbAggregateSource(
 			false);
 	}
 
-	SourceActor.Destroy();
+	if (RetiredSource)
+	{
+		RetiredSource->Destroy();
+	}
 	ForceNetUpdate();
-	NotifyWorldOfAggregateSources();
+	if (bOwnsLogicalSource)
+	{
+		NotifyWorldOfAggregateSources();
+	}
 	return true;
+}
+
+void AFragment2DActor::RefreshBuoyancyDensity()
+{
+	if (!BuoyancyComponent || !IMatterFluxScriptRuntime::IsAvailable())
+	{
+		return;
+	}
+	const FMatterFluxContentRegistryPtr Registry =
+		IMatterFluxScriptRuntime::Get().GetActiveRegistry();
+	if (!Registry.IsValid())
+	{
+		return;
+	}
+
+	double WeightedDensity = 0.0;
+	double TotalWeight = 0.0;
+	const auto AddMaterial = [&Registry, &WeightedDensity, &TotalWeight](
+		const FName MaterialId,
+		const double Volume)
+	{
+		const FMatterFluxMaterialDefinition* Material =
+			Registry->Materials.Find(MaterialId);
+		if (!Material
+			|| !FMath::IsFinite(Material->Density)
+			|| Material->Density <= 0.0f
+			|| !FMath::IsFinite(Volume)
+			|| Volume <= UE_SMALL_NUMBER)
+		{
+			return;
+		}
+		WeightedDensity += static_cast<double>(Material->Density) * Volume;
+		TotalWeight += Volume;
+	};
+	const auto MaskVolume = [](const FFragmentSourceMask& Mask)
+	{
+		if (!Mask.HasValidLayout())
+		{
+			return 0.0;
+		}
+		const double CellSize = static_cast<double>(Mask.CellSize);
+		return static_cast<double>(CountSetCells(Mask.SolidMask))
+			* CellSize * CellSize * CellSize;
+	};
+	const auto PayloadVolume = [&MaskVolume](
+		const FFragmentSpawnPayload& Payload)
+	{
+		const double VoxelVolume = MaskVolume(Payload.DetachedVoxelMask);
+		if (VoxelVolume > UE_SMALL_NUMBER)
+		{
+			return VoxelVolume;
+		}
+		double FaceArea = 0.0;
+		for (int32 Index = 0;
+			Index + 2 < Payload.TriangleIndices.Num();
+			Index += 3)
+		{
+			const int32 A = Payload.TriangleIndices[Index];
+			const int32 B = Payload.TriangleIndices[Index + 1];
+			const int32 C = Payload.TriangleIndices[Index + 2];
+			if (!Payload.Vertices2D.IsValidIndex(A)
+				|| !Payload.Vertices2D.IsValidIndex(B)
+				|| !Payload.Vertices2D.IsValidIndex(C))
+			{
+				continue;
+			}
+			const FVector2D AB =
+				Payload.Vertices2D[B] - Payload.Vertices2D[A];
+			const FVector2D AC =
+				Payload.Vertices2D[C] - Payload.Vertices2D[A];
+			FaceArea += FMath::Abs(
+				static_cast<double>(AB.X) * AC.Y
+					- static_cast<double>(AB.Y) * AC.X) * 0.5;
+		}
+		return FaceArea * FMath::Max(
+			static_cast<double>(Payload.Thickness), 0.0);
+	};
+	AddMaterial(
+		SpawnPayload.MaterialId,
+		PayloadVolume(SpawnPayload));
+	for (const FFragmentAggregateSourceState& Source : AggregateSources)
+	{
+		AddMaterial(
+			Source.MaterialId,
+			MaskVolume(Source.SourceMask));
+	}
+	if (TotalWeight > UE_SMALL_NUMBER)
+	{
+		BuoyancyComponent->SetBodyDensity(
+			static_cast<float>(WeightedDensity / TotalWeight));
+	}
 }
 
 void AFragment2DActor::ApplyFragmentMaterial()
 {
-	if (!FragmentMaterial)
+	UMaterialInterface* ParentMaterial = SpawnPayload.FadeOutDuration > 0.0f
+		&& TransientFadeMaterial
+		? TransientFadeMaterial.Get()
+		: FragmentMaterial.Get();
+	ParentMaterial = MatterFlux::Rendering::ResolveDynamicMaterialParent(
+		ParentMaterial);
+	if (!ParentMaterial)
 	{
 		DynamicFragmentMaterial = nullptr;
 		DynamicFragmentSideMaterial = nullptr;
@@ -483,47 +1939,82 @@ void AFragment2DActor::ApplyFragmentMaterial()
 		return;
 	}
 
-	const auto ConfigureVoxelMaterial =
-		[](UMaterialInstanceDynamic* Material)
-		{
-			if (!Material)
-			{
-				return;
-			}
-			Material->SetScalarParameterValue(TEXT("FaceContrast"), 0.88f);
-			Material->SetScalarParameterValue(TEXT("ColorVariation"), 0.035f);
-			Material->SetScalarParameterValue(TEXT("PixelSize"), 12.0f);
-			Material->SetScalarParameterValue(TEXT("Roughness"), 0.86f);
-			Material->SetScalarParameterValue(TEXT("ShadowLift"), 0.18f);
-		};
+	const float CellSize = SpawnPayload.DetachedVoxelMask.CellSize > 0.0f
+		? SpawnPayload.DetachedVoxelMask.CellSize
+		: 12.0f;
 
-	if (FragmentColor.Equals(FLinearColor::White))
+	DynamicFragmentMaterial =
+		UMaterialInstanceDynamic::Create(ParentMaterial, this);
+	MatterFlux::Rendering::ApplyVoxelMaterialProjection(
+		*DynamicFragmentMaterial,
+		MatterFlux::Rendering::ResolveVoxelMaterialProjection(
+			FragmentColor,
+			SpawnPayload.MaterialId,
+			CellSize,
+			MatterFlux::Rendering::EVoxelMaterialFaceRole::Primary),
+		TransientFadeAlpha);
+	MeshComponent->SetMaterial(0, DynamicFragmentMaterial);
+	DynamicFragmentSideMaterial =
+		UMaterialInstanceDynamic::Create(ParentMaterial, this);
+	MatterFlux::Rendering::ApplyVoxelMaterialProjection(
+		*DynamicFragmentSideMaterial,
+		MatterFlux::Rendering::ResolveVoxelMaterialProjection(
+			FragmentColor,
+			SpawnPayload.MaterialId,
+			CellSize,
+			MatterFlux::Rendering::EVoxelMaterialFaceRole::Side),
+		TransientFadeAlpha);
+	MeshComponent->SetMaterial(1, DynamicFragmentSideMaterial);
+}
+
+void AFragment2DActor::ConfigureTransientFade()
+{
+	if (!FMath::IsFinite(SpawnPayload.FadeOutDuration)
+		|| SpawnPayload.FadeOutDuration <= 0.0f)
 	{
-		DynamicFragmentMaterial = nullptr;
-		MeshComponent->SetMaterial(0, FragmentMaterial);
+		TransientFadeElapsed = 0.0f;
+		TransientFadeAlpha = 1.0f;
+		SetActorTickEnabled(IsRootCombusting());
+		return;
 	}
-	else
+
+	TransientFadeElapsed = 0.0f;
+	TransientFadeAlpha = 1.0f;
+	MeshComponent->SetSimulatePhysics(false);
+	MeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	SetActorTickEnabled(true);
+	SetLifeSpan(SpawnPayload.FadeOutDuration + 0.1f);
+	ApplyTransientFadeAlpha();
+}
+
+void AFragment2DActor::ApplyTransientFadeAlpha()
+{
+	if (DynamicFragmentMaterial)
 	{
-		DynamicFragmentMaterial =
-			UMaterialInstanceDynamic::Create(FragmentMaterial, this);
 		DynamicFragmentMaterial->SetVectorParameterValue(
 			TEXT("Color"),
-			FragmentColor);
-		ConfigureVoxelMaterial(DynamicFragmentMaterial);
-		MeshComponent->SetMaterial(0, DynamicFragmentMaterial);
+			FLinearColor(
+				FragmentColor.R,
+				FragmentColor.G,
+				FragmentColor.B,
+				TransientFadeAlpha));
+		DynamicFragmentMaterial->SetScalarParameterValue(
+			TEXT("Opacity"),
+			TransientFadeAlpha);
 	}
-	DynamicFragmentSideMaterial =
-		UMaterialInstanceDynamic::Create(FragmentMaterial, this);
-	const FLinearColor SideColor(
-		FragmentColor.R * 0.72f,
-		FragmentColor.G * 0.72f,
-		FragmentColor.B * 0.72f,
-		FragmentColor.A);
-	DynamicFragmentSideMaterial->SetVectorParameterValue(
-		TEXT("Color"),
-		SideColor);
-	ConfigureVoxelMaterial(DynamicFragmentSideMaterial);
-	MeshComponent->SetMaterial(1, DynamicFragmentSideMaterial);
+	if (DynamicFragmentSideMaterial)
+	{
+		DynamicFragmentSideMaterial->SetVectorParameterValue(
+			TEXT("Color"),
+			FLinearColor(
+				FragmentColor.R * 0.72f,
+				FragmentColor.G * 0.72f,
+				FragmentColor.B * 0.72f,
+				TransientFadeAlpha));
+		DynamicFragmentSideMaterial->SetScalarParameterValue(
+			TEXT("Opacity"),
+			TransientFadeAlpha);
+	}
 }
 
 bool AFragment2DActor::RebuildMeshFromPayload()
@@ -544,6 +2035,16 @@ bool AFragment2DActor::RebuildMeshFromPayload()
 			Triangles,
 			Normals,
 			UVs);
+	VisualDepthOffset = bMeshValid
+		? ComputeVisualDepthOffset(SpawnPayload.FragmentId)
+		: 0.0f;
+	if (bMeshValid)
+	{
+		for (FVector& Vertex : Vertices)
+		{
+			Vertex.Y += VisualDepthOffset;
+		}
+	}
 
 	// Authority needs a body immediately so mass and launch velocity are
 	// committed in the same transaction. Simulated client copies receive their
@@ -563,6 +2064,11 @@ bool AFragment2DActor::RebuildMeshFromPayload()
 		return false;
 	}
 
+	const bool bRenderRootAsWholeVoxel =
+		SpawnPayload.DetachedVoxelMask.IsValid()
+		&& SpawnPayload.DetachedVoxelMask.GeometryStyle
+			== EFragmentSourceGeometryStyle::VoxelBlocks
+		&& !SpawnPayload.MaterialId.IsNone();
 	const int32 FaceIndexCount = SpawnPayload.TriangleIndices.Num() * 2;
 	if (FaceIndexCount <= 0 || FaceIndexCount >= Triangles.Num())
 	{
@@ -570,31 +2076,34 @@ bool AFragment2DActor::RebuildMeshFromPayload()
 		MeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 		return false;
 	}
-	TArray<int32> FaceTriangles;
-	FaceTriangles.Append(Triangles.GetData(), FaceIndexCount);
-	TArray<int32> SideTriangles;
-	SideTriangles.Append(
-		Triangles.GetData() + FaceIndexCount,
-		Triangles.Num() - FaceIndexCount);
-	MeshComponent->CreateMeshSection(
-		0,
-		Vertices,
-		FaceTriangles,
-		Normals,
-		UVs,
-		TArray<FColor>(),
-		TArray<FProcMeshTangent>(),
-		false);
-	MeshComponent->CreateMeshSection(
-		1,
-		Vertices,
-		SideTriangles,
-		Normals,
-		UVs,
-		TArray<FColor>(),
-		TArray<FProcMeshTangent>(),
-		false);
-	ApplyFragmentMaterial();
+	if (!bRenderRootAsWholeVoxel)
+	{
+		TArray<int32> FaceTriangles;
+		FaceTriangles.Append(Triangles.GetData(), FaceIndexCount);
+		TArray<int32> SideTriangles;
+		SideTriangles.Append(
+			Triangles.GetData() + FaceIndexCount,
+			Triangles.Num() - FaceIndexCount);
+		MeshComponent->CreateMeshSection(
+			0,
+			Vertices,
+			FaceTriangles,
+			Normals,
+			UVs,
+			TArray<FColor>(),
+			TArray<FProcMeshTangent>(),
+			false);
+		MeshComponent->CreateMeshSection(
+			1,
+			Vertices,
+			SideTriangles,
+			Normals,
+			UVs,
+			TArray<FColor>(),
+			TArray<FProcMeshTangent>(),
+			false);
+		ApplyFragmentMaterial();
+	}
 	if (!RebuildAggregateSourceSections())
 	{
 		MeshComponent->ClearAllMeshSections();
@@ -626,18 +2135,316 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 		FName MaterialId = NAME_None;
 		FLinearColor Color = FLinearColor::White;
 		bool bSide = false;
+		float CellSize = 1.0f;
 		TArray<FVector> Vertices;
 		TArray<int32> Triangles;
 		TArray<FVector> Normals;
 		TArray<FVector2D> UVs;
+		TArray<FColor> VertexColors;
 	};
 
 	TMap<FString, FRenderGroup> Groups;
+	TSet<FGuid> WholeRenderedSourceIds;
+
+	// 第二个真实 Adapter：动态 aggregate 与静态 chunk proxy 调用同一
+	// WholeObject 编译器。Actor 只负责承载 replicated movement 和物理，
+	// 不再逐 source 重新生成一套不同的可视网格。
+	struct FWholeMaterial
+	{
+		FString StableKey;
+		TObjectPtr<UMaterialInterface> Material;
+		FName MaterialId = NAME_None;
+		FLinearColor Color = FLinearColor::White;
+		float CellSize = 1.0f;
+	};
+	TArray<FWholeMaterial> WholeMaterials;
+	const bool bIncludeRootVoxel =
+		SpawnPayload.DetachedVoxelMask.IsValid()
+		&& SpawnPayload.DetachedVoxelMask.GeometryStyle
+			== EFragmentSourceGeometryStyle::VoxelBlocks
+		&& !SpawnPayload.MaterialId.IsNone();
+	const bool bUseRootCombustionState = bIncludeRootVoxel
+		&& RootCombustionState.SourceId == SpawnPayload.FragmentId
+		&& RootCombustionState.IsValid();
+	const FFragmentSourceMask& RootRenderMask = bUseRootCombustionState
+		? RootCombustionState.SourceMask
+		: SpawnPayload.DetachedVoxelMask;
+	if (bIncludeRootVoxel)
+	{
+		if (RootRenderMask.SolidMask.Contains(1))
+		{
+			WholeMaterials.Add({
+				FString::Printf(
+					TEXT("%s|%08x|%08x"),
+					*SpawnPayload.MaterialId.ToString(),
+					FragmentColor.ToFColor(false).DWColor(),
+					GetTypeHash(RootRenderMask.CellSize)),
+				FragmentMaterial,
+				SpawnPayload.MaterialId,
+				FragmentColor,
+				RootRenderMask.CellSize});
+		}
+		if (bUseRootCombustionState
+			&& RootCombustionState.bHasCombustionState
+			&& RootCombustionState.ResidueMask.SolidMask.Contains(1))
+		{
+			const FName ResidueMaterialId =
+				RootCombustionState.ResidueMaterialId.IsNone()
+					? FName(TEXT("residue"))
+					: RootCombustionState.ResidueMaterialId;
+			WholeMaterials.Add({
+				FString::Printf(
+					TEXT("%s|%08x|%08x"),
+					*ResidueMaterialId.ToString(),
+					RootCombustionState.ResidueColor.ToFColor(false).DWColor(),
+					GetTypeHash(RootRenderMask.CellSize)),
+				FragmentMaterial,
+				ResidueMaterialId,
+				RootCombustionState.ResidueColor,
+				RootRenderMask.CellSize});
+		}
+	}
+	for (const FFragmentAggregateSourceState& Source : AggregateSources)
+	{
+		if (!Source.IsValid()
+			|| Source.SourceMask.GeometryStyle
+				!= EFragmentSourceGeometryStyle::VoxelBlocks)
+		{
+			continue;
+		}
+		const auto AddMaterial = [&WholeMaterials, &Source](
+			const FName MaterialId,
+			const FLinearColor& Color)
+		{
+			const FString StableKey = FString::Printf(
+				TEXT("%s|%08x|%08x"),
+				*MaterialId.ToString(),
+				Color.ToFColor(false).DWColor(),
+				GetTypeHash(Source.SourceMask.CellSize));
+			if (!WholeMaterials.ContainsByPredicate(
+				[&StableKey](const FWholeMaterial& Existing)
+				{
+					return Existing.StableKey == StableKey;
+				}))
+			{
+				WholeMaterials.Add({
+					StableKey,
+					Source.Material,
+					MaterialId,
+					Color,
+					Source.SourceMask.CellSize});
+			}
+		};
+		if (Source.SourceMask.SolidMask.Contains(1))
+		{
+			AddMaterial(Source.MaterialId, Source.Color);
+		}
+		if (Source.bHasCombustionState
+			&& Source.ResidueMask.SolidMask.Contains(1))
+		{
+			AddMaterial(
+				Source.ResidueMaterialId.IsNone()
+					? FName(TEXT("residue"))
+					: Source.ResidueMaterialId,
+				Source.ResidueColor);
+		}
+	}
+	WholeMaterials.Sort([](const FWholeMaterial& A, const FWholeMaterial& B)
+	{
+		return A.StableKey < B.StableKey;
+	});
+	TArray<MatterFlux::WholeObject::FLayer> WholeLayers;
+	if (bIncludeRootVoxel)
+	{
+		const auto AddRootLayer = [
+			&WholeLayers,
+			&WholeMaterials,
+			&RootRenderMask,
+			this](
+				const TArray<uint8>& Mask,
+				const FName MaterialId,
+				const FLinearColor& Color,
+				const int32 Priority)
+		{
+			if (!Mask.Contains(1))
+			{
+				return;
+			}
+			const FString StableKey = FString::Printf(
+				TEXT("%s|%08x|%08x"),
+				*MaterialId.ToString(),
+				Color.ToFColor(false).DWColor(),
+				GetTypeHash(RootRenderMask.CellSize));
+			const int32 MaterialIndex = WholeMaterials.IndexOfByPredicate(
+				[&StableKey](const FWholeMaterial& Existing)
+				{
+					return Existing.StableKey == StableKey;
+				});
+			if (MaterialIndex == INDEX_NONE)
+			{
+				return;
+			}
+			MatterFlux::WholeObject::FLayer& RootLayer =
+				WholeLayers.AddDefaulted_GetRef();
+			RootLayer.MaterialIndex = MaterialIndex;
+			RootLayer.Priority = Priority;
+			RootLayer.bEnableCollision = SpawnPayload.bEnableCollision;
+			RootLayer.Width = RootRenderMask.Width;
+			RootLayer.Height = RootRenderMask.Height;
+			RootLayer.CellSize = RootRenderMask.CellSize;
+			RootLayer.LocalTransform = FTransform(
+				FQuat::Identity,
+				FVector(0.0f, VisualDepthOffset, 0.0f));
+			RootLayer.SolidMask = Mask;
+		};
+		AddRootLayer(
+			RootRenderMask.SolidMask,
+			SpawnPayload.MaterialId,
+			FragmentColor,
+			SpawnPayload.MaterialId == TEXT("leaf") ? 100 : 10);
+		if (bUseRootCombustionState
+			&& RootCombustionState.bHasCombustionState)
+		{
+			AddRootLayer(
+				RootCombustionState.ResidueMask.SolidMask,
+				RootCombustionState.ResidueMaterialId.IsNone()
+					? FName(TEXT("residue"))
+					: RootCombustionState.ResidueMaterialId,
+				RootCombustionState.ResidueColor,
+				200);
+		}
+	}
+	for (const FFragmentAggregateSourceState& Source : AggregateSources)
+	{
+		if (!Source.IsValid()
+			|| Source.SourceMask.GeometryStyle
+				!= EFragmentSourceGeometryStyle::VoxelBlocks)
+		{
+			continue;
+		}
+		const auto AddLayer = [
+			&WholeLayers,
+			&WholeMaterials,
+			&Source,
+			this](
+				const TArray<uint8>& Mask,
+				const FName MaterialId,
+				const FLinearColor& Color,
+				const int32 Priority)
+		{
+			if (!Mask.Contains(1))
+			{
+				return;
+			}
+			const FString StableKey = FString::Printf(
+				TEXT("%s|%08x|%08x"),
+				*MaterialId.ToString(),
+				Color.ToFColor(false).DWColor(),
+				GetTypeHash(Source.SourceMask.CellSize));
+			const int32 MaterialIndex = WholeMaterials.IndexOfByPredicate(
+				[&StableKey](const FWholeMaterial& Existing)
+				{
+					return Existing.StableKey == StableKey;
+				});
+			if (MaterialIndex == INDEX_NONE)
+			{
+				return;
+			}
+			MatterFlux::WholeObject::FLayer& Layer =
+				WholeLayers.AddDefaulted_GetRef();
+			Layer.MaterialIndex = MaterialIndex;
+			Layer.Priority = Priority;
+			Layer.bEnableCollision = Source.bEnableCollision;
+			Layer.Width = Source.SourceMask.Width;
+			Layer.Height = Source.SourceMask.Height;
+			Layer.CellSize = Source.SourceMask.CellSize;
+			Layer.LocalTransform = Source.LocalTransform;
+			Layer.LocalTransform.AddToTranslation(
+				FVector(0.0f, VisualDepthOffset, 0.0f));
+			Layer.SolidMask = Mask;
+		};
+		AddLayer(
+			Source.SourceMask.SolidMask,
+			Source.MaterialId,
+			Source.Color,
+			Source.MaterialId == TEXT("leaf") ? 100 : 10);
+		if (Source.bHasCombustionState)
+		{
+			AddLayer(
+				Source.ResidueMask.SolidMask,
+				Source.ResidueMaterialId.IsNone()
+					? FName(TEXT("residue"))
+					: Source.ResidueMaterialId,
+				Source.ResidueColor,
+				200);
+		}
+	}
+	WholeLayers.RemoveAll(
+		[](const MatterFlux::WholeObject::FLayer& Layer)
+		{
+			return !Layer.SolidMask.Contains(1);
+		});
+	MatterFlux::WholeObject::FBuildResult WholeMesh;
+	if (!WholeLayers.IsEmpty()
+		&& MatterFlux::WholeObject::BuildMesh(WholeLayers, WholeMesh))
+	{
+		for (const MatterFlux::WholeObject::FMeshSection& Section
+			: WholeMesh.Sections)
+		{
+			if (!WholeMaterials.IsValidIndex(Section.MaterialIndex))
+			{
+				continue;
+			}
+			const FWholeMaterial& WholeMaterial =
+				WholeMaterials[Section.MaterialIndex];
+			// 与静态 proxy 使用完全相同的面角色：顶面不属于侧面。
+			// 否则树刚脱离地形就会再次出现暗色“凹顶”。
+			const bool bSide = Section.FaceRole
+				== MatterFlux::WholeObject::EFaceRole::Side;
+			const FString Key = FString::Printf(
+				TEXT("%s|%s|%08x|%08x|%08x|%08x|%d"),
+				*GetPathNameSafe(WholeMaterial.Material.Get()),
+				*WholeMaterial.MaterialId.ToString(),
+				FPlatformMath::AsUInt(WholeMaterial.Color.R),
+				FPlatformMath::AsUInt(WholeMaterial.Color.G),
+				FPlatformMath::AsUInt(WholeMaterial.Color.B),
+				FPlatformMath::AsUInt(WholeMaterial.Color.A),
+				bSide ? 1 : 0);
+			FRenderGroup& Group = Groups.FindOrAdd(Key);
+			Group.Material = WholeMaterial.Material;
+			Group.MaterialId = WholeMaterial.MaterialId;
+			Group.Color = WholeMaterial.Color;
+			Group.bSide = bSide;
+			Group.CellSize = WholeMaterial.CellSize;
+			const int32 VertexOffset = Group.Vertices.Num();
+			Group.Vertices.Append(Section.Vertices);
+			Group.Normals.Append(Section.Normals);
+			Group.UVs.Append(Section.UVs);
+			Group.VertexColors.Append(Section.VertexColors);
+			for (const int32 TriangleIndex : Section.Triangles)
+			{
+				Group.Triangles.Add(TriangleIndex + VertexOffset);
+			}
+		}
+		for (const FFragmentAggregateSourceState& Source : AggregateSources)
+		{
+			if (Source.SourceMask.GeometryStyle
+				== EFragmentSourceGeometryStyle::VoxelBlocks)
+			{
+				WholeRenderedSourceIds.Add(Source.SourceId);
+			}
+		}
+	}
+
 	for (const FFragmentAggregateSourceState& Source : AggregateSources)
 	{
 		if (!Source.IsValid())
 		{
 			return false;
+		}
+		if (WholeRenderedSourceIds.Contains(Source.SourceId))
+		{
+			continue;
 		}
 		struct FRenderLayer
 		{
@@ -681,20 +2488,38 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 			TArray<int32> SourceTriangles;
 			TArray<FVector> SourceNormals;
 			TArray<FVector2D> SourceUVs;
-			if (!MatterFlux::FragmentGeometry::BuildExtrudedMesh(
-				Geometry.Vertices2D,
-				Geometry.TriangleIndices,
-				Geometry.OuterContours,
-				Geometry.HoleContours,
-				Source.SourceMask.CellSize,
-				SourceVertices,
-				SourceTriangles,
-				SourceNormals,
-				SourceUVs))
+			int32 FaceIndexCount = 0;
+			const bool bBuilt = Source.SourceMask.GeometryStyle
+				== EFragmentSourceGeometryStyle::VoxelBlocks
+				? MatterFlux::FragmentGeometry::BuildVoxelBlockMeshFromMask(
+					*Layer.Mask,
+					Source.SourceMask.Width,
+					Source.SourceMask.Height,
+					Source.SourceMask.CellSize,
+					SourceVertices,
+					SourceTriangles,
+					SourceNormals,
+					SourceUVs,
+					FaceIndexCount)
+				: MatterFlux::FragmentGeometry::BuildExtrudedMesh(
+					Geometry.Vertices2D,
+					Geometry.TriangleIndices,
+					Geometry.OuterContours,
+					Geometry.HoleContours,
+					Source.SourceMask.CellSize,
+					SourceVertices,
+					SourceTriangles,
+					SourceNormals,
+					SourceUVs);
+			if (!bBuilt)
 			{
 				return false;
 			}
-			const int32 FaceIndexCount = Geometry.TriangleIndices.Num() * 2;
+			if (Source.SourceMask.GeometryStyle
+				!= EFragmentSourceGeometryStyle::VoxelBlocks)
+			{
+				FaceIndexCount = Geometry.TriangleIndices.Num() * 2;
+			}
 			if (FaceIndexCount <= 0 || FaceIndexCount >= SourceTriangles.Num())
 			{
 				return false;
@@ -716,14 +2541,26 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 				Group.MaterialId = Layer.MaterialId;
 				Group.Color = Layer.Color;
 				Group.bSide = bSide;
+				Group.CellSize = Source.SourceMask.CellSize;
 				const int32 VertexOffset = Group.Vertices.Num();
 				Group.Vertices.Reserve(VertexOffset + SourceVertices.Num());
 				Group.Normals.Reserve(VertexOffset + SourceNormals.Num());
 				Group.UVs.Append(SourceUVs);
+				Group.VertexColors.AddDefaulted(SourceVertices.Num());
+				for (int32 ColorIndex =
+					Group.VertexColors.Num() - SourceVertices.Num();
+					ColorIndex < Group.VertexColors.Num();
+					++ColorIndex)
+				{
+					Group.VertexColors[ColorIndex] = FColor::White;
+				}
 				for (int32 Index = 0; Index < SourceVertices.Num(); ++Index)
 				{
-					Group.Vertices.Add(Source.LocalTransform.TransformPosition(
-						SourceVertices[Index]));
+					FVector RenderPosition =
+						Source.LocalTransform.TransformPosition(
+							SourceVertices[Index]);
+					RenderPosition.Y += VisualDepthOffset;
+					Group.Vertices.Add(RenderPosition);
 					Group.Normals.Add(Source.LocalTransform.TransformVectorNoScale(
 						SourceNormals[Index]).GetSafeNormal());
 				}
@@ -746,7 +2583,7 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 	Groups.GenerateKeyArray(Keys);
 	Keys.Sort();
 	AggregateDynamicMaterials.Reset();
-	int32 SectionIndex = 2;
+	int32 SectionIndex = bIncludeRootVoxel ? 0 : 2;
 	for (const FString& Key : Keys)
 	{
 		FRenderGroup& Group = Groups.FindChecked(Key);
@@ -756,7 +2593,7 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 			Group.Triangles,
 			Group.Normals,
 			Group.UVs,
-			TArray<FColor>(),
+			Group.VertexColors,
 			TArray<FProcMeshTangent>(),
 			false);
 		UMaterialInterface* Parent = Group.Material
@@ -766,19 +2603,15 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 		{
 			UMaterialInstanceDynamic* Dynamic =
 				UMaterialInstanceDynamic::Create(Parent, this);
-			const float Brightness = Group.bSide ? 0.72f : 1.0f;
-			Dynamic->SetVectorParameterValue(
-				TEXT("Color"),
-				FLinearColor(
-					Group.Color.R * Brightness,
-					Group.Color.G * Brightness,
-					Group.Color.B * Brightness,
-					Group.Color.A));
-			Dynamic->SetScalarParameterValue(TEXT("FaceContrast"), 0.56f);
-			Dynamic->SetScalarParameterValue(TEXT("ColorVariation"), 0.035f);
-			Dynamic->SetScalarParameterValue(TEXT("PixelSize"), 12.0f);
-			Dynamic->SetScalarParameterValue(TEXT("Roughness"), 0.86f);
-			Dynamic->SetScalarParameterValue(TEXT("ShadowLift"), 0.18f);
+			MatterFlux::Rendering::ApplyVoxelMaterialProjection(
+				*Dynamic,
+				MatterFlux::Rendering::ResolveVoxelMaterialProjection(
+					Group.Color,
+					Group.MaterialId,
+					Group.CellSize,
+					Group.bSide
+						? MatterFlux::Rendering::EVoxelMaterialFaceRole::Side
+						: MatterFlux::Rendering::EVoxelMaterialFaceRole::Primary));
 			AggregateDynamicMaterials.Add(Dynamic);
 			MeshComponent->SetMaterial(SectionIndex, Dynamic);
 		}
@@ -798,7 +2631,10 @@ void AFragment2DActor::NotifyWorldOfAggregateSources()
 	{
 		for (const FFragmentAggregateSourceState& Source : AggregateSources)
 		{
-			It->NotifyDynamicAggregateOwnsSource(Source.SourceId, this);
+			if (Source.bOwnsLogicalSource)
+			{
+				It->NotifyDynamicAggregateOwnsSource(Source.SourceId, this);
+			}
 		}
 	}
 }

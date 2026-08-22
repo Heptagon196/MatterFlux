@@ -103,15 +103,15 @@ bool FMatterFluxGroundRuntimeSparseUpdatePerformanceTest::RunTest(
 	Mask.CellSize = MatterFlux::PlayableLevel::TerrainCellSize;
 	Mask.SolidMask.Init(1, Width * Height);
 
-	FMatterFluxCombustionDefinition Rule;
+	FMatterFluxReactionDefinition Rule;
 	Rule.Id = TEXT("ground_sparse_update_performance");
-	Rule.FuelMaterial = TEXT("grassland");
-	Rule.FlameMaterial = TEXT("fire");
-	Rule.SmokeMaterial = TEXT("smoke");
-	Rule.ResidueMaterial = TEXT("ash");
-	Rule.IgnitionChancePermille = 1000;
-	Rule.SpreadChancePermille = 0;
-	Rule.BurnDurationSteps = 255;
+	Rule.InputA = TEXT("grassland");
+	Rule.InputB = TEXT("fire");
+	Rule.EmissionMaterial = TEXT("smoke");
+	Rule.OutputA = TEXT("ash");
+	Rule.ChancePermille = 1000;
+	Rule.PropagationChancePermille = 0;
+	Rule.DurationSteps = 255;
 
 	MatterFlux::Combustion::FGroundRuntimeSettings Settings;
 	Settings.Width = Width;
@@ -132,7 +132,7 @@ bool FMatterFluxGroundRuntimeSparseUpdatePerformanceTest::RunTest(
 	{
 		Ignited += Runtime.Ignite(
 			FIntPoint(Index % Width, Index / Width),
-			Rule.FlameMaterial)
+			Rule.InputB)
 			? 1
 			: 0;
 	}
@@ -488,15 +488,15 @@ bool FMatterFluxGroundRuntimeAdvanceBreakdownPerformanceTest::RunTest(
 
 	// Keep this aligned with Content/Lua/World/Chemistry.lua so the benchmark
 	// represents the actual grassland fire rather than a synthetic workload.
-	FMatterFluxCombustionDefinition Rule;
+	FMatterFluxReactionDefinition Rule;
 	Rule.Id = TEXT("grassland_burn_performance");
-	Rule.FuelMaterial = TEXT("grassland");
-	Rule.FlameMaterial = TEXT("fire");
-	Rule.SmokeMaterial = TEXT("smoke");
-	Rule.ResidueMaterial = TEXT("ash");
-	Rule.IgnitionChancePermille = 1000;
-	Rule.SpreadChancePermille = 420;
-	Rule.BurnDurationSteps = 8;
+	Rule.InputA = TEXT("grassland");
+	Rule.InputB = TEXT("fire");
+	Rule.EmissionMaterial = TEXT("smoke");
+	Rule.OutputA = TEXT("ash");
+	Rule.ChancePermille = 1000;
+	Rule.PropagationChancePermille = 420;
+	Rule.DurationSteps = 8;
 
 	MatterFlux::Combustion::FGroundRuntimeSettings Settings;
 	Settings.Width = Width;
@@ -512,7 +512,7 @@ bool FMatterFluxGroundRuntimeAdvanceBreakdownPerformanceTest::RunTest(
 	}
 	TestTrue(
 		TEXT("Ground breakdown runtime ignites its center cell"),
-		Runtime.Ignite(FIntPoint(Width / 2, Height / 2), Rule.FlameMaterial));
+		Runtime.Ignite(FIntPoint(Width / 2, Height / 2), Rule.InputB));
 
 	double AdvanceSeconds = 0.0;
 	double ReplicationSeconds = 0.0;
@@ -685,10 +685,10 @@ bool FMatterFluxLargeWorldStreamingPerformanceTest::RunTest(
 	const auto ToChunk = [](const FVector& Location)
 	{
 		const FIntPoint Cell(
-			FMath::RoundToInt(
+			FMath::FloorToInt(
 				Location.X
 					/ MatterFlux::PlayableLevel::TerrainCellSize),
-			FMath::RoundToInt(
+			FMath::FloorToInt(
 				Location.Y
 					/ MatterFlux::PlayableLevel::TerrainCellSize));
 		return FIntPoint(

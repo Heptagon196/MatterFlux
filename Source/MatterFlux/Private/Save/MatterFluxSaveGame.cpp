@@ -130,9 +130,11 @@ bool UMatterFluxSaveGame::ValidateAndMigrate(FString& OutError)
 	}
 	if (Progression.Items.Num() > MaximumProgressionEntries
 		|| Progression.Quests.Num() > MaximumProgressionEntries
+		|| Progression.ShopPurchases.Num() > MaximumProgressionEntries
 		|| Progression.Revision < 0
 		|| (Progression.Revision == 0
 			&& (!Progression.Items.IsEmpty() || !Progression.Quests.IsEmpty()
+				|| !Progression.ShopPurchases.IsEmpty()
 				|| !Progression.SelectedQuest.IsNone())))
 	{
 		OutError = TEXT("save has invalid progression metadata");
@@ -159,6 +161,18 @@ bool UMatterFluxSaveGame::ValidateAndMigrate(FString& OutError)
 			return false;
 		}
 		SeenQuestIds.Add(Quest.QuestId);
+	}
+	TSet<FName> SeenShopOfferKeys;
+	for (const FMatterFluxSavedShopPurchase& Purchase
+		: Progression.ShopPurchases)
+	{
+		if (Purchase.OfferKey.IsNone() || Purchase.PurchaseCount <= 0
+			|| SeenShopOfferKeys.Contains(Purchase.OfferKey))
+		{
+			OutError = TEXT("save contains an invalid shop purchase");
+			return false;
+		}
+		SeenShopOfferKeys.Add(Purchase.OfferKey);
 	}
 	if (!Progression.SelectedQuest.IsNone()
 		&& !SeenQuestIds.Contains(Progression.SelectedQuest))

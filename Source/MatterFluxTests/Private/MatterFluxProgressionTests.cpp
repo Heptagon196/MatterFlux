@@ -377,6 +377,54 @@ bool FMatterFluxProgressionAuthorityComponentTest::RunTest(
 		Progression->GetItemQuantity(TEXT("std.coin")), 0);
 	TestEqual(TEXT("Restore keeps snapshot item quantities"),
 		Progression->GetItemQuantity(TEXT("std.heal_item")), 1);
+
+	const FMatterFluxContentRegistryPtr Registry =
+		IMatterFluxScriptRuntime::Get().GetActiveRegistry();
+	if (!TestTrue(TEXT("Shop registry is available"), Registry.IsValid()))
+	{
+		return false;
+	}
+	const FMatterFluxShopDefinition& Shop =
+		Registry->Shops.FindChecked(TEXT("std.template_merchant"));
+	TestTrue(TEXT("Shop test coins commit"),
+		Progression->AddItemAuthority(TEXT("std.coin"), 100, Error));
+	const int32 PurchaseRevision = Progression->GetRevision();
+	int32 RemainingPurchases = INDEX_NONE;
+	const int32 PotionCountBeforePurchase =
+		Progression->GetItemQuantity(TEXT("std.heal_item"));
+	if (!TestTrue(TEXT("Authority shop purchase commits atomically"),
+		Progression->PurchaseOfferAuthority(
+			Shop.Offers[0], TEXT("std.template_merchant.offer.0"),
+			PurchaseRevision, RemainingPurchases, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	TestEqual(TEXT("Purchase deducts configured currency"),
+		Progression->GetItemQuantity(TEXT("std.coin")), 0);
+	TestEqual(TEXT("Purchase grants configured product"),
+		Progression->GetItemQuantity(TEXT("std.heal_item")),
+		PotionCountBeforePurchase + 1);
+	FMatterFluxProgressionSaveState PurchasedSnapshot;
+	TestTrue(TEXT("Purchased offer state is saveable"),
+		Progression->CaptureSaveState(PurchasedSnapshot, Error));
+	TestEqual(TEXT("Save contains one stable shop offer counter"),
+		PurchasedSnapshot.ShopPurchases.Num(), 1);
+	if (PurchasedSnapshot.ShopPurchases.Num() == 1)
+	{
+		TestEqual(TEXT("Saved shop purchase count"),
+			PurchasedSnapshot.ShopPurchases[0].PurchaseCount, 1);
+	}
+	const int32 CommittedPurchaseRevision = Progression->GetRevision();
+	TestFalse(TEXT("Stale purchase revision is rejected"),
+		Progression->PurchaseOfferAuthority(
+			Shop.Offers[0], TEXT("std.template_merchant.offer.0"),
+			PurchaseRevision, RemainingPurchases, Error));
+	TestEqual(TEXT("Rejected purchase does not mutate revision"),
+		Progression->GetRevision(), CommittedPurchaseRevision);
+	TestEqual(TEXT("Rejected purchase does not duplicate product"),
+		Progression->GetItemQuantity(TEXT("std.heal_item")),
+		PotionCountBeforePurchase + 1);
 	return true;
 }
 
@@ -413,6 +461,20 @@ bool FMatterFluxProgressionMagicEffectsTransactionTest::RunTest(
 		AddError(Error);
 		return false;
 	}
+	TestEqual(TEXT("Starter loadout includes four bound and two unbound casters"),
+		Inventory->GetOwnedWands().Num(), 6);
+	TestTrue(TEXT("PaperMagic default wand starts owned"),
+		Inventory->GetOwnedWands().ContainsByPredicate(
+			[](const FMatterFluxOwnedWand& Wand)
+			{
+				return Wand.DefinitionId == TEXT("std.default");
+			}));
+	TestTrue(TEXT("PaperMagic shoe caster starts owned"),
+		Inventory->GetOwnedWands().ContainsByPredicate(
+			[](const FMatterFluxOwnedWand& Wand)
+			{
+				return Wand.DefinitionId == TEXT("std.default_shoe");
+			}));
 
 	FMatterFluxMagicInventorySaveState DrainedState;
 	if (!TestTrue(TEXT("Magic inventory snapshot captures"),

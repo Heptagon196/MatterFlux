@@ -18,14 +18,18 @@
 #include "Game/MatterFluxFragmentSourceProxyComponent.h"
 #include "Game/MatterFluxPlayableLevel.h"
 #include "Game/MatterFluxTerrainMesh.h"
+#include "Game/MatterFluxTwoStoreyHouseActor.h"
 #include "Game/MatterFluxWorldStreamingPlan.h"
 #include "GameFramework/PlayerController.h"
 #include "HAL/PlatformTime.h"
 #include "MatterFluxLog.h"
+#include "Material/MatterFluxLiquidBuoyancy.h"
+#include "Material/MatterFluxMaterialReactionEngine.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Net/UnrealNetwork.h"
 #include "ProceduralMeshComponent.h"
 #include "Rendering/MatterFluxInstanceVisuals.h"
+#include "Rendering/MatterFluxLiquidSurfaceProjection.h"
 #include "Stats/Stats.h"
 #include "UObject/ConstructorHelpers.h"
 
@@ -73,6 +77,16 @@ DECLARE_CYCLE_STAT(
 	TEXT("Combustion Propagation"),
 	STAT_MatterFluxCombustionPropagation,
 	STATGROUP_MatterFlux);
+
+namespace
+{
+	// Body displacement is a local pressure boundary, not a request to rescan
+	// the whole visible lake for every occupied cell. Sixteen material cells
+	// provide substantially more free-column capacity than the largest current
+	// character/creature footprint while keeping work inside a compact dirty
+	// neighborhood. The conserved wake pass reconnects that local surplus later.
+	constexpr int32 BodyLiquidDisplacementSearchRadiusCells = 16;
+}
 
 bool FMatterFluxReplicatedFragmentSourceStateList::RebuildAuthorityCache()
 {
@@ -488,6 +502,35 @@ namespace
 	constexpr int32 MaxStreamingWindowChunks = 65536;
 	constexpr int32 MaxReplicatedFragmentSourceStates = 4096;
 	constexpr int32 MaxReplicatedFragmentSourceStateBytes = 1024 * 1024;
+	constexpr float NeutralVoxelLiquidRefractionIndex = 1.0f;
+
+	void ApplyLiquidOptics(
+		UMaterialInstanceDynamic& DynamicMaterial,
+		const FMatterFluxMaterialDefinition& Material)
+	{
+		// The material simulation supplies volume; this adapter draws only the
+		// outside free surface. Depth-fading against the stepped terrain below
+		// exposes every basin voxel as a false ring/crack in that surface, so the
+		// complete projected shape uses one opacity. Refraction remains neutral to
+		// avoid a second, screen-space copy of the voxel shoreline.
+		// Refraction is neutral and the simulation already provides the complete
+		// outside silhouette. Making that shell opaque prevents stepped terrain
+		// below from masquerading as holes or detached liquid fragments.
+		const float SurfaceOpacity = 1.0f;
+		DynamicMaterial.SetVectorParameterValue(TEXT("Color"), Material.Color);
+		DynamicMaterial.SetScalarParameterValue(
+			TEXT("ShallowOpacity"),
+			SurfaceOpacity);
+		DynamicMaterial.SetScalarParameterValue(
+			TEXT("DeepOpacity"),
+			SurfaceOpacity);
+		DynamicMaterial.SetScalarParameterValue(
+			TEXT("OpacityDepth"),
+			Material.OpacityDepth);
+		DynamicMaterial.SetScalarParameterValue(
+			TEXT("RefractionIndex"),
+			NeutralVoxelLiquidRefractionIndex);
+	}
 
 	bool UnpackFragmentSourceMask(
 		const TArray<uint8>& Packed,
@@ -574,6 +617,7 @@ namespace
 			MixMaterialVisualHash(Hash, static_cast<uint32>(Cell.WorldCell.X));
 			MixMaterialVisualHash(Hash, static_cast<uint32>(Cell.WorldCell.Y));
 			MixMaterialVisualHash(Hash, static_cast<uint32>(Cell.SupportHeight));
+			MixMaterialVisualHash(Hash, static_cast<uint32>(Cell.Amount));
 		}
 		return Hash;
 	}
@@ -681,22 +725,24 @@ namespace
 		}
 		const FVector Local =
 			WorldTransform.InverseTransformPosition(WorldLocation);
-		const double RoundedX =
-			FMath::RoundToDouble(Local.X / CellSize);
-		const double RoundedY =
-			FMath::RoundToDouble(Local.Y / CellSize);
-		if (!FMath::IsFinite(RoundedX)
-			|| !FMath::IsFinite(RoundedY)
-			|| RoundedX < MIN_int32
-			|| RoundedX > MAX_int32
-			|| RoundedY < MIN_int32
-			|| RoundedY > MAX_int32)
+		// 世界格使用左下闭、右上开的 floor 约定。地形中心允许位于
+		// 半格坐标；这里必须与初始化边界及 SeedSurface 完全一致。
+		const double CellX =
+			FMath::FloorToDouble(Local.X / CellSize);
+		const double CellY =
+			FMath::FloorToDouble(Local.Y / CellSize);
+		if (!FMath::IsFinite(CellX)
+			|| !FMath::IsFinite(CellY)
+			|| CellX < MIN_int32
+			|| CellX > MAX_int32
+			|| CellY < MIN_int32
+			|| CellY > MAX_int32)
 		{
 			return false;
 		}
 		OutCell = FIntPoint(
-			static_cast<int32>(RoundedX),
-			static_cast<int32>(RoundedY));
+			static_cast<int32>(CellX),
+			static_cast<int32>(CellY));
 		return true;
 	}
 
@@ -707,10 +753,16 @@ namespace
 		{
 			return FBox(ForceInit);
 		}
+		const double RadialHalfExtent =
+			static_cast<double>(Source.Mask.Width)
+				* Source.Mask.CellSize * 0.5;
 		const FVector HalfExtent(
 			static_cast<double>(Source.Mask.Width)
 				* Source.Mask.CellSize * 0.5,
-			Source.Mask.CellSize * 0.5,
+			Source.Mask.GeometryStyle
+				== EFragmentSourceGeometryStyle::RadialColumn
+					? RadialHalfExtent
+					: Source.Mask.CellSize * 0.5,
 			static_cast<double>(Source.Mask.Height)
 				* Source.Mask.CellSize * 0.5);
 		return FBox(-HalfExtent, HalfExtent).TransformBy(
@@ -745,6 +797,8 @@ AMatterFluxPlayableWorldActor::AMatterFluxPlayableWorldActor()
 	SetMinNetUpdateFrequency(2.0f);
 	PrimaryActorTick.bCanEverTick = true;
 	PrimaryActorTick.TickInterval = 0.0f;
+	verify(SmokeVisualPool.Configure(
+		MatterFlux::Rendering::FSmokeVisualSettings()));
 
 	SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));
 	// The playable-world actor itself never moves. A static root is required
@@ -758,6 +812,8 @@ AMatterFluxPlayableWorldActor::AMatterFluxPlayableWorldActor()
 
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> CubeFinder(
 		TEXT("/Engine/BasicShapes/Cube.Cube"));
+	static ConstructorHelpers::FObjectFinder<UStaticMesh> PlaneFinder(
+		TEXT("/Engine/BasicShapes/Plane.Plane"));
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> SphereFinder(
 		TEXT("/Engine/BasicShapes/Sphere.Sphere"));
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> CylinderFinder(
@@ -770,9 +826,18 @@ AMatterFluxPlayableWorldActor::AMatterFluxPlayableWorldActor()
 		TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial"));
 	static ConstructorHelpers::FObjectFinder<UMaterialInterface> VoxelColorMaterialFinder(
 		TEXT("/Game/MatterFlux/Materials/M_VoxelPalette.M_VoxelPalette"));
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> VoxelLeafMaterialFinder(
+		TEXT("/Game/MatterFlux/Materials/M_VoxelLeaf.M_VoxelLeaf"));
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> VoxelWoodMaterialFinder(
+		TEXT("/Game/MatterFlux/Materials/M_VoxelWood.M_VoxelWood"));
 	static ConstructorHelpers::FObjectFinder<UMaterialInterface> VoxelGasMaterialFinder(
 		TEXT("/Game/MatterFlux/Materials/M_VoxelGas.M_VoxelGas"));
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> VoxelLiquidMaterialFinder(
+		TEXT("/Game/MatterFlux/Materials/M_VoxelLiquid.M_VoxelLiquid"));
 	CubeMesh = CubeFinder.Object;
+	LiquidSurfaceMesh = PlaneFinder.Succeeded()
+		? PlaneFinder.Object.Get()
+		: CubeMesh.Get();
 	SphereMesh = SphereFinder.Object;
 	CylinderMesh = CylinderFinder.Object;
 	ConeMesh = ConeFinder.Object;
@@ -784,10 +849,23 @@ AMatterFluxPlayableWorldActor::AMatterFluxPlayableWorldActor()
 	VoxelColorMaterialTemplate = VoxelColorMaterialFinder.Succeeded()
 		? VoxelColorMaterialFinder.Object
 		: ColorMaterialTemplate;
+	VoxelLeafMaterialTemplate = VoxelLeafMaterialFinder.Succeeded()
+		? VoxelLeafMaterialFinder.Object
+		: VoxelColorMaterialTemplate;
+	VoxelWoodMaterialTemplate = VoxelWoodMaterialFinder.Succeeded()
+		? VoxelWoodMaterialFinder.Object
+		: VoxelColorMaterialTemplate;
 	VoxelGasMaterialTemplate = VoxelGasMaterialFinder.Succeeded()
 		? VoxelGasMaterialFinder.Object
 		: VoxelColorMaterialTemplate;
-	FragmentSourceProxy->Configure(SceneRoot, VoxelColorMaterialTemplate);
+	VoxelLiquidMaterialTemplate = VoxelLiquidMaterialFinder.Succeeded()
+		? VoxelLiquidMaterialFinder.Object
+		: VoxelColorMaterialTemplate;
+	FragmentSourceProxy->Configure(
+		SceneRoot,
+		VoxelColorMaterialTemplate,
+		VoxelLeafMaterialTemplate,
+		VoxelWoodMaterialTemplate);
 
 	SunLight = CreateDefaultSubobject<UDirectionalLightComponent>(TEXT("SunLight"));
 	SunLight->SetupAttachment(SceneRoot);
@@ -897,10 +975,13 @@ void AMatterFluxPlayableWorldActor::EndPlay(const EEndPlayReason::Type EndPlayRe
 	FragmentSourcePresenceHandle.Reset();
 	DestroyMaterialVisualization();
 	DestroyTerrainChunkMeshes();
+	DestroyGeneratedHouse();
 	if (FragmentSourceProxy)
 	{
 		FragmentSourceProxy->ResetSources();
 	}
+	PendingMaterialDisplacementCells.Reset();
+	PreviousMaterialDisplacementCells.Reset();
 	MaterialSimulation.Reset();
 	if (HasAuthority())
 	{
@@ -968,6 +1049,7 @@ void AMatterFluxPlayableWorldActor::Tick(const float DeltaSeconds)
 	AdvanceAsyncGeneration();
 	ProcessPendingTerrainChunkPrefetches();
 	AdvanceLogicalSourceCombustion(DeltaSeconds);
+	AdvanceUnifiedSmokeVisualization(DeltaSeconds);
 	if (!MaterialSimulation)
 	{
 		RefreshVisibleLevelLayers(false);
@@ -1001,10 +1083,41 @@ void AMatterFluxPlayableWorldActor::Tick(const float DeltaSeconds)
 		bMaterialVisualizationDeferredForStreaming;
 	TArray<FIntPoint> NextMaterialFocusCells;
 	GatherMaterialSimulationFocusCells(NextMaterialFocusCells);
-	const MatterFlux::Material::FRuntimeAdvanceResult MaterialAdvance =
+	int32 DisplacedMaterialCells =
+		0;
+	TArray<MatterFlux::Material::FLiquidDisplacementConstraint>
+		DisplacementConstraints;
+	DisplacementConstraints.Reserve(
+		PendingMaterialDisplacementCells.Num());
+	for (const TPair<
+		FIntPoint,
+		FMatterFluxMaterialDisplacementState>& Pair
+		: PendingMaterialDisplacementCells)
+	{
+		DisplacementConstraints.Add({
+			Pair.Key,
+			Pair.Value.MaximumRemainingAmount });
+	}
+	DisplacedMaterialCells += MaterialSimulation->DisplaceLiquids(
+		DisplacementConstraints,
+		BodyLiquidDisplacementSearchRadiusCells);
+	MatterFlux::Material::FRuntimeAdvanceResult MaterialAdvance =
 		MaterialSimulation->AdvanceAuthority(
 			DeltaSeconds,
 			NextMaterialFocusCells);
+	// Only a material step can flow liquid back into a body. Frames that merely
+	// project the already constrained state do not need a second identical
+	// solve. This keeps body occupancy deterministic while avoiding a redundant
+	// full displacement search on most render frames.
+	if (MaterialAdvance.Steps > 0)
+	{
+		DisplacedMaterialCells += MaterialSimulation->DisplaceLiquids(
+			DisplacementConstraints,
+			BodyLiquidDisplacementSearchRadiusCells);
+	}
+	PreviousMaterialDisplacementCells = PendingMaterialDisplacementCells;
+	PendingMaterialDisplacementCells.Reset();
+	MaterialAdvance.bStateChanged |= DisplacedMaterialCells > 0;
 	if (MaterialAdvance.bFocusChanged)
 	{
 		ReplicatedMaterialSimulationFocus =
@@ -1016,6 +1129,11 @@ void AMatterFluxPlayableWorldActor::Tick(const float DeltaSeconds)
 	// Terrain, decorations, and the material simulation all follow every
 	// possessed authority player. The material world's round-robin allocator
 	// keeps this union deterministic and within its hard chunk budget.
+	TArray<FIntPoint> StreamingFocusChunks;
+	GatherStreamingFocusChunks(StreamingFocusChunks);
+	const bool bStreamingFocusChanged =
+		StreamingFocusChunks != VisibleLayerFocusChunks
+		|| StreamingFocusChunks != VisibleFragmentFocusChunks;
 	RefreshVisibleLevelLayers(false);
 	RefreshVisibleFragmentSources(false);
 	ProcessPendingFragmentSourceSpawns();
@@ -1025,10 +1143,21 @@ void AMatterFluxPlayableWorldActor::Tick(const float DeltaSeconds)
 	{
 		bMaterialVisualizationDirty = true;
 	}
+	if (MaterialAdvance.Steps > 0)
+	{
+		const FMatterFluxContentRegistryPtr Registry =
+			IMatterFluxScriptRuntime::Get().GetActiveRegistry();
+		if (Registry.IsValid())
+		{
+			ApplyMaterialSourceContactReactions(*Registry);
+		}
+	}
 	// Focus changes already archive/restore material chunks and refresh both
-	// terrain streaming systems. Publish the now-dirty atomic snapshot on the
-	// next stable-focus frame so compression does not stack on that boundary.
+	// terrain streaming systems. Publish the now-dirty atomic snapshot on a
+	// stable streaming frame so compression does not stack on either a material
+	// or render/source chunk boundary.
 	if (!MaterialAdvance.bFocusChanged
+		&& !bStreamingFocusChanged
 		&& MaterialSimulation->NeedsReplicationPublish())
 	{
 		PublishMaterialSimulationState();
@@ -1208,6 +1337,7 @@ void AMatterFluxPlayableWorldActor::AdvanceAsyncGeneration()
 	case EMatterFluxWorldGenerationPhase::BuildingStreaming:
 		BuildLayerStreamingCache(*PendingGeneratedLayout);
 		RefreshVisibleLevelLayers(true);
+		RebuildGeneratedHouse(*PendingGeneratedLayout);
 		GenerationPhase =
 			EMatterFluxWorldGenerationPhase::SpawningWorldObjects;
 		GenerationProgress = 0.82f;
@@ -1321,6 +1451,7 @@ void AMatterFluxPlayableWorldActor::RebuildLevel()
 	{
 		BuildLayerStreamingCache(Layout);
 		RefreshVisibleLevelLayers(true);
+		RebuildGeneratedHouse(Layout);
 		RebuildFragmentSources(Layout.FragmentSources);
 	}
 	RecaptureStaticSky();
@@ -1346,6 +1477,14 @@ void AMatterFluxPlayableWorldActor::SanitizeGenerationSettings()
 				4.0f,
 				100.0f)
 			: MatterFlux::PlayableLevel::TerrainCellSize;
+	MaterialLiquidColumnHeight =
+		FMath::IsFinite(MaterialLiquidColumnHeight)
+			? FMath::Clamp(MaterialLiquidColumnHeight, 8.0f, 300.0f)
+			: 128.0f;
+	MaterialLiquidVisualThickness =
+		FMath::IsFinite(MaterialLiquidVisualThickness)
+			? FMath::Clamp(MaterialLiquidVisualThickness, 1.0f, 32.0f)
+			: 8.0f;
 	MaterialVisualizationInterval =
 		FMath::IsFinite(MaterialVisualizationInterval)
 			? FMath::Clamp(
@@ -1397,6 +1536,7 @@ void AMatterFluxPlayableWorldActor::ApplyGeneratedLayoutSynchronously(
 	InitializeGroundCombustion(Registry, Layout);
 	BuildLayerStreamingCache(Layout);
 	RefreshVisibleLevelLayers(true);
+	RebuildGeneratedHouse(Layout);
 	RebuildFragmentSources(Layout.FragmentSources);
 }
 
@@ -1408,6 +1548,74 @@ void AMatterFluxPlayableWorldActor::RecaptureStaticSky()
 	{
 		SkyLight->RecaptureSky();
 	}
+}
+
+void AMatterFluxPlayableWorldActor::RebuildGeneratedHouse(
+	const MatterFlux::PlayableLevel::FLevelLayout& Layout)
+{
+	// 房屋是带权威碰撞的复制 Actor。客户端只接收服务器生成的实例，
+	// 不能在 OnRep_MapSeed 的本地地图重建中再生成一份重叠房屋。
+	if (!HasAuthority() || !GetWorld())
+	{
+		return;
+	}
+	DestroyGeneratedHouse();
+
+	const FVector2D SampleOffsets[] = {
+		FVector2D::ZeroVector,
+		FVector2D(-500.0f, -360.0f),
+		FVector2D(-500.0f, 360.0f),
+		FVector2D(500.0f, -360.0f),
+		FVector2D(500.0f, 360.0f),
+		FVector2D(-500.0f, 0.0f),
+		FVector2D(500.0f, 0.0f)
+	};
+	float FoundationTop = -TNumericLimits<float>::Max();
+	for (const FVector2D Offset : SampleOffsets)
+	{
+		FVector Sample = Layout.HouseLocation;
+		Sample.X += Offset.X;
+		Sample.Y += Offset.Y;
+		float Height = 0.0f;
+		if (TrySampleTerrainHeightAtWorldLocation(Sample, Height))
+		{
+			FoundationTop = FMath::Max(FoundationTop, Height);
+		}
+	}
+	if (!FMath::IsFinite(FoundationTop))
+	{
+		FoundationTop = 150.0f;
+	}
+
+	const FTransform HouseTransform(
+		// 固定 2.5D 镜头的 yaw 为 -45°。房屋旋转 45° 后，山墙
+		// 面向镜头、屋脊横跨屏幕，避免沿屋脊观察产生放射透视。
+		FRotator(0.0f, 45.0f, 0.0f),
+		FVector(
+			Layout.HouseLocation.X,
+			Layout.HouseLocation.Y,
+			FoundationTop + 4.0f));
+	FActorSpawnParameters SpawnParameters;
+	SpawnParameters.Owner = this;
+	SpawnParameters.SpawnCollisionHandlingOverride =
+		ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	GeneratedHouse = GetWorld()->SpawnActor<AMatterFluxTwoStoreyHouseActor>(
+		AMatterFluxTwoStoreyHouseActor::StaticClass(),
+		HouseTransform,
+		SpawnParameters);
+	if (GeneratedHouse)
+	{
+		GeneratedHouse->Tags.AddUnique(TEXT("MatterFluxGeneratedHouse"));
+	}
+}
+
+void AMatterFluxPlayableWorldActor::DestroyGeneratedHouse()
+{
+	if (IsValid(GeneratedHouse))
+	{
+		GeneratedHouse->Destroy();
+	}
+	GeneratedHouse = nullptr;
 }
 
 bool AMatterFluxPlayableWorldActor::CaptureSaveState(
@@ -1582,7 +1790,7 @@ bool AMatterFluxPlayableWorldActor::RestoreSaveState(
 
 	if (State.bHasGroundCombustionState)
 	{
-		const FMatterFluxCombustionDefinition* Rule = Registry->Combustions.Find(
+		const FMatterFluxReactionDefinition* Rule = Registry->Reactions.Find(
 			State.GroundCombustionState.RuleId);
 		if (!Rule)
 		{
@@ -1656,13 +1864,13 @@ bool AMatterFluxPlayableWorldActor::RestoreSaveState(
 		for (const TPair<FGuid, FFragment2DSourceStreamingState>& Pair
 			: StreamedFragmentSourceStates)
 		{
-			const FMatterFluxCombustionDefinition* Rule = nullptr;
+			const FMatterFluxReactionDefinition* Rule = nullptr;
 			FName ResidueMaterial = NAME_None;
 			FLinearColor ResidueColor = FLinearColor::Transparent;
 			TArray<uint8> ResidueMask;
 			if (Pair.Value.bHasCombustionState)
 			{
-				Rule = Registry->Combustions.Find(
+				Rule = Registry->Reactions.Find(
 					Pair.Value.CombustionState.RuleId);
 				const MatterFlux::PlayableLevel::FLevelFragmentSource* Source =
 					FindFragmentSourceDefinition(Pair.Key);
@@ -1672,10 +1880,10 @@ bool AMatterFluxPlayableWorldActor::RestoreSaveState(
 					return false;
 				}
 				ResidueMask = Pair.Value.CombustionState.ResidueMask;
-				ResidueMaterial = Rule->ResidueMaterial;
+				ResidueMaterial = Rule->OutputA;
 				ResidueColor = FLinearColor(0.08f, 0.07f, 0.06f);
 				if (const FMatterFluxMaterialDefinition* Material =
-					Registry->Materials.Find(Rule->ResidueMaterial))
+					Registry->Materials.Find(Rule->OutputA))
 				{
 					ResidueColor = Material->Color;
 				}
@@ -1771,6 +1979,474 @@ int32 AMatterFluxPlayableWorldActor::GetSimulatedMaterialCount(
 	return MaterialSimulation
 		? MaterialSimulation->CountMaterial(MaterialId)
 		: 0;
+}
+
+int64 AMatterFluxPlayableWorldActor::GetSimulatedMaterialAmount(
+	const FName MaterialId) const
+{
+	return MaterialSimulation
+		? MaterialSimulation->SumMaterialAmount(MaterialId)
+		: 0;
+}
+
+bool AMatterFluxPlayableWorldActor::SetSimulatedMaterialAtWorldLocation(
+	const FVector& WorldLocation,
+	const FName MaterialId)
+{
+	if (!HasAuthority() || !MaterialSimulation || IsGenerationInProgress())
+	{
+		return false;
+	}
+	FIntPoint WorldCell;
+	if (!TryWorldLocationToCell(
+		GetActorTransform(),
+		WorldLocation,
+		MaterialSimulationCellSize,
+		WorldCell)
+		|| !MaterialSimulation->SetCell(WorldCell, MaterialId))
+	{
+		return false;
+	}
+	bMaterialVisualizationDirty = true;
+	return true;
+}
+
+bool AMatterFluxPlayableWorldActor::TrySampleTerrainHeightAtWorldLocation(
+	const FVector& WorldLocation,
+	float& OutWorldHeight) const
+{
+	if (!TerrainHeightField.IsValid())
+	{
+		return false;
+	}
+	const FVector Local = GetActorTransform().InverseTransformPosition(
+		WorldLocation);
+	const int64 CellX = FMath::RoundToInt64(
+		(Local.X - TerrainHeightField.FirstCellCenter.X)
+			/ TerrainHeightField.CellSize);
+	const int64 CellY = FMath::RoundToInt64(
+		(Local.Y - TerrainHeightField.FirstCellCenter.Y)
+			/ TerrainHeightField.CellSize);
+	float LocalHeight = 0.0f;
+	uint8 ColorBand = 0;
+	if (!TerrainHeightField.TrySampleWorldCell(
+		CellX, CellY, LocalHeight, ColorBand))
+	{
+		return false;
+	}
+	OutWorldHeight = GetActorTransform().TransformPosition(
+		FVector(Local.X, Local.Y, LocalHeight)).Z;
+	return true;
+}
+
+bool AMatterFluxPlayableWorldActor::TrySampleLiquidColumnAtWorldLocation(
+	const FVector& WorldLocation,
+	MatterFlux::Liquid::FLiquidColumn& OutColumn) const
+{
+	OutColumn = {};
+	if (!MaterialSimulation)
+	{
+		return false;
+	}
+
+	FIntPoint WorldCell;
+	if (!TryWorldLocationToCell(
+			GetActorTransform(),
+			WorldLocation,
+			MaterialSimulationCellSize,
+			WorldCell))
+	{
+		return false;
+	}
+
+	MatterFlux::Material::FCellSnapshot Snapshot;
+	FName MaterialId = NAME_None;
+	float LocalBottomZ = 0.0f;
+	float LocalSurfaceZ = 0.0f;
+	if (MaterialSimulation->TryGetCellSnapshot(WorldCell, Snapshot)
+		&& MaterialLiquidDensities.Contains(Snapshot.MaterialId))
+	{
+		MaterialId = Snapshot.MaterialId;
+		LocalBottomZ = static_cast<float>(Snapshot.SupportHeight);
+		LocalSurfaceZ = LocalBottomZ
+			+ MaterialLiquidColumnHeight
+				* (static_cast<float>(Snapshot.Amount) / 255.0f);
+	}
+	const float* LiquidDensity = MaterialLiquidDensities.Find(MaterialId);
+	if (!LiquidDensity
+		|| !FMath::IsFinite(*LiquidDensity)
+		|| *LiquidDensity <= 0.0f)
+	{
+		return false;
+	}
+
+	const FVector LocalCenter(
+		(static_cast<double>(WorldCell.X) + 0.5)
+			* MaterialSimulationCellSize,
+		(static_cast<double>(WorldCell.Y) + 0.5)
+			* MaterialSimulationCellSize,
+		LocalBottomZ);
+	const FVector WorldBottom =
+		GetActorTransform().TransformPosition(LocalCenter);
+	const FVector WorldSurface = GetActorTransform().TransformPosition(
+		FVector(LocalCenter.X, LocalCenter.Y, LocalSurfaceZ));
+	OutColumn.MaterialId = MaterialId;
+	OutColumn.Density = *LiquidDensity;
+	OutColumn.BottomZ = FMath::Min(WorldBottom.Z, WorldSurface.Z);
+	OutColumn.SurfaceZ = FMath::Max(WorldBottom.Z, WorldSurface.Z);
+	OutColumn.FlowVelocity = FVector::ZeroVector;
+	return OutColumn.IsValid();
+}
+
+bool AMatterFluxPlayableWorldActor::
+	TrySampleAmbientLiquidColumnAtWorldLocation(
+		const FVector& WorldLocation,
+		MatterFlux::Liquid::FLiquidColumn& OutColumn) const
+{
+	FIntPoint WorldCell;
+	if (!TryWorldLocationToCell(
+		GetActorTransform(),
+		WorldLocation,
+		MaterialSimulationCellSize,
+		WorldCell))
+	{
+		return false;
+	}
+	MatterFlux::Liquid::FLiquidColumn LocalColumn;
+	const bool bHasLocalColumn = TrySampleLiquidColumnAtWorldLocation(
+		WorldLocation, LocalColumn);
+	if (!PreviousMaterialDisplacementCells.Contains(WorldCell))
+	{
+		OutColumn = LocalColumn;
+		return bHasLocalColumn;
+	}
+
+	const FVector Local =
+		GetActorTransform().InverseTransformPosition(WorldLocation);
+	for (int32 Radius = 1; Radius <= 6; ++Radius)
+	{
+		TArray<FIntPoint, TInlineAllocator<48>> Ring;
+		for (int32 X = -Radius; X <= Radius; ++X)
+		{
+			Ring.Add(FIntPoint(X, -Radius));
+		}
+		for (int32 Y = -Radius + 1; Y <= Radius; ++Y)
+		{
+			Ring.Add(FIntPoint(Radius, Y));
+		}
+		for (int32 X = Radius - 1; X >= -Radius; --X)
+		{
+			Ring.Add(FIntPoint(X, Radius));
+		}
+		for (int32 Y = Radius - 1; Y > -Radius; --Y)
+		{
+			Ring.Add(FIntPoint(-Radius, Y));
+		}
+		for (const FIntPoint Offset : Ring)
+		{
+			const FIntPoint NeighborCell = WorldCell + Offset;
+			if (PreviousMaterialDisplacementCells.Contains(NeighborCell))
+			{
+				continue;
+			}
+			const FVector NeighborWorld =
+				GetActorTransform().TransformPosition(FVector(
+					(static_cast<double>(NeighborCell.X) + 0.5)
+						* MaterialSimulationCellSize,
+					(static_cast<double>(NeighborCell.Y) + 0.5)
+						* MaterialSimulationCellSize,
+					Local.Z));
+			MatterFlux::Liquid::FLiquidColumn Neighbor;
+			if (!TrySampleLiquidColumnAtWorldLocation(
+					NeighborWorld, Neighbor))
+			{
+				continue;
+			}
+			OutColumn = Neighbor;
+			float LocalTerrainHeight = 0.0f;
+			if (TrySampleTerrainHeightAtWorldLocation(
+					WorldLocation, LocalTerrainHeight)
+				&& LocalTerrainHeight < OutColumn.SurfaceZ)
+			{
+				OutColumn.BottomZ = LocalTerrainHeight;
+			}
+			return OutColumn.IsValid();
+		}
+	}
+	OutColumn = LocalColumn;
+	return bHasLocalColumn;
+}
+
+bool AMatterFluxPlayableWorldActor::DisplaceLiquidInWorldBounds(
+	const FVector& Center,
+	const FVector& HorizontalExtent,
+	const float BottomZ,
+	const float TopZ,
+	const bool bCapsuleShape,
+	const bool bDeferMaterialSolve)
+{
+	if (!HasAuthority()
+		|| !MaterialSimulation
+		|| Center.ContainsNaN()
+		|| HorizontalExtent.ContainsNaN()
+		|| !FMath::IsFinite(BottomZ)
+		|| !FMath::IsFinite(TopZ)
+		|| HorizontalExtent.X <= UE_SMALL_NUMBER
+		|| HorizontalExtent.Y <= UE_SMALL_NUMBER
+		|| TopZ <= BottomZ)
+	{
+		return false;
+	}
+
+	FIntPoint MinCell;
+	FIntPoint MaxCell;
+	if (!TryWorldLocationToCell(
+			GetActorTransform(),
+			Center - FVector(
+				HorizontalExtent.X, HorizontalExtent.Y, 0.0f),
+			MaterialSimulationCellSize,
+			MinCell)
+		|| !TryWorldLocationToCell(
+			GetActorTransform(),
+			Center + FVector(
+				HorizontalExtent.X, HorizontalExtent.Y, 0.0f),
+			MaterialSimulationCellSize,
+			MaxCell))
+	{
+		return false;
+	}
+
+	const FVector LocalCenter =
+		GetActorTransform().InverseTransformPosition(Center);
+	const float BodyHalfHeight = (TopZ - BottomZ) * 0.5f;
+	const float CapsuleRadius = FMath::Min(
+		HorizontalExtent.X, HorizontalExtent.Y);
+	const float CapsuleCylinderHalfHeight = FMath::Max(
+		BodyHalfHeight - CapsuleRadius, 0.0f);
+	TArray<
+		MatterFlux::Material::FLiquidDisplacementConstraint,
+		TInlineAllocator<64>> Constraints;
+	for (int64 CellY = MinCell.Y; CellY <= MaxCell.Y; ++CellY)
+	{
+		for (int64 CellX = MinCell.X; CellX <= MaxCell.X; ++CellX)
+		{
+			const FIntPoint Cell(
+				static_cast<int32>(CellX),
+				static_cast<int32>(CellY));
+			const FVector LocalCellCenter(
+				(static_cast<double>(Cell.X) + 0.5)
+					* MaterialSimulationCellSize,
+				(static_cast<double>(Cell.Y) + 0.5)
+					* MaterialSimulationCellSize,
+				LocalCenter.Z);
+			const double ClosestDx = FMath::Max(
+				FMath::Abs(LocalCellCenter.X - LocalCenter.X)
+					- MaterialSimulationCellSize * 0.5,
+				0.0);
+			const double ClosestDy = FMath::Max(
+				FMath::Abs(LocalCellCenter.Y - LocalCenter.Y)
+					- MaterialSimulationCellSize * 0.5,
+				0.0);
+			const double NormalizedDistanceSquared = bCapsuleShape
+				? FMath::Square(ClosestDx / HorizontalExtent.X)
+					+ FMath::Square(ClosestDy / HorizontalExtent.Y)
+				: 0.0;
+			if (bCapsuleShape && NormalizedDistanceSquared > 1.0)
+			{
+				continue;
+			}
+			if (!bCapsuleShape
+				&& (ClosestDx > UE_SMALL_NUMBER
+					|| ClosestDy > UE_SMALL_NUMBER))
+			{
+				continue;
+			}
+
+			const FVector WorldCellCenter =
+				GetActorTransform().TransformPosition(LocalCellCenter);
+			FMatterFluxMaterialDisplacementState State;
+			if (const FMatterFluxMaterialDisplacementState* Existing =
+				PendingMaterialDisplacementCells.Find(Cell))
+			{
+				State = *Existing;
+			}
+			else if (const FMatterFluxMaterialDisplacementState* Previous =
+				PreviousMaterialDisplacementCells.Find(Cell))
+			{
+				State = *Previous;
+			}
+			else
+			{
+				MatterFlux::Material::FCellSnapshot Snapshot;
+				if (!MaterialSimulation->TryGetCellSnapshot(Cell, Snapshot)
+					|| !MaterialLiquidDensities.Contains(
+						Snapshot.MaterialId))
+				{
+					// Keep empty cells inside the footprint unavailable as
+					// displacement destinations, matching the physical obstacle.
+					State.MaximumRemainingAmount = 0;
+					PendingMaterialDisplacementCells.Add(Cell, State);
+					Constraints.Add({ Cell, 0 });
+					continue;
+				}
+				State.MaterialId = Snapshot.MaterialId;
+				State.SupportHeight = Snapshot.SupportHeight;
+				State.ReferenceAmount = Snapshot.Amount;
+				State.MaximumRemainingAmount = Snapshot.Amount;
+			}
+
+			if (State.ReferenceAmount == 0
+				|| State.MaterialId.IsNone())
+			{
+				PendingMaterialDisplacementCells.Add(Cell, State);
+				Constraints.Add({ Cell, 0 });
+				continue;
+			}
+
+			const FVector WorldReferenceBottom =
+				GetActorTransform().TransformPosition(FVector(
+					LocalCellCenter.X,
+					LocalCellCenter.Y,
+					static_cast<double>(State.SupportHeight)));
+			const FVector WorldReferenceSurface =
+				GetActorTransform().TransformPosition(FVector(
+					LocalCellCenter.X,
+					LocalCellCenter.Y,
+					static_cast<double>(State.SupportHeight)
+						+ MaterialLiquidColumnHeight
+							* (static_cast<float>(
+								State.ReferenceAmount) / 255.0f)));
+			const float ReferenceBottomZ = FMath::Min(
+				WorldReferenceBottom.Z, WorldReferenceSurface.Z);
+			const float ReferenceSurfaceZ = FMath::Max(
+				WorldReferenceBottom.Z, WorldReferenceSurface.Z);
+			if (TopZ <= ReferenceBottomZ || BottomZ >= ReferenceSurfaceZ)
+			{
+				continue;
+			}
+
+			float AverageOverlapHeight = 0.0f;
+			if (!bCapsuleShape)
+			{
+				const float CellMinX = LocalCellCenter.X
+					- MaterialSimulationCellSize * 0.5f;
+				const float CellMaxX = LocalCellCenter.X
+					+ MaterialSimulationCellSize * 0.5f;
+				const float CellMinY = LocalCellCenter.Y
+					- MaterialSimulationCellSize * 0.5f;
+				const float CellMaxY = LocalCellCenter.Y
+					+ MaterialSimulationCellSize * 0.5f;
+				const float OverlapX = FMath::Max(
+					FMath::Min(CellMaxX, LocalCenter.X + HorizontalExtent.X)
+						- FMath::Max(CellMinX, LocalCenter.X - HorizontalExtent.X),
+					0.0f);
+				const float OverlapY = FMath::Max(
+					FMath::Min(CellMaxY, LocalCenter.Y + HorizontalExtent.Y)
+						- FMath::Max(CellMinY, LocalCenter.Y - HorizontalExtent.Y),
+					0.0f);
+				const float HorizontalCoverage = FMath::Clamp(
+					(OverlapX * OverlapY)
+						/ FMath::Square(MaterialSimulationCellSize),
+					0.0f,
+					1.0f);
+				const float VerticalOverlap = FMath::Max(
+					FMath::Min(TopZ, ReferenceSurfaceZ)
+						- FMath::Max(BottomZ, ReferenceBottomZ),
+					0.0f);
+				AverageOverlapHeight = VerticalOverlap
+					* HorizontalCoverage;
+			}
+			else
+			{
+				constexpr int32 SamplesPerAxis = 4;
+				float AccumulatedOverlap = 0.0f;
+				for (int32 SampleY = 0;
+					SampleY < SamplesPerAxis;
+					++SampleY)
+				{
+					for (int32 SampleX = 0;
+						SampleX < SamplesPerAxis;
+						++SampleX)
+					{
+						const float LocalSampleX = LocalCellCenter.X
+							+ ((SampleX + 0.5f) / SamplesPerAxis - 0.5f)
+								* MaterialSimulationCellSize;
+						const float LocalSampleY = LocalCellCenter.Y
+							+ ((SampleY + 0.5f) / SamplesPerAxis - 0.5f)
+								* MaterialSimulationCellSize;
+						const float NormalizedRadiusSquared =
+							FMath::Square(
+								(LocalSampleX - LocalCenter.X)
+									/ HorizontalExtent.X)
+							+ FMath::Square(
+								(LocalSampleY - LocalCenter.Y)
+									/ HorizontalExtent.Y);
+						if (NormalizedRadiusSquared >= 1.0f)
+						{
+							continue;
+						}
+						const float CapHalfHeight = CapsuleRadius
+							* FMath::Sqrt(1.0f - NormalizedRadiusSquared);
+						const float SampleHalfHeight =
+							CapsuleCylinderHalfHeight + CapHalfHeight;
+						const float SampleBottom = Center.Z
+							- SampleHalfHeight;
+						const float SampleTop = Center.Z
+							+ SampleHalfHeight;
+						AccumulatedOverlap += FMath::Max(
+							FMath::Min(SampleTop, ReferenceSurfaceZ)
+								- FMath::Max(SampleBottom, ReferenceBottomZ),
+							0.0f);
+					}
+				}
+				AverageOverlapHeight = AccumulatedOverlap
+					/ static_cast<float>(SamplesPerAxis * SamplesPerAxis);
+			}
+
+			const int32 OccupiedAmount = FMath::Clamp(
+				FMath::CeilToInt(
+					255.0f * AverageOverlapHeight
+						/ MaterialLiquidColumnHeight),
+				0,
+				static_cast<int32>(State.ReferenceAmount));
+			if (OccupiedAmount <= 0)
+			{
+				continue;
+			}
+			State.MaximumRemainingAmount = FMath::Min(
+				State.MaximumRemainingAmount,
+				static_cast<uint8>(
+					State.ReferenceAmount - OccupiedAmount));
+			PendingMaterialDisplacementCells.Add(Cell, State);
+			Constraints.Add({ Cell, State.MaximumRemainingAmount });
+		}
+	}
+	// Buoyancy components tick before the playable world and submit into the
+	// same sparse footprint map. Defer their solve so every character, creature,
+	// and rigid body is handled by one merged material transaction. Direct
+	// callers keep the immediate behavior used by tools and focused tests.
+	if (!bDeferMaterialSolve
+		&& MaterialSimulation->DisplaceLiquids(
+			Constraints,
+			BodyLiquidDisplacementSearchRadiusCells) > 0)
+	{
+		bMaterialVisualizationDirty = true;
+	}
+	return !Constraints.IsEmpty();
+}
+
+bool AMatterFluxPlayableWorldActor::TryGetLiquidProjectionHeightAudit(
+	const FName MaterialId,
+	FMatterFluxLiquidProjectionHeightAudit& OutAudit) const
+{
+	if (const FMatterFluxLiquidProjectionHeightAudit* Audit =
+		LiquidProjectionHeightAudits.Find(MaterialId))
+	{
+		OutAudit = *Audit;
+		return true;
+	}
+	OutAudit = {};
+	return false;
 }
 
 void AMatterFluxPlayableWorldActor::SetWorldStreamingFocus(
@@ -1901,6 +2577,141 @@ int32 AMatterFluxPlayableWorldActor::
 		: 0;
 }
 
+void AMatterFluxPlayableWorldActor::SetFragmentSourceDebugIsolatedAggregate(
+	const FGuid& AggregateId)
+{
+	if (FragmentSourceProxy)
+	{
+		FragmentSourceProxy->SetDebugIsolatedAggregate(AggregateId);
+	}
+}
+
+bool AMatterFluxPlayableWorldActor::
+	FindNearestTreeAggregateForVisualInspection(
+		const FVector& Focus,
+		FGuid& OutAggregateId,
+		FGuid& OutRootSourceId,
+		FBox& OutWorldBounds,
+		FTransform& OutRootWorldTransform) const
+{
+	OutAggregateId.Invalidate();
+	OutRootSourceId.Invalidate();
+	OutWorldBounds = FBox(ForceInit);
+	OutRootWorldTransform = FTransform::Identity;
+	double BestDistanceSquared = TNumericLimits<double>::Max();
+	for (const TPair<
+		FIntPoint,
+		TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>>& Pair
+		: FragmentSourceChunks)
+	{
+		for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
+			: Pair.Value)
+		{
+			if (!Source.bAggregateRoot
+				|| Source.Name != TEXT("TreeTrunk")
+				|| !Source.AggregateId.IsValid()
+				|| RemovedFragmentSourceIds.Contains(Source.SourceId))
+			{
+				continue;
+			}
+			const FTransform WorldTransform =
+				Source.Transform * GetActorTransform();
+			const double DistanceSquared = FVector::DistSquared(
+				WorldTransform.GetLocation(),
+				Focus);
+			if (OutAggregateId.IsValid()
+				&& DistanceSquared >= BestDistanceSquared)
+			{
+				continue;
+			}
+			OutAggregateId = Source.AggregateId;
+			OutRootSourceId = Source.SourceId;
+			OutRootWorldTransform = WorldTransform;
+			BestDistanceSquared = DistanceSquared;
+		}
+	}
+	if (!OutAggregateId.IsValid())
+	{
+		return false;
+	}
+	for (const TPair<
+		FIntPoint,
+		TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>>& Pair
+		: FragmentSourceChunks)
+	{
+		for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
+			: Pair.Value)
+		{
+			if (Source.AggregateId == OutAggregateId
+				&& !RemovedFragmentSourceIds.Contains(Source.SourceId))
+			{
+				OutWorldBounds += BuildFragmentSourceLocalBounds(Source)
+					.TransformBy(GetActorTransform().ToMatrixWithScale());
+			}
+		}
+	}
+	return OutWorldBounds.IsValid != 0;
+}
+
+bool AMatterFluxPlayableWorldActor::IgniteLogicalFragmentAggregate(
+	const FGuid& AggregateId,
+	const FVector& WorldLocation,
+	const FName FlameMaterial,
+	const int32 EventSeed)
+{
+	if (!HasAuthority() || !AggregateId.IsValid())
+	{
+		return false;
+	}
+	TArray<const MatterFlux::PlayableLevel::FLevelFragmentSource*> Candidates;
+	for (const TPair<
+		FIntPoint,
+		TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>>& Pair
+		: FragmentSourceChunks)
+	{
+		for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
+			: Pair.Value)
+		{
+			if (Source.AggregateId == AggregateId
+				&& !RemovedFragmentSourceIds.Contains(Source.SourceId)
+				&& !GeneratedFragmentSources.Contains(Source.SourceId))
+			{
+				Candidates.Add(&Source);
+			}
+		}
+	}
+	Candidates.Sort([this, &WorldLocation](
+		const MatterFlux::PlayableLevel::FLevelFragmentSource& Left,
+		const MatterFlux::PlayableLevel::FLevelFragmentSource& Right)
+	{
+		const double LeftDistance = BuildFragmentSourceLocalBounds(Left)
+			.TransformBy(GetActorTransform().ToMatrixWithScale())
+			.ComputeSquaredDistanceToPoint(WorldLocation);
+		const double RightDistance = BuildFragmentSourceLocalBounds(Right)
+			.TransformBy(GetActorTransform().ToMatrixWithScale())
+			.ComputeSquaredDistanceToPoint(WorldLocation);
+		if (!FMath::IsNearlyEqual(LeftDistance, RightDistance))
+		{
+			return LeftDistance < RightDistance;
+		}
+		return Left.SourceId.ToString(EGuidFormats::Digits)
+			< Right.SourceId.ToString(EGuidFormats::Digits);
+	});
+	for (const MatterFlux::PlayableLevel::FLevelFragmentSource* Source
+		: Candidates)
+	{
+		if (Source && IgniteLogicalFragmentSource(
+			*Source,
+			WorldLocation,
+			FlameMaterial,
+			EventSeed ^ static_cast<int32>(GetTypeHash(Source->SourceId))))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
 void AMatterFluxPlayableWorldActor::GatherFragmentSourcesInBounds(
 	const FBox& Bounds,
 	TArray<AFragment2DSourceActor*>& OutSources)
@@ -1921,6 +2732,14 @@ void AMatterFluxPlayableWorldActor::GatherFragmentSourcesInBounds(
 			|| RemovedFragmentSourceIds.Contains(Source->SourceId)
 			|| GeneratedFragmentSources.Contains(Source->SourceId)
 			|| !Source->Mask.IsValid())
+		{
+			continue;
+		}
+		const FBox SourceWorldBounds =
+			BuildFragmentSourceLocalBounds(*Source).TransformBy(
+				GetActorTransform().ToMatrixWithScale());
+		if (!SourceWorldBounds.IsValid
+			|| !SourceWorldBounds.Intersect(Bounds))
 		{
 			continue;
 		}
@@ -2059,12 +2878,14 @@ int32 AMatterFluxPlayableWorldActor::
 		return 0;
 	}
 	TSet<FName> FuelMaterials;
-	for (const TPair<FName, FMatterFluxCombustionDefinition>& Pair
-		: Registry->Combustions)
+	for (const TPair<FName, FMatterFluxReactionDefinition>& Pair
+		: Registry->Reactions)
 	{
-		if (Pair.Value.FlameMaterial == FlameMaterial)
+		if (Pair.Value.Kind
+				== FMatterFluxReactionDefinition::EKind::Propagating
+			&& Pair.Value.InputB == FlameMaterial)
 		{
-			FuelMaterials.Add(Pair.Value.FuelMaterial);
+			FuelMaterials.Add(Pair.Value.InputA);
 		}
 	}
 	if (FuelMaterials.IsEmpty())
@@ -2156,10 +2977,35 @@ void AMatterFluxPlayableWorldActor::MaterializeFragmentAggregate(
 	}
 }
 
+void AMatterFluxPlayableWorldActor::SetFragmentSourceStreamingPinned(
+	const FGuid& SourceId,
+	const bool bPinned)
+{
+	if (!HasAuthority() || !SourceId.IsValid())
+	{
+		return;
+	}
+	if (bPinned)
+	{
+		if (!GeneratedFragmentSources.Contains(SourceId))
+		{
+			return;
+		}
+		StreamingPinnedFragmentSourceIds.Add(SourceId);
+		PendingFragmentSourceDespawns.Remove(SourceId);
+	}
+	else
+	{
+		StreamingPinnedFragmentSourceIds.Remove(SourceId);
+	}
+}
+
 bool AMatterFluxPlayableWorldActor::DematerializeFragmentSource(
 	const FGuid& SourceId)
 {
-	if (!HasAuthority() || !SourceId.IsValid())
+	if (!HasAuthority()
+		|| !SourceId.IsValid()
+		|| StreamingPinnedFragmentSourceIds.Contains(SourceId))
 	{
 		return false;
 	}
@@ -2271,10 +3117,41 @@ void AMatterFluxPlayableWorldActor::NotifyDynamicAggregateOwnsSource(
 		return;
 	}
 	RemovedFragmentSourceIds.Add(SourceId);
+	StreamingPinnedFragmentSourceIds.Remove(SourceId);
 	if (IsValid(CarrierActor)
 		&& CarrierActor->GetWorld() == GetWorld())
 	{
 		DynamicAggregateCarriers.Add(SourceId, CarrierActor);
+		if (const FFragment2DSourceStreamingState* Existing =
+			StreamedFragmentSourceStates.Find(SourceId);
+			Existing && Existing->bHasCombustionState)
+		{
+			FName ResidueMaterial = NAME_None;
+			FLinearColor ResidueColor(0.08f, 0.07f, 0.06f);
+			const FMatterFluxContentRegistryPtr Registry =
+				IMatterFluxScriptRuntime::IsAvailable()
+					? IMatterFluxScriptRuntime::Get().GetActiveRegistry()
+					: nullptr;
+			if (Registry.IsValid())
+			{
+				if (const FMatterFluxReactionDefinition* Rule =
+					Registry->Reactions.Find(
+						Existing->CombustionState.RuleId))
+				{
+					ResidueMaterial = Rule->OutputA;
+					if (const FMatterFluxMaterialDefinition* Material =
+						Registry->Materials.Find(ResidueMaterial))
+					{
+						ResidueColor = Material->Color;
+					}
+				}
+			}
+			CarrierActor->ApplyAggregateSourceStreamingState(
+				SourceId,
+				*Existing,
+				ResidueMaterial,
+				ResidueColor);
+		}
 	}
 	PendingFragmentSourceSpawns.RemoveAll(
 		[&SourceId](
@@ -2352,7 +3229,7 @@ bool AMatterFluxPlayableWorldActor::ArchiveFragmentSourceState(
 	}
 	TUniquePtr<MatterFlux::Combustion::FSourceCombustionRuntime>
 		PreparedRuntime;
-	const FMatterFluxCombustionDefinition* Rule = nullptr;
+	const FMatterFluxReactionDefinition* Rule = nullptr;
 	FLinearColor ResidueColor(0.08f, 0.07f, 0.06f);
 	if (State.bHasCombustionState)
 	{
@@ -2361,7 +3238,7 @@ bool AMatterFluxPlayableWorldActor::ArchiveFragmentSourceState(
 				? IMatterFluxScriptRuntime::Get().GetActiveRegistry()
 				: nullptr;
 		Rule = Registry.IsValid()
-			? Registry->Combustions.Find(State.CombustionState.RuleId)
+			? Registry->Reactions.Find(State.CombustionState.RuleId)
 			: nullptr;
 		if (!Rule)
 		{
@@ -2374,7 +3251,7 @@ bool AMatterFluxPlayableWorldActor::ArchiveFragmentSourceState(
 			return false;
 		}
 		if (const FMatterFluxMaterialDefinition* Material =
-			Registry->Materials.Find(Rule->ResidueMaterial))
+			Registry->Materials.Find(Rule->OutputA))
 		{
 			ResidueColor = Material->Color;
 		}
@@ -2433,7 +3310,7 @@ bool AMatterFluxPlayableWorldActor::ArchiveFragmentSourceState(
 		if (State.bHasCombustionState && Rule)
 		{
 			ResidueMask = State.CombustionState.ResidueMask;
-			ResidueMaterial = Rule->ResidueMaterial;
+			ResidueMaterial = Rule->OutputA;
 		}
 		if (FragmentSourceProxy->ApplySourceState(
 			SourceId,
@@ -2525,17 +3402,9 @@ bool AMatterFluxPlayableWorldActor::IgniteLogicalFragmentSource(
 	{
 		return false;
 	}
-	const FMatterFluxCombustionDefinition* Rule = nullptr;
-	for (const TPair<FName, FMatterFluxCombustionDefinition>& Pair
-		: Registry->Combustions)
-	{
-		if (Pair.Value.FuelMaterial == Source.MaterialId
-			&& Pair.Value.FlameMaterial == FlameMaterial)
-		{
-			Rule = &Pair.Value;
-			break;
-		}
-	}
+	const FMatterFluxReactionDefinition* Rule =
+		MatterFlux::Reaction::FMaterialReactionEngine::FindPropagatingRule(
+			*Registry, Source.MaterialId, FlameMaterial);
 	if (!Rule)
 	{
 		return false;
@@ -2625,6 +3494,162 @@ bool AMatterFluxPlayableWorldActor::IgniteLogicalFragmentSource(
 	return true;
 }
 
+bool AMatterFluxPlayableWorldActor::IgniteDynamicAggregateSource(
+	AFragment2DActor& CarrierActor,
+	const FGuid& SourceId,
+	const FVector& WorldLocation,
+	const FName FlameMaterial,
+	const int32 EventSeed)
+{
+	const TWeakObjectPtr<AFragment2DActor>* RegisteredCarrier =
+		DynamicAggregateCarriers.Find(SourceId);
+	if (!HasAuthority()
+		|| CarrierActor.GetWorld() != GetWorld()
+		|| !RegisteredCarrier
+		|| RegisteredCarrier->Get() != &CarrierActor
+		|| WorldLocation.ContainsNaN()
+		|| FlameMaterial.IsNone())
+	{
+		return false;
+	}
+	const MatterFlux::PlayableLevel::FLevelFragmentSource* Source =
+		FindFragmentSourceDefinition(SourceId);
+	FFragmentAggregateSourceState CarrierState;
+	if (!Source
+		|| !CarrierActor.GetAggregateSourceState(SourceId, CarrierState)
+		|| CarrierState.MaterialId != Source->MaterialId)
+	{
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry =
+		IMatterFluxScriptRuntime::IsAvailable()
+			? IMatterFluxScriptRuntime::Get().GetActiveRegistry()
+			: nullptr;
+	if (!Registry.IsValid())
+	{
+		return false;
+	}
+	const FMatterFluxReactionDefinition* Rule = nullptr;
+	TArray<FName> RuleIds;
+	Registry->Reactions.GetKeys(RuleIds);
+	RuleIds.Sort(FNameLexicalLess());
+	for (const FName RuleId : RuleIds)
+	{
+		const FMatterFluxReactionDefinition* CandidateRule =
+			Registry->Reactions.Find(RuleId);
+		if (CandidateRule
+			&& CandidateRule->Kind
+				== FMatterFluxReactionDefinition::EKind::Propagating
+			&& CandidateRule->InputA == CarrierState.MaterialId
+			&& CandidateRule->InputB == FlameMaterial)
+		{
+			Rule = CandidateRule;
+			break;
+		}
+	}
+	if (!Rule)
+	{
+		return false;
+	}
+
+	TUniquePtr<MatterFlux::Combustion::FSourceCombustionRuntime> Candidate;
+	TUniquePtr<MatterFlux::Combustion::FSourceCombustionRuntime>* RuntimePtr =
+		ActiveSourceCombustions.Find(SourceId);
+	MatterFlux::Combustion::FSourceCombustionRuntime* Runtime =
+		RuntimePtr ? RuntimePtr->Get() : nullptr;
+	if (!Runtime)
+	{
+		Candidate = MakeUnique<
+			MatterFlux::Combustion::FSourceCombustionRuntime>();
+		FString Error;
+		if (CarrierState.bHasCombustionState)
+		{
+			MatterFlux::Combustion::FSourceRuntimeSnapshot Snapshot;
+			Snapshot.CombustionState.RuleId = CarrierState.CombustionRuleId;
+			Snapshot.CombustionState.Width = CarrierState.SourceMask.Width;
+			Snapshot.CombustionState.Height = CarrierState.SourceMask.Height;
+			Snapshot.CombustionState.Seed = CarrierState.CombustionSeed;
+			Snapshot.CombustionState.Tick = CarrierState.CombustionTick;
+			Snapshot.CombustionState.FuelMask =
+				CarrierState.SourceMask.SolidMask;
+			Snapshot.CombustionState.ResidueMask =
+				CarrierState.ResidueMask.SolidMask;
+			Snapshot.CombustionState.BurningMask =
+				CarrierState.BurningMask.SolidMask;
+			Snapshot.CombustionAccumulator =
+				CarrierState.CombustionAccumulator;
+			Snapshot.TotalSmokeEmissionCount =
+				CarrierState.TotalSmokeEmissionCount;
+			if (!Candidate->RestoreState(
+				MatterFlux::Combustion::FSourceRuntimeSettings(),
+				Snapshot,
+				*Rule,
+				Error))
+			{
+				UE_LOG(
+					LogMatterFlux,
+					Error,
+					TEXT("Dynamic aggregate source %s combustion restore failed: %s"),
+					*SourceId.ToString(),
+					*Error);
+				return false;
+			}
+		}
+		else if (!Candidate->Initialize(
+			MatterFlux::Combustion::FSourceRuntimeSettings(),
+			CarrierState.SourceMask,
+			*Rule,
+			EventSeed,
+			Error))
+		{
+			UE_LOG(
+				LogMatterFlux,
+				Error,
+				TEXT("Dynamic aggregate source %s combustion initialization failed: %s"),
+				*SourceId.ToString(),
+				*Error);
+			return false;
+		}
+		Runtime = Candidate.Get();
+	}
+
+	FTransform SourceWorldTransform;
+	if (!CarrierActor.GetAggregateSourceWorldTransform(
+		SourceId,
+		SourceWorldTransform))
+	{
+		return false;
+	}
+	const FVector Local = SourceWorldTransform.InverseTransformPosition(
+		WorldLocation);
+	const FIntPoint RequestedCell(
+		FMath::FloorToInt(
+			Local.X / CarrierState.SourceMask.CellSize
+				+ static_cast<double>(CarrierState.SourceMask.Width) * 0.5),
+		FMath::FloorToInt(
+			Local.Z / CarrierState.SourceMask.CellSize
+				+ static_cast<double>(CarrierState.SourceMask.Height) * 0.5));
+	if (!Runtime->IgniteNearest(RequestedCell, FlameMaterial))
+	{
+		return false;
+	}
+	if (Candidate)
+	{
+		ActiveSourceCombustions.Add(SourceId, MoveTemp(Candidate));
+		Runtime = ActiveSourceCombustions.FindChecked(SourceId).Get();
+	}
+	if (!SynchronizeLogicalSourceCombustionState(
+		SourceId,
+		*Source,
+		*Runtime,
+		true))
+	{
+		return false;
+	}
+	bSourceCombustionVisualDirty = true;
+	return true;
+}
+
 bool AMatterFluxPlayableWorldActor::
 	SynchronizeLogicalSourceCombustionState(
 		const FGuid& SourceId,
@@ -2644,7 +3669,7 @@ bool AMatterFluxPlayableWorldActor::
 		State.bHasCombustionState,
 		State.CombustionState.BurningMask);
 	const FName ResidueMaterial = Runtime.GetRule()
-		? Runtime.GetRule()->ResidueMaterial
+		? Runtime.GetRule()->OutputA
 		: NAME_None;
 	FLinearColor ResidueColor(0.08f, 0.07f, 0.06f);
 	const FMatterFluxContentRegistryPtr Registry =
@@ -2787,9 +3812,13 @@ int32 AMatterFluxPlayableWorldActor::IgniteLogicalFragmentSourcesInBounds(
 	const FBox& Bounds,
 	const FVector& IgnitionPoint,
 	const FName FlameMaterial,
-	const int32 EventSeed)
+	const int32 EventSeed,
+	const int32 MaxIgnitions)
 {
-	if (!HasAuthority() || !Bounds.IsValid || IgnitionPoint.ContainsNaN())
+	if (!HasAuthority()
+		|| !Bounds.IsValid
+		|| IgnitionPoint.ContainsNaN()
+		|| MaxIgnitions <= 0)
 	{
 		return 0;
 	}
@@ -2797,9 +3826,20 @@ int32 AMatterFluxPlayableWorldActor::IgniteLogicalFragmentSourcesInBounds(
 	TArray<const MatterFlux::PlayableLevel::FLevelFragmentSource*>
 		Candidates;
 	GatherLogicalFragmentSourceCandidates(Bounds, Candidates);
+	Candidates.Sort([](
+		const MatterFlux::PlayableLevel::FLevelFragmentSource& A,
+		const MatterFlux::PlayableLevel::FLevelFragmentSource& B)
+	{
+		return A.SourceId.ToString(EGuidFormats::Digits)
+			< B.SourceId.ToString(EGuidFormats::Digits);
+	});
 	for (const MatterFlux::PlayableLevel::FLevelFragmentSource* Source
 		: Candidates)
 	{
+		if (Ignited >= MaxIgnitions)
+		{
+			break;
+		}
 		if (!Source
 			|| GeneratedFragmentSources.Contains(Source->SourceId)
 			|| ActiveSourceCombustions.Contains(Source->SourceId)
@@ -2887,14 +3927,12 @@ bool AMatterFluxPlayableWorldActor::IgniteFirstGeneratedTree(
 			: nullptr;
 	if (Registry.IsValid())
 	{
-		for (const TPair<FName, FMatterFluxCombustionDefinition>& Pair
-			: Registry->Combustions)
+		if (const FMatterFluxReactionDefinition* Rule =
+			MatterFlux::Reaction::FMaterialReactionEngine::
+				FindPropagatingRule(
+					*Registry, BestLogicalTree->MaterialId))
 		{
-			if (Pair.Value.FuelMaterial == BestLogicalTree->MaterialId)
-			{
-				FlameMaterial = Pair.Value.FlameMaterial;
-				break;
-			}
+			FlameMaterial = Rule->InputB;
 		}
 	}
 	const FVector LocalIgnitionPoint(
@@ -2931,6 +3969,13 @@ int32 AMatterFluxPlayableWorldActor::GetCombustingSourceCount() const
 				? 1
 				: 0;
 	}
+	if (UWorld* World = GetWorld())
+	{
+		for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+		{
+			Count += It->IsRootCombusting() ? 1 : 0;
+		}
+	}
 	return Count;
 }
 
@@ -2955,6 +4000,13 @@ int32 AMatterFluxPlayableWorldActor::GetCombustionResidueCellCount() const
 		if (IsValid(Pair.Value))
 		{
 			Count += Pair.Value->GetResidueCellCount();
+		}
+	}
+	if (UWorld* World = GetWorld())
+	{
+		for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+		{
+			Count += It->GetRootCombustionResidueCellCount();
 		}
 	}
 	return Count;
@@ -3039,16 +4091,9 @@ void AMatterFluxPlayableWorldActor::InitializeGroundCombustion(
 	{
 		return;
 	}
-	const FMatterFluxCombustionDefinition* GrassRule = nullptr;
-	for (const TPair<FName, FMatterFluxCombustionDefinition>& Pair
-		: Registry.Combustions)
-	{
-		if (Pair.Value.FuelMaterial == TEXT("grassland"))
-		{
-			GrassRule = &Pair.Value;
-			break;
-		}
-	}
+	const FMatterFluxReactionDefinition* GrassRule =
+		MatterFlux::Reaction::FMaterialReactionEngine::FindPropagatingRule(
+			Registry, TEXT("grassland"));
 	if (!GrassRule)
 	{
 		return;
@@ -3165,13 +4210,13 @@ bool AMatterFluxPlayableWorldActor::IgniteGroundAtWorldLocation(
 	const FIntPoint Requested(
 		static_cast<int32>(RoundedX),
 		static_cast<int32>(RoundedY));
-	const FMatterFluxCombustionDefinition* Rule =
+	const FMatterFluxReactionDefinition* Rule =
 		GroundCombustion->GetRule();
 	if (!Rule)
 	{
 		return false;
 	}
-	const FName Flame = Rule->FlameMaterial;
+	const FName Flame = Rule->InputB;
 	FIntPoint IgnitedCell = Requested;
 	bool bIgnited = GroundCombustion->Ignite(Requested, Flame);
 	for (int32 Radius = 1; !bIgnited && Radius <= 5; ++Radius)
@@ -3291,8 +4336,12 @@ void AMatterFluxPlayableWorldActor::EnsureGroundCombustionVisuals(
 	CreateLayer(
 		GroundSmokeInstances,
 		TEXT("GroundCombustionSmoke"));
+	// Smoke is rendered by the shared world pool. Keep this legacy component
+	// empty so old serialized worlds cannot display one static grey cube per cell.
+	GroundSmokeInstances->SetVisibility(false);
+	GroundSmokeInstances->ClearInstances();
 
-	const FMatterFluxCombustionDefinition* Rule =
+	const FMatterFluxReactionDefinition* Rule =
 		GroundCombustion
 			? GroundCombustion->GetRule()
 			: nullptr;
@@ -3323,22 +4372,22 @@ void AMatterFluxPlayableWorldActor::EnsureGroundCombustionVisuals(
 	ApplyMaterial(
 		GroundResidueInstances,
 		GroundResidueMaterial,
-		Rule->ResidueMaterial,
+		Rule->OutputA,
 		FLinearColor(0.24f, 0.23f, 0.21f));
 	ApplyMaterial(
 		GroundFlameInstances,
 		GroundFlameMaterial,
-		Rule->FlameMaterial,
+		Rule->InputB,
 		FLinearColor(1.0f, 0.22f, 0.01f));
 	ApplyMaterial(
 		GroundSmokeInstances,
 		GroundSmokeMaterial,
-		Rule->SmokeMaterial,
+		Rule->EmissionMaterial,
 		FLinearColor(0.15f, 0.16f, 0.18f));
 	if (GroundSmokeMaterial)
 	{
 		const FMatterFluxMaterialDefinition* SmokeDefinition =
-			Registry.Materials.Find(Rule->SmokeMaterial);
+			Registry.Materials.Find(Rule->EmissionMaterial);
 		const FLinearColor SmokeColor = SmokeDefinition
 			? SmokeDefinition->Color
 			: FLinearColor(0.15f, 0.16f, 0.18f);
@@ -3375,12 +4424,10 @@ void AMatterFluxPlayableWorldActor::
 	}
 	TArray<FTransform> ResidueTransforms;
 	TArray<FTransform> FlameTransforms;
-	TArray<FTransform> SmokeTransforms;
 	TArray<int32> ResidueCellIndices;
 	TArray<int32> BurningCellIndices;
 	TArray<int32> ResidueVisualCells;
 	TArray<int32> FlameVisualCells;
-	TArray<int32> SmokeVisualCells;
 	constexpr int32 ChunkSize = 64;
 	const FIntPoint FirstWorldCell(
 		FMath::FloorToInt(
@@ -3420,7 +4467,6 @@ void AMatterFluxPlayableWorldActor::
 		BurningCellIndices);
 	ResidueTransforms.Reserve(ResidueCellIndices.Num());
 	FlameTransforms.Reserve(FMath::Min(BurningCellIndices.Num(), 256));
-	SmokeTransforms.Reserve(FMath::Min(BurningCellIndices.Num() / 3, 96));
 	for (const int32 CellIndex : ResidueCellIndices)
 	{
 		if (!GroundSurfacePositions.IsValidIndex(CellIndex))
@@ -3450,14 +4496,6 @@ void AMatterFluxPlayableWorldActor::
 				FVector(0.24f, 0.24f, 0.34f));
 			FlameVisualCells.Add(CellIndex);
 		}
-		if ((CellIndex % 3) == 0 && SmokeTransforms.Num() < 96)
-		{
-			SmokeTransforms.Emplace(
-				FRotator::ZeroRotator,
-				Surface + FVector(-Jitter, Jitter, 76.0f),
-				FVector(0.10f, 0.10f, 0.16f));
-			SmokeVisualCells.Add(CellIndex);
-		}
 	}
 	const auto ReplaceInstances =
 		[](UInstancedStaticMeshComponent* Component,
@@ -3475,10 +4513,10 @@ void AMatterFluxPlayableWorldActor::
 		FlameTransforms);
 	ReplaceInstances(
 		GroundSmokeInstances,
-		SmokeTransforms);
+		TArray<FTransform>());
 	GroundResidueCellByInstance = MoveTemp(ResidueVisualCells);
 	GroundFlameCellByInstance = MoveTemp(FlameVisualCells);
-	GroundSmokeCellByInstance = MoveTemp(SmokeVisualCells);
+	GroundSmokeCellByInstance.Reset();
 	GroundResidueInstanceByCell.Reset();
 	GroundFlameInstanceByCell.Reset();
 	GroundSmokeInstanceByCell.Reset();
@@ -3498,17 +4536,11 @@ void AMatterFluxPlayableWorldActor::
 			GroundFlameCellByInstance[InstanceIndex],
 			InstanceIndex);
 	}
-	for (int32 InstanceIndex = 0;
-		InstanceIndex < GroundSmokeCellByInstance.Num();
-		++InstanceIndex)
-	{
-		GroundSmokeInstanceByCell.Add(
-			GroundSmokeCellByInstance[InstanceIndex],
-			InstanceIndex);
-	}
+	GroundSmokeInstanceByCell.Reset();
 	bGroundCombustionVisualDirty = false;
 	bGroundCombustionVisualNeedsFullRebuild = false;
 	PendingGroundCombustionVisualCellIndices.Reset();
+	RebuildGroundSmokeAnchors();
 }
 
 bool AMatterFluxPlayableWorldActor::IsGroundCombustionCellVisible(
@@ -3631,11 +4663,6 @@ void AMatterFluxPlayableWorldActor::ApplyGroundCombustionVisualChanges(
 				GroundFlameInstanceByCell,
 				GroundFlameCellByInstance,
 				CellIndex);
-			RemoveCellInstance(
-				*GroundSmokeInstances,
-				GroundSmokeInstanceByCell,
-				GroundSmokeCellByInstance,
-				CellIndex);
 		}
 	}
 	for (const int32 CellIndex : ChangedCellIndices)
@@ -3704,21 +4731,7 @@ void AMatterFluxPlayableWorldActor::ApplyGroundCombustionVisualChanges(
 					Surface + FVector(Jitter, -Jitter, 20.0f),
 					FVector(0.24f, 0.24f, 0.34f)));
 		}
-		if ((CellIndex % 3) == 0
-			&& GroundSmokeCellByInstance.Num() < 96)
-		{
-			AddCellInstance(
-				*GroundSmokeInstances,
-				GroundSmokeInstanceByCell,
-				GroundSmokeCellByInstance,
-				CellIndex,
-				FTransform(
-					FRotator::ZeroRotator,
-					Surface + FVector(-Jitter, Jitter, 76.0f),
-					FVector(0.10f, 0.10f, 0.16f)));
-		}
-		if (GroundFlameCellByInstance.Num() >= 256
-			&& GroundSmokeCellByInstance.Num() >= 96)
+		if (GroundFlameCellByInstance.Num() >= 256)
 		{
 			break;
 		}
@@ -3726,6 +4739,7 @@ void AMatterFluxPlayableWorldActor::ApplyGroundCombustionVisualChanges(
 	PendingGroundCombustionVisualCellIndices.Reset();
 	bGroundCombustionVisualDirty =
 		bGroundCombustionVisualNeedsFullRebuild;
+	RebuildGroundSmokeAnchors();
 }
 
 int32 AMatterFluxPlayableWorldActor::
@@ -4006,16 +5020,16 @@ void AMatterFluxPlayableWorldActor::
 		{
 			continue;
 		}
-		if (const FMatterFluxCombustionDefinition* Rule =
-			Registry->Combustions.Find(State->CombustionState.RuleId))
+		if (const FMatterFluxReactionDefinition* Rule =
+			Registry->Reactions.Find(State->CombustionState.RuleId))
 		{
 			if (const FMatterFluxMaterialDefinition* Material =
-				Registry->Materials.Find(Rule->FlameMaterial))
+				Registry->Materials.Find(Rule->InputB))
 			{
 				FlameColor = Material->Color;
 			}
 			if (const FMatterFluxMaterialDefinition* Material =
-				Registry->Materials.Find(Rule->SmokeMaterial))
+				Registry->Materials.Find(Rule->EmissionMaterial))
 			{
 				SmokeColor = Material->Color;
 			}
@@ -4026,12 +5040,13 @@ void AMatterFluxPlayableWorldActor::
 		[this](
 			TObjectPtr<UMaterialInstanceDynamic>& Material,
 			UInstancedStaticMeshComponent* Component,
-			const FLinearColor& Color)
+			const FLinearColor& Color,
+			UMaterialInterface* Template)
 		{
-			if (!Material && VoxelColorMaterialTemplate)
+			if (!Material && Template)
 			{
 				Material = UMaterialInstanceDynamic::Create(
-					VoxelColorMaterialTemplate,
+					Template,
 					this);
 				Material->SetVectorParameterValue(TEXT("Color"), Color);
 				Material->SetScalarParameterValue(TEXT("FaceContrast"), 0.35f);
@@ -4039,15 +5054,24 @@ void AMatterFluxPlayableWorldActor::
 				Component->SetMaterial(0, Material);
 			}
 		};
-	ConfigureMaterial(SourceFlameMaterial, SourceFlameInstances, FlameColor);
+	ConfigureMaterial(
+		SourceFlameMaterial,
+		SourceFlameInstances,
+		FlameColor,
+		VoxelColorMaterialTemplate);
 	SmokeColor = FLinearColor::LerpUsingHSV(
 		SmokeColor,
 		FLinearColor(0.48f, 0.51f, 0.56f, 1.0f),
 		0.65f);
-	ConfigureMaterial(SourceSmokeMaterial, SourceSmokeInstances, SmokeColor);
+	SmokeColor.A = 0.52f;
+	ConfigureMaterial(
+		SourceSmokeMaterial,
+		SourceSmokeInstances,
+		SmokeColor,
+		VoxelGasMaterialTemplate);
 
 	TArray<FTransform> FlameTransforms;
-	TArray<FTransform> SmokeTransforms;
+	SourceSmokeAnchors.Reset();
 	constexpr int32 MaxVisualInstances = 8192;
 	for (const FGuid& SourceId : ActiveVisualIds)
 	{
@@ -4076,13 +5100,65 @@ void AMatterFluxPlayableWorldActor::
 			}
 		}
 		const TArray<uint8>& Burning = State->CombustionState.BurningMask;
-		for (int32 Index = 0;
-			Index < Burning.Num() && FlameTransforms.Num() < MaxVisualInstances;
-			++Index)
+		float SmokeProbability = 0.7f;
+		if (Registry.IsValid())
 		{
-			if (Burning[Index] == 0)
+			if (const FMatterFluxReactionDefinition* Rule =
+				Registry->Reactions.Find(State->CombustionState.RuleId))
 			{
-				continue;
+				SmokeProbability = FMath::Clamp(
+					static_cast<float>(Rule->EmissionChancePermille) / 1000.0f,
+					0.0f,
+					1.0f);
+			}
+		}
+		TArray<int32, TInlineAllocator<64>> VisibleBurningCells;
+		for (int32 Index = 0; Index < Burning.Num(); ++Index)
+		{
+			if (Burning[Index] != 0)
+			{
+				VisibleBurningCells.Add(Index);
+			}
+		}
+		TSet<int32> SmokeSourceCells;
+		if (Source->Mask.GeometryStyle
+			== EFragmentSourceGeometryStyle::VoxelBlocks)
+		{
+			TArray<uint8, TInlineAllocator<256>> Occupied;
+			Occupied.Append(State->GetRuntimeMask());
+			if (State->CombustionState.ResidueMask.Num() == Occupied.Num())
+			{
+				for (int32 Index = 0; Index < Occupied.Num(); ++Index)
+				{
+					Occupied[Index] = Occupied[Index] != 0
+						|| State->CombustionState.ResidueMask[Index] != 0;
+				}
+			}
+			TArray<uint8> OccupiedArray(Occupied);
+			TArray<int32> SurfaceCells;
+			MatterFlux::FragmentGeometry::GatherTopExposedBurningMaskCells(
+				OccupiedArray,
+				Burning,
+				Source->Mask.Width,
+				Source->Mask.Height,
+				SurfaceCells);
+			for (const int32 SurfaceCell : SurfaceCells)
+			{
+				SmokeSourceCells.Add(SurfaceCell);
+			}
+		}
+		else
+		{
+			for (const int32 VisibleBurningCell : VisibleBurningCells)
+			{
+				SmokeSourceCells.Add(VisibleBurningCell);
+			}
+		}
+		for (const int32 Index : VisibleBurningCells)
+		{
+			if (FlameTransforms.Num() >= MaxVisualInstances)
+			{
+				break;
 			}
 			const int32 X = Index % Source->Mask.Width;
 			const int32 Y = Index / Source->Mask.Width;
@@ -4090,36 +5166,123 @@ void AMatterFluxPlayableWorldActor::
 				(static_cast<float>(X) + 0.5f
 					- static_cast<float>(Source->Mask.Width) * 0.5f)
 					* Source->Mask.CellSize,
-				-Source->Mask.CellSize * 0.82f,
-				(static_cast<float>(Y) + 0.65f
+				0.0f,
+				(static_cast<float>(Y) + 0.62f
 					- static_cast<float>(Source->Mask.Height) * 0.5f)
 					* Source->Mask.CellSize);
 			const FVector Position =
 				VisualTransform.TransformPosition(LocalPosition);
-			const float Scale = Source->Mask.CellSize * 0.58f / 100.0f;
+			const float BaseScale = Source->Mask.CellSize / 100.0f;
+			const FVector FlameScale(
+				BaseScale * 1.06f,
+				BaseScale * 1.06f,
+				BaseScale * 1.18f);
 			FlameTransforms.Emplace(
 				VisualTransform.Rotator(),
 				Position,
-				FVector(Scale));
-			if (SmokeTransforms.Num() < MaxVisualInstances)
+				FlameScale);
+			if (SmokeSourceCells.Contains(Index)
+				&& SourceSmokeAnchors.Num() < MaxVisualInstances)
 			{
-				SmokeTransforms.Emplace(
-					VisualTransform.Rotator(),
-					Position + FVector(
-						0.0f,
-						0.0f,
-						Source->Mask.CellSize * 1.35f),
-					FVector(Scale * 0.42f));
+				MatterFlux::Rendering::FSmokeEmissionAnchor& Anchor =
+					SourceSmokeAnchors.AddDefaulted_GetRef();
+				Anchor.WorldPosition = Position + FVector(
+					0.0f,
+					0.0f,
+					Source->Mask.CellSize * 1.05f);
+				Anchor.CellSize = Source->Mask.CellSize;
+				Anchor.EmissionProbability = SmokeProbability;
+				Anchor.Seed = GetTypeHash(SourceId)
+					^ static_cast<uint32>(Index) * 0x9e3779b9u;
 			}
+		}
+	}
+	if (UWorld* World = GetWorld())
+	{
+		for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+		{
+			It->GatherRootCombustionVisualTransforms(
+				FlameTransforms,
+				SourceSmokeAnchors,
+				MaxVisualInstances);
+		}
+	}
+	if (UWorld* World = GetWorld())
+	{
+		for (TActorIterator<AFragment2DSourceActor> It(World); It; ++It)
+		{
+			It->GatherCombustionSmokeAnchors(
+				SourceSmokeAnchors,
+				MaxVisualInstances);
 		}
 	}
 	MatterFlux::Rendering::SynchronizeInstancesWithoutClearing(
 		*SourceFlameInstances,
 		FlameTransforms);
+	RefreshUnifiedSmokeAnchors();
+	bSourceCombustionVisualDirty = false;
+}
+
+void AMatterFluxPlayableWorldActor::RefreshUnifiedSmokeAnchors()
+{
+	TArray<MatterFlux::Rendering::FSmokeEmissionAnchor> CombinedAnchors;
+	CombinedAnchors.Reserve(
+		GroundSmokeAnchors.Num() + SourceSmokeAnchors.Num());
+	CombinedAnchors.Append(GroundSmokeAnchors);
+	CombinedAnchors.Append(SourceSmokeAnchors);
+	SmokeVisualPool.SetEmissionAnchors(CombinedAnchors);
+}
+
+void AMatterFluxPlayableWorldActor::AdvanceUnifiedSmokeVisualization(
+	const float DeltaSeconds)
+{
+	if (GetNetMode() == NM_DedicatedServer || !SourceSmokeInstances)
+	{
+		return;
+	}
+	SmokeVisualPool.Advance(DeltaSeconds);
+	TArray<FTransform> SmokeClusterTransforms;
+	SmokeVisualPool.BuildInstanceTransforms(SmokeClusterTransforms);
 	MatterFlux::Rendering::SynchronizeInstancesWithoutClearing(
 		*SourceSmokeInstances,
-		SmokeTransforms);
-	bSourceCombustionVisualDirty = false;
+		SmokeClusterTransforms);
+}
+
+void AMatterFluxPlayableWorldActor::RebuildGroundSmokeAnchors()
+{
+	GroundSmokeAnchors.Reset();
+	if (!GroundCombustion)
+	{
+		RefreshUnifiedSmokeAnchors();
+		return;
+	}
+	const FMatterFluxReactionDefinition* Rule = GroundCombustion->GetRule();
+	const float SmokeProbability = Rule
+		? FMath::Clamp(
+			static_cast<float>(Rule->EmissionChancePermille) / 1000.0f,
+			0.0f,
+			1.0f)
+		: 0.42f;
+	const float VisualCellSize = FMath::Max(
+		TerrainHeightField.CellSize,
+		12.0f);
+	GroundSmokeAnchors.Reserve(GroundFlameCellByInstance.Num());
+	for (const int32 CellIndex : GroundFlameCellByInstance)
+	{
+		if (!GroundSurfacePositions.IsValidIndex(CellIndex))
+		{
+			continue;
+		}
+		MatterFlux::Rendering::FSmokeEmissionAnchor& Anchor =
+			GroundSmokeAnchors.AddDefaulted_GetRef();
+		Anchor.WorldPosition = GroundSurfacePositions[CellIndex]
+			+ FVector(0.0f, 0.0f, VisualCellSize * 1.1f);
+		Anchor.CellSize = VisualCellSize;
+		Anchor.EmissionProbability = SmokeProbability;
+		Anchor.Seed = static_cast<uint32>(CellIndex) * 0x9e3779b9u
+			^ static_cast<uint32>(MapSeed);
+	}
+	RefreshUnifiedSmokeAnchors();
 }
 
 void AMatterFluxPlayableWorldActor::PropagateCombustion(
@@ -4144,6 +5307,7 @@ void AMatterFluxPlayableWorldActor::PropagateCombustion(
 
 	TArray<FGuid> LogicalBurningIds;
 	LogicalSourceCombustionIndex.GatherStableIds(LogicalBurningIds);
+	TSet<FGuid> PropagatedAggregateIds;
 	bBatchingGroundIgnitions = true;
 	for (const FGuid& BurningId : LogicalBurningIds)
 	{
@@ -4158,10 +5322,23 @@ void AMatterFluxPlayableWorldActor::PropagateCombustion(
 			continue;
 		}
 		FBox FireBounds(ForceInit);
+		TArray<FVector, TInlineAllocator<64>> BurningCellCenters;
 		const TArray<uint8>& BurningMask =
 			BurningState->CombustionState.BurningMask;
-		const FTransform SourceWorldTransform =
+		FTransform SourceWorldTransform =
 			BurningSource->Transform * GetActorTransform();
+		AFragment2DActor* DynamicCarrier = nullptr;
+		if (const TWeakObjectPtr<AFragment2DActor>* CarrierPtr =
+			DynamicAggregateCarriers.Find(BurningId))
+		{
+			DynamicCarrier = CarrierPtr->Get();
+			if (DynamicCarrier)
+			{
+				DynamicCarrier->GetAggregateSourceWorldTransform(
+					BurningId,
+					SourceWorldTransform);
+			}
+		}
 		for (int32 Index = 0; Index < BurningMask.Num(); ++Index)
 		{
 			if (BurningMask[Index] == 0)
@@ -4178,6 +5355,7 @@ void AMatterFluxPlayableWorldActor::PropagateCombustion(
 				(static_cast<float>(Y) + 0.5f
 					- BurningSource->Mask.Height * 0.5f)
 					* BurningSource->Mask.CellSize));
+			BurningCellCenters.Add(Center);
 			FireBounds += FBox::BuildAABB(
 				Center,
 				FVector(BurningSource->Mask.CellSize));
@@ -4186,7 +5364,15 @@ void AMatterFluxPlayableWorldActor::PropagateCombustion(
 		{
 			continue;
 		}
-		if (!SourcesThatIgnitedGround.Contains(BurningId)
+		float GroundHeight = 0.0f;
+		const bool bCanReachGround =
+			TrySampleTerrainHeightAtWorldLocation(
+				FireBounds.GetCenter(),
+				GroundHeight)
+			&& FireBounds.Min.Z
+				<= GroundHeight + BurningSource->Mask.CellSize * 1.5f;
+		if (bCanReachGround
+			&& !SourcesThatIgnitedGround.Contains(BurningId)
 			&& IgniteGroundAtWorldLocation(
 				FireBounds.GetCenter(),
 				MapSeed ^ GetTypeHash(BurningId)
@@ -4203,19 +5389,153 @@ void AMatterFluxPlayableWorldActor::PropagateCombustion(
 				: nullptr;
 		if (Registry.IsValid())
 		{
-			if (const FMatterFluxCombustionDefinition* Rule =
-				Registry->Combustions.Find(
+			if (const FMatterFluxReactionDefinition* Rule =
+				Registry->Reactions.Find(
 					BurningState->CombustionState.RuleId))
 			{
-				FlameMaterial = Rule->FlameMaterial;
+				FlameMaterial = Rule->InputB;
 			}
 		}
-		IgniteLogicalFragmentSourcesInBounds(
-			IgnitionBounds,
-			IgnitionBounds.GetCenter(),
-			FlameMaterial,
-			MapSeed ^ GetTypeHash(BurningId)
-				^ ReplicatedMaterialSimulationStep);
+		const bool bAggregateAlreadyPropagated =
+			BurningSource->AggregateId.IsValid()
+			&& PropagatedAggregateIds.Contains(BurningSource->AggregateId);
+		if (bAggregateAlreadyPropagated)
+		{
+			continue;
+		}
+		if (BurningSource->AggregateId.IsValid())
+		{
+			PropagatedAggregateIds.Add(BurningSource->AggregateId);
+		}
+		const int32 PropagationSeed = MapSeed ^ GetTypeHash(BurningId)
+			^ ReplicatedMaterialSimulationStep;
+		struct FAggregateContact
+		{
+			const MatterFlux::PlayableLevel::FLevelFragmentSource* Source = nullptr;
+			FVector WorldLocation = FVector::ZeroVector;
+			double DistanceSquared = TNumericLimits<double>::Max();
+			int32 CellIndex = INDEX_NONE;
+		};
+		FAggregateContact BestContact;
+		if (BurningSource->AggregateId.IsValid())
+		{
+			for (const TPair<
+				FIntPoint,
+				TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>>& Pair
+				: FragmentSourceChunks)
+			{
+				for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Candidate
+					: Pair.Value)
+				{
+					if (Candidate.SourceId == BurningId
+						|| Candidate.AggregateId != BurningSource->AggregateId
+						|| RemovedFragmentSourceIds.Contains(Candidate.SourceId)
+						|| GeneratedFragmentSources.Contains(Candidate.SourceId)
+						|| ActiveSourceCombustions.Contains(Candidate.SourceId))
+					{
+						continue;
+					}
+					const FFragment2DSourceStreamingState* CandidateState =
+						StreamedFragmentSourceStates.Find(Candidate.SourceId);
+					const TArray<uint8>& CandidateFuel = CandidateState
+						? CandidateState->GetRuntimeMask()
+						: Candidate.Mask.SolidMask;
+					if (CandidateFuel.Num()
+						!= Candidate.Mask.Width * Candidate.Mask.Height)
+					{
+						continue;
+					}
+					FTransform CandidateWorldTransform =
+						Candidate.Transform * GetActorTransform();
+					if (DynamicCarrier)
+					{
+						DynamicCarrier->GetAggregateSourceWorldTransform(
+							Candidate.SourceId,
+							CandidateWorldTransform);
+					}
+					const double ContactDistance = FMath::Max(
+						BurningSource->Mask.CellSize,
+						Candidate.Mask.CellSize) * 1.05;
+					const double MaximumDistanceSquared =
+						FMath::Square(ContactDistance);
+					for (int32 CellIndex = 0;
+						CellIndex < CandidateFuel.Num();
+						++CellIndex)
+					{
+						if (CandidateFuel[CellIndex] == 0)
+						{
+							continue;
+						}
+						const int32 X = CellIndex % Candidate.Mask.Width;
+						const int32 Y = CellIndex / Candidate.Mask.Width;
+						const FVector CandidateCenter =
+							CandidateWorldTransform.TransformPosition(FVector(
+								(static_cast<float>(X) + 0.5f
+									- Candidate.Mask.Width * 0.5f)
+									* Candidate.Mask.CellSize,
+								0.0f,
+								(static_cast<float>(Y) + 0.5f
+									- Candidate.Mask.Height * 0.5f)
+									* Candidate.Mask.CellSize));
+						for (const FVector& BurningCenter : BurningCellCenters)
+						{
+							const double DistanceSquared = FVector::DistSquared(
+								BurningCenter,
+								CandidateCenter);
+							if (DistanceSquared > MaximumDistanceSquared)
+							{
+								continue;
+							}
+							const bool bStableTieBreak =
+								FMath::IsNearlyEqual(
+									DistanceSquared,
+									BestContact.DistanceSquared)
+								&& (!BestContact.Source
+									|| Candidate.SourceId.ToString(EGuidFormats::Digits)
+										< BestContact.Source->SourceId.ToString(
+											EGuidFormats::Digits)
+									|| (Candidate.SourceId == BestContact.Source->SourceId
+										&& CellIndex < BestContact.CellIndex));
+							if (!BestContact.Source
+								|| DistanceSquared < BestContact.DistanceSquared
+								|| bStableTieBreak)
+							{
+								BestContact.Source = &Candidate;
+								BestContact.WorldLocation = CandidateCenter;
+								BestContact.DistanceSquared = DistanceSquared;
+								BestContact.CellIndex = CellIndex;
+							}
+						}
+					}
+				}
+			}
+		}
+		bool bIgnitedAggregateNeighbor = false;
+		if (BestContact.Source)
+		{
+			bIgnitedAggregateNeighbor = DynamicCarrier
+				? IgniteDynamicAggregateSource(
+					*DynamicCarrier,
+					BestContact.Source->SourceId,
+					BestContact.WorldLocation,
+					FlameMaterial,
+					PropagationSeed)
+				: IgniteLogicalFragmentSource(
+					*BestContact.Source,
+					BestContact.WorldLocation,
+					FlameMaterial,
+					PropagationSeed);
+		}
+		if (!bIgnitedAggregateNeighbor
+			&& !BurningSource->AggregateId.IsValid())
+		{
+			IgniteLogicalFragmentSourcesInBounds(
+				IgnitionBounds,
+				IgnitionBounds.GetCenter(),
+				FlameMaterial,
+				PropagationSeed,
+				1);
+		}
 	}
 	bBatchingGroundIgnitions = false;
 	if (GroundCombustion && GroundCombustion->HasPendingReplication())
@@ -4250,7 +5570,15 @@ void AMatterFluxPlayableWorldActor::PropagateCombustion(
 		{
 			continue;
 		}
-		if (!SourcesThatIgnitedGround.Contains(BurningSource->SourceId)
+		float GroundHeight = 0.0f;
+		const bool bCanReachGround =
+			TrySampleTerrainHeightAtWorldLocation(
+				FireBounds.GetCenter(),
+				GroundHeight)
+			&& FireBounds.Min.Z
+				<= GroundHeight + BurningSource->GetCellSize() * 1.5f;
+		if (bCanReachGround
+			&& !SourcesThatIgnitedGround.Contains(BurningSource->SourceId)
 			&& IgniteGroundAtWorldLocation(
 				FireBounds.GetCenter(),
 				MapSeed
@@ -4266,11 +5594,12 @@ void AMatterFluxPlayableWorldActor::PropagateCombustion(
 			MapSeed
 				^ GetTypeHash(BurningSource->SourceId)
 				^ ReplicatedMaterialSimulationStep;
-		IgniteLogicalFragmentSourcesInBounds(
+		const int32 LogicalIgnitions = IgniteLogicalFragmentSourcesInBounds(
 			IgnitionBounds,
 			IgnitionBounds.GetCenter(),
 			BurningSource->GetCombustionFlameMaterial(),
-			PropagationSeed);
+			PropagationSeed,
+			1);
 		TArray<AFragment2DSourceActor*> MaterializedCandidates;
 		if (FragmentSubsystem)
 		{
@@ -4280,6 +5609,10 @@ void AMatterFluxPlayableWorldActor::PropagateCombustion(
 		}
 		for (AFragment2DSourceActor* Candidate : MaterializedCandidates)
 		{
+			if (LogicalIgnitions > 0)
+			{
+				break;
+			}
 			if (!IsValid(Candidate)
 				|| Candidate == BurningSource
 				|| Candidate->IsCombusting()
@@ -4296,10 +5629,13 @@ void AMatterFluxPlayableWorldActor::PropagateCombustion(
 			const FVector Contact =
 				CandidateBounds.GetClosestPointTo(
 					IgnitionBounds.GetCenter());
-			Candidate->IgniteAtWorldLocation(
+			if (Candidate->IgniteAtWorldLocation(
 				Contact,
 				Candidate->GetCombustionFlameMaterial(),
-				PropagationSeed ^ GetTypeHash(Candidate->SourceId));
+				PropagationSeed ^ GetTypeHash(Candidate->SourceId)))
+			{
+				break;
+			}
 		}
 	}
 	bBatchingGroundIgnitions = false;
@@ -4393,7 +5729,7 @@ void AMatterFluxPlayableWorldActor::PropagateCombustion(
 	if (Registry.IsValid())
 	{
 		TArray<FName> RuleIds;
-		Registry->Combustions.GetKeys(RuleIds);
+		Registry->Reactions.GetKeys(RuleIds);
 		RuleIds.Sort(
 			[](const FName A, const FName B)
 			{
@@ -4401,14 +5737,15 @@ void AMatterFluxPlayableWorldActor::PropagateCombustion(
 			});
 		for (const FName RuleId : RuleIds)
 		{
-			const FMatterFluxCombustionDefinition* Rule =
-				Registry->Combustions.Find(RuleId);
+			const FMatterFluxReactionDefinition* Rule =
+				Registry->Reactions.Find(RuleId);
 			if (Rule
-				&& !FlameMaterialByFuel.Contains(Rule->FuelMaterial))
+				&& Rule->Kind == FMatterFluxReactionDefinition::EKind::Propagating
+				&& !FlameMaterialByFuel.Contains(Rule->InputA))
 			{
 				FlameMaterialByFuel.Add(
-					Rule->FuelMaterial,
-					Rule->FlameMaterial);
+					Rule->InputA,
+					Rule->InputB);
 			}
 		}
 	}
@@ -4559,6 +5896,20 @@ void AMatterFluxPlayableWorldActor::InitializeMaterialSimulation(
 	const FMatterFluxContentRegistry& Registry,
 	const MatterFlux::PlayableLevel::FLevelLayout& Layout)
 {
+	PendingMaterialDisplacementCells.Reset();
+	PreviousMaterialDisplacementCells.Reset();
+	MaterialLiquidDensities.Reset();
+	for (const TPair<FName, FMatterFluxMaterialDefinition>& Pair
+		: Registry.Materials)
+	{
+		if (Pair.Value.Phase == EMatterFluxMaterialPhase::Liquid
+			&& FMath::IsFinite(Pair.Value.Density)
+			&& Pair.Value.Density > 0.0f)
+		{
+			MaterialLiquidDensities.Add(Pair.Key, Pair.Value.Density);
+		}
+	}
+
 	MatterFlux::Material::FRuntimeSettings RuntimeSettings;
 	MatterFlux::Material::FWorldSettings& Settings =
 		RuntimeSettings.World;
@@ -4572,6 +5923,8 @@ void AMatterFluxPlayableWorldActor::InitializeMaterialSimulation(
 	Settings.bCullOutsideVerticalBounds = true;
 	Settings.bUseSurfaceTopology = true;
 	Settings.bCullOutsideSurfaceBounds = true;
+	Settings.LiquidFullColumnHeight = FMath::RoundToInt(
+		MaterialLiquidColumnHeight);
 	RuntimeSettings.StepSeconds = MaterialSimulationStepSeconds;
 	RuntimeSettings.MaxStepsPerAdvance =
 		MaxMaterialSimulationStepsPerFrame;
@@ -4678,6 +6031,8 @@ void AMatterFluxPlayableWorldActor::SeedMaterialSimulation(
 		Layout.Terrain;
 	const MatterFlux::PlayableLevel::FLevelLayer* Stream =
 		Layout.FindLayer(TEXT("Stream"));
+	const MatterFlux::PlayableLevel::FLevelLayer* Lake =
+		Layout.FindLayer(TEXT("Lake"));
 	if (!Terrain.IsValid() || !Stream)
 	{
 		return;
@@ -4709,9 +6064,9 @@ void AMatterFluxPlayableWorldActor::SeedMaterialSimulation(
 		}
 	}
 
-	for (int32 StreamIndex = 2;
+	for (int32 StreamIndex = 0;
 		StreamIndex < Stream->Instances.Num();
-		StreamIndex += 16)
+		++StreamIndex)
 	{
 		if (const int32* SeedIndex =
 			SeedIndices.Find(
@@ -4719,6 +6074,56 @@ void AMatterFluxPlayableWorldActor::SeedMaterialSimulation(
 					Stream->Instances[StreamIndex].GetLocation())))
 		{
 			SeedCells[*SeedIndex].MaterialId = TEXT("water");
+			SeedCells[*SeedIndex].Amount = static_cast<uint8>(FMath::Clamp(
+				FMath::RoundToInt(
+					120.0f / MaterialLiquidColumnHeight * 255.0f),
+				1,
+				255));
+		}
+	}
+	if (Lake)
+	{
+		for (const FTransform& Transform : Lake->Instances)
+		{
+			const FVector Location = Transform.GetLocation();
+			const FIntPoint Cell = ToCell(Location);
+			const int32 TerrainX = FMath::Clamp(
+				FMath::RoundToInt(
+					(Location.X - Terrain.FirstCellCenter.X)
+						/ Terrain.CellSize),
+				0,
+				Terrain.Width - 1);
+			const int32 TerrainY = FMath::Clamp(
+				FMath::RoundToInt(
+					(Location.Y - Terrain.FirstCellCenter.Y)
+						/ Terrain.CellSize),
+				0,
+				Terrain.Height - 1);
+			const float BottomZ = Terrain.HeightAt(TerrainX, TerrainY);
+			const float SurfaceZ = Location.Z
+				+ Transform.GetScale3D().Z * 50.0f;
+			const int32* SeedIndex = SeedIndices.Find(Cell);
+			if (!SeedIndex || SurfaceZ <= BottomZ)
+			{
+				continue;
+			}
+			MatterFlux::Material::FSeedCell& SeedCell =
+				SeedCells[*SeedIndex];
+			const FName LakeMaterial = Lake->MaterialId.IsNone()
+				? FName(TEXT("water"))
+				: Lake->MaterialId;
+			const bool bAlreadyLake =
+				SeedCell.MaterialId == LakeMaterial;
+			SeedCell.MaterialId = LakeMaterial;
+			const uint8 LakeAmount = static_cast<uint8>(FMath::Clamp(
+				FMath::RoundToInt(
+					(SurfaceZ - BottomZ)
+						/ MaterialLiquidColumnHeight * 255.0f),
+				1,
+				255));
+			SeedCell.Amount = bAlreadyLake
+				? FMath::Max(SeedCell.Amount, LakeAmount)
+				: LakeAmount;
 		}
 	}
 
@@ -4754,34 +6159,16 @@ void AMatterFluxPlayableWorldActor::SeedMaterialSimulation(
 		if (const int32* SeedIndex = SeedIndices.Find(StreamCell))
 		{
 			SeedCells[*SeedIndex].MaterialId = TEXT("water");
+			SeedCells[*SeedIndex].Amount = static_cast<uint8>(FMath::Clamp(
+				FMath::RoundToInt(
+					120.0f / MaterialLiquidColumnHeight * 255.0f),
+				1,
+				255));
 		}
-		static const FIntPoint NeighborOffsets[] =
-		{
-			FIntPoint(1, 0),
-			FIntPoint(-1, 0),
-			FIntPoint(0, 1),
-			FIntPoint(0, -1),
-			FIntPoint(1, 1),
-			FIntPoint(-1, -1)
-		};
-		int32 LavaPlaced = 0;
-		for (int32 Radius = 1; Radius <= 4 && LavaPlaced < 12; ++Radius)
-		{
-			for (const FIntPoint& Offset : NeighborOffsets)
-			{
-				const FIntPoint Candidate =
-					StreamCell + Offset * Radius;
-				const int32* SeedIndex =
-					SeedIndices.Find(Candidate);
-				if (SeedIndex
-					&& SeedCells[*SeedIndex].MaterialId.IsNone())
-				{
-					SeedCells[*SeedIndex].MaterialId =
-						TEXT("lava");
-					++LavaPlaced;
-				}
-			}
-		}
+		// Do not seed reactive showcase materials beside the authored stream.
+		// The stream and lake are one connected water state, so a nearby lava
+		// sample becomes a permanent drain and turns shallow lake-edge cells
+		// into real holes. Reactions are exercised in isolated maps/tests.
 		for (int32 Index = 0;
 			Index < Stream->Instances.Num();
 			Index += 48)
@@ -4830,22 +6217,74 @@ void AMatterFluxPlayableWorldActor::SeedMaterialSimulation(
 			++StonePlaced;
 		}
 	}
-	static const TPair<FIntPoint, FName> CenterShowcase[] =
+	// Diagnostic material samples are secondary content. Never let them
+	// overwrite authored stream/lake cells: the simulation state is the fact
+	// from which the liquid surface is projected, so such an overwrite creates
+	// a real square hole rather than a harmless visual marker.
+	static const TPair<FIntPoint, FName> DistantShowcase[] =
 	{
 		{ FIntPoint(-12, -12), TEXT("water") },
 		{ FIntPoint(12, -12), TEXT("lava") },
 		{ FIntPoint(-12, 12), TEXT("sand") },
-		{ FIntPoint(12, 12), TEXT("steam") },
-		{ FIntPoint(0, 0), TEXT("stone") }
+		{ FIntPoint(12, 12), TEXT("steam") }
 	};
 	for (const TPair<FIntPoint, FName>& Showcase
-		: CenterShowcase)
+		: DistantShowcase)
 	{
 		if (const int32* SeedIndex =
 			SeedIndices.Find(Showcase.Key))
 		{
-			SeedCells[*SeedIndex].MaterialId = Showcase.Value;
+			MatterFlux::Material::FSeedCell& Cell = SeedCells[*SeedIndex];
+			if (Cell.MaterialId.IsNone())
+			{
+				Cell.MaterialId = Showcase.Value;
+				Cell.Amount = 255;
+			}
 		}
+	}
+
+	// 酸样本仍需相邻的水、草地和木头来覆盖反应链，但整组只放进
+	// 已经为空的地表格，避免把地图生成器定义的液体或固体替换掉。
+	static const FIntPoint ReactiveShowcaseAnchors[] =
+	{
+		FIntPoint(16, 16),
+		FIntPoint(-16, 16),
+		FIntPoint(16, -16),
+		FIntPoint(-16, -16),
+		FIntPoint(24, 0),
+		FIntPoint(-24, 0)
+	};
+	static const TPair<FIntPoint, FName> ReactiveShowcase[] =
+	{
+		{ FIntPoint(0, 0), TEXT("acid") },
+		{ FIntPoint(-1, 0), TEXT("water") },
+		{ FIntPoint(1, 0), TEXT("grassland") },
+		{ FIntPoint(0, 1), TEXT("wood") }
+	};
+	for (const FIntPoint Anchor : ReactiveShowcaseAnchors)
+	{
+		bool bFootprintIsEmpty = true;
+		for (const TPair<FIntPoint, FName>& Showcase : ReactiveShowcase)
+		{
+			const int32* SeedIndex = SeedIndices.Find(Anchor + Showcase.Key);
+			if (!SeedIndex || !SeedCells[*SeedIndex].MaterialId.IsNone())
+			{
+				bFootprintIsEmpty = false;
+				break;
+			}
+		}
+		if (!bFootprintIsEmpty)
+		{
+			continue;
+		}
+		for (const TPair<FIntPoint, FName>& Showcase : ReactiveShowcase)
+		{
+			MatterFlux::Material::FSeedCell& Cell = SeedCells[
+				SeedIndices.FindChecked(Anchor + Showcase.Key)];
+			Cell.MaterialId = Showcase.Value;
+			Cell.Amount = 255;
+		}
+		break;
 	}
 	if (!MaterialSimulation->SeedSurface(SeedCells))
 	{
@@ -4899,6 +6338,12 @@ void AMatterFluxPlayableWorldActor::
 	PublishMaterialSimulationState()
 {
 	if (!HasAuthority() || !MaterialSimulation)
+	{
+		return;
+	}
+	if (GetNetMode() == NM_Standalone
+		&& GetWorld()
+		&& GetWorld()->IsGameWorld())
 	{
 		return;
 	}
@@ -5177,10 +6622,10 @@ bool AMatterFluxPlayableWorldActor::ApplyReplicatedFragmentSourceState(
 			: nullptr;
 	if (Registry.IsValid() && Replicated.bHasCombustionState)
 	{
-		if (const FMatterFluxCombustionDefinition* Rule =
-			Registry->Combustions.Find(Replicated.CombustionRuleId))
+		if (const FMatterFluxReactionDefinition* Rule =
+			Registry->Reactions.Find(Replicated.CombustionRuleId))
 		{
-			ResidueMaterial = Rule->ResidueMaterial;
+			ResidueMaterial = Rule->OutputA;
 			if (const FMatterFluxMaterialDefinition* Material =
 				Registry->Materials.Find(ResidueMaterial))
 			{
@@ -5204,6 +6649,22 @@ bool AMatterFluxPlayableWorldActor::ApplyReplicatedFragmentSourceState(
 		StreamedFragmentSourceStates.Add(
 			Replicated.SourceId,
 			MoveTemp(CandidateState));
+	if (TWeakObjectPtr<AFragment2DActor>* CarrierPtr =
+		DynamicAggregateCarriers.Find(Replicated.SourceId))
+	{
+		if (AFragment2DActor* Carrier = CarrierPtr->Get())
+		{
+			Carrier->ApplyAggregateSourceStreamingState(
+				Replicated.SourceId,
+				RuntimeState,
+				ResidueMaterial,
+				ResidueColor);
+		}
+		else
+		{
+			DynamicAggregateCarriers.Remove(Replicated.SourceId);
+		}
+	}
 	LogicalSourceCombustionIndex.ApplySnapshot(
 		Replicated.SourceId,
 		RuntimeState.bHasCombustionState,
@@ -5258,6 +6719,326 @@ void AMatterFluxPlayableWorldActor::UpdateMaterialVisualization(
 	}
 }
 
+void AMatterFluxPlayableWorldActor::ApplyMaterialSourceContactReactions(
+	const FMatterFluxContentRegistry& Registry)
+{
+	if (!HasAuthority()
+		|| !MaterialSimulation
+		|| MaxMaterialSourceReactionsPerFrame <= 0)
+	{
+		return;
+	}
+
+	// Lua 注册表是无序映射；先稳定排序，保证 listen host、服务器和回放
+	// 在多个规则都可能匹配时仍选择同一条规则。
+	TArray<FName> ContactRuleIds;
+	TSet<FName> SourceReactiveLiquidMaterials;
+	for (const TPair<FName, FMatterFluxReactionDefinition>& Pair
+		: Registry.Reactions)
+	{
+		if (Pair.Value.Kind
+			== FMatterFluxReactionDefinition::EKind::Contact)
+		{
+			ContactRuleIds.Add(Pair.Key);
+			const FMatterFluxMaterialDefinition* InputA =
+				Registry.Materials.Find(Pair.Value.InputA);
+			const FMatterFluxMaterialDefinition* InputB =
+				Registry.Materials.Find(Pair.Value.InputB);
+			if (InputA && InputB
+				&& InputA->Phase == EMatterFluxMaterialPhase::Liquid
+				&& InputB->Phase
+					== EMatterFluxMaterialPhase::StaticSolid)
+			{
+				SourceReactiveLiquidMaterials.Add(Pair.Value.InputA);
+			}
+			if (InputA && InputB
+				&& InputB->Phase == EMatterFluxMaterialPhase::Liquid
+				&& InputA->Phase
+					== EMatterFluxMaterialPhase::StaticSolid)
+			{
+				SourceReactiveLiquidMaterials.Add(Pair.Value.InputB);
+			}
+		}
+	}
+	ContactRuleIds.Sort(FNameLexicalLess());
+	if (ContactRuleIds.IsEmpty())
+	{
+		return;
+	}
+
+	TArray<MatterFlux::Material::FCellSnapshot> Cells;
+	MaterialSimulation->GetAllCells(Cells);
+	int32 AcceptedReactions = 0;
+	TSet<FGuid> ReactedAggregateIds;
+	for (const MatterFlux::Material::FCellSnapshot& Cell : Cells)
+	{
+		if (AcceptedReactions >= MaxMaterialSourceReactionsPerFrame)
+		{
+			break;
+		}
+		const FMatterFluxMaterialDefinition* CellMaterial =
+			Registry.Materials.Find(Cell.MaterialId);
+		if (!CellMaterial
+			|| CellMaterial->Phase != EMatterFluxMaterialPhase::Liquid
+			|| !SourceReactiveLiquidMaterials.Contains(Cell.MaterialId))
+		{
+			continue;
+		}
+
+		const FVector LocalColumnBottom(
+			(static_cast<double>(Cell.WorldCell.X) + 0.5)
+				* MaterialSimulationCellSize,
+			(static_cast<double>(Cell.WorldCell.Y) + 0.5)
+				* MaterialSimulationCellSize,
+			static_cast<double>(Cell.SupportHeight));
+		const FVector LocalColumnCenter = LocalColumnBottom
+			+ FVector(0.0f, 0.0f, MaterialLiquidColumnHeight * 0.5f);
+		const FVector WorldColumnCenter =
+			GetActorTransform().TransformPosition(LocalColumnCenter);
+		const FVector WorldHalfExtent(
+			MaterialSimulationCellSize * 0.52f,
+			MaterialSimulationCellSize * 0.52f,
+			MaterialLiquidColumnHeight * 0.5f);
+		const FBox ContactBounds = FBox::BuildAABB(
+			WorldColumnCenter,
+			WorldHalfExtent);
+
+		TArray<AFragment2DSourceActor*> Sources;
+		GatherFragmentSourcesInBounds(ContactBounds, Sources);
+		Sources.Sort([](
+			const AFragment2DSourceActor& Left,
+			const AFragment2DSourceActor& Right)
+		{
+			// 一个整体物体必须由根 Source 发起破坏事务。若先按 GUID
+			// 命中枝干/叶片，它会先生成独立物理碎片，随后根事务又把
+			// 整棵树转成 carrier，两套实体便会互相穿过。
+			if (Left.bAggregateRoot != Right.bAggregateRoot)
+			{
+				return Left.bAggregateRoot;
+			}
+			return Left.SourceId.ToString(EGuidFormats::Digits)
+				< Right.SourceId.ToString(EGuidFormats::Digits);
+		});
+		for (AFragment2DSourceActor* Source : Sources)
+		{
+			if (AcceptedReactions >= MaxMaterialSourceReactionsPerFrame)
+			{
+				break;
+			}
+			if (!IsValid(Source)
+				|| Source->IsActorBeingDestroyed()
+				|| Source->bBroken
+				|| Source->SourceMaterialId.IsNone())
+			{
+				continue;
+			}
+			// 液体的接触包围盒可能只覆盖方柱背面的深度切片。整体物体的
+			// 化学事务必须始终从 aggregate root 发起，否则该切片会比
+			// 正面多提交一次 revision，树桩最终就会变成 L 形。
+			if (Source->AggregateId.IsValid() && !Source->bAggregateRoot)
+			{
+				for (const TPair<FGuid, TObjectPtr<AFragment2DSourceActor>>& Pair
+					: GeneratedFragmentSources)
+				{
+					AFragment2DSourceActor* CandidateRoot = Pair.Value;
+					if (IsValid(CandidateRoot)
+						&& !CandidateRoot->bBroken
+						&& CandidateRoot->bAggregateRoot
+						&& CandidateRoot->AggregateId == Source->AggregateId)
+					{
+						Source = CandidateRoot;
+						break;
+					}
+				}
+			}
+			if (Source->AggregateId.IsValid()
+				&& ReactedAggregateIds.Contains(Source->AggregateId))
+			{
+				continue;
+			}
+
+			const FMatterFluxReactionDefinition* MatchingRule = nullptr;
+			MatterFlux::Reaction::FContactResult ContactResult;
+			for (const FName RuleId : ContactRuleIds)
+			{
+				const FMatterFluxReactionDefinition& Rule =
+					Registry.Reactions.FindChecked(RuleId);
+				MatterFlux::Reaction::FDeterministicContext Context;
+				Context.Seed = MapSeed;
+				Context.Tick = static_cast<uint32>(
+					MaterialSimulation->GetLogicalStep());
+				Context.FirstCell = Cell.WorldCell;
+				const uint32 SourceHash = GetTypeHash(Source->SourceId);
+				Context.SecondCell = FIntPoint(
+					static_cast<int32>(SourceHash & 0xffffu),
+					static_cast<int32>(SourceHash >> 16u));
+				if (MatterFlux::Reaction::FMaterialReactionEngine::EvaluateContact(
+						Rule,
+						Cell.MaterialId,
+						Source->SourceMaterialId,
+						Context,
+						ContactResult)
+					&& ContactResult.bReacted)
+				{
+					MatchingRule = &Rule;
+					break;
+				}
+			}
+			if (!MatchingRule)
+			{
+				continue;
+			}
+
+			const FGuid ReactionSourceId = Source->SourceId;
+			const FGuid ReactionAggregateId = Source->AggregateId;
+			bool bNeedsAggregateCarrier = false;
+			bool bHasAggregateCarrier = false;
+			if (Source->bAggregateRoot && ReactionAggregateId.IsValid())
+			{
+				for (const TPair<FGuid, TWeakObjectPtr<AFragment2DActor>>& Pair
+					: DynamicAggregateCarriers)
+				{
+					const MatterFlux::PlayableLevel::FLevelFragmentSource* Definition =
+						FindFragmentSourceDefinition(Pair.Key);
+					if (Pair.Value.IsValid()
+						&& Definition
+						&& Definition->AggregateId == ReactionAggregateId)
+					{
+						bHasAggregateCarrier = true;
+						break;
+					}
+				}
+				// 第一次腐蚀切断树根时，整棵树仍需要成为一个物理载体。
+				// 先物化同 aggregate 成员，既让根事务能吸收它们，也用来
+				// 区分“完整树”与之后只剩在地形中的木桩。
+				MaterializeFragmentAggregate(ReactionAggregateId);
+				bNeedsAggregateCarrier = !bHasAggregateCarrier;
+			}
+			const FBox SourceBounds = Source->GetComponentsBoundingBox(true);
+			const FVector ContactPoint = SourceBounds.IsValid
+				? SourceBounds.GetClosestPointTo(WorldColumnCenter)
+				: Source->GetActorLocation();
+			FFragmentDamageEvent Damage;
+			Damage.SourceId = ReactionSourceId;
+			Damage.BaseRevision = Source->Revision;
+			Damage.DamageShape.Type = EFragmentDamageShapeType::Circle;
+			Damage.DamageShape.WorldTransform = FTransform(ContactPoint);
+			Damage.DamageShape.Radius = FMath::Max(
+				Source->GetCellSize() * 0.8f,
+				MaterialSimulationCellSize * 0.2f);
+			Damage.DamagePower = bNeedsAggregateCarrier ? 1000.0f : 0.0f;
+			Damage.bDissolveDetachedFragments = !bNeedsAggregateCarrier;
+			Damage.EventSeed = MapSeed
+				^ MaterialSimulation->GetLogicalStep()
+				^ static_cast<int32>(GetTypeHash(Cell.WorldCell))
+				^ static_cast<int32>(GetTypeHash(ReactionSourceId));
+			bool bDamageAccepted =
+				UFragmentSimulationSubsystem::ExecuteFragmentDamage(
+					Source,
+					Damage);
+			// 载体已经存在后，酸继续溶解的是地面上留下的整根树桩。
+			// 对所有平行树干切片复用根切片的局部 X/Z 切割平面，避免
+			// 前层逐步变矮而后层保留成一块高木板，最终形成 L 形。
+			if (bHasAggregateCarrier && ReactionAggregateId.IsValid())
+			{
+				TArray<AFragment2DSourceActor*> ParallelStumpSlices;
+				for (const TPair<FGuid, TObjectPtr<AFragment2DSourceActor>>& Pair
+					: GeneratedFragmentSources)
+				{
+					AFragment2DSourceActor* Member = Pair.Value;
+					FFragmentDamageEvent MemberDamage;
+					if (IsValid(Member)
+						&& Member != Source
+						&& !Member->bBroken
+						&& Member->BuildSynchronizedDamageEventFrom(
+							*Source,
+							Damage,
+							MemberDamage))
+					{
+						ParallelStumpSlices.Add(Member);
+					}
+				}
+				ParallelStumpSlices.Sort([](
+					const AFragment2DSourceActor& Left,
+					const AFragment2DSourceActor& Right)
+				{
+					return Left.SourceId.ToString(EGuidFormats::Digits)
+						< Right.SourceId.ToString(EGuidFormats::Digits);
+				});
+				for (AFragment2DSourceActor* Member : ParallelStumpSlices)
+				{
+					FFragmentDamageEvent MemberDamage;
+					if (Member->BuildSynchronizedDamageEventFrom(
+						*Source,
+						Damage,
+						MemberDamage))
+					{
+						MemberDamage.DamagePower = 0.0f;
+						MemberDamage.bDissolveDetachedFragments = true;
+						bDamageAccepted |=
+							UFragmentSimulationSubsystem::ExecuteFragmentDamage(
+								Member,
+								MemberDamage);
+					}
+				}
+			}
+			if (!bDamageAccepted)
+			{
+				continue;
+			}
+
+			++AcceptedReactions;
+			if (ReactionAggregateId.IsValid())
+			{
+				ReactedAggregateIds.Add(ReactionAggregateId);
+			}
+			if (ContactResult.FirstMaterial != Cell.MaterialId)
+			{
+				MaterialSimulation->SetCell(
+					Cell.WorldCell,
+					ContactResult.FirstMaterial == TEXT("empty")
+						? NAME_None
+						: ContactResult.FirstMaterial);
+			}
+
+			const FMatterFluxMaterialDefinition* SourceOutput =
+				Registry.Materials.Find(ContactResult.SecondMaterial);
+			if (!SourceOutput
+				|| SourceOutput->Phase != EMatterFluxMaterialPhase::Gas)
+			{
+				continue;
+			}
+			static const FIntPoint GasOffsets[] = {
+				FIntPoint(1, 0), FIntPoint(0, 1),
+				FIntPoint(-1, 0), FIntPoint(0, -1),
+				FIntPoint(1, 1), FIntPoint(-1, 1),
+				FIntPoint(-1, -1), FIntPoint(1, -1)
+			};
+			const uint32 FirstOffset = GetTypeHash(ReactionSourceId)
+				% UE_ARRAY_COUNT(GasOffsets);
+			for (int32 Offset = 0;
+				Offset < UE_ARRAY_COUNT(GasOffsets);
+				++Offset)
+			{
+				const FIntPoint GasCell = Cell.WorldCell
+					+ GasOffsets[(FirstOffset + Offset)
+						% UE_ARRAY_COUNT(GasOffsets)];
+				if (MaterialSimulation->GetMaterialAt(GasCell).IsNone()
+					&& MaterialSimulation->SetCell(
+						GasCell,
+						ContactResult.SecondMaterial))
+				{
+					break;
+				}
+			}
+		}
+	}
+	if (AcceptedReactions > 0)
+	{
+		bMaterialVisualizationDirty = true;
+	}
+}
+
 void AMatterFluxPlayableWorldActor::RebuildMaterialVisualization(
 	const FMatterFluxContentRegistry& Registry)
 {
@@ -5272,16 +7053,23 @@ void AMatterFluxPlayableWorldActor::RebuildMaterialVisualization(
 	MaterialVisualizationAccumulator = 0.0f;
 
 	TArray<MatterFlux::Material::FCellSnapshot> Cells;
-	MaterialSimulation->GetActiveCells(Cells);
+	MaterialSimulation->GetAllCells(Cells);
 	TMap<
 		FMaterialVisualKey,
 		TArray<MatterFlux::Material::FCellSnapshot>> MaterialCells;
+	TMap<FName, TArray<MatterFlux::Material::FCellSnapshot>>
+		LiquidMaterialCells;
 	for (const MatterFlux::Material::FCellSnapshot& Cell : Cells)
 	{
 		const FMatterFluxMaterialDefinition* Material =
 			Registry.Materials.Find(Cell.MaterialId);
 		if (!Material)
 		{
+			continue;
+		}
+		if (Material->Phase == EMatterFluxMaterialPhase::Liquid)
+		{
+			LiquidMaterialCells.FindOrAdd(Cell.MaterialId).Add(Cell);
 			continue;
 		}
 		const FIntPoint Chunk(
@@ -5330,7 +7118,19 @@ void AMatterFluxPlayableWorldActor::RebuildMaterialVisualization(
 		{
 			float Thickness = 8.0f;
 			float HeightOffset = Thickness * 0.5f;
-			if (Material->Phase == EMatterFluxMaterialPhase::Powder)
+			float VerticalScale = Thickness / 100.0f;
+			if (Material->Phase == EMatterFluxMaterialPhase::Liquid)
+			{
+				// 动态液体使用没有侧壁的平面；相邻格边缘刚好拼接成
+				// 连续液面。液量用于流动、浮力和外轮廓收边；同一承托
+				// 高度上的顶面保持共面，避免逐格液量差形成百叶窗条纹。
+				// 边缘也保留完整像素格：随机轮廓来自占用格集合，不能靠
+				// 缩放单格制造会把液面切碎的视觉缝隙。
+				Thickness = MaterialLiquidVisualThickness;
+				HeightOffset = Thickness;
+				VerticalScale = 1.0f;
+			}
+			else if (Material->Phase == EMatterFluxMaterialPhase::Powder)
 			{
 				Thickness = 14.0f;
 				HeightOffset = Thickness * 0.5f;
@@ -5349,23 +7149,20 @@ void AMatterFluxPlayableWorldActor::RebuildMaterialVisualization(
 			const float HorizontalScale =
 				Material->Phase == EMatterFluxMaterialPhase::Gas
 					? MaterialSimulationCellSize * 0.26f / 100.0f
-					: (Material->Phase
-							== EMatterFluxMaterialPhase::Liquid
-						? MaterialSimulationCellSize * 0.62f / 100.0f
-						: MaterialSimulationCellSize / 100.0f);
+					: MaterialSimulationCellSize / 100.0f;
 			Transforms.Emplace(
 				FRotator::ZeroRotator,
 				FVector(
-					static_cast<float>(Cell.WorldCell.X)
+					(static_cast<float>(Cell.WorldCell.X) + 0.5f)
 						* MaterialSimulationCellSize,
-					static_cast<float>(Cell.WorldCell.Y)
+					(static_cast<float>(Cell.WorldCell.Y) + 0.5f)
 						* MaterialSimulationCellSize,
 					static_cast<float>(Cell.SupportHeight)
 						+ HeightOffset),
 				FVector(
 					HorizontalScale,
 					HorizontalScale,
-					Thickness / 100.0f));
+					VerticalScale));
 		}
 
 		const FName ComponentKey =
@@ -5443,6 +7240,46 @@ void AMatterFluxPlayableWorldActor::RebuildMaterialVisualization(
 			Pair.Value->SetHiddenInGame(true, true);
 		}
 	}
+	TSet<FName> ActiveLiquidMaterials;
+	for (TPair<FName, TArray<MatterFlux::Material::FCellSnapshot>>& Pair
+		: LiquidMaterialCells)
+	{
+		const FMatterFluxMaterialDefinition* Material =
+			Registry.Materials.Find(Pair.Key);
+		if (!Material)
+		{
+			continue;
+		}
+		Pair.Value.Sort([](
+			const MatterFlux::Material::FCellSnapshot& Left,
+			const MatterFlux::Material::FCellSnapshot& Right)
+		{
+			return Left.WorldCell.Y != Right.WorldCell.Y
+				? Left.WorldCell.Y < Right.WorldCell.Y
+				: Left.WorldCell.X < Right.WorldCell.X;
+		});
+		ActiveLiquidMaterials.Add(Pair.Key);
+		BuildLiquidMaterialMesh(Pair.Key, *Material, Pair.Value);
+	}
+	TArray<FName> StaleLiquidMaterials;
+	for (const TPair<FName, TObjectPtr<UProceduralMeshComponent>>& Pair
+		: GeneratedLiquidLayerMeshes)
+	{
+		if (!ActiveLiquidMaterials.Contains(Pair.Key))
+		{
+			StaleLiquidMaterials.Add(Pair.Key);
+		}
+	}
+	for (const FName MaterialId : StaleLiquidMaterials)
+	{
+		if (UProceduralMeshComponent* Component =
+			GeneratedLiquidLayerMeshes.FindRef(MaterialId))
+		{
+			Component->DestroyComponent();
+		}
+		GeneratedLiquidLayerMeshes.Remove(MaterialId);
+		LiquidProjectionHeightAudits.Remove(MaterialId);
+	}
 }
 
 void AMatterFluxPlayableWorldActor::DestroyMaterialVisualization()
@@ -5458,6 +7295,16 @@ void AMatterFluxPlayableWorldActor::DestroyMaterialVisualization()
 		}
 	}
 	GeneratedMaterialInstances.Reset();
+	for (const TPair<FName, TObjectPtr<UProceduralMeshComponent>>& Pair
+		: GeneratedLiquidLayerMeshes)
+	{
+		if (IsValid(Pair.Value))
+		{
+			Pair.Value->DestroyComponent();
+		}
+	}
+	GeneratedLiquidLayerMeshes.Reset();
+	LiquidProjectionHeightAudits.Reset();
 	MaterialVisualizationHashes.Reset();
 	MaterialVisualizationMaterials.Reset();
 	bMaterialVisualizationDirty = false;
@@ -5494,7 +7341,22 @@ AMatterFluxPlayableWorldActor::FindOrCreateMaterialComponent(
 	Instances->SetVisibility(true, true);
 	Instances->SetHiddenInGame(false, true);
 
-	Instances->SetStaticMesh(CubeMesh);
+	const bool bLiquid =
+		Material.Phase == EMatterFluxMaterialPhase::Liquid;
+	Instances->SetStaticMesh(
+		bLiquid && LiquidSurfaceMesh
+			? LiquidSurfaceMesh.Get()
+			: CubeMesh.Get());
+	if (bLiquid)
+	{
+		Instances->ComponentTags.AddUnique(
+			TEXT("MatterFluxSimulatedLiquidSurface"));
+	}
+	else
+	{
+		Instances->ComponentTags.Remove(
+			TEXT("MatterFluxSimulatedLiquidSurface"));
+	}
 	Instances->SetCastShadow(
 		Material.Phase
 		== EMatterFluxMaterialPhase::StaticSolid);
@@ -5513,7 +7375,9 @@ AMatterFluxPlayableWorldActor::FindOrCreateMaterialComponent(
 	UMaterialInterface* VisualizationTemplate =
 		Material.Phase == EMatterFluxMaterialPhase::Gas
 			? VoxelGasMaterialTemplate.Get()
-			: VoxelColorMaterialTemplate.Get();
+			: Material.Phase == EMatterFluxMaterialPhase::Liquid
+				? VoxelLiquidMaterialTemplate.Get()
+				: VoxelColorMaterialTemplate.Get();
 	if (VisualizationTemplate)
 	{
 		UMaterialInstanceDynamic* DynamicMaterial =
@@ -5528,8 +7392,6 @@ AMatterFluxPlayableWorldActor::FindOrCreateMaterialComponent(
 		DynamicMaterial->SetVectorParameterValue(
 			TEXT("Color"),
 			Material.Color);
-		const bool bLiquid =
-			Material.Phase == EMatterFluxMaterialPhase::Liquid;
 		const bool bGas =
 			Material.Phase == EMatterFluxMaterialPhase::Gas;
 		if (bGas)
@@ -5537,6 +7399,10 @@ AMatterFluxPlayableWorldActor::FindOrCreateMaterialComponent(
 			DynamicMaterial->SetScalarParameterValue(
 				TEXT("Opacity"),
 				FMath::Clamp(Material.Color.A * 0.42f, 0.12f, 0.30f));
+		}
+		else if (bLiquid)
+		{
+			ApplyLiquidOptics(*DynamicMaterial, Material);
 		}
 		DynamicMaterial->SetScalarParameterValue(
 			TEXT("FaceContrast"),
@@ -5556,7 +7422,6 @@ AMatterFluxPlayableWorldActor::FindOrCreateMaterialComponent(
 	}
 	return Instances;
 }
-
 void AMatterFluxPlayableWorldActor::RebuildFragmentSources(
 	const TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>& Sources,
 	const bool bImmediate)
@@ -5566,6 +7431,7 @@ void AMatterFluxPlayableWorldActor::RebuildFragmentSources(
 	FragmentSourceDefinitionIndex.Reset();
 	FragmentSourceChunkById.Reset();
 	RemovedFragmentSourceIds.Reset();
+	StreamingPinnedFragmentSourceIds.Reset();
 	AppliedReplicatedFragmentSourceIds.Reset();
 	if (HasAuthority())
 	{
@@ -5576,23 +7442,51 @@ void AMatterFluxPlayableWorldActor::RebuildFragmentSources(
 	{
 		ReplicatedFragmentSourceStates.RequestClientFullRebuild();
 	}
+	// 同一 aggregate 必须驻留在同一个渲染 chunk。树冠和树干若按各自
+	// 世界位置分桶，跨区块树会退化为两份网格，内部面无法统一剔除。
+	TMap<FGuid, FIntPoint> AggregateRootChunks;
+	const auto ChunkForLocation = [this](const FVector& Location)
+	{
+		const FIntPoint Cell(
+			FMath::RoundToInt(
+				Location.X / MatterFlux::PlayableLevel::TerrainCellSize),
+			FMath::RoundToInt(
+				Location.Y / MatterFlux::PlayableLevel::TerrainCellSize));
+		return FIntPoint(
+			FMath::FloorToInt(
+				static_cast<double>(Cell.X) / TerrainStreamingChunkSize),
+			FMath::FloorToInt(
+				static_cast<double>(Cell.Y) / TerrainStreamingChunkSize));
+	};
+	for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source : Sources)
+	{
+		if (Source.AggregateId.IsValid() && Source.bAggregateRoot)
+		{
+			AggregateRootChunks.Add(
+				Source.AggregateId,
+				ChunkForLocation(Source.Transform.GetLocation()));
+		}
+	}
 	for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source : Sources)
 	{
 		const FVector Location = Source.Transform.GetLocation();
-		const FIntPoint Cell(
-			FMath::RoundToInt(
-				Location.X
-					/ MatterFlux::PlayableLevel::TerrainCellSize),
-			FMath::RoundToInt(
-				Location.Y
-					/ MatterFlux::PlayableLevel::TerrainCellSize));
-		const FIntPoint Chunk(
-			FMath::FloorToInt(
-				static_cast<double>(Cell.X)
-					/ TerrainStreamingChunkSize),
-			FMath::FloorToInt(
-				static_cast<double>(Cell.Y)
-					/ TerrainStreamingChunkSize));
+		FIntPoint Chunk = ChunkForLocation(Location);
+		if (Source.AggregateId.IsValid())
+		{
+			if (const FIntPoint* RootChunk =
+				AggregateRootChunks.Find(Source.AggregateId))
+			{
+				Chunk = *RootChunk;
+			}
+			else
+			{
+				// 损坏数据没有 root 时仍保持确定性：输入稳定顺序中的首个
+				// member 决定 aggregate chunk。
+				Chunk = AggregateRootChunks.FindOrAdd(
+					Source.AggregateId,
+					Chunk);
+			}
+		}
 		FragmentSourceChunks.FindOrAdd(Chunk).Add(Source);
 		if (Source.SourceId.IsValid())
 		{
@@ -5611,7 +7505,9 @@ void AMatterFluxPlayableWorldActor::RebuildFragmentSources(
 	{
 		FragmentSourceProxy->Configure(
 			SceneRoot,
-			VoxelColorMaterialTemplate);
+			VoxelColorMaterialTemplate,
+			VoxelLeafMaterialTemplate,
+			VoxelWoodMaterialTemplate);
 		FragmentSourceProxy->SetSourceChunks(FragmentSourceChunks);
 		if (!HasAuthority())
 		{
@@ -5702,11 +7598,13 @@ void AMatterFluxPlayableWorldActor::RefreshVisibleFragmentSources(
 		if (!IsValid(SourceActor))
 		{
 			PendingFragmentSourceDespawns.Remove(Pair.Key);
+			StreamingPinnedFragmentSourceIds.Remove(Pair.Key);
 			RemovedFragmentSourceIds.Add(Pair.Key);
 			SourcesToRemove.Add(Pair.Key);
 			continue;
 		}
 		if (!IsSourceDesired(Pair.Key)
+			&& !StreamingPinnedFragmentSourceIds.Contains(Pair.Key)
 			&& !SourceActor->bDetachedFromTerrain)
 		{
 			FFragment2DSourceStreamingState State;
@@ -5750,6 +7648,7 @@ void AMatterFluxPlayableWorldActor::RefreshVisibleFragmentSources(
 	for (auto It = PendingFragmentSourceDespawns.CreateIterator(); It; ++It)
 	{
 		if (IsSourceDesired(*It)
+			|| StreamingPinnedFragmentSourceIds.Contains(*It)
 			|| !GeneratedFragmentSources.Contains(*It))
 		{
 			It.RemoveCurrent();
@@ -5791,11 +7690,13 @@ void AMatterFluxPlayableWorldActor::
 			GeneratedFragmentSources.FindRef(SourceId);
 		if (!IsValid(SourceActor))
 		{
+			StreamingPinnedFragmentSourceIds.Remove(SourceId);
 			RemovedFragmentSourceIds.Add(SourceId);
 			GeneratedFragmentSources.Remove(SourceId);
 			bCompleted = true;
 		}
-		else if (SourceActor->bDetachedFromTerrain)
+		else if (SourceActor->bDetachedFromTerrain
+			|| StreamingPinnedFragmentSourceIds.Contains(SourceId))
 		{
 			bCompleted = true;
 		}
@@ -5885,7 +7786,11 @@ void AMatterFluxPlayableWorldActor::SpawnFragmentSource(
 		return;
 	}
 
-	SourceActor->FragmentMaterial = VoxelColorMaterialTemplate;
+	SourceActor->FragmentMaterial = Source.MaterialId == TEXT("leaf")
+		? VoxelLeafMaterialTemplate.Get()
+		: (Source.MaterialId == TEXT("wood")
+			? VoxelWoodMaterialTemplate.Get()
+			: VoxelColorMaterialTemplate.Get());
 	// Lazy render-only sources keep a hidden replicated actor after a complete
 	// break. That actor is the durable tombstone preventing a client-side
 	// pristine proxy from reappearing when the source is destroyed.
@@ -5962,6 +7867,7 @@ void AMatterFluxPlayableWorldActor::DestroyGeneratedFragmentSources()
 	RemovedFragmentSourceIds.Reset();
 	PendingFragmentSourceSpawns.Reset();
 	PendingFragmentSourceDespawns.Reset();
+	StreamingPinnedFragmentSourceIds.Reset();
 	DynamicAggregateCarriers.Reset();
 	if (SourceFlameInstances)
 	{
@@ -5971,6 +7877,9 @@ void AMatterFluxPlayableWorldActor::DestroyGeneratedFragmentSources()
 	{
 		SourceSmokeInstances->ClearInstances();
 	}
+	SourceSmokeAnchors.Reset();
+	GroundSmokeAnchors.Reset();
+	SmokeVisualPool.Reset();
 	bSourceCombustionVisualDirty = false;
 	SourceCombustionVisualAccumulator = 0.0f;
 }
@@ -5979,9 +7888,11 @@ void AMatterFluxPlayableWorldActor::BuildLayerStreamingCache(
 	const MatterFlux::PlayableLevel::FLevelLayout& Layout)
 {
 	LayerStreamingCaches.Reset();
+	LiquidLayerDefinitions.Reset();
 	VisibleLayerFocusChunks.Reset();
 	BuildTerrainStreamingCache(Layout.Terrain);
 	TSet<FName> ActiveLayerNames;
+	TSet<FName> ActiveLiquidMaterialIds;
 	const auto ToChunk =
 		[this](const FVector& LocalLocation)
 		{
@@ -6011,6 +7922,13 @@ void AMatterFluxPlayableWorldActor::BuildLayerStreamingCache(
 		{
 			continue;
 		}
+		if (Layer.RenderMode
+			== MatterFlux::PlayableLevel::ELevelLayerRenderMode::Liquid)
+		{
+			ActiveLiquidMaterialIds.Add(Layer.MaterialId);
+			LiquidLayerDefinitions.Add(Layer.Name, Layer);
+			continue;
+		}
 		ActiveLayerNames.Add(Layer.Name);
 		FLayerStreamingCache& Cache =
 			LayerStreamingCaches.FindOrAdd(Layer.Name);
@@ -6018,6 +7936,7 @@ void AMatterFluxPlayableWorldActor::BuildLayerStreamingCache(
 		Cache.Layer.Primitive = Layer.Primitive;
 		Cache.Layer.RenderMode = Layer.RenderMode;
 		Cache.Layer.Color = Layer.Color;
+		Cache.Layer.MaterialId = Layer.MaterialId;
 		Cache.Layer.bEnableCollision = Layer.bEnableCollision;
 		const bool bSmallRenderOnlyLayer =
 			!Layer.bEnableCollision
@@ -6061,6 +7980,26 @@ void AMatterFluxPlayableWorldActor::BuildLayerStreamingCache(
 			Component->DestroyComponent();
 		}
 		GeneratedLayerInstances.Remove(StaleLayerName);
+	}
+
+	TArray<FName> StaleLiquidLayerNames;
+	for (const TPair<FName, TObjectPtr<UProceduralMeshComponent>>& Pair
+		: GeneratedLiquidLayerMeshes)
+	{
+		if (!ActiveLiquidMaterialIds.Contains(Pair.Key))
+		{
+			StaleLiquidLayerNames.Add(Pair.Key);
+		}
+	}
+	for (const FName StaleLayerName : StaleLiquidLayerNames)
+	{
+		if (UProceduralMeshComponent* Component =
+			GeneratedLiquidLayerMeshes.FindRef(StaleLayerName))
+		{
+			Component->DestroyComponent();
+		}
+		GeneratedLiquidLayerMeshes.Remove(StaleLayerName);
+		LiquidProjectionHeightAudits.Remove(StaleLayerName);
 	}
 }
 
@@ -6806,11 +8745,14 @@ AMatterFluxPlayableWorldActor::FindOrCreateLayerComponent(
 	Instances->SetCollisionResponseToAllChannels(
 		Layer.bEnableCollision ? ECR_Block : ECR_Ignore);
 
-	UMaterialInterface* LayerMaterialTemplate =
-		Layer.RenderMode
+	const bool bLiquidLayer = Layer.RenderMode
+		== MatterFlux::PlayableLevel::ELevelLayerRenderMode::Liquid;
+	UMaterialInterface* LayerMaterialTemplate = bLiquidLayer
+		? VoxelLiquidMaterialTemplate.Get()
+		: Layer.RenderMode
 			== MatterFlux::PlayableLevel::ELevelLayerRenderMode::VoxelUnlit
-		? VoxelColorMaterialTemplate.Get()
-		: ColorMaterialTemplate.Get();
+			? VoxelColorMaterialTemplate.Get()
+			: ColorMaterialTemplate.Get();
 	if (bVisible && LayerMaterialTemplate)
 	{
 		UMaterialInstanceDynamic* Material =
@@ -6822,7 +8764,22 @@ AMatterFluxPlayableWorldActor::FindOrCreateLayerComponent(
 			Instances->SetMaterial(0, Material);
 		}
 		Material->SetVectorParameterValue(TEXT("Color"), Layer.Color);
-		const bool bStreamLayer = Layer.Name == TEXT("Stream");
+		if (bLiquidLayer
+			&& IMatterFluxScriptRuntime::IsAvailable())
+		{
+			const FMatterFluxContentRegistryPtr Registry =
+				IMatterFluxScriptRuntime::Get().GetActiveRegistry();
+			if (Registry.IsValid())
+			{
+				if (const FMatterFluxMaterialDefinition* Definition =
+					Registry->Materials.Find(Layer.MaterialId))
+				{
+					ApplyLiquidOptics(*Material, *Definition);
+				}
+			}
+		}
+		const bool bStreamLayer = Layer.Name == TEXT("Stream")
+			|| Layer.Name == TEXT("Lake");
 		Material->SetScalarParameterValue(
 			TEXT("FaceContrast"),
 			bStreamLayer ? 0.42f : 0.72f);
@@ -6838,4 +8795,126 @@ AMatterFluxPlayableWorldActor::FindOrCreateLayerComponent(
 			0.20f);
 	}
 	return Instances;
+}
+
+void AMatterFluxPlayableWorldActor::BuildLiquidMaterialMesh(
+	const FName MaterialId,
+	const FMatterFluxMaterialDefinition& MaterialDefinition,
+	const TConstArrayView<MatterFlux::Material::FCellSnapshot> Cells)
+{
+	UProceduralMeshComponent* Mesh =
+		GeneratedLiquidLayerMeshes.FindRef(MaterialId);
+	if (!Mesh)
+	{
+		const FName ComponentName = MakeUniqueObjectName(
+			this,
+			UProceduralMeshComponent::StaticClass(),
+			*FString::Printf(
+				TEXT("CanonicalLiquid_%s_Surface"),
+				*MaterialId.ToString()));
+		Mesh = NewObject<UProceduralMeshComponent>(this, ComponentName);
+		Mesh->SetupAttachment(SceneRoot);
+		Mesh->SetMobility(EComponentMobility::Movable);
+		Mesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		Mesh->SetCanEverAffectNavigation(false);
+		Mesh->SetCastShadow(false);
+		Mesh->ComponentTags.AddUnique(TEXT("MatterFluxLiquidSurface"));
+		Mesh->ComponentTags.AddUnique(
+			TEXT("MatterFluxCanonicalLiquidSurface"));
+		AddInstanceComponent(Mesh);
+		Mesh->RegisterComponent();
+		GeneratedLiquidLayerMeshes.Add(MaterialId, Mesh);
+	}
+
+	Mesh->ClearAllMeshSections();
+	if (GetNetMode() == NM_DedicatedServer || Cells.IsEmpty())
+	{
+		Mesh->SetVisibility(false, true);
+		return;
+	}
+
+	MatterFlux::Rendering::FLiquidSurfaceProjection Projection;
+	MatterFlux::Rendering::BuildLiquidSurfaceProjection(
+		Cells,
+		MaterialSimulationCellSize,
+		MaterialLiquidColumnHeight,
+		Projection);
+	// Keep the disposable free-surface projection just above coplanar voxel
+	// support faces. This is a render-space depth bias only: sampling, buoyancy,
+	// displacement, replication, and the projection history retain canonical Z.
+	constexpr float LiquidSurfaceDepthBias = 2.0f;
+	for (FVector& Vertex : Projection.Vertices)
+	{
+		Vertex.Z += LiquidSurfaceDepthBias;
+	}
+	FMatterFluxLiquidProjectionHeightAudit& Audit =
+		LiquidProjectionHeightAudits.FindOrAdd(MaterialId);
+	Audit.CanonicalMedianSurfaceZ =
+		Projection.CanonicalMedianSurfaceHeight;
+	Audit.RenderedMedianSurfaceZ =
+		Projection.ProjectedCanonicalMedianSurfaceHeight
+			+ LiquidSurfaceDepthBias;
+	Audit.MedianOffset = Projection.MedianCanonicalHeightOffset
+		+ LiquidSurfaceDepthBias;
+	Audit.MaximumAbsoluteLocalOffset =
+		Projection.MaximumAbsoluteCanonicalHeightOffset
+			+ LiquidSurfaceDepthBias;
+	Audit.CanonicalCellCount = Cells.Num();
+	Audit.ProjectedCellCount = Projection.ProjectedCellCount;
+	float MaximumTriangleHeightSpan = 0.0f;
+	for (int32 TriangleIndex = 0;
+		TriangleIndex + 2 < Projection.TopTriangleIndexCount;
+		TriangleIndex += 3)
+	{
+		const float Height0 = Projection.Vertices[
+			Projection.Triangles[TriangleIndex]].Z;
+		const float Height1 = Projection.Vertices[
+			Projection.Triangles[TriangleIndex + 1]].Z;
+		const float Height2 = Projection.Vertices[
+			Projection.Triangles[TriangleIndex + 2]].Z;
+		MaximumTriangleHeightSpan = FMath::Max(
+			MaximumTriangleHeightSpan,
+			FMath::Max3(Height0, Height1, Height2)
+				- FMath::Min3(Height0, Height1, Height2));
+	}
+	Audit.MaximumTriangleHeightSpan = MaximumTriangleHeightSpan;
+	Audit.SurfacePatchCount = Projection.SurfacePatchCount;
+	if (Projection.Triangles.IsEmpty())
+	{
+		Mesh->SetVisibility(false, true);
+		return;
+	}
+
+	TArray<FVector> Normals;
+	TArray<FLinearColor> Colors;
+	TArray<FProcMeshTangent> Tangents;
+	Normals.Init(FVector::UpVector, Projection.Vertices.Num());
+	Colors.Init(FLinearColor::White, Projection.Vertices.Num());
+	Tangents.Init(
+		FProcMeshTangent(FVector::ForwardVector, false),
+		Projection.Vertices.Num());
+	Mesh->CreateMeshSection_LinearColor(
+		0,
+		Projection.Vertices,
+		Projection.Triangles,
+		Normals,
+		Projection.UVs,
+		Colors,
+		Tangents,
+		false);
+	Mesh->SetVisibility(true, true);
+	Mesh->SetHiddenInGame(false, true);
+	if (VoxelLiquidMaterialTemplate)
+	{
+		UMaterialInstanceDynamic* Material =
+			Cast<UMaterialInstanceDynamic>(Mesh->GetMaterial(0));
+		if (!Material)
+		{
+			Material = UMaterialInstanceDynamic::Create(
+				VoxelLiquidMaterialTemplate, this);
+			Mesh->SetMaterial(0, Material);
+		}
+		ApplyLiquidOptics(*Material, MaterialDefinition);
+		Material->SetScalarParameterValue(TEXT("Roughness"), 0.24f);
+	}
 }

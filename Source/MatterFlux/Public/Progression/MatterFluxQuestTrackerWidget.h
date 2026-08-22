@@ -19,6 +19,7 @@ class MATTERFLUX_API UMatterFluxQuestTrackerWidget : public UUserWidget
 
 public:
 	void InitializeForPlayer(APlayerController* InPlayerController);
+	void SetSuppressedByFrontEnd(bool bSuppressed);
 	UMatterFluxProgressionComponent* ResolveProgression() const;
 	void RefreshTracker();
 

@@ -1,5 +1,6 @@
 #include "Material/MatterFluxReplicatedMaterialState.h"
 
+#include "Compression/OodleDataCompression.h"
 #include "Misc/Compression.h"
 #include "Misc/Crc.h"
 
@@ -8,7 +9,8 @@ namespace
 	constexpr int32 MaximumMaterialSnapshotBytes = 1024 * 1024;
 	// Keep the property payload well below an actor-channel bunch so unrelated
 	// replicated fields can share the same update safely.
-	constexpr int32 MaximumCompressedMaterialSnapshotBytes = 3 * 1024;
+	constexpr int32 MaximumCompressedMaterialSnapshotBytes =
+		FMatterFluxReplicatedMaterialState::MaximumCompressedBytes;
 }
 
 bool FMatterFluxReplicatedMaterialState::EncodeActiveState(
@@ -26,34 +28,53 @@ bool FMatterFluxReplicatedMaterialState::EncodeActiveState(
 		return false;
 	}
 
-	const int32 Bound = FCompression::CompressMemoryBound(
-		NAME_Zlib,
-		InActiveState.Num(),
-		COMPRESS_BiasSpeed);
-	if (Bound <= 0)
+	// Active regions are small, latency-sensitive network snapshots. Most
+	// compact canonical states fit with Optimal3; only retry the rare oversized
+	// frame at Optimal5. This keeps the 4096-byte actor-channel guarantee
+	// without charging every stable streaming frame the stronger level's cost.
+	// The compressor id is embedded in the Oodle stream, so decode compatibility
+	// is unchanged.
+	const int64 Bound = FOodleDataCompression::CompressedBufferSizeNeeded(
+		InActiveState.Num());
+	if (Bound <= 0 || Bound > MAX_int32)
 	{
-		OutError = TEXT("UE could not determine a zlib material snapshot bound");
+		OutError = TEXT("UE could not determine an Oodle material snapshot bound");
 		return false;
 	}
-	CompressedState.SetNumUninitialized(Bound);
-	int32 CompressedBytes = Bound;
-	if (!FCompression::CompressMemory(
-		NAME_Zlib,
-		CompressedState.GetData(),
-		CompressedBytes,
-		InActiveState.GetData(),
-		InActiveState.Num(),
-		COMPRESS_BiasSpeed)
-		|| CompressedBytes <= 0
+	CompressedState.SetNumUninitialized(static_cast<int32>(Bound));
+	const auto CompressAtLevel = [&](const FOodleDataCompression::
+		ECompressionLevel Level)
+	{
+		return FOodleDataCompression::Compress(
+			CompressedState.GetData(),
+			Bound,
+			InActiveState.GetData(),
+			InActiveState.Num(),
+			FOodleDataCompression::ECompressor::Kraken,
+			Level);
+	};
+	int64 CompressedBytes = CompressAtLevel(
+		FOodleDataCompression::ECompressionLevel::Optimal3);
+	if (CompressedBytes <= 0
+		|| CompressedBytes > MaximumCompressedMaterialSnapshotBytes)
+	{
+		CompressedBytes = CompressAtLevel(
+			FOodleDataCompression::ECompressionLevel::Optimal5);
+	}
+	if (CompressedBytes <= 0
 		|| CompressedBytes > MaximumCompressedMaterialSnapshotBytes)
 	{
 		CompressedState.Reset();
 		OutError = FString::Printf(
-			TEXT("Compressed material snapshot exceeds the safe %d-byte actor-channel budget"),
+			TEXT("Compressed material snapshot uses %d bytes from %d raw bytes, exceeding the safe %d-byte actor-channel budget"),
+			CompressedBytes,
+			InActiveState.Num(),
 			MaximumCompressedMaterialSnapshotBytes);
 		return false;
 	}
-	CompressedState.SetNum(CompressedBytes, EAllowShrinking::Yes);
+	CompressedState.SetNum(
+		static_cast<int32>(CompressedBytes),
+		EAllowShrinking::Yes);
 	UncompressedByteCount = InActiveState.Num();
 	StateHash = FCrc::MemCrc32(
 		InActiveState.GetData(),
@@ -78,7 +99,7 @@ bool FMatterFluxReplicatedMaterialState::DecodeActiveState(
 	TArray<uint8> Candidate;
 	Candidate.SetNumUninitialized(UncompressedByteCount);
 	if (!FCompression::UncompressMemory(
-		NAME_Zlib,
+		NAME_Oodle,
 		Candidate.GetData(),
 		Candidate.Num(),
 		CompressedState.GetData(),

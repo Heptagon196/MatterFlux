@@ -7,6 +7,7 @@
 #include "EngineUtils.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/AutomationTest.h"
+#include "PhysicsEngine/BodySetup.h"
 #include "ProceduralMeshComponent.h"
 #include "Tests/AutomationEditorCommon.h"
 
@@ -271,7 +272,7 @@ bool FMatterFluxTreeRepeatedMultiDirectionCutTest::RunTest(
 	double TotalNotchMilliseconds = 0.0;
 	double MaximumNotchMilliseconds = 0.0;
 	int32 SuccessfulNotches = 0;
-	int32 TotalAcceptedSources = 0;
+	bool bTouchedOverlappingLeafLayer = false;
 	for (int32 Pass = 0; Pass < CutsPerDirection; ++Pass)
 	{
 		for (int32 DirectionIndex = 0;
@@ -343,14 +344,19 @@ bool FMatterFluxTreeRepeatedMultiDirectionCutTest::RunTest(
 
 			const int32 ChangedSourceCount =
 				(Trunk->Revision - TrunkRevisionBefore)
-				+ (Leaves->Revision - LeafRevisionBefore);
+					+ (Leaves->Revision - LeafRevisionBefore);
+			bTouchedOverlappingLeafLayer |=
+				Leaves->Revision > LeafRevisionBefore;
 			if (TestTrue(
 				TEXT("Each directional notch affects the trunk"),
 				AcceptedSources >= 1)
 				&& TestEqual(
-					TEXT("World-cut result matches all changed material layers"),
+					TEXT("One aggregate reports one affected logical target"),
 					AcceptedSources,
-					ChangedSourceCount)
+					1)
+				&& TestTrue(
+					TEXT("One logical target may update multiple material layers"),
+					ChangedSourceCount >= 1)
 				&& TestEqual(
 					TEXT("Each directional notch advances the trunk once"),
 					Trunk->Revision,
@@ -358,7 +364,6 @@ bool FMatterFluxTreeRepeatedMultiDirectionCutTest::RunTest(
 			{
 				++SuccessfulNotches;
 			}
-			TotalAcceptedSources += AcceptedSources;
 			const int32 SolidAfter =
 				static_cast<int32>(
 					Algo::Count(
@@ -398,8 +403,7 @@ bool FMatterFluxTreeRepeatedMultiDirectionCutTest::RunTest(
 		DirectionCount * CutsPerDirection);
 	TestTrue(
 		TEXT("At least one cut exercises overlapping wood and leaf layers"),
-		TotalAcceptedSources
-			> DirectionCount * CutsPerDirection);
+		bTouchedOverlappingLeafLayer);
 	TestEqual(
 		TEXT("Repeated notches remove exactly one cell each"),
 		InitialSolidCellCount
@@ -455,6 +459,12 @@ bool FMatterFluxTreeRepeatedMultiDirectionCutTest::RunTest(
 	TestFalse(
 		TEXT("Supported stump remains part of the terrain"),
 		Trunk->bBroken);
+	TestFalse(
+		TEXT("Supported stump is visible in the same frame as aggregate separation"),
+		Trunk->IsHidden());
+	TestTrue(
+		TEXT("Supported stump mesh never relies on a delayed reveal"),
+		Trunk->MeshComponent->IsVisible());
 
 	TSet<FGuid> FragmentIds;
 	AFragment2DActor* Carrier = nullptr;
@@ -498,6 +508,25 @@ bool FMatterFluxTreeRepeatedMultiDirectionCutTest::RunTest(
 			TEXT("Felled tree has enough angular damping to prevent contact jitter"),
 			Carrier->MeshComponent->GetAngularDamping() >= 4.0f);
 		TestEqual(
+			TEXT("Felled tree stays on the 2.5D XZ physics plane"),
+			Carrier->MeshComponent->BodyInstance.DOFMode.GetValue(),
+			EDOFMode::XZPlane);
+		TestEqual(
+			TEXT("Independent debris bodies do not depenetrate each other"),
+			Carrier->MeshComponent->GetCollisionResponseToChannel(ECC_PhysicsBody),
+			ECR_Ignore);
+		TestEqual(
+			TEXT("Felled tree uses a custom early-sleep policy"),
+			Carrier->MeshComponent->BodyInstance.SleepFamily,
+			ESleepFamily::Custom);
+		TestTrue(
+			TEXT("Low-speed felled trees settle instead of jittering indefinitely"),
+			Carrier->MeshComponent->BodyInstance.CustomSleepThresholdMultiplier >= 2.0f);
+		TestTrue(
+			TEXT("Felled tree gets a bounded render-only depth lane"),
+			!FMath::IsNearlyZero(Carrier->GetVisualDepthOffset())
+			&& FMath::Abs(Carrier->GetVisualDepthOffset()) < 2.0f);
+		TestEqual(
 			TEXT("Felled carrier owns one logical leaf member"),
 			Carrier->GetAggregateMemberCount(),
 			1);
@@ -530,5 +559,232 @@ bool FMatterFluxTreeRepeatedMultiDirectionCutTest::RunTest(
 	TestTrue(
 		TEXT("The final physics-producing cut avoids a visible long hitch"),
 		FellingMilliseconds < 50.0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxTreeFellingAngleCollisionTest,
+	"MatterFlux.Fragment.Physics.TreeFellingAnglesBuildStableTrunkCollision",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxTreeFellingAngleCollisionTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	UFragmentSimulationSubsystem* Subsystem = World
+		? World->GetSubsystem<UFragmentSimulationSubsystem>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Felling-angle test world exists"), World)
+		|| !TestNotNull(TEXT("Fragment subsystem exists"), Subsystem))
+	{
+		return false;
+	}
+
+	const TArray<float> CutAngles = { -30.0f, -15.0f, 0.0f, 15.0f, 30.0f };
+	for (int32 AngleIndex = 0; AngleIndex < CutAngles.Num(); ++AngleIndex)
+	{
+		const float CutAngle = CutAngles[AngleIndex];
+		const FVector TreeOrigin(
+			static_cast<float>(AngleIndex) * 900.0f,
+			0.0f,
+			0.0f);
+		AFragment2DSourceActor* Trunk =
+			World->SpawnActor<AFragment2DSourceActor>(
+				TreeOrigin,
+				FRotator::ZeroRotator);
+		AFragment2DSourceActor* Leaves =
+			World->SpawnActor<AFragment2DSourceActor>(
+				TreeOrigin + FVector(0.0f, -16.0f, 170.0f),
+				FRotator::ZeroRotator);
+		if (!TestNotNull(TEXT("Angled tree trunk spawns"), Trunk)
+			|| !TestNotNull(TEXT("Angled tree leaves spawn"), Leaves))
+		{
+			return false;
+		}
+
+		const FGuid AggregateId = FGuid::NewDeterministicGuid(
+			TEXT("TreeFellingAngleAggregate"),
+			AngleIndex);
+		const FGuid TrunkId = FGuid::NewDeterministicGuid(
+			TEXT("TreeFellingAngleTrunk"),
+			AngleIndex);
+		const FGuid LeafId = FGuid::NewDeterministicGuid(
+			TEXT("TreeFellingAngleLeaves"),
+			AngleIndex);
+		Trunk->bDestroySourceOnFirstBreak = false;
+		Leaves->bDestroySourceOnFirstBreak = false;
+		if (!TestTrue(
+				TEXT("Angled tree trunk mask initializes"),
+				Trunk->InitializeFromProceduralMask(
+					MakeStressTreeMask(),
+					TrunkId,
+					FLinearColor(0.32f, 0.12f, 0.035f),
+					TEXT("wood")))
+			|| !TestTrue(
+				TEXT("Angled tree leaf mask initializes"),
+				Leaves->InitializeFromProceduralMask(
+					MakeLeafMask(),
+					LeafId,
+					FLinearColor(0.08f, 0.55f, 0.12f),
+					TEXT("leaf"))))
+		{
+			return false;
+		}
+		Trunk->ConfigureAggregate(AggregateId, true);
+		Leaves->ConfigureAggregate(AggregateId, false);
+		Leaves->SetSourceCollisionEnabled(false);
+
+		FFragmentWorldCutRequest FellingCut;
+		FellingCut.CutShape.Type = EFragmentDamageShapeType::Line;
+		FellingCut.CutShape.WorldTransform = FTransform(
+			FQuat(
+				FVector::YAxisVector,
+				FMath::DegreesToRadians(CutAngle)),
+			TreeOrigin + CellCenterLocal(
+				TreeWidth,
+				TreeHeight,
+				TreeWidth / 2,
+				10));
+		FellingCut.CutShape.Extents.X = TreeWidth * TreeCellSize;
+		// Match the shipped TerrainCut spell instead of using a sub-cell test
+		// incision. With 8-neighbour connectivity, a one-cell diagonal can
+		// intentionally remain connected through its corners.
+		FellingCut.CutShape.Thickness = 30.0f;
+		FellingCut.DamagePower = 600.0f;
+		FellingCut.EventSeed = 9400 + AngleIndex;
+		FellingCut.TargetPadding = TreeCellSize;
+		TestEqual(
+			*FString::Printf(TEXT("%.0f degree cut affects only its trunk"), CutAngle),
+			Subsystem->RequestWorldCut(FellingCut),
+			1);
+
+		AFragment2DActor* Carrier = nullptr;
+		for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+		{
+			if (It->ContainsAggregateSource(LeafId))
+			{
+				Carrier = *It;
+				break;
+			}
+		}
+		if (!TestNotNull(
+				*FString::Printf(TEXT("%.0f degree cut creates one tree carrier"), CutAngle),
+				Carrier))
+		{
+			continue;
+		}
+		TestEqual(
+			TEXT("Every angled carrier enables query and physics collision"),
+			Carrier->MeshComponent->GetCollisionEnabled(),
+			ECollisionEnabled::QueryAndPhysics);
+		const UBodySetup* BodySetup = Carrier->MeshComponent->GetBodySetup();
+		TestNotNull(TEXT("Every angled carrier has a body setup"), BodySetup);
+		if (BodySetup)
+		{
+			TestTrue(
+				TEXT("Every angled trunk produces at least one convex collision hull"),
+				!BodySetup->AggGeom.ConvexElems.IsEmpty());
+			TestEqual(
+				TEXT("Leaf visuals do not add a second collision hull"),
+				BodySetup->AggGeom.ConvexElems.Num(),
+				Carrier->SpawnPayload.CollisionContours.Num());
+		}
+		TestTrue(
+			TEXT("Every angled carrier retains its collision-free leaf member"),
+			Carrier->ContainsAggregateSource(LeafId));
+		TestEqual(
+			TEXT("Every angled leaf member remains independently materialed"),
+			Carrier->GetAggregateSourceMaterialId(LeafId),
+			FName(TEXT("leaf")));
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxBatchTreeCutPerformanceTest,
+	"MatterFlux.Fragment.Stress.BatchTreeCutPerformance",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxBatchTreeCutPerformanceTest::RunTest(
+	const FString& Parameters)
+{
+	constexpr int32 TreeCount = 24;
+	constexpr float TreeSpacing = TreeWidth * TreeCellSize + 16.0f;
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Batch tree-cut world exists"), World))
+	{
+		return false;
+	}
+
+	const FFragmentSourceMask TreeMask = MakeStressTreeMask();
+	for (int32 Index = 0; Index < TreeCount; ++Index)
+	{
+		AFragment2DSourceActor* Tree =
+			World->SpawnActor<AFragment2DSourceActor>(
+				FVector(Index * TreeSpacing, 0.0f, 0.0f),
+				FRotator::ZeroRotator);
+		if (!TestNotNull(TEXT("Batch tree spawns"), Tree))
+		{
+			return false;
+		}
+		Tree->bDestroySourceOnFirstBreak = false;
+		if (!TestTrue(TEXT("Batch tree mask initializes"),
+			Tree->InitializeFromProceduralMask(
+				TreeMask,
+				FGuid::NewDeterministicGuid(
+					FString::Printf(TEXT("BatchTree%d"), Index),
+					1),
+				FLinearColor(0.32f, 0.12f, 0.035f),
+				TEXT("wood"))))
+		{
+			return false;
+		}
+	}
+
+	FFragmentWorldCutRequest Cut;
+	Cut.CutShape.Type = EFragmentDamageShapeType::Line;
+	Cut.CutShape.WorldTransform = FTransform(FVector(
+		(TreeCount - 1) * TreeSpacing * 0.5f,
+		0.0f,
+		CellCenterLocal(TreeWidth, TreeHeight, TreeWidth / 2, 10).Z));
+	Cut.CutShape.Extents.X = TreeCount * TreeSpacing;
+	Cut.CutShape.Thickness = TreeCellSize * 0.9f;
+	Cut.DamagePower = 600.0f;
+	Cut.EventSeed = 9100;
+	Cut.TargetPadding = TreeCellSize;
+	Cut.MaxAffectedSources = TreeCount;
+	const double StartSeconds = FPlatformTime::Seconds();
+	const int32 AcceptedTrees =
+		UFragmentSimulationSubsystem::ExecuteWorldCut(World, Cut);
+	const double ElapsedMilliseconds =
+		(FPlatformTime::Seconds() - StartSeconds) * 1000.0;
+	const double PerTreeMilliseconds =
+		ElapsedMilliseconds / static_cast<double>(TreeCount);
+
+	int32 PhysicalCarriers = 0;
+	for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+	{
+		if (It->SpawnPayload.bEnableCollision)
+		{
+			++PhysicalCarriers;
+		}
+	}
+	AddInfo(FString::Printf(
+		TEXT("Batch tree cut: %d trees in %.2f ms (%.2f ms/tree)"),
+		AcceptedTrees,
+		ElapsedMilliseconds,
+		PerTreeMilliseconds));
+	TestEqual(TEXT("One explicit batch request cuts every tree"),
+		AcceptedTrees,
+		TreeCount);
+	TestEqual(TEXT("Every felled tree produces one physical carrier"),
+		PhysicalCarriers,
+		TreeCount);
+	TestTrue(TEXT("Twenty-four tree batch avoids a one-second hitch"),
+		ElapsedMilliseconds < 1000.0);
+	TestTrue(TEXT("Per-tree cut cost remains bounded"),
+		PerTreeMilliseconds < 35.0);
 	return true;
 }

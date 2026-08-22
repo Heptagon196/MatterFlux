@@ -1,13 +1,17 @@
 #include "Game/MatterFluxGameMode.h"
 
 #include "Game/MatterFluxCharacter.h"
+#include "Creatures/MatterFluxCreatureActor.h"
 #include "Game/MatterFluxGameState.h"
 #include "Game/MatterFluxPlayableWorldActor.h"
 #include "Game/MatterFluxPlayerController.h"
 #include "Game/MatterFluxPlayerState.h"
 #include "IMatterFluxScriptRuntime.h"
 #include "MatterFluxLog.h"
+#include "Progression/MatterFluxProgressionComponent.h"
+#include "TimerManager.h"
 #include "EngineUtils.h"
+#include "Misc/Crc.h"
 
 AMatterFluxGameMode::AMatterFluxGameMode()
 {
@@ -146,4 +150,136 @@ void AMatterFluxGameMode::StartPlay()
 	}
 
 	Super::StartPlay();
+	if (HasAuthority() && GetWorld())
+	{
+		GetWorld()->GetTimerManager().SetTimer(
+			CreatureSpawnTimer,
+			this,
+			&AMatterFluxGameMode::RefreshConfiguredCreatureSpawns,
+			0.5f,
+			true,
+			0.2f);
+	}
+}
+
+void AMatterFluxGameMode::EndPlay(
+	const EEndPlayReason::Type EndPlayReason)
+{
+	if (GetWorld())
+	{
+		GetWorld()->GetTimerManager().ClearTimer(CreatureSpawnTimer);
+	}
+	Super::EndPlay(EndPlayReason);
+}
+
+bool AMatterFluxGameMode::ShouldSpawnCreature(
+	const FName SpawnQuestId) const
+{
+	if (SpawnQuestId.IsNone()) return true;
+	const AGameStateBase* CurrentGameState = GetGameState<AGameStateBase>();
+	if (!CurrentGameState) return false;
+	for (APlayerState* PlayerState : CurrentGameState->PlayerArray)
+	{
+		const AMatterFluxPlayerState* MatterFluxState =
+			Cast<AMatterFluxPlayerState>(PlayerState);
+		const UMatterFluxProgressionComponent* Progression =
+			MatterFluxState ? MatterFluxState->GetProgression() : nullptr;
+		const FMatterFluxQuestState* Quest = Progression
+			? Progression->FindQuestState(SpawnQuestId) : nullptr;
+		if (Quest && (Quest->Status == EMatterFluxQuestRuntimeStatus::Active
+			|| Quest->Status == EMatterFluxQuestRuntimeStatus::Completed))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+void AMatterFluxGameMode::RefreshConfiguredCreatureSpawns()
+{
+	if (!HasAuthority() || !GetWorld()) return;
+	const FMatterFluxContentRegistryPtr Registry =
+		IMatterFluxScriptRuntime::Get().GetActiveRegistry();
+	if (!Registry.IsValid()) return;
+	AMatterFluxPlayableWorldActor* PlayableWorld = nullptr;
+	for (TActorIterator<AMatterFluxPlayableWorldActor> It(GetWorld()); It; ++It)
+	{
+		PlayableWorld = *It;
+		break;
+	}
+	if (!PlayableWorld) return;
+
+	FVector Anchor = FVector::ZeroVector;
+	bool bHasPlayerAnchor = false;
+	for (TActorIterator<AMatterFluxCharacter> It(GetWorld()); It; ++It)
+	{
+		Anchor = It->GetActorLocation();
+		bHasPlayerAnchor = true;
+		break;
+	}
+	if (!bHasPlayerAnchor) return;
+	TArray<FName> CreatureIds;
+	Registry->Creatures.GetKeys(CreatureIds);
+	CreatureIds.Sort(FNameLexicalLess());
+	for (const FName CreatureId : CreatureIds)
+	{
+		if (SpawnedCreatureDefinitions.Contains(CreatureId)) continue;
+		const FMatterFluxCreatureDefinition& Definition =
+			Registry->Creatures.FindChecked(CreatureId);
+		if (Definition.SpawnCount <= 0
+			|| !ShouldSpawnCreature(Definition.SpawnQuestId))
+		{
+			continue;
+		}
+		TArray<AMatterFluxCreatureActor*> DeferredCreatures;
+		TArray<FTransform> SpawnTransforms;
+		const uint32 IdHash = FCrc::StrCrc32(*CreatureId.ToString());
+		for (int32 Index = 0; Index < Definition.SpawnCount; ++Index)
+		{
+			const float Angle = static_cast<float>(IdHash % 360u)
+				+ 360.0f * static_cast<float>(Index)
+					/ static_cast<float>(Definition.SpawnCount);
+			const float Radius = Definition.SpawnDistance
+				+ static_cast<float>(Index) * 90.0f;
+			FVector Location = Anchor + FVector(
+				FMath::Cos(FMath::DegreesToRadians(Angle)) * Radius,
+				FMath::Sin(FMath::DegreesToRadians(Angle)) * Radius,
+				0.0f);
+			float TerrainHeight = 0.0f;
+			if (!PlayableWorld->TrySampleTerrainHeightAtWorldLocation(
+				Location, TerrainHeight))
+			{
+				return;
+			}
+			Location.Z = TerrainHeight + Definition.Height * 0.55f + 20.0f;
+			const FTransform Transform(FRotator::ZeroRotator, Location);
+			AMatterFluxCreatureActor* Creature =
+				GetWorld()->SpawnActorDeferred<AMatterFluxCreatureActor>(
+					AMatterFluxCreatureActor::StaticClass(),
+					Transform,
+					nullptr,
+					nullptr,
+					ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn);
+			if (!Creature)
+			{
+				for (AMatterFluxCreatureActor* Existing : DeferredCreatures)
+				{
+					if (Existing) Existing->Destroy();
+				}
+				return;
+			}
+			Creature->InitializeCreature(CreatureId);
+			DeferredCreatures.Add(Creature);
+			SpawnTransforms.Add(Transform);
+		}
+		for (int32 Index = 0; Index < DeferredCreatures.Num(); ++Index)
+		{
+			DeferredCreatures[Index]->FinishSpawning(SpawnTransforms[Index]);
+		}
+		UE_LOG(LogMatterFlux, Display,
+			TEXT("Spawned %d Lua creature(s) for '%s' (quest='%s')"),
+			DeferredCreatures.Num(), *CreatureId.ToString(),
+			*Definition.SpawnQuestId.ToString());
+		SpawnedCreatureDefinitions.Add(CreatureId);
+	}
 }

@@ -43,7 +43,7 @@ namespace MatterFlux::Combustion
 	bool FGroundCombustionRuntime::Initialize(
 		const FGroundRuntimeSettings& Settings,
 		const FFragmentSourceMask& GroundMask,
-		const FMatterFluxCombustionDefinition& Rule,
+		const FMatterFluxReactionDefinition& Rule,
 		const int32 Seed,
 		FString& OutError)
 	{
@@ -477,7 +477,7 @@ namespace MatterFlux::Combustion
 	bool FGroundCombustionRuntime::RestoreState(
 		const FGroundRuntimeSettings& Settings,
 		const FGroundRuntimeSnapshot& State,
-		const FMatterFluxCombustionDefinition& Rule,
+		const FMatterFluxReactionDefinition& Rule,
 		FString& OutError)
 	{
 		OutError.Reset();

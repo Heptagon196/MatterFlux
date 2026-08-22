@@ -15,6 +15,7 @@ public:
 	AMatterFluxGameMode();
 
 	virtual void StartPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual APawn* SpawnDefaultPawnAtTransform_Implementation(
 		AController* NewPlayer,
 		const FTransform& SpawnTransform) override;
@@ -25,4 +26,11 @@ public:
 	/** Spacing used when several players share a map with one PlayerStart. */
 	UPROPERTY(EditDefaultsOnly, Category = "Multiplayer", meta = (ClampMin = "80.0"))
 	float MultiplayerSpawnSpacing = 180.0f;
+
+private:
+	void RefreshConfiguredCreatureSpawns();
+	bool ShouldSpawnCreature(FName SpawnQuestId) const;
+
+	FTimerHandle CreatureSpawnTimer;
+	TSet<FName> SpawnedCreatureDefinitions;
 };

@@ -23,12 +23,15 @@ namespace MatterFlux::PlayableLevel
 		Lit,
 		VoxelLit,
 		VoxelUnlit,
+		Liquid,
 		CollisionOnly
 	};
 
 	struct MATTERFLUX_API FLevelLayer
 	{
 		FName Name = NAME_None;
+		/** 可选的 Lua 材质 ID；液体层用它读取透明度和折射参数。 */
+		FName MaterialId = NAME_None;
 		ELayerPrimitive Primitive = ELayerPrimitive::Cube;
 		ELevelLayerRenderMode RenderMode = ELevelLayerRenderMode::Lit;
 		FLinearColor Color = FLinearColor::White;
@@ -107,6 +110,8 @@ namespace MatterFlux::PlayableLevel
 	struct MATTERFLUX_API FLevelLayout
 	{
 		FLevelTerrain Terrain;
+		/** 确定性的房屋预留位置；Z 在运行时按局部最高地形求得。 */
+		FVector HouseLocation = FVector::ZeroVector;
 		TArray<FLevelLayer> Layers;
 		TArray<FLevelFragmentSource> FragmentSources;
 

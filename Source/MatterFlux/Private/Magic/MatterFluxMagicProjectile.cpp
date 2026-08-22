@@ -2,11 +2,15 @@
 
 #include "Components/SphereComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "Creatures/MatterFluxCreatureActor.h"
 #include "EngineUtils.h"
 #include "Fragment/Fragment2DSourceActor.h"
 #include "Fragment/FragmentSimulationSubsystem.h"
 #include "Game/MatterFluxPlayableWorldActor.h"
+#include "Game/MatterFluxCharacter.h"
+#include "Game/MatterFluxPlayerState.h"
 #include "GameFramework/ProjectileMovementComponent.h"
+#include "GAS/MatterFluxPlayerAttributeSet.h"
 #include "Kismet/GameplayStatics.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Misc/Crc.h"
@@ -332,6 +336,31 @@ bool AMatterFluxMagicProjectile::ResolveImpactAuthority(
 		return false;
 	}
 	bImpactHandled = true;
+	AActor* HitActor = Hit.GetActor();
+	if (AMatterFluxCreatureActor* Creature =
+		Cast<AMatterFluxCreatureActor>(HitActor))
+	{
+		Creature->ApplyDamageAuthority(ServerPlan.Damage, GetOwner());
+	}
+	else if (AMatterFluxCharacter* Character =
+		Cast<AMatterFluxCharacter>(HitActor))
+	{
+		// Creature projectiles damage players; player-owned projectiles cannot
+		// damage their owner through a trigger payload.
+		if (Cast<AMatterFluxCreatureActor>(GetOwner()))
+		{
+			if (AMatterFluxPlayerState* PlayerState =
+				Character->GetPlayerState<AMatterFluxPlayerState>())
+			{
+				if (UMatterFluxPlayerAttributeSet* Attributes =
+					PlayerState->GetPlayerAttributes())
+				{
+					Attributes->SetHealth(FMath::Max(
+						0.0f, Attributes->GetHealth() - ServerPlan.Damage));
+				}
+			}
+		}
+	}
 	ApplyWorldImpact(Hit);
 	SpawnTriggerPayload(
 		ServerPlan.OnImpactProjectiles,

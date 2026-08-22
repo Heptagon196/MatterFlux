@@ -7,6 +7,7 @@
 #include "Magic/MatterFluxWandProgram.h"
 #include "Magic/MatterFluxSpellProgramLayout.h"
 #include "Magic/MatterFluxMagicInventoryComponent.h"
+#include "Magic/MatterFluxMagicWorkbenchInteraction.h"
 #include "Magic/MatterFluxMagicProjectile.h"
 #include "Misc/AutomationTest.h"
 #include "Tests/AutomationEditorCommon.h"
@@ -14,7 +15,7 @@
 namespace MatterFluxMagicTests
 {
 	const TCHAR* BasicPack = TEXT(R"LUA(
-content.set_manifest("magic.test", 1, 1)
+content.set_manifest("magic.test", 1, 2)
 content.register_spell({
 	id = "spell.spark_bolt",
 	name = "Spark Bolt",
@@ -45,7 +46,7 @@ content.register_wand({
 )LUA");
 
 	const TCHAR* ProgramPack = TEXT(R"LUA(
-content.set_manifest("magic.program", 1, 1)
+content.set_manifest("magic.program", 1, 2)
 content.register_spell({
 	id = "spell.add_five", name = "Add Five", kind = "modifier",
 	mana_cost = 1, damage_add = 5, draw_count = 1
@@ -76,6 +77,55 @@ content.register_wand({
 		FString Ignored;
 		Runtime.ReloadDefaultContentPack(Ignored);
 	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxMagicWorkbenchDragBehaviorTest,
+	"MatterFlux.Magic.Workbench.DragDropExposesEverySlotAndResolvesEdits",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxMagicWorkbenchDragBehaviorTest::RunTest(
+	const FString& Parameters)
+{
+	FMatterFluxOwnedWand Wand;
+	Wand.InstanceId = FGuid(1, 2, 3, 4);
+	Wand.SpellSlots = {
+		TEXT("spell.bolt"), NAME_None, TEXT("spell.trigger"), NAME_None
+	};
+	TArray<int32> Targets;
+	FMatterFluxMagicWorkbenchInteraction::BuildSpellDropTargets(Wand, Targets);
+	TestEqual(TEXT("Every capacity slot remains a visible drop target"),
+		Targets, TArray<int32>({0, 1, 2, 3}));
+
+	FMatterFluxMagicDragPayload InventoryPayload;
+	InventoryPayload.Source = EMatterFluxMagicDragSource::SpellInventory;
+	InventoryPayload.SpellId = TEXT("spell.bolt");
+	FMatterFluxMagicEdit Edit;
+	TestTrue(TEXT("Inventory spell can drop into an empty wand slot"),
+		FMatterFluxMagicWorkbenchInteraction::ResolveSpellDrop(
+			InventoryPayload, Wand.InstanceId, 1, Edit));
+	TestEqual(TEXT("Inventory drop becomes assign edit"),
+		Edit.Type, EMatterFluxMagicEditType::AssignSpell);
+	TestEqual(TEXT("Inventory drop keeps target slot"), Edit.ToSpellSlot, 1);
+
+	FMatterFluxMagicDragPayload SlotPayload;
+	SlotPayload.Source = EMatterFluxMagicDragSource::WandSpellSlot;
+	SlotPayload.WandId = Wand.InstanceId;
+	SlotPayload.SpellSlot = 0;
+	TestTrue(TEXT("Wand spell can move to another slot"),
+		FMatterFluxMagicWorkbenchInteraction::ResolveSpellDrop(
+			SlotPayload, Wand.InstanceId, 3, Edit));
+	TestEqual(TEXT("Slot drop becomes swap edit"),
+		Edit.Type, EMatterFluxMagicEditType::SwapSpellSlots);
+	TestEqual(TEXT("Swap remembers source"), Edit.FromSpellSlot, 0);
+	TestEqual(TEXT("Swap remembers target"), Edit.ToSpellSlot, 3);
+	TestFalse(TEXT("Cross-wand drops are rejected without mutation"),
+		FMatterFluxMagicWorkbenchInteraction::ResolveSpellDrop(
+			SlotPayload, FGuid(9, 8, 7, 6), 2, Edit));
+	TestFalse(TEXT("Dropping onto the same slot is a no-op"),
+		FMatterFluxMagicWorkbenchInteraction::ResolveSpellDrop(
+			SlotPayload, Wand.InstanceId, 0, Edit));
+	return true;
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -428,6 +478,34 @@ bool FMatterFluxMagicPaperMagicLibraryTest::RunTest(
 			PrecisionWand->ManaRechargePerSecond, 22.0f);
 		TestEqual(TEXT("Wand cast interval is configured"),
 			PrecisionWand->CastDelay, 0.10f);
+	}
+	const FMatterFluxWandDefinition* PaperMagicDefaultWand =
+		Registry->Wands.Find(TEXT("std.default"));
+	if (TestNotNull(TEXT("PaperMagic default wand is migrated"),
+		PaperMagicDefaultWand))
+	{
+		TestEqual(TEXT("Default wand capacity"),
+			PaperMagicDefaultWand->Capacity, 10);
+		TestEqual(TEXT("Default wand mana maximum"),
+			PaperMagicDefaultWand->ManaMax, 100.0f);
+		TestEqual(TEXT("Default wand mana recovery"),
+			PaperMagicDefaultWand->ManaRechargePerSecond, 10.0f);
+		TestEqual(TEXT("Default wand cast interval"),
+			PaperMagicDefaultWand->CastDelay, 0.5f);
+		TestEqual(TEXT("Default wand starts owned but unbound"),
+			PaperMagicDefaultWand->StarterCount, 1);
+	}
+	const FMatterFluxWandDefinition* PaperMagicShoe =
+		Registry->Wands.Find(TEXT("std.default_shoe"));
+	if (TestNotNull(TEXT("PaperMagic shoe caster is migrated"), PaperMagicShoe))
+	{
+		TestEqual(TEXT("Shoe caster capacity"), PaperMagicShoe->Capacity, 1);
+		TestEqual(TEXT("Shoe caster mana recovery"),
+			PaperMagicShoe->ManaRechargePerSecond, 50.0f);
+		TestEqual(TEXT("Shoe caster interval"),
+			PaperMagicShoe->CastDelay, 0.5f);
+		TestEqual(TEXT("Shoe caster starts owned but unbound"),
+			PaperMagicShoe->StarterCount, 1);
 	}
 	return true;
 }

@@ -23,6 +23,13 @@ bool FFragmentSourceMask::NetSerialize(
 		SupportMode =
 			static_cast<EFragmentSupportMode>(SupportModeValue);
 	}
+	uint8 GeometryStyleValue = static_cast<uint8>(GeometryStyle);
+	Ar << GeometryStyleValue;
+	if (Ar.IsLoading())
+	{
+		GeometryStyle =
+			static_cast<EFragmentSourceGeometryStyle>(GeometryStyleValue);
+	}
 
 	const bool bMetadataValid =
 		Width > 0 && Width <= 256
@@ -32,7 +39,10 @@ bool FFragmentSourceMask::NetSerialize(
 		&& MaxFragmentsPerBreak > 0
 		&& MaxFragmentsPerBreak <= 16
 		&& (SupportMode == EFragmentSupportMode::None
-			|| SupportMode == EFragmentSupportMode::Bottom);
+			|| SupportMode == EFragmentSupportMode::Bottom)
+		&& (GeometryStyle == EFragmentSourceGeometryStyle::ExtrudedMask
+			|| GeometryStyle == EFragmentSourceGeometryStyle::RadialColumn
+			|| GeometryStyle == EFragmentSourceGeometryStyle::VoxelBlocks);
 	if (Ar.IsError() || !bMetadataValid)
 	{
 		if (Ar.IsLoading())

@@ -357,6 +357,7 @@ int32 UFragmentSimulationSubsystem::RequestWorldCut(
 		|| Request.DamagePower < 0.0f
 		|| !FMath::IsFinite(Request.TargetPadding)
 		|| Request.TargetPadding < 0.0f
+		|| Request.MaxAffectedSources < 0
 		|| QueuedWorldCuts.Num() - NextQueuedWorldCut >= 64)
 	{
 		return 0;
@@ -396,7 +397,8 @@ int32 UFragmentSimulationSubsystem::ExecuteWorldCut(
 		|| !FMath::IsFinite(Request.DamagePower)
 		|| Request.DamagePower < 0.0f
 		|| !FMath::IsFinite(Request.TargetPadding)
-		|| Request.TargetPadding < 0.0f)
+		|| Request.TargetPadding < 0.0f
+		|| Request.MaxAffectedSources < 0)
 	{
 		return 0;
 	}
@@ -441,7 +443,41 @@ int32 UFragmentSimulationSubsystem::ExecuteWorldCut(
 			QueryBounds,
 			CandidateSources);
 	}
-	int32 AcceptedCuts = 0;
+	const auto GuidLess = [](const FGuid& Left, const FGuid& Right)
+	{
+		return Left.A != Right.A ? Left.A < Right.A
+			: Left.B != Right.B ? Left.B < Right.B
+			: Left.C != Right.C ? Left.C < Right.C
+			: Left.D < Right.D;
+	};
+
+	// 世界切割的预算单位是“逻辑物体”，不是组成物体的二维 source
+	// 层。一棵体素树有多层树干、枝条和树叶；旧实现按 actor 距离直接
+	// 截断候选数组，最近的非根层会先耗掉预算，最终把横刀错误地显示成
+	// 几块纵向木板。先按 AggregateId 分组，再由根 source 发起事务；根
+	// 成功后会把同一刀口应用到所有成员并交给同一个物理 carrier。
+	TMap<FGuid, AFragment2DSourceActor*> AggregateRoots;
+	for (AFragment2DSourceActor* Source : CandidateSources)
+	{
+		if (IsValid(Source)
+			&& !Source->IsActorBeingDestroyed()
+			&& !Source->bBroken
+			&& Source->AggregateId.IsValid()
+			&& Source->bAggregateRoot)
+		{
+			AggregateRoots.FindOrAdd(Source->AggregateId) = Source;
+		}
+	}
+
+	struct FCutTargetGroup
+	{
+		FGuid StableId;
+		TObjectPtr<AFragment2DSourceActor> Root;
+		TArray<TObjectPtr<AFragment2DSourceActor>> Sources;
+		double DistanceSquared = TNumericLimits<double>::Max();
+	};
+	TArray<FCutTargetGroup> TargetGroups;
+	TMap<FGuid, int32> TargetGroupIndices;
 	for (AFragment2DSourceActor* Source : CandidateSources)
 	{
 		if (!IsValid(Source)
@@ -451,24 +487,124 @@ int32 UFragmentSimulationSubsystem::ExecuteWorldCut(
 		{
 			continue;
 		}
-
-		const FBox Bounds =
-			Source->GetComponentsBoundingBox(true);
+		const FBox Bounds = Source->GetComponentsBoundingBox(true);
 		if (!Bounds.IsValid)
 		{
 			continue;
 		}
-		FFragmentDamageEvent Event;
-		Event.SourceId = Source->SourceId;
-		Event.BaseRevision = Source->Revision;
-		Event.DamageShape = Shape;
-		Event.DamagePower = Request.DamagePower;
-		Event.EventSeed = Request.EventSeed
-			^ static_cast<int32>(
-				GetTypeHash(Source->SourceId));
-		AcceptedCuts += ExecuteFragmentDamage(Source, Event)
-			? 1
-			: 0;
+
+		const FGuid StableId = Source->AggregateId.IsValid()
+			? Source->AggregateId
+			: Source->SourceId;
+		int32* GroupIndex = TargetGroupIndices.Find(StableId);
+		if (!GroupIndex)
+		{
+			FCutTargetGroup& NewGroup = TargetGroups.AddDefaulted_GetRef();
+			NewGroup.StableId = StableId;
+			if (Source->AggregateId.IsValid())
+			{
+				NewGroup.Root = AggregateRoots.FindRef(Source->AggregateId);
+			}
+			TargetGroupIndices.Add(StableId, TargetGroups.Num() - 1);
+			GroupIndex = TargetGroupIndices.Find(StableId);
+		}
+		FCutTargetGroup& Group = TargetGroups[*GroupIndex];
+		Group.Sources.AddUnique(Source);
+		Group.DistanceSquared = FMath::Min(
+			Group.DistanceSquared,
+			Bounds.ComputeSquaredDistanceToPoint(ShapeCenter));
+	}
+	for (FCutTargetGroup& Group : TargetGroups)
+	{
+		if (IsValid(Group.Root))
+		{
+			Group.Sources.AddUnique(Group.Root);
+			// 根只决定事务提交顺序，不代表整个逻辑物体的位置。全局
+			// 目标排序保留上面由所有相交成员包围盒算出的最近表面距离；
+			// 否则贴着树根的一刀会因为树干中心较远而被旁边小草抢走。
+		}
+		Group.Sources.Sort(
+			[&GuidLess, &Group, &ShapeCenter](
+				const AFragment2DSourceActor& Left,
+				const AFragment2DSourceActor& Right)
+			{
+				if (&Left == Group.Root.Get() || &Right == Group.Root.Get())
+				{
+					return &Left == Group.Root.Get()
+						&& &Right != Group.Root.Get();
+				}
+				const double LeftDistance = FVector::DistSquared(
+					Left.GetActorLocation(), ShapeCenter);
+				const double RightDistance = FVector::DistSquared(
+					Right.GetActorLocation(), ShapeCenter);
+				if (LeftDistance != RightDistance)
+				{
+					return LeftDistance < RightDistance;
+				}
+				return GuidLess(Left.SourceId, Right.SourceId);
+			});
+	}
+	TargetGroups.Sort(
+		[&GuidLess](const FCutTargetGroup& Left, const FCutTargetGroup& Right)
+		{
+			if (Left.DistanceSquared != Right.DistanceSquared)
+			{
+				return Left.DistanceSquared < Right.DistanceSquared;
+			}
+			return GuidLess(Left.StableId, Right.StableId);
+		});
+	int32 AcceptedCuts = 0;
+	int32 AttemptedTargets = 0;
+	for (FCutTargetGroup& Group : TargetGroups)
+	{
+		if (Request.MaxAffectedSources > 0
+			&& AttemptedTargets >= Request.MaxAffectedSources)
+		{
+			break;
+		}
+		++AttemptedTargets;
+		bool bTargetAccepted = false;
+		TMap<FGuid, int32> InitialRevisions;
+		for (AFragment2DSourceActor* Source : Group.Sources)
+		{
+			if (IsValid(Source) && Source->SourceId.IsValid())
+			{
+				InitialRevisions.Add(Source->SourceId, Source->Revision);
+			}
+		}
+		for (AFragment2DSourceActor* Source : Group.Sources)
+		{
+			if (!IsValid(Source)
+				|| Source->IsActorBeingDestroyed()
+				|| Source->bBroken
+				|| !Source->SourceId.IsValid())
+			{
+				continue;
+			}
+			const int32* InitialRevision =
+				InitialRevisions.Find(Source->SourceId);
+			if (!InitialRevision || Source->Revision != *InitialRevision)
+			{
+				// 根层若已经生成 carrier，TransferAggregateMembersTo 会
+				// 先提交各成员的同一刀口；这里不能再重复伤害它们。
+				continue;
+			}
+			FFragmentDamageEvent Event;
+			Event.SourceId = Source->SourceId;
+			Event.BaseRevision = Source->Revision;
+			Event.DamageShape = Shape;
+			Event.DamagePower = Request.DamagePower;
+			Event.EventSeed = Request.EventSeed
+				^ static_cast<int32>(GetTypeHash(Source->SourceId));
+			if (ExecuteFragmentDamage(Source, Event))
+			{
+				bTargetAccepted = true;
+				// 不提前终止：没有产生 carrier 的表面刻痕仍需穿过木叶
+				// 多材质层。已由根事务接管的成员会在循环顶部按 revision
+				// 或对象有效性跳过，整棵树仍只计作一个法术目标。
+			}
+		}
+		AcceptedCuts += bTargetAccepted ? 1 : 0;
 	}
 	return AcceptedCuts;
 }
@@ -617,11 +753,19 @@ bool UFragmentSimulationSubsystem::ExecuteFragmentDamage(AFragment2DSourceActor*
 			}
 		}
 		SourceActor->TransferAggregateMembersTo(
-			*DeferredFragments[0]);
+			*DeferredFragments[0],
+			&DamageEvent);
+		if (SourceActor->AggregateId.IsValid()
+			&& SourceActor->bAggregateRoot)
+		{
+			SourceActor->BeginAggregateSeparationGracePeriod(
+				*DeferredFragments[0]);
+		}
 	}
 
 	const bool bReturnedToBatch =
-		Cast<AMatterFluxPlayableWorldActor>(SourceActor->GetOwner())
+		!SourceActor->IsAggregateSeparationCollisionSuppressed()
+		&& Cast<AMatterFluxPlayableWorldActor>(SourceActor->GetOwner())
 			? CastChecked<AMatterFluxPlayableWorldActor>(
 				SourceActor->GetOwner())
 				->DematerializeFragmentSource(SourceActor->SourceId)

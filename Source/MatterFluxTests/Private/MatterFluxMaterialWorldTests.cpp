@@ -47,6 +47,34 @@ namespace
 		Lava.Mobility = 96;
 		Registry.Materials.Add(Lava.Id, Lava);
 
+		FMatterFluxMaterialDefinition Acid;
+		Acid.Id = TEXT("acid");
+		Acid.Density = 1.22f;
+		Acid.Phase = EMatterFluxMaterialPhase::Liquid;
+		Acid.Mobility = 255;
+		Acid.Dispersion = 210;
+		Registry.Materials.Add(Acid.Id, Acid);
+
+		FMatterFluxMaterialDefinition AcidGas;
+		AcidGas.Id = TEXT("acid_gas");
+		AcidGas.Density = 0.07f;
+		AcidGas.Phase = EMatterFluxMaterialPhase::Gas;
+		AcidGas.Mobility = 255;
+		AcidGas.Dispersion = 255;
+		Registry.Materials.Add(AcidGas.Id, AcidGas);
+
+		FMatterFluxMaterialDefinition Wood;
+		Wood.Id = TEXT("wood");
+		Wood.Density = 0.82f;
+		Wood.Phase = EMatterFluxMaterialPhase::StaticSolid;
+		Registry.Materials.Add(Wood.Id, Wood);
+
+		FMatterFluxMaterialDefinition Grassland;
+		Grassland.Id = TEXT("grassland");
+		Grassland.Density = 0.42f;
+		Grassland.Phase = EMatterFluxMaterialPhase::StaticSolid;
+		Registry.Materials.Add(Grassland.Id, Grassland);
+
 		FMatterFluxReactionDefinition Quench;
 		Quench.Id = TEXT("water_lava_quench");
 		Quench.InputA = TEXT("water");
@@ -55,8 +83,979 @@ namespace
 		Quench.OutputB = TEXT("stone");
 		Quench.ChancePermille = 1000;
 		Registry.Reactions.Add(Quench.Id, Quench);
+
+		FMatterFluxReactionDefinition CorrodeWood;
+		CorrodeWood.Id = TEXT("acid_wood_corrosion");
+		CorrodeWood.InputA = TEXT("acid");
+		CorrodeWood.InputB = TEXT("wood");
+		CorrodeWood.OutputA = TEXT("acid");
+		CorrodeWood.OutputB = TEXT("acid_gas");
+		CorrodeWood.ChancePermille = 1000;
+		Registry.Reactions.Add(CorrodeWood.Id, CorrodeWood);
+
+		FMatterFluxReactionDefinition CorrodeGrassland;
+		CorrodeGrassland.Id = TEXT("acid_grassland_corrosion");
+		CorrodeGrassland.InputA = TEXT("acid");
+		CorrodeGrassland.InputB = TEXT("grassland");
+		CorrodeGrassland.OutputA = TEXT("acid");
+		CorrodeGrassland.OutputB = TEXT("acid_gas");
+		CorrodeGrassland.ChancePermille = 1000;
+		Registry.Reactions.Add(CorrodeGrassland.Id, CorrodeGrassland);
 		return Registry;
 	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxDynamicBodyLiquidDisplacementTest,
+	"MatterFlux.Material.DynamicBodyDisplacesLiquidAndConservesAmount",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxDynamicBodyLiquidDisplacementTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 8;
+	Settings.ActiveChunkRadius = 1;
+	Settings.MaxActiveChunks = 9;
+	Settings.bUseSurfaceTopology = true;
+	Settings.MinSurfaceCell = FIntPoint(-4, -4);
+	Settings.MaxSurfaceCellExclusive = FIntPoint(5, 5);
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(TEXT("Displacement world initializes"),
+		World.Initialize(Settings, MakeLiquidRegistry(), 20260822, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	TArray<MatterFlux::Material::FSeedCell> Seeds;
+	for (int32 Y = -4; Y <= 4; ++Y)
+	{
+		for (int32 X = -4; X <= 4; ++X)
+		{
+			const bool bWater = X == 0 && Y == 0;
+			Seeds.Add({
+				FIntPoint(X, Y),
+				bWater ? FName(TEXT("water")) : NAME_None,
+				0,
+				bWater ? static_cast<uint8>(137) : static_cast<uint8>(0) });
+		}
+	}
+	TestTrue(TEXT("Surface state is seeded"), World.SeedSurface(Seeds));
+
+	const FIntPoint OccupiedFootprint[] = {
+		FIntPoint::ZeroValue,
+		FIntPoint(1, 0)
+	};
+	TestEqual(TEXT("One overlapping liquid cell is displaced"),
+		World.DisplaceLiquids(OccupiedFootprint), 1);
+	TestTrue(TEXT("Body center is materially empty"),
+		World.GetMaterialAt(FIntPoint::ZeroValue).IsNone());
+	TestTrue(TEXT("Whole body footprint remains materially empty"),
+		World.GetMaterialAt(FIntPoint(1, 0)).IsNone());
+	TestEqual(TEXT("Liquid cell identity is conserved"),
+		World.CountMaterial(TEXT("water")), 1);
+
+	TArray<MatterFlux::Material::FCellSnapshot> Cells;
+	World.GetActiveCells(Cells);
+	const MatterFlux::Material::FCellSnapshot* Water =
+		Cells.FindByPredicate(
+			[](const MatterFlux::Material::FCellSnapshot& Cell)
+			{
+				return Cell.MaterialId == TEXT("water");
+			});
+	if (!TestNotNull(TEXT("Displaced liquid has a destination"), Water))
+	{
+		return false;
+	}
+	TestEqual(TEXT("Liquid amount is conserved exactly"),
+		Water->Amount, static_cast<uint8>(137));
+	TestEqual(TEXT("World-level amount query observes exact conservation"),
+		World.SumMaterialAmount(TEXT("water")), static_cast<int64>(137));
+	TestFalse(TEXT("Destination is outside submitted body footprint"),
+		Water->WorldCell == FIntPoint::ZeroValue
+			|| Water->WorldCell == FIntPoint(1, 0));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxPartialBodyLiquidDisplacementTest,
+	"MatterFlux.Material.PartialBodyDisplacementIsIdempotent",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxPartialBodyLiquidDisplacementTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 8;
+	Settings.ActiveChunkRadius = 1;
+	Settings.MaxActiveChunks = 9;
+	Settings.bUseSurfaceTopology = true;
+	Settings.MinSurfaceCell = FIntPoint(-2, -2);
+	Settings.MaxSurfaceCellExclusive = FIntPoint(3, 3);
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(TEXT("Partial-displacement world initializes"),
+		World.Initialize(Settings, MakeLiquidRegistry(), 20260822, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	TArray<MatterFlux::Material::FSeedCell> Seeds;
+	for (int32 Y = -2; Y <= 2; ++Y)
+	{
+		for (int32 X = -2; X <= 2; ++X)
+		{
+			const bool bSource = X == 0 && Y == 0;
+			const bool bNeighbor = X == 1 && Y == 0;
+			Seeds.Add({
+				FIntPoint(X, Y),
+				bSource || bNeighbor ? FName(TEXT("water")) : NAME_None,
+				0,
+				bSource
+					? static_cast<uint8>(200)
+					: (bNeighbor ? static_cast<uint8>(100) : static_cast<uint8>(0)) });
+		}
+	}
+	TestTrue(TEXT("Partial liquid surface is seeded"), World.SeedSurface(Seeds));
+	const MatterFlux::Material::FLiquidDisplacementConstraint Constraint = {
+		FIntPoint::ZeroValue,
+		190
+	};
+	TestEqual(TEXT("Only the requested excess amount is displaced"),
+		World.DisplaceLiquids(MakeArrayView(&Constraint, 1)), 1);
+	MatterFlux::Material::FCellSnapshot SourceAfter;
+	MatterFlux::Material::FCellSnapshot NeighborAfter;
+	TestTrue(TEXT("Partially occupied source column remains liquid"),
+		World.TryGetCellSnapshot(FIntPoint::ZeroValue, SourceAfter));
+	TestTrue(TEXT("Existing same-liquid neighbor receives displaced volume first"),
+		World.TryGetCellSnapshot(FIntPoint(1, 0), NeighborAfter));
+	TestEqual(TEXT("Source retains the constrained amount"),
+		SourceAfter.Amount, static_cast<uint8>(190));
+	TestEqual(TEXT("Neighbor surface rises by the displaced amount"),
+		NeighborAfter.Amount, static_cast<uint8>(110));
+	TestEqual(TEXT("Partial displacement conserves total liquid amount"),
+		World.SumMaterialAmount(TEXT("water")), static_cast<int64>(300));
+	TestEqual(TEXT("Submitting the same body constraint is idempotent"),
+		World.DisplaceLiquids(MakeArrayView(&Constraint, 1)), 0);
+	MatterFlux::Material::FCellSnapshot SourceAfterRepeat;
+	TestTrue(TEXT("Repeated constraint keeps source column"),
+		World.TryGetCellSnapshot(FIntPoint::ZeroValue, SourceAfterRepeat));
+	TestEqual(TEXT("Repeated constraint does not drain more liquid"),
+		SourceAfterRepeat.Amount, static_cast<uint8>(190));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxLiquidDisplacementPressureDistributionTest,
+	"MatterFlux.Material.LiquidDisplacementDistributesPressureWithoutPumpingSurface",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxLiquidDisplacementPressureDistributionTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 8;
+	Settings.ActiveChunkRadius = 1;
+	Settings.MaxActiveChunks = 9;
+	Settings.bUseSurfaceTopology = true;
+	Settings.MinSurfaceCell = FIntPoint(-1, -1);
+	Settings.MaxSurfaceCellExclusive = FIntPoint(2, 2);
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(TEXT("Pressure-distribution world initializes"),
+		World.Initialize(Settings, MakeLiquidRegistry(), 20260823, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	TArray<MatterFlux::Material::FSeedCell> Seeds;
+	for (int32 Y = -1; Y <= 1; ++Y)
+	{
+		for (int32 X = -1; X <= 1; ++X)
+		{
+			const bool bSource = X == 0 && Y == 0;
+			const int32 TerrainBand = bSource
+				? -100
+				: 20 * ((X + 1 + (Y + 1) * 3) % 4);
+			Seeds.Add({
+				FIntPoint(X, Y),
+				TEXT("water"),
+				TerrainBand,
+				static_cast<uint8>(bSource ? 200 : 100 - TerrainBand) });
+		}
+	}
+	TestTrue(TEXT("Level free surface is seeded over uneven support"),
+		World.SeedSurface(Seeds));
+	const int64 AmountBefore = World.SumMaterialAmount(TEXT("water"));
+	const MatterFlux::Material::FLiquidDisplacementConstraint Constraint = {
+		FIntPoint::ZeroValue,
+		120
+	};
+	TestEqual(TEXT("Body displacement moves the requested source volume"),
+		World.DisplaceLiquids(MakeArrayView(&Constraint, 1), 1), 1);
+
+	TArray<MatterFlux::Material::FCellSnapshot> Cells;
+	World.GetAllCells(Cells);
+	int32 MaximumSurface = MIN_int32;
+	int32 MinimumSurface = MAX_int32;
+	for (const MatterFlux::Material::FCellSnapshot& Cell : Cells)
+	{
+		if (Cell.MaterialId != TEXT("water")
+			|| Cell.WorldCell == FIntPoint::ZeroValue)
+		{
+			continue;
+		}
+		const int32 Surface = Cell.SupportHeight + Cell.Amount;
+		MaximumSurface = FMath::Max(MaximumSurface, Surface);
+		MinimumSurface = FMath::Min(MinimumSurface, Surface);
+	}
+	TestEqual(TEXT("Pressure redistribution conserves exact liquid amount"),
+		World.SumMaterialAmount(TEXT("water")), AmountBefore);
+	TestTrue(TEXT("Displaced volume is shared by the surrounding free surface"),
+		MaximumSurface <= 111);
+	TestTrue(TEXT("Uneven support does not bias the resulting free surface"),
+		MaximumSurface - MinimumSurface <= 1);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxLiquidDensityStratificationTest,
+	"MatterFlux.Material.LiquidsStratifyByDensity",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxLiquidDensityStratificationTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 8;
+	Settings.ActiveChunkRadius = 1;
+	Settings.MaxActiveChunks = 9;
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(TEXT("Density world initializes"),
+		World.Initialize(Settings, MakeLiquidRegistry(), 8102, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	// 石壁把测试约束成一格宽的液柱，避免液体从侧面绕开彼此。
+	for (int32 Y = -1; Y <= 2; ++Y)
+	{
+		TestTrue(TEXT("Left wall is authored"),
+			World.SetCell(FIntPoint(-1, Y), TEXT("stone")));
+		TestTrue(TEXT("Right wall is authored"),
+			World.SetCell(FIntPoint(1, Y), TEXT("stone")));
+	}
+	TestTrue(TEXT("Column floor is authored"),
+		World.SetCell(FIntPoint(0, -1), TEXT("stone")));
+	TestTrue(TEXT("Water starts below acid"),
+		World.SetCell(FIntPoint(0, 0), TEXT("water")));
+	TestTrue(TEXT("Denser acid starts above water"),
+		World.SetCell(FIntPoint(0, 1), TEXT("acid")));
+
+	const MatterFlux::Material::FStepStats Stats = World.Step();
+	TestEqual(TEXT("Denser acid displaces water downward"),
+		World.GetMaterialAt(FIntPoint(0, 0)), FName(TEXT("acid")));
+	TestEqual(TEXT("Water is displaced upward"),
+		World.GetMaterialAt(FIntPoint(0, 1)), FName(TEXT("water")));
+	TestEqual(TEXT("Layering conserves acid"),
+		World.CountMaterial(TEXT("acid")), 1);
+	TestEqual(TEXT("Layering conserves water"),
+		World.CountMaterial(TEXT("water")), 1);
+	TestEqual(TEXT("Density exchange is one movement"), Stats.MovedCells, 1);
+	TestEqual(TEXT("Acid and water do not chemically react"),
+		Stats.ReactedPairs, 0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxDenseDropSinksThroughLighterPoolTest,
+	"MatterFlux.Material.DenseLiquidDropSinksThroughLighterPool",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxDenseDropSinksThroughLighterPoolTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 8;
+	Settings.ActiveChunkRadius = 2;
+	Settings.MaxActiveChunks = 25;
+	Settings.MinWorldHeightCells = 0;
+	Settings.MaxWorldHeightCells = 24;
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(TEXT("Dense-drop world initializes"),
+		World.Initialize(Settings, MakeLiquidRegistry(), 8401, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	for (int32 X = -10; X <= 10; ++X)
+	{
+		World.SetCell(FIntPoint(X, 0), TEXT("stone"));
+	}
+	for (int32 Y = 1; Y < 24; ++Y)
+	{
+		World.SetCell(FIntPoint(-10, Y), TEXT("stone"));
+		World.SetCell(FIntPoint(10, Y), TEXT("stone"));
+	}
+	for (int32 Y = 1; Y <= 5; ++Y)
+	{
+		for (int32 X = -9; X <= 9; ++X)
+		{
+			World.SetCell(FIntPoint(X, Y), TEXT("water"));
+		}
+	}
+	constexpr int32 DropCenterY = 15;
+	constexpr int32 DropRadius = 3;
+	int32 InitialAcidCells = 0;
+	for (int32 LocalY = -DropRadius; LocalY <= DropRadius; ++LocalY)
+	{
+		for (int32 X = -DropRadius; X <= DropRadius; ++X)
+		{
+			if (X * X + LocalY * LocalY <= DropRadius * DropRadius)
+			{
+				World.SetCell(FIntPoint(X, DropCenterY + LocalY), TEXT("acid"));
+				++InitialAcidCells;
+			}
+		}
+	}
+	TestEqual(TEXT("Authored acid drop has a circular cross-section"),
+		InitialAcidCells, 29);
+
+	for (int32 Step = 0; Step < 120; ++Step)
+	{
+		World.Step();
+	}
+
+	TArray<MatterFlux::Material::FCellSnapshot> Cells;
+	World.GetActiveCells(Cells);
+	int32 AcidCount = 0;
+	int32 WaterCount = 0;
+	int32 AcidHeightSum = 0;
+	int32 WaterHeightSum = 0;
+	int32 HighestAcid = MIN_int32;
+	for (const MatterFlux::Material::FCellSnapshot& Cell : Cells)
+	{
+		if (Cell.MaterialId == TEXT("acid"))
+		{
+			++AcidCount;
+			AcidHeightSum += Cell.WorldCell.Y;
+			HighestAcid = FMath::Max(HighestAcid, Cell.WorldCell.Y);
+		}
+		else if (Cell.MaterialId == TEXT("water"))
+		{
+			++WaterCount;
+			WaterHeightSum += Cell.WorldCell.Y;
+		}
+	}
+	TestEqual(TEXT("Dense drop conserves every acid cell"),
+		AcidCount, InitialAcidCells);
+	TestEqual(TEXT("Pool conserves every water cell"), WaterCount, 95);
+	if (AcidCount > 0 && WaterCount > 0)
+	{
+		const float AverageAcidHeight = static_cast<float>(AcidHeightSum)
+			/ AcidCount;
+		const float AverageWaterHeight = static_cast<float>(WaterHeightSum)
+			/ WaterCount;
+		AddInfo(FString::Printf(
+			TEXT("Dense drop settled: acid average=%.2f, water average=%.2f, acid top=%d"),
+			AverageAcidHeight,
+			AverageWaterHeight,
+			HighestAcid));
+		TestTrue(TEXT("Denser acid settles below the displaced water"),
+			AverageAcidHeight + 0.5f < AverageWaterHeight);
+		TestTrue(TEXT("Acid drop enters the pool instead of resting on its surface"),
+			HighestAcid <= 6);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxLightDropFloatsOnDenserPoolTest,
+	"MatterFlux.Material.LightLiquidDropFloatsOnDenserPool",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxLightDropFloatsOnDenserPoolTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 8;
+	Settings.ActiveChunkRadius = 2;
+	Settings.MaxActiveChunks = 25;
+	Settings.MinWorldHeightCells = 0;
+	Settings.MaxWorldHeightCells = 24;
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(TEXT("Light-drop world initializes"),
+		World.Initialize(Settings, MakeLiquidRegistry(), 8402, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	for (int32 X = -10; X <= 10; ++X)
+	{
+		World.SetCell(FIntPoint(X, 0), TEXT("stone"));
+	}
+	for (int32 Y = 1; Y < 24; ++Y)
+	{
+		World.SetCell(FIntPoint(-10, Y), TEXT("stone"));
+		World.SetCell(FIntPoint(10, Y), TEXT("stone"));
+	}
+	for (int32 Y = 1; Y <= 5; ++Y)
+	{
+		for (int32 X = -9; X <= 9; ++X)
+		{
+			World.SetCell(FIntPoint(X, Y), TEXT("acid"));
+		}
+	}
+	constexpr int32 DropCenterY = 15;
+	constexpr int32 DropRadius = 3;
+	int32 InitialWaterCells = 0;
+	for (int32 LocalY = -DropRadius; LocalY <= DropRadius; ++LocalY)
+	{
+		for (int32 X = -DropRadius; X <= DropRadius; ++X)
+		{
+			if (X * X + LocalY * LocalY <= DropRadius * DropRadius)
+			{
+				World.SetCell(FIntPoint(X, DropCenterY + LocalY), TEXT("water"));
+				++InitialWaterCells;
+			}
+		}
+	}
+	TestEqual(TEXT("Authored water drop has a circular cross-section"),
+		InitialWaterCells, 29);
+
+	for (int32 Step = 0; Step < 120; ++Step)
+	{
+		World.Step();
+	}
+
+	TArray<MatterFlux::Material::FCellSnapshot> Cells;
+	World.GetActiveCells(Cells);
+	int32 AcidCount = 0;
+	int32 WaterCount = 0;
+	int32 AcidHeightSum = 0;
+	int32 WaterHeightSum = 0;
+	int32 LowestWater = MAX_int32;
+	for (const MatterFlux::Material::FCellSnapshot& Cell : Cells)
+	{
+		if (Cell.MaterialId == TEXT("acid"))
+		{
+			++AcidCount;
+			AcidHeightSum += Cell.WorldCell.Y;
+		}
+		else if (Cell.MaterialId == TEXT("water"))
+		{
+			++WaterCount;
+			WaterHeightSum += Cell.WorldCell.Y;
+			LowestWater = FMath::Min(LowestWater, Cell.WorldCell.Y);
+		}
+	}
+	TestEqual(TEXT("Dense pool conserves every acid cell"), AcidCount, 95);
+	TestEqual(TEXT("Light drop conserves every water cell"),
+		WaterCount, InitialWaterCells);
+	if (AcidCount > 0 && WaterCount > 0)
+	{
+		const float AverageAcidHeight = static_cast<float>(AcidHeightSum)
+			/ AcidCount;
+		const float AverageWaterHeight = static_cast<float>(WaterHeightSum)
+			/ WaterCount;
+		AddInfo(FString::Printf(
+			TEXT("Light drop settled: water average=%.2f, acid average=%.2f, water bottom=%d"),
+			AverageWaterHeight,
+			AverageAcidHeight,
+			LowestWater));
+		TestTrue(TEXT("Lighter water settles above the acid pool"),
+			AverageWaterHeight > AverageAcidHeight + 0.5f);
+		TestTrue(TEXT("Water drop does not tunnel through denser acid"),
+			LowestWater >= 6);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxSurfaceLiquidDensityStratificationTest,
+	"MatterFlux.Material.SurfaceLiquidsDisplaceByDensityAndTerrainHeight",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxSurfaceLiquidDensityStratificationTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 8;
+	Settings.ActiveChunkRadius = 1;
+	Settings.MaxActiveChunks = 9;
+	Settings.bUseSurfaceTopology = true;
+	Settings.MinSurfaceCell = FIntPoint(-1, -1);
+	Settings.MaxSurfaceCellExclusive = FIntPoint(3, 2);
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(TEXT("Surface density world initializes"),
+		World.Initialize(Settings, MakeLiquidRegistry(), 8103, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	for (int32 Y = -1; Y <= 1; ++Y)
+	{
+		for (int32 X = -1; X <= 2; ++X)
+		{
+			World.SetSupportHeight(FIntPoint(X, Y), 40);
+		}
+	}
+	World.SetSupportHeight(FIntPoint(0, 0), 20);
+	World.SetSupportHeight(FIntPoint(1, 0), 0);
+	World.SetCell(FIntPoint(0, 0), TEXT("acid"));
+	World.SetCell(FIntPoint(1, 0), TEXT("water"));
+
+	const MatterFlux::Material::FStepStats Stats = World.Step();
+	TestEqual(TEXT("Denser acid takes the lower terrain column"),
+		World.GetMaterialAt(FIntPoint(1, 0)), FName(TEXT("acid")));
+	TestEqual(TEXT("Lighter water is displaced to the higher column"),
+		World.GetMaterialAt(FIntPoint(0, 0)), FName(TEXT("water")));
+	TestEqual(TEXT("Surface exchange conserves acid"),
+		World.CountMaterial(TEXT("acid")), 1);
+	TestEqual(TEXT("Surface exchange conserves water"),
+		World.CountMaterial(TEXT("water")), 1);
+	TestEqual(TEXT("Surface density exchange is one movement"),
+		Stats.MovedCells, 1);
+	TestEqual(TEXT("Surface acid and water do not chemically react"),
+		Stats.ReactedPairs, 0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxSurfaceLiquidSpreadsByAmountTest,
+	"MatterFlux.Material.SurfaceLiquidSpreadsByAmountWithoutWholeCellRandomWalk",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxSurfaceLiquidSpreadsByAmountTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 8;
+	Settings.ActiveChunkRadius = 1;
+	Settings.MaxActiveChunks = 9;
+	Settings.bUseSurfaceTopology = true;
+	Settings.MinSurfaceCell = FIntPoint(-2, -2);
+	Settings.MaxSurfaceCellExclusive = FIntPoint(3, 3);
+
+	FMatterFluxContentRegistry Registry = MakeLiquidRegistry();
+	// 高扩散率不应让整个液体格随机跳走；应只转移一部分守恒液量。
+	Registry.Materials.FindChecked(TEXT("acid")).Dispersion = 255;
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(TEXT("Level-surface material world initializes"),
+		World.Initialize(Settings, Registry, 8301, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	for (int32 Y = -2; Y <= 2; ++Y)
+	{
+		for (int32 X = -2; X <= 2; ++X)
+		{
+			World.SetSupportHeight(FIntPoint(X, Y), 20);
+		}
+	}
+	TestTrue(TEXT("Acid sample is placed on level ground"),
+		World.SetCell(FIntPoint::ZeroValue, TEXT("acid")));
+
+	const MatterFlux::Material::FStepStats Stats = World.Step();
+	MatterFlux::Material::FCellSnapshot SourceSnapshot;
+	TestTrue(TEXT("Source keeps part of its liquid"),
+		World.TryGetCellSnapshot(FIntPoint::ZeroValue, SourceSnapshot));
+	TestTrue(TEXT("Source amount is split instead of moved wholesale"),
+		SourceSnapshot.Amount > 0 && SourceSnapshot.Amount < 255);
+	TArray<MatterFlux::Material::FCellSnapshot> Cells;
+	World.GetActiveCells(Cells);
+	int32 TotalAmount = 0;
+	int32 AcidCellCount = 0;
+	for (const MatterFlux::Material::FCellSnapshot& Cell : Cells)
+	{
+		if (Cell.MaterialId == TEXT("acid"))
+		{
+			TotalAmount += Cell.Amount;
+			++AcidCellCount;
+		}
+	}
+	TestTrue(TEXT("Partial flow occupies another cell"), AcidCellCount >= 2);
+	TestEqual(TEXT("Partial flow conserves exact liquid amount"),
+		TotalAmount, 255);
+	TestEqual(TEXT("One source performs one bounded transfer"),
+		Stats.MovedCells, 1);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxSurfaceLiquidRefillsAcrossUnevenSupportTest,
+	"MatterFlux.Material.SurfaceLiquidRefillsDisplacementAcrossUnevenSupport",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxSurfaceLiquidRefillsAcrossUnevenSupportTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 8;
+	Settings.ActiveChunkRadius = 1;
+	Settings.MaxActiveChunks = 9;
+	Settings.bUseSurfaceTopology = true;
+	Settings.MinSurfaceCell = FIntPoint(-1, -1);
+	Settings.MaxSurfaceCellExclusive = FIntPoint(2, 2);
+	Settings.LiquidFullColumnHeight = 128;
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(TEXT("Uneven-support refill world initializes"),
+		World.Initialize(Settings, MakeLiquidRegistry(), 8303, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	for (int32 Y = -1; Y <= 1; ++Y)
+	{
+		for (int32 X = -1; X <= 1; ++X)
+		{
+			World.SetSupportHeight(FIntPoint(X, Y), 200);
+		}
+	}
+	World.SetSupportHeight(FIntPoint(0, 0), 0);
+	World.SetSupportHeight(FIntPoint(1, 0), 8);
+	TArray<MatterFlux::Material::FSeedCell> Seeds;
+	for (int32 Y = -1; Y <= 1; ++Y)
+	{
+		for (int32 X = -1; X <= 1; ++X)
+		{
+			const bool bDisplacedCell = X == 1 && Y == 0;
+			Seeds.Add({
+				FIntPoint(X, Y),
+				TEXT("water"),
+				bDisplacedCell ? 8 : 0,
+				static_cast<uint8>(120) });
+		}
+	}
+	TestTrue(TEXT("Deep partial source column is seeded"),
+		World.SeedSurface(Seeds));
+	// Advance once so the subsequent empty timestamp unambiguously comes from
+	// transient body displacement rather than authored shoreline state.
+	World.Step();
+	const int64 AmountBefore = World.SumMaterialAmount(TEXT("water"));
+	const MatterFlux::Material::FLiquidDisplacementConstraint Constraint = {
+		FIntPoint(1, 0), 0
+	};
+	TestEqual(TEXT("Body creates one recent empty column"),
+		World.DisplaceLiquids(MakeArrayView(&Constraint, 1), 1), 1);
+
+	const MatterFlux::Material::FStepStats Stats = World.Step();
+	MatterFlux::Material::FCellSnapshot Source;
+	MatterFlux::Material::FCellSnapshot Refilled;
+	TestTrue(TEXT("Source retains liquid after bounded hydraulic transfer"),
+		World.TryGetCellSnapshot(FIntPoint(0, 0), Source));
+	TestTrue(TEXT("Empty displaced column refills despite different terrain support"),
+		World.TryGetCellSnapshot(FIntPoint(1, 0), Refilled));
+	TestTrue(TEXT("Refill transfers a bounded partial volume into the hole"),
+		Refilled.Amount > 0 && Refilled.Amount < 255);
+	TestEqual(TEXT("Uneven-support refill conserves exact liquid amount"),
+		World.SumMaterialAmount(TEXT("water")), AmountBefore);
+	TestTrue(TEXT("At least one surrounding liquid column participates"),
+		Stats.MovedCells > 0);
+	uint8 MaximumRefilledAmount = Refilled.Amount;
+	for (int32 StepIndex = 0; StepIndex < 32; ++StepIndex)
+	{
+		World.Step();
+		MatterFlux::Material::FCellSnapshot Current;
+		if (World.TryGetCellSnapshot(FIntPoint(1, 0), Current))
+		{
+			MaximumRefilledAmount = FMath::Max(
+				MaximumRefilledAmount, Current.Amount);
+		}
+	}
+	MatterFlux::Material::FCellSnapshot Restored;
+	TestTrue(TEXT("Displaced column remains material after restitution"),
+		World.TryGetCellSnapshot(FIntPoint(1, 0), Restored));
+	TestEqual(TEXT("Body vacancy restores its pre-displacement amount"),
+		Restored.Amount, static_cast<uint8>(120));
+	TestEqual(TEXT("Restitution never pumps above the reference amount"),
+		MaximumRefilledAmount, static_cast<uint8>(120));
+	TestEqual(TEXT("Long restitution conserves exact liquid amount"),
+		World.SumMaterialAmount(TEXT("water")), AmountBefore);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxBodyWakeRefillConsumesOnlyDisplacedSurplusTest,
+	"MatterFlux.Material.BodyWakeRefillConsumesOnlyDisplacedSurplus",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxBodyWakeRefillConsumesOnlyDisplacedSurplusTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 32;
+	Settings.ActiveChunkRadius = 1;
+	Settings.MaxActiveChunks = 9;
+	Settings.bUseSurfaceTopology = true;
+	Settings.MinSurfaceCell = FIntPoint(-8, -8);
+	Settings.MaxSurfaceCellExclusive = FIntPoint(9, 9);
+	Settings.LiquidFullColumnHeight = 255;
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(TEXT("Wake-surplus world initializes"),
+		World.Initialize(Settings, MakeLiquidRegistry(), 20260824, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	TArray<MatterFlux::Material::FSeedCell> Seeds;
+	for (int32 Y = -8; Y <= 8; ++Y)
+	{
+		for (int32 X = -8; X <= 8; ++X)
+		{
+			Seeds.Add({ FIntPoint(X, Y), TEXT("water"), 0, 120 });
+		}
+	}
+	TestTrue(TEXT("Flat lake is seeded"), World.SeedSurface(Seeds));
+	const int64 AmountBefore = World.SumMaterialAmount(TEXT("water"));
+	const MatterFlux::Material::FLiquidDisplacementConstraint Constraint = {
+		FIntPoint::ZeroValue, 0
+	};
+	TestEqual(TEXT("Body displaces the central column"),
+		World.DisplaceLiquids(MakeArrayView(&Constraint, 1), 2), 1);
+
+	World.Step();
+	for (const MatterFlux::Material::FSeedCell& Seed : Seeds)
+	{
+		if (Seed.WorldCell == FIntPoint::ZeroValue)
+		{
+			continue;
+		}
+		MatterFlux::Material::FCellSnapshot Current;
+		TestTrue(TEXT("A donor column remains liquid"),
+			World.TryGetCellSnapshot(Seed.WorldCell, Current));
+		TestTrue(TEXT("Wake refill never borrows a donor's baseline particles"),
+			Current.Amount >= Seed.Amount);
+	}
+
+	for (int32 StepIndex = 0; StepIndex < 64; ++StepIndex)
+	{
+		World.Step();
+	}
+	MatterFlux::Material::FCellSnapshot Restored;
+	TestTrue(TEXT("Displaced center becomes liquid again"),
+		World.TryGetCellSnapshot(FIntPoint::ZeroValue, Restored));
+	TestEqual(TEXT("Displaced center recovers its conserved baseline volume"),
+		Restored.Amount, static_cast<uint8>(120));
+	TestEqual(TEXT("Wake restitution conserves the exact lake volume"),
+		World.SumMaterialAmount(TEXT("water")), AmountBefore);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxBodyWakeRestitutionWorkScaleTest,
+	"MatterFlux.Performance.BodyWakeRestitutionVisitsEachActiveRegionOnce",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxBodyWakeRestitutionWorkScaleTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 64;
+	Settings.ActiveChunkRadius = 1;
+	Settings.MaxActiveChunks = 9;
+	Settings.bUseSurfaceTopology = true;
+	Settings.MinSurfaceCell = FIntPoint(-32, -32);
+	Settings.MaxSurfaceCellExclusive = FIntPoint(33, 33);
+	Settings.LiquidFullColumnHeight = 255;
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(TEXT("Restitution-scale world initializes"),
+		World.Initialize(Settings, MakeLiquidRegistry(), 20260825, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	TArray<MatterFlux::Material::FSeedCell> Seeds;
+	Seeds.Reserve(65 * 65);
+	for (int32 Y = -32; Y <= 32; ++Y)
+	{
+		for (int32 X = -32; X <= 32; ++X)
+		{
+			Seeds.Add({ FIntPoint(X, Y), TEXT("water"), 0, 120 });
+		}
+	}
+	TestTrue(TEXT("Large flat lake is seeded"), World.SeedSurface(Seeds));
+	const int64 AmountBefore = World.SumMaterialAmount(TEXT("water"));
+
+	TArray<MatterFlux::Material::FLiquidDisplacementConstraint> Constraints;
+	for (int32 Y = -10; Y <= 10; ++Y)
+	{
+		for (int32 X = -10; X <= 10; ++X)
+		{
+			Constraints.Add({ FIntPoint(X, Y), 0 });
+		}
+	}
+	TestEqual(TEXT("Every occupied lake column is displaced"),
+		World.DisplaceLiquids(Constraints, 32), Constraints.Num());
+
+	const MatterFlux::Material::FStepStats Stats = World.Step();
+	TestTrue(TEXT("Wake restitution performs useful transfers"),
+		Stats.MovedCells > 0);
+	TestTrue(TEXT("Restitution search is bounded by one active-region traversal"),
+		Stats.RestitutionVisitedCells <= Seeds.Num() * 2);
+	TestEqual(TEXT("Batched restitution conserves exact lake volume"),
+		World.SumMaterialAmount(TEXT("water")), AmountBefore);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxSurfaceLiquidRelaxesIntoOrganicPuddleTest,
+	"MatterFlux.Material.SurfaceLiquidRelaxesIntoRoundSeededPuddle",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxSurfaceLiquidRelaxesIntoOrganicPuddleTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 16;
+	Settings.ActiveChunkRadius = 1;
+	Settings.MaxActiveChunks = 9;
+	Settings.bUseSurfaceTopology = true;
+	Settings.MinSurfaceCell = FIntPoint(-12, -12);
+	Settings.MaxSurfaceCellExclusive = FIntPoint(13, 13);
+
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(TEXT("Puddle material world initializes"),
+		World.Initialize(Settings, MakeLiquidRegistry(), 8302, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	for (int32 Y = -12; Y <= 12; ++Y)
+	{
+		for (int32 X = -12; X <= 12; ++X)
+		{
+			World.SetSupportHeight(FIntPoint(X, Y), 20);
+		}
+	}
+	for (int32 Y = -4; Y <= 4; ++Y)
+	{
+		for (int32 X = -2; X <= 1; ++X)
+		{
+			World.SetCell(FIntPoint(X, Y), TEXT("acid"));
+		}
+	}
+	constexpr int32 InitialAmount = 4 * 9 * 255;
+	for (int32 Step = 0; Step < 96; ++Step)
+	{
+		World.Step();
+	}
+
+	TArray<MatterFlux::Material::FCellSnapshot> Cells;
+	World.GetActiveCells(Cells);
+	TArray<MatterFlux::Material::FCellSnapshot> AcidCells;
+	int32 TotalAmount = 0;
+	for (const MatterFlux::Material::FCellSnapshot& Cell : Cells)
+	{
+		if (Cell.MaterialId == TEXT("acid"))
+		{
+			AcidCells.Add(Cell);
+			TotalAmount += Cell.Amount;
+		}
+	}
+	TestEqual(TEXT("Puddle relaxation conserves exact liquid amount"),
+		TotalAmount, InitialAmount);
+	if (!TestTrue(TEXT("Relaxed puddle remains visible"),
+		!AcidCells.IsEmpty()))
+	{
+		return false;
+	}
+
+	FIntPoint Minimum(MAX_int32, MAX_int32);
+	FIntPoint Maximum(MIN_int32, MIN_int32);
+	TMap<int32, int32> RowWidths;
+	for (const MatterFlux::Material::FCellSnapshot& Cell : AcidCells)
+	{
+		Minimum.X = FMath::Min(Minimum.X, Cell.WorldCell.X);
+		Minimum.Y = FMath::Min(Minimum.Y, Cell.WorldCell.Y);
+		Maximum.X = FMath::Max(Maximum.X, Cell.WorldCell.X);
+		Maximum.Y = FMath::Max(Maximum.Y, Cell.WorldCell.Y);
+		++RowWidths.FindOrAdd(Cell.WorldCell.Y);
+	}
+	const int32 Width = Maximum.X - Minimum.X + 1;
+	const int32 Height = Maximum.Y - Minimum.Y + 1;
+	const float Aspect = static_cast<float>(FMath::Max(Width, Height))
+		/ static_cast<float>(FMath::Max(FMath::Min(Width, Height), 1));
+	AddInfo(FString::Printf(
+		TEXT("Relaxed puddle bounds: %dx%d, occupied=%d, aspect=%.3f, fill=%.3f"),
+		Width,
+		Height,
+		AcidCells.Num(),
+		Aspect,
+		static_cast<float>(AcidCells.Num())
+			/ static_cast<float>(Width * Height)));
+	TestTrue(TEXT("Relaxed puddle is approximately round"), Aspect <= 1.20f);
+	const float BoundsFillRatio = static_cast<float>(AcidCells.Num())
+		/ static_cast<float>(Width * Height);
+	TestTrue(TEXT("Rounded puddle tapers its corners instead of filling a box"),
+		BoundsFillRatio >= 0.62f && BoundsFillRatio <= 0.82f);
+	TSet<int32> DistinctRowWidths;
+	for (const TPair<int32, int32>& Row : RowWidths)
+	{
+		DistinctRowWidths.Add(Row.Value);
+	}
+	TestTrue(TEXT("Seeded surface tension leaves an irregular rounded edge"),
+		DistinctRowWidths.Num() >= 3);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxAcidCorrosionTest,
+	"MatterFlux.Material.AcidCorrodesSolidsIntoGasWithoutBeingConsumed",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxAcidCorrosionTest::RunTest(const FString& Parameters)
+{
+	const auto RunCorrosion = [this](const FName SolidMaterial, const int32 Seed)
+	{
+		MatterFlux::Material::FWorldSettings Settings;
+		Settings.ChunkSize = 8;
+		Settings.ActiveChunkRadius = 1;
+		Settings.MaxActiveChunks = 9;
+		MatterFlux::Material::FChunkedMaterialWorld World;
+		FString Error;
+		if (!TestTrue(TEXT("Corrosion world initializes"),
+			World.Initialize(Settings, MakeLiquidRegistry(), Seed, Error)))
+		{
+			AddError(Error);
+			return false;
+		}
+		World.SetCell(FIntPoint(0, 0), TEXT("acid"));
+		World.SetCell(FIntPoint(1, 0), SolidMaterial);
+		const MatterFlux::Material::FStepStats Stats = World.Step();
+		TestEqual(TEXT("Acid remains after corrosion"),
+			World.GetMaterialAt(FIntPoint(0, 0)), FName(TEXT("acid")));
+		TestEqual(TEXT("Corroded material becomes acid gas"),
+			World.GetMaterialAt(FIntPoint(1, 0)), FName(TEXT("acid_gas")));
+		TestEqual(TEXT("Exactly one corrosion pair reacts"),
+			Stats.ReactedPairs, 1);
+		return true;
+	};
+
+	return RunCorrosion(TEXT("wood"), 8201)
+		&& RunCorrosion(TEXT("grassland"), 8202);
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -836,16 +1835,17 @@ bool FMatterFluxSurfaceLiquidDownhillTest::RunTest(
 	World.SetCell(FIntPoint(0, 0), TEXT("water"));
 
 	const MatterFlux::Material::FStepStats Stats = World.Step();
-	TestEqual(TEXT("Water moves to the uniquely lowest ground neighbor"),
+	TestEqual(TEXT("Water begins flowing to the uniquely lowest ground neighbor"),
 		World.GetMaterialAt(FIntPoint(1, 0)),
 		FName(TEXT("water")));
-	TestEqual(TEXT("The uphill source becomes empty"),
+	TestEqual(TEXT("The uphill source retains the untransferred particles"),
 		World.GetMaterialAt(FIntPoint(0, 0)),
-		NAME_None);
-	TestEqual(TEXT("Surface movement conserves water"),
-		World.CountMaterial(TEXT("water")),
-		1);
-	TestEqual(TEXT("Exactly one surface cell moved"), Stats.MovedCells, 1);
+		FName(TEXT("water")));
+	TestEqual(TEXT("Surface flow conserves every liquid particle"),
+		World.SumMaterialAmount(TEXT("water")),
+		static_cast<int64>(255));
+	TestEqual(TEXT("Exactly one bounded surface transfer occurs"),
+		Stats.MovedCells, 1);
 
 	TArray<MatterFlux::Material::FCellSnapshot> Cells;
 	World.GetActiveCells(Cells);
@@ -853,10 +1853,13 @@ bool FMatterFluxSurfaceLiquidDownhillTest::RunTest(
 		Cells.FindByPredicate(
 			[](const MatterFlux::Material::FCellSnapshot& Cell)
 			{
-				return Cell.MaterialId == TEXT("water");
+				return Cell.WorldCell == FIntPoint(1, 0)
+					&& Cell.MaterialId == TEXT("water");
 			});
 	TestTrue(TEXT("Snapshot carries the destination terrain elevation"),
 		Water && Water->SupportHeight == 0);
+	TestTrue(TEXT("Downhill flow transfers a bounded particle amount"),
+		Water && Water->Amount > 0 && Water->Amount < 255);
 	return true;
 }
 
@@ -918,6 +1921,44 @@ bool FMatterFluxBulkSurfaceSeedTest::RunTest(
 	TestEqual(TEXT("Archived material remains queryable"),
 		World.GetMaterialAt(FIntPoint(23, 7)),
 		FName(TEXT("water")));
+	MatterFlux::Material::FCellSnapshot Snapshot;
+	TestTrue(TEXT("Archived material exposes a point snapshot"),
+		World.TryGetCellSnapshot(FIntPoint(23, 7), Snapshot));
+	TestEqual(TEXT("Archived snapshot preserves material"),
+		Snapshot.MaterialId, FName(TEXT("water")));
+	TestEqual(TEXT("Archived snapshot preserves support height"),
+		Snapshot.SupportHeight, 30);
+	TestFalse(TEXT("Empty archived cells do not masquerade as liquid"),
+		World.TryGetCellSnapshot(FIntPoint(22, 7), Snapshot));
+
+	TArray<MatterFlux::Material::FCellSnapshot> ActiveCells;
+	World.GetActiveCells(ActiveCells);
+	TestFalse(TEXT("Active enumeration excludes archived material facts"),
+		ActiveCells.ContainsByPredicate(
+			[](const MatterFlux::Material::FCellSnapshot& Cell)
+			{
+				return Cell.WorldCell == FIntPoint(23, 7);
+			}));
+
+	TArray<MatterFlux::Material::FCellSnapshot> AllCells;
+	World.GetAllCells(AllCells);
+	const MatterFlux::Material::FCellSnapshot* ArchivedWater =
+		AllCells.FindByPredicate(
+			[](const MatterFlux::Material::FCellSnapshot& Cell)
+			{
+				return Cell.WorldCell == FIntPoint(23, 7);
+			});
+	TestTrue(TEXT("Complete enumeration includes archived material facts"),
+		ArchivedWater != nullptr);
+	if (ArchivedWater)
+	{
+		TestEqual(TEXT("Complete enumeration preserves archived material"),
+			ArchivedWater->MaterialId, FName(TEXT("water")));
+		TestEqual(TEXT("Complete enumeration preserves archived support height"),
+			ArchivedWater->SupportHeight, 30);
+		TestEqual(TEXT("Complete enumeration preserves archived amount"),
+			ArchivedWater->Amount, static_cast<uint8>(255));
+	}
 	return true;
 }
 
@@ -1095,6 +2136,10 @@ bool FMatterFluxAuthoritativeActiveStateTest::RunTest(
 			TEXT("Snapshot carries support height for occupied cells"),
 			ClientCells[Index].SupportHeight,
 			ServerCells[Index].SupportHeight);
+		TestEqual(
+			TEXT("Snapshot carries exact per-cell material amount"),
+			ClientCells[Index].Amount,
+			ServerCells[Index].Amount);
 	}
 
 	const int32 MaterialCountBeforeRejectedImport =

@@ -2,8 +2,10 @@
 #include "UI/MatterFluxShellSlate.h"
 
 #include "Game/MatterFluxPlayerController.h"
+#include "Engine/Engine.h"
 #include "InputCoreTypes.h"
 #include "Kismet/KismetSystemLibrary.h"
+#include "MatterFluxLog.h"
 #include "Save/MatterFluxSaveSubsystem.h"
 #include "Save/MatterFluxSaveGame.h"
 
@@ -37,7 +39,21 @@ void UMatterFluxShellWidget::ShowStartMenu()
 
 void UMatterFluxShellWidget::ShowSinglePlayerMenu()
 {
+	CancelPendingJoinForSinglePlayer();
 	SetView(EMatterFluxShellView::SinglePlayerMenu);
+}
+
+void UMatterFluxShellWidget::CancelPendingJoinForSinglePlayer()
+{
+	UWorld* World = GetWorld();
+	if (GEngine && World && GEngine->PendingNetGameFromWorld(World))
+	{
+		GEngine->CancelPending(World);
+		UE_LOG(
+			LogMatterFlux,
+			Display,
+			TEXT("MatterFlux single-player flow cancelled a pending multiplayer join."));
+	}
 }
 
 void UMatterFluxShellWidget::ShowMultiplayerMenu()
@@ -73,32 +89,88 @@ void UMatterFluxShellWidget::ShowPauseMenu()
 
 void UMatterFluxShellWidget::ShowSettings()
 {
-	SubmenuReturnView = IsFrontEndView()
-		? View : EMatterFluxShellView::PauseMenu;
+	if (View == EMatterFluxShellView::Settings)
+	{
+		return;
+	}
+	if (IsFrontEndView())
+	{
+		SubmenuReturnView = View;
+	}
+	else if (!IsStartMenuOpen())
+	{
+		SubmenuReturnView = EMatterFluxShellView::PauseMenu;
+	}
 	SetView(EMatterFluxShellView::Settings);
 }
 
 void UMatterFluxShellWidget::ShowSaveSlots()
 {
-	SubmenuReturnView = IsFrontEndView()
-		? View : EMatterFluxShellView::PauseMenu;
+	if (View == EMatterFluxShellView::SaveSlots)
+	{
+		return;
+	}
+	if (IsFrontEndView())
+	{
+		SubmenuReturnView = View;
+	}
+	else if (!IsStartMenuOpen())
+	{
+		SubmenuReturnView = EMatterFluxShellView::PauseMenu;
+	}
 	SetView(EMatterFluxShellView::SaveSlots);
 }
 
 void UMatterFluxShellWidget::ShowLoadSlots()
 {
-	SubmenuReturnView = IsFrontEndView()
-		? View : EMatterFluxShellView::PauseMenu;
+	if (View == EMatterFluxShellView::LoadSlots)
+	{
+		return;
+	}
+	if (IsFrontEndView())
+	{
+		SubmenuReturnView = View;
+	}
+	else if (!IsStartMenuOpen())
+	{
+		SubmenuReturnView = EMatterFluxShellView::PauseMenu;
+	}
 	SetView(EMatterFluxShellView::LoadSlots);
 }
 
 void UMatterFluxShellWidget::CloseMenus()
 {
+	if (IsStartMenuOpen())
+	{
+		return;
+	}
+	SetView(EMatterFluxShellView::Gameplay);
+}
+
+void UMatterFluxShellWidget::EnterGameplayAfterSuccessfulOperation()
+{
+	bFrontEndContext = false;
 	SetView(EMatterFluxShellView::Gameplay);
 }
 
 void UMatterFluxShellWidget::SetView(const EMatterFluxShellView NewView)
 {
+	switch (NewView)
+	{
+	case EMatterFluxShellView::StartMenu:
+	case EMatterFluxShellView::SinglePlayerMenu:
+	case EMatterFluxShellView::MultiplayerMenu:
+	case EMatterFluxShellView::CreateRoomMenu:
+	case EMatterFluxShellView::JoinRoomMenu:
+		bFrontEndContext = true;
+		break;
+	case EMatterFluxShellView::Gameplay:
+	case EMatterFluxShellView::PauseMenu:
+		bFrontEndContext = false;
+		break;
+	default:
+		break;
+	}
 	View = NewView;
 	RenamingSlotIndex = INDEX_NONE;
 	RenameDraft.Reset();
@@ -114,6 +186,10 @@ void UMatterFluxShellWidget::ReturnFromSubmenu()
 
 void UMatterFluxShellWidget::RequestNewGame()
 {
+	// A join request may still be connecting even after the player navigates
+	// back to this panel. Shared-world operations deliberately reject clients,
+	// so restore the existing local world before starting generation.
+	CancelPendingJoinForSinglePlayer();
 	if (UMatterFluxSaveSubsystem* Save = GetSaveSubsystem())
 	{
 		bCloseAfterSuccessfulOperation = true;
@@ -363,7 +439,7 @@ void UMatterFluxShellWidget::NativeTick(
 		if (bSucceeded && bCloseAfterSuccessfulOperation)
 		{
 			bCloseAfterSuccessfulOperation = false;
-			CloseMenus();
+			EnterGameplayAfterSuccessfulOperation();
 		}
 		else
 		{
@@ -421,5 +497,3 @@ void UMatterFluxShellWidget::NotifyControllerState(
 			bOperationActive);
 	}
 }
-
-

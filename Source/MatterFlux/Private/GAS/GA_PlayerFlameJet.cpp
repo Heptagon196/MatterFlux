@@ -1,6 +1,7 @@
 #include "GAS/GA_PlayerFlameJet.h"
 
 #include "EngineUtils.h"
+#include "Fragment/Fragment2DActor.h"
 #include "Fragment/Fragment2DSourceActor.h"
 #include "Fragment/FragmentSimulationSubsystem.h"
 #include "Game/MatterFluxCharacter.h"
@@ -170,6 +171,35 @@ int32 UGA_PlayerFlameJet::ExecuteFlameJet(
 			FlameMaterial,
 			EventSeed ^ static_cast<int32>(
 				GetTypeHash(Source->SourceId))))
+		{
+			++IgnitedTargets;
+		}
+	}
+
+	// Detached pieces are rigid-body carriers rather than Source Actors. They
+	// still use the same Lua combustion rules, so normal wand fire must query
+	// them through the same cone instead of requiring a debug-only ignition path.
+	for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+	{
+		AFragment2DActor* Fragment = *It;
+		if (!IsValid(Fragment) || Fragment->IsActorBeingDestroyed())
+		{
+			continue;
+		}
+		const FBox Bounds = Fragment->GetCombustibleWorldBounds();
+		if (!Bounds.IsValid || !Bounds.Intersect(FlameBounds))
+		{
+			continue;
+		}
+		if (Fragment->IgniteInCone(
+			Start,
+			Direction,
+			Range,
+			StartRadius,
+			EndRadius,
+			FlameMaterial,
+			EventSeed ^ static_cast<int32>(
+				GetTypeHash(Fragment->SpawnPayload.FragmentId))))
 		{
 			++IgnitedTargets;
 		}

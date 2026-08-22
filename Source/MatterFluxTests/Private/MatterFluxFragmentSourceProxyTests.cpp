@@ -363,12 +363,12 @@ bool FMatterFluxFragmentSourceProxyCompactBatchTest::RunTest(
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FMatterFluxFragmentSourceProxyCombustionDeferralTest,
-	"MatterFlux.Game.FragmentSourceProxyDefersCombustionGeometryUntilFinished",
+	FMatterFluxFragmentSourceProxyCombustionLiveUpdateTest,
+	"MatterFlux.Game.FragmentSourceProxyUpdatesCombustionGeometryWhileBurning",
 	EAutomationTestFlags::EditorContext
 		| EAutomationTestFlags::ProductFilter)
 
-bool FMatterFluxFragmentSourceProxyCombustionDeferralTest::RunTest(
+bool FMatterFluxFragmentSourceProxyCombustionLiveUpdateTest::RunTest(
 	const FString& Parameters)
 {
 	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
@@ -420,27 +420,8 @@ bool FMatterFluxFragmentSourceProxyCombustionDeferralTest::RunTest(
 		FLinearColor::Transparent,
 		true);
 	Proxy->FlushPendingChanges();
-	TestEqual(
-		TEXT("An active combustion update keeps the cached chunk mesh"),
-		CountProxyMeshVertices(*Owner),
-		InitialVertexCount);
-
-	Proxy->ApplySourceState(
-		Source.SourceId,
-		CutRuntime,
-		EmptyResidue,
-		NAME_None,
-		FLinearColor::Transparent,
-		false);
-	Proxy->FlushPendingChanges();
-	TestEqual(
-		TEXT("Finishing combustion remains deferred until the batch flush"),
-		CountProxyMeshVertices(*Owner),
-		InitialVertexCount);
-	Proxy->FlushDeferredCombustionChanges();
-	Proxy->FlushPendingChanges();
 	TestNotEqual(
-		TEXT("The finished combustion rebuilds the completed proxy geometry"),
+		TEXT("An active combustion update immediately replaces stale green geometry"),
 		CountProxyMeshVertices(*Owner),
 		InitialVertexCount);
 	return true;

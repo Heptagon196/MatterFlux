@@ -11,6 +11,7 @@
 #include "Material/MatterFluxSourceCombustionRuntime.h"
 #include "Material/MatterFluxMaterialSimulationRuntime.h"
 #include "Material/MatterFluxReplicatedMaterialState.h"
+#include "Rendering/MatterFluxSmokeVisualPool.h"
 #include "Save/MatterFluxSaveTypes.h"
 #include "MatterFluxPlayableWorldActor.generated.h"
 
@@ -29,12 +30,18 @@ class AFragment2DSourceActor;
 class AFragment2DActor;
 class AMatterFluxGroundStateChunkActor;
 class AMatterFluxPlayableWorldActor;
+class AMatterFluxTwoStoreyHouseActor;
 
 namespace MatterFlux::PlayableLevel
 {
 	struct FLevelLayer;
 	struct FLevelFragmentSource;
 	struct FLevelLayout;
+}
+
+namespace MatterFlux::Liquid
+{
+	struct FLiquidColumn;
 }
 
 UENUM(BlueprintType)
@@ -47,6 +54,26 @@ enum class EMatterFluxWorldGenerationPhase : uint8
 	SpawningWorldObjects,
 	Complete,
 	Failed
+};
+
+struct FMatterFluxMaterialDisplacementState
+{
+	FName MaterialId = NAME_None;
+	int32 SupportHeight = 0;
+	uint8 ReferenceAmount = 0;
+	uint8 MaximumRemainingAmount = 0;
+};
+
+struct FMatterFluxLiquidProjectionHeightAudit
+{
+	float CanonicalMedianSurfaceZ = 0.0f;
+	float RenderedMedianSurfaceZ = 0.0f;
+	float MedianOffset = 0.0f;
+	float MaximumAbsoluteLocalOffset = 0.0f;
+	float MaximumTriangleHeightSpan = 0.0f;
+	int32 CanonicalCellCount = 0;
+	int32 ProjectedCellCount = 0;
+	int32 SurfacePatchCount = 0;
 };
 
 DECLARE_MULTICAST_DELEGATE_TwoParams(
@@ -96,16 +123,70 @@ public:
 	int32 GetMapSeed() const { return MapSeed; }
 
 	UFUNCTION(BlueprintPure, Category = "Playable World")
-	int32 GetGeneratedLayerCount() const { return GeneratedLayerInstances.Num(); }
+	int32 GetGeneratedLayerCount() const
+	{
+		return GeneratedLayerInstances.Num()
+			+ GeneratedLiquidLayerMeshes.Num();
+	}
+	/** 连续液面使用合并顶面网格，避免透明 HISM 单元互相排序产生格缝。 */
+	int32 GetGeneratedLiquidLayerCount() const
+	{
+		return GeneratedLiquidLayerMeshes.Num();
+	}
 
 	UFUNCTION(BlueprintPure, Category = "Playable World")
 	int32 GetGeneratedFragmentSourceCount() const { return GeneratedFragmentSources.Num(); }
+	bool TrySampleTerrainHeightAtWorldLocation(
+		const FVector& WorldLocation,
+		float& OutWorldHeight) const;
+	/**
+	 * 将世界坐标映射到材质格，并返回与渲染一致的液柱。
+	 * 非液体、空格和未初始化状态均返回 false。
+	 */
+	bool TrySampleLiquidColumnAtWorldLocation(
+		const FVector& WorldLocation,
+		MatterFlux::Liquid::FLiquidColumn& OutColumn) const;
+	/**
+	 * Buoyancy-only query. A body that vacated its own column still receives
+	 * pressure from the surrounding liquid surface recorded on the prior frame.
+	 */
+	bool TrySampleAmbientLiquidColumnAtWorldLocation(
+		const FVector& WorldLocation,
+		MatterFlux::Liquid::FLiquidColumn& OutColumn) const;
+	/**
+	 * Authority-only material transaction used by every buoyant body. Liquid
+	 * overlapping the submitted body volume is moved to nearby free cells.
+	 */
+	bool DisplaceLiquidInWorldBounds(
+		const FVector& Center,
+		const FVector& HorizontalExtent,
+		float BottomZ,
+		float TopZ,
+		bool bCapsuleShape = false,
+		bool bDeferMaterialSolve = false);
+	/** Read-only visual acceptance data; never participates in material simulation. */
+	bool TryGetLiquidProjectionHeightAudit(
+		FName MaterialId,
+		FMatterFluxLiquidProjectionHeightAudit& OutAudit) const;
 
 	UFUNCTION(BlueprintPure, Category = "Playable World|Streaming")
 	int32 GetCachedFragmentSourceCount() const;
 
 	UFUNCTION(BlueprintPure, Category = "Playable World|Streaming")
 	int32 GetVisibleFragmentSourceProxyCount() const;
+	/** Restricts merged source presentation for deterministic visual QA. Invalid restores all. */
+	void SetFragmentSourceDebugIsolatedAggregate(const FGuid& AggregateId);
+	bool FindNearestTreeAggregateForVisualInspection(
+		const FVector& Focus,
+		FGuid& OutAggregateId,
+		FGuid& OutRootSourceId,
+		FBox& OutWorldBounds,
+		FTransform& OutRootWorldTransform) const;
+	bool IgniteLogicalFragmentAggregate(
+		const FGuid& AggregateId,
+		const FVector& WorldLocation,
+		FName FlameMaterial,
+		int32 EventSeed);
 
 	/** Materializes pristine mask proxies intersecting Bounds, then returns all active sources there. */
 	void GatherFragmentSourcesInBounds(
@@ -132,8 +213,23 @@ public:
 		const FBox& Bounds,
 		const FVector& IgnitionPoint,
 		FName FlameMaterial,
+		int32 EventSeed,
+		int32 MaxIgnitions = MAX_int32);
+	bool IgniteDynamicAggregateSource(
+		AFragment2DActor& CarrierActor,
+		const FGuid& SourceId,
+		const FVector& WorldLocation,
+		FName FlameMaterial,
 		int32 EventSeed);
+	void MarkSourceCombustionVisualizationDirty()
+	{
+		bSourceCombustionVisualDirty = true;
+	}
 	void MaterializeFragmentAggregate(const FGuid& AggregateId);
+	/** Keeps an interaction source resident across asynchronous presentation steps. */
+	void SetFragmentSourceStreamingPinned(
+		const FGuid& SourceId,
+		bool bPinned);
 	bool DematerializeFragmentSource(const FGuid& SourceId);
 	bool RetireFragmentSourceIntoDynamicAggregate(
 		AFragment2DSourceActor& SourceActor,
@@ -184,6 +280,16 @@ public:
 
 	UFUNCTION(BlueprintPure, Category = "Playable World|Material Simulation")
 	int32 GetSimulatedMaterialCount(FName MaterialId) const;
+	int64 GetSimulatedMaterialAmount(FName MaterialId) const;
+
+	/**
+	 * 在权威端把 Lua 材质写入对应的地表模拟格。法术、容器和测试场景
+	 * 共用这一入口，避免各自复制世界坐标到材料格的换算规则。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Playable World|Material Simulation")
+	bool SetSimulatedMaterialAtWorldLocation(
+		const FVector& WorldLocation,
+		FName MaterialId);
 
 	UFUNCTION(BlueprintCallable, Category = "Playable World|Streaming")
 	void SetWorldStreamingFocus(const FVector& WorldLocation);
@@ -272,6 +378,16 @@ public:
 		return VoxelColorMaterialTemplate;
 	}
 
+	UMaterialInterface* GetVoxelLiquidMaterialTemplate() const
+	{
+		return VoxelLiquidMaterialTemplate;
+	}
+
+	AMatterFluxTwoStoreyHouseActor* GetGeneratedHouse() const
+	{
+		return GeneratedHouse;
+	}
+
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Playable World")
 	TObjectPtr<USceneComponent> SceneRoot;
 
@@ -328,6 +444,17 @@ protected:
 	float MaterialSimulationCellSize =
 		MatterFlux::PlayableLevel::TerrainCellSize;
 
+	/** 一个液体材质格在世界 Z 方向占据的高度（厘米）。 */
+	UPROPERTY(EditAnywhere, Category = "Playable World|Material Simulation", meta = (ClampMin = "8.0", ClampMax = "300.0"))
+	float MaterialLiquidColumnHeight = 128.0f;
+
+	/**
+	 * 液体格的可视表面厚度（厘米）。它不等于浮力采样深度：
+	 * 2.5D 模拟中一个格可以表示有深度的液体，但不应把每个格渲染成独立高柱。
+	 */
+	UPROPERTY(EditAnywhere, Category = "Playable World|Material Simulation", meta = (ClampMin = "1.0", ClampMax = "32.0"))
+	float MaterialLiquidVisualThickness = 8.0f;
+
 	UPROPERTY(EditAnywhere, Category = "Playable World|Material Simulation", meta = (ClampMin = "0.05", ClampMax = "1.0"))
 	float MaterialVisualizationInterval = 0.10f;
 
@@ -350,6 +477,9 @@ private:
 	void AdvanceAsyncGeneration();
 	void CompleteAsyncGeneration(bool bSuccess, const FString& Message);
 	void RecaptureStaticSky();
+	void RebuildGeneratedHouse(
+		const MatterFlux::PlayableLevel::FLevelLayout& Layout);
+	void DestroyGeneratedHouse();
 	void HandleFragmentSourcePresenceChanged(
 		const FGuid& SourceId,
 		bool bMaterialized);
@@ -378,6 +508,9 @@ private:
 	void MarkReplicatedFragmentSourceStatesDirty();
 	void UpdateMaterialVisualization(float DeltaSeconds);
 	void RebuildMaterialVisualization(
+		const FMatterFluxContentRegistry& Registry);
+	/** 执行动态材料格与可切割 Source 之间由 Lua contact 规则定义的接触反应。 */
+	void ApplyMaterialSourceContactReactions(
 		const FMatterFluxContentRegistry& Registry);
 	void DestroyMaterialVisualization();
 	UInstancedStaticMeshComponent*
@@ -412,6 +545,9 @@ private:
 		const MatterFlux::Combustion::FSourceCombustionRuntime& Runtime,
 		bool bPublish);
 	void RebuildLogicalSourceCombustionVisualization();
+	void AdvanceUnifiedSmokeVisualization(float DeltaSeconds);
+	void RefreshUnifiedSmokeAnchors();
+	void RebuildGroundSmokeAnchors();
 	void InitializeGroundCombustion(
 		const FMatterFluxContentRegistry& Registry,
 		const MatterFlux::PlayableLevel::FLevelLayout& Layout);
@@ -443,6 +579,10 @@ private:
 	void DestroyTerrainChunkMeshes();
 	UHierarchicalInstancedStaticMeshComponent* FindOrCreateLayerComponent(
 		const MatterFlux::PlayableLevel::FLevelLayer& Layer);
+	void BuildLiquidMaterialMesh(
+		FName MaterialId,
+		const FMatterFluxMaterialDefinition& Material,
+		TConstArrayView<MatterFlux::Material::FCellSnapshot> Cells);
 
 	struct FLayerStreamingCache
 	{
@@ -453,7 +593,11 @@ private:
 
 	UPROPERTY(Transient)
 	TMap<FName, TObjectPtr<UHierarchicalInstancedStaticMeshComponent>> GeneratedLayerInstances;
+	UPROPERTY(Transient)
+	TMap<FName, TObjectPtr<UProceduralMeshComponent>> GeneratedLiquidLayerMeshes;
 	TMap<FName, FLayerStreamingCache> LayerStreamingCaches;
+	TMap<FName, MatterFlux::PlayableLevel::FLevelLayer>
+		LiquidLayerDefinitions;
 	TArray<FIntPoint> VisibleLayerFocusChunks;
 	MatterFlux::PlayableLevel::FLevelTerrain TerrainHeightField;
 
@@ -470,6 +614,9 @@ private:
 	UPROPERTY(Transient)
 	TMap<FGuid, TObjectPtr<AFragment2DSourceActor>> GeneratedFragmentSources;
 
+	UPROPERTY(Transient)
+	TObjectPtr<AMatterFluxTwoStoreyHouseActor> GeneratedHouse;
+
 	TMap<FIntPoint, TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>>
 		FragmentSourceChunks;
 	MatterFlux::Fragment::FSourceSpatialIndex
@@ -482,6 +629,7 @@ private:
 	TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>
 		PendingFragmentSourceSpawns;
 	TSet<FGuid> PendingFragmentSourceDespawns;
+	TSet<FGuid> StreamingPinnedFragmentSourceIds;
 	TMap<FGuid, TWeakObjectPtr<AFragment2DActor>>
 		DynamicAggregateCarriers;
 
@@ -550,6 +698,10 @@ private:
 	UPROPERTY()
 	TObjectPtr<UStaticMesh> CubeMesh;
 
+	/** 动态液体只渲染可拼接顶面，避免透明立方体侧壁形成格栅和空洞。 */
+	UPROPERTY()
+	TObjectPtr<UStaticMesh> LiquidSurfaceMesh;
+
 	UPROPERTY()
 	TObjectPtr<UStaticMesh> SphereMesh;
 
@@ -565,11 +717,34 @@ private:
 	UPROPERTY()
 	TObjectPtr<UMaterialInterface> VoxelColorMaterialTemplate;
 
+	/** 叶片专用的点采样方块材质；仍按区块/材质合并渲染。 */
+	UPROPERTY()
+	TObjectPtr<UMaterialInterface> VoxelLeafMaterialTemplate;
+
+	/** 每个木体素独立重复一格树皮纹理，避免树干读成长木板。 */
+	UPROPERTY()
+	TObjectPtr<UMaterialInterface> VoxelWoodMaterialTemplate;
+
 	UPROPERTY()
 	TObjectPtr<UMaterialInterface> VoxelGasMaterialTemplate;
 
+	/** 深度感知透明度和折射参数均由 Lua 液体定义驱动。 */
+	UPROPERTY()
+	TObjectPtr<UMaterialInterface> VoxelLiquidMaterialTemplate;
+
 	TUniquePtr<MatterFlux::Material::FSimulationRuntime>
 		MaterialSimulation;
+	/** 热路径液柱查询只读缓存，避免每个浮力采样重复访问脚本注册表。 */
+	TMap<FName, float> MaterialLiquidDensities;
+	/** Idempotent per-column volume constraints submitted by bodies this frame. */
+	TMap<FIntPoint, FMatterFluxMaterialDisplacementState>
+		PendingMaterialDisplacementCells;
+	/** Last committed constraints retain the undisturbed amount and pressure footprint. */
+	TMap<FIntPoint, FMatterFluxMaterialDisplacementState>
+		PreviousMaterialDisplacementCells;
+	/** Read-only diagnostics for proving the disposable mesh follows current facts. */
+	TMap<FName, FMatterFluxLiquidProjectionHeightAudit>
+		LiquidProjectionHeightAudits;
 	TUniquePtr<MatterFlux::Combustion::FGroundCombustionRuntime>
 		GroundCombustion;
 	TMap<FGuid, TUniquePtr<
@@ -585,6 +760,10 @@ private:
 	TArray<FVector> GroundSurfacePositions;
 	TSet<FGuid> SourcesThatIgnitedGround;
 	float MaterialVisualizationAccumulator = 0.0f;
+	/** 每帧最多提交的材料-Source 接触反应，防止大面积泄漏触发切割尖峰。 */
+	UPROPERTY(EditAnywhere, Category = "Playable World|Material Simulation",
+		meta = (ClampMin = "1", ClampMax = "64"))
+	int32 MaxMaterialSourceReactionsPerFrame = 8;
 	bool bMaterialVisualizationDirty = false;
 	bool bMaterialVisualizationDeferredForStreaming = false;
 	float CombustionPropagationAccumulator = 0.0f;
@@ -599,6 +778,11 @@ private:
 	TArray<int32> GroundFlameCellByInstance;
 	TMap<int32, int32> GroundSmokeInstanceByCell;
 	TArray<int32> GroundSmokeCellByInstance;
+	TArray<MatterFlux::Rendering::FSmokeEmissionAnchor>
+		GroundSmokeAnchors;
+	TArray<MatterFlux::Rendering::FSmokeEmissionAnchor>
+		SourceSmokeAnchors;
+	MatterFlux::Rendering::FSmokeVisualPool SmokeVisualPool;
 	float SourceCombustionVisualAccumulator = 0.0f;
 	bool bSourceCombustionVisualDirty = false;
 	bool bBatchingGroundIgnitions = false;

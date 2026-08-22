@@ -74,16 +74,27 @@ namespace MatterFlux::Material
 			FIntPoint& OutPrimaryFocus,
 			FString& OutError);
 		bool SeedSurface(const TArray<FSeedCell>& SeedCells);
+		int32 DisplaceLiquids(
+			TConstArrayView<FIntPoint> OccupiedCells,
+			int32 MaxSearchRadius = 64);
+		int32 DisplaceLiquids(
+			TConstArrayView<FLiquidDisplacementConstraint> Constraints,
+			int32 MaxSearchRadius = 64);
 		void SetFocuses(TConstArrayView<FIntPoint> Focuses);
 		void RequireFocusReconciliation() { CurrentFocuses.Reset(); }
 
 		bool SetCell(const FIntPoint& WorldCell, FName MaterialId);
 		FName GetMaterialAt(const FIntPoint& WorldCell) const;
+		bool TryGetCellSnapshot(
+			const FIntPoint& WorldCell,
+			FCellSnapshot& OutSnapshot) const;
 		int32 CountMaterial(FName MaterialId) const;
+		int64 SumMaterialAmount(FName MaterialId) const;
 		int32 GetResidentChunkCount() const;
 		int32 GetArchivedChunkCount() const;
 		int32 GetSimulationFocusCount() const;
 		void GetActiveCells(TArray<FCellSnapshot>& OutCells) const;
+		void GetAllCells(TArray<FCellSnapshot>& OutCells) const;
 		int32 GetLogicalStep() const { return LogicalStep; }
 		int32 GetAppliedStateRevision() const { return AppliedStateRevision; }
 		bool NeedsReplicationPublish() const { return bReplicationDirty; }

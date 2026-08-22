@@ -17,6 +17,12 @@ struct MATTERFLUX_API FMatterFluxReplicatedMaterialState
 {
 	GENERATED_BODY()
 
+	/**
+	 * 单次原子材质快照的压缩后上限。4 KiB 仍远低于 actor-channel
+	 * bunch 上限，同时能容纳默认森林发生局部化学反应后的活动状态。
+	 */
+	static constexpr int32 MaximumCompressedBytes = 4 * 1024;
+
 	bool EncodeActiveState(
 		const TArray<uint8>& InActiveState,
 		FString& OutError);

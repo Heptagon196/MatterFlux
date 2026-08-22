@@ -35,29 +35,36 @@ struct FMatterFluxMaterialDefinition
 	EMatterFluxMaterialPhase Phase = EMatterFluxMaterialPhase::StaticSolid;
 	uint8 Mobility = 255;
 	uint8 Dispersion = 128;
+	/** 浅水处的透明度；0 完全透明，1 完全不透明。 */
+	float ShallowOpacity = 1.0f;
+	/** 达到吸收距离后的不透明度，必须不小于 ShallowOpacity。 */
+	float DeepOpacity = 1.0f;
+	/** 从浅水过渡到深水不透明度所需的视线内液体深度（厘米）。 */
+	float OpacityDepth = 100.0f;
+	/** 传给 UE 折射输入的物理折射率；空气为 1，水约为 1.33。 */
+	float RefractionIndex = 1.0f;
 };
 
 struct FMatterFluxReactionDefinition
 {
-	FName Id;
-	FName InputA;
-	FName InputB;
-	FName OutputA;
-	FName OutputB;
-	int32 ChancePermille = 1000;
-};
+	/** 规则如何被触发：两格接触立即变换，或激活后持续并向邻格传播。 */
+	enum class EKind : uint8
+	{
+		Contact,
+		Propagating
+	};
 
-struct FMatterFluxCombustionDefinition
-{
-	FName Id;
-	FName FuelMaterial;
-	FName FlameMaterial;
-	FName SmokeMaterial;
-	FName ResidueMaterial;
-	int32 IgnitionChancePermille = 1000;
-	int32 SpreadChancePermille = 650;
-	int32 BurnDurationSteps = 12;
-	int32 SmokeChancePermille = 700;
+	FName Id; // Lua 中稳定且全局唯一的规则 ID。
+	EKind Kind = EKind::Contact;
+	FName InputA; // 主反应物；传播规则中是被逐步消耗的物质。
+	FName InputB; // 接触物；传播规则中是激活该反应的物质。
+	FName OutputA; // InputA 完成反应后的产物，empty 表示清空。
+	FName OutputB; // InputB 完成接触反应后的产物。
+	int32 ChancePermille = 1000; // 首次触发概率，使用整数千分比。
+	FName EmissionMaterial; // 持续反应活跃时产生的副产物；empty 表示不排放。
+	int32 PropagationChancePermille = 0; // 向四邻域传播的每步概率。
+	int32 DurationSteps = 0; // 从激活到完成转换的固定模拟步数。
+	int32 EmissionChancePermille = 0; // 每个固定步产生副产物事件的概率。
 };
 
 struct FMatterFluxDecoratorDefinition
@@ -77,6 +84,194 @@ struct FMatterFluxEntityDefinition
 	FString Behavior;
 	float MaxHealth = 100.0f;
 	float MoveSpeed = 300.0f;
+};
+
+enum class EMatterFluxCreatureFaction : uint8
+{
+	Friendly,
+	Hostile,
+	Neutral
+};
+
+enum class EMatterFluxCreatureLevel : uint8
+{
+	Normal,
+	Elite,
+	Boss
+};
+
+enum class EMatterFluxCreatureAiMode : uint8
+{
+	Passive,
+	Patrol,
+	Skirmisher,
+	Boss,
+	BehaviorTree
+};
+
+/** Node kinds accepted by the restricted Lua creature behavior-tree DSL. */
+enum class EMatterFluxCreatureBehaviorNodeKind : uint8
+{
+	Selector,
+	Sequence,
+	Condition,
+	Action
+};
+
+/** Bounded read-only facts that a Lua-authored behavior tree may query. */
+enum class EMatterFluxCreatureBehaviorCondition : uint8
+{
+	HasVisibleTarget,
+	HasTarget,
+	TargetTooClose,
+	TargetInAttackRange,
+	AttackReady,
+	SkillReady
+};
+
+/** Server-authoritative capabilities that a behavior tree may select. */
+enum class EMatterFluxCreatureBehaviorAction : uint8
+{
+	Passive,
+	Patrol,
+	Chase,
+	Retreat,
+	Attack,
+	Skill
+};
+
+struct FMatterFluxCreatureBehaviorNodeDefinition
+{
+	EMatterFluxCreatureBehaviorNodeKind Kind =
+		EMatterFluxCreatureBehaviorNodeKind::Action;
+	EMatterFluxCreatureBehaviorCondition Condition =
+		EMatterFluxCreatureBehaviorCondition::HasTarget;
+	EMatterFluxCreatureBehaviorAction Action =
+		EMatterFluxCreatureBehaviorAction::Passive;
+	TArray<int32> Children;
+};
+
+/**
+ * Immutable, bounded behavior tree compiled from Lua. Nodes reference their
+ * children by index so the runtime never retains Lua functions or tables.
+ */
+struct FMatterFluxCreatureBehaviorProgramDefinition
+{
+	int32 RootNodeIndex = INDEX_NONE;
+	TArray<FMatterFluxCreatureBehaviorNodeDefinition> Nodes;
+
+	bool IsEmpty() const
+	{
+		return RootNodeIndex == INDEX_NONE && Nodes.IsEmpty();
+	}
+};
+
+/**
+ * One bounded creature cast program compiled from Lua. This represents the
+ * useful behavior of a PaperMagic spell tree without storing executable Lua
+ * callbacks on an Actor.
+ */
+struct FMatterFluxCreatureCastProgramDefinition
+{
+	FName SpellId;
+	int32 ProjectileCount = 1;
+	float SpreadDegrees = 0.0f;
+	float ProjectileInterval = 0.0f;
+	float RecoverySeconds = 0.0f;
+	bool bRadial = false;
+	float HorizontalImpulse = 0.0f;
+	float VerticalImpulse = 0.0f;
+	bool bOverrideColor = false;
+	FLinearColor Color = FLinearColor::White;
+};
+
+/**
+ * Immutable creature program compiled from Lua. The server interprets these
+ * bounded values; Lua is never called from an Actor tick.
+ */
+struct FMatterFluxCreatureDefinition
+{
+	FName Id;
+	FString DisplayName;
+	EMatterFluxCreatureFaction Faction = EMatterFluxCreatureFaction::Neutral;
+	EMatterFluxCreatureLevel Level = EMatterFluxCreatureLevel::Normal;
+	EMatterFluxCreatureAiMode AiMode = EMatterFluxCreatureAiMode::Passive;
+	FMatterFluxCreatureBehaviorProgramDefinition BehaviorProgram;
+	float MaxHealth = 100.0f;
+	float Width = 70.0f;
+	float Height = 160.0f;
+	/** 生物体积密度；与液体材质 Density 比较决定漂浮或下沉。 */
+	float Density = 0.65f;
+	float MoveSpeed = 240.0f;
+	float PerceptionRange = 900.0f;
+	float AttackRange = 650.0f;
+	float RetreatRange = 180.0f;
+	float TargetMemorySeconds = 5.0f;
+	float PatrolTurnSeconds = 3.0f;
+	float PatrolPauseSeconds = 0.5f;
+	float AttackCooldown = 2.0f;
+	float SkillCooldown = 10.0f;
+	FMatterFluxCreatureCastProgramDefinition AttackProgram;
+	FMatterFluxCreatureCastProgramDefinition SkillProgram;
+	FName DialogueId;
+	FName ShopId;
+	FName DropItemId;
+	int32 DropItemCount = 0;
+	FName SpawnQuestId;
+	int32 SpawnCount = 0;
+	float SpawnDistance = 600.0f;
+	FLinearColor Color = FLinearColor::White;
+};
+
+struct FMatterFluxDialogueOptionDefinition
+{
+	FString Text;
+	FName NextNodeId;
+	FName ShopId;
+	bool bClose = false;
+};
+
+struct FMatterFluxDialogueNodeDefinition
+{
+	FName Id;
+	FString Text;
+	FName NextNodeId;
+	FName ShopId;
+	bool bClose = false;
+	TArray<FMatterFluxDialogueOptionDefinition> Options;
+};
+
+/** A bounded, deterministic dialogue graph authored in Lua. */
+struct FMatterFluxDialogueDefinition
+{
+	FName Id;
+	FString DisplayName;
+	FName StartNodeId;
+	TArray<FMatterFluxDialogueNodeDefinition> Nodes;
+};
+
+enum class EMatterFluxShopProductKind : uint8
+{
+	Item,
+	Spell,
+	Wand
+};
+
+struct FMatterFluxShopOfferDefinition
+{
+	EMatterFluxShopProductKind ProductKind = EMatterFluxShopProductKind::Item;
+	FName ProductId;
+	int32 ProductCount = 1;
+	FName CostItemId;
+	int32 CostCount = 1;
+	int32 PurchaseLimit = INDEX_NONE;
+};
+
+struct FMatterFluxShopDefinition
+{
+	FName Id;
+	FString DisplayName;
+	TArray<FMatterFluxShopOfferDefinition> Offers;
 };
 
 enum class EMatterFluxSpellKind : uint8
@@ -152,6 +347,7 @@ struct FMatterFluxWandDefinition
 	float ManaMax = 100.0f;
 	float ManaRechargePerSecond = 20.0f;
 	float Spread = 0.0f;
+	int32 StarterCount = 0;
 	int32 StarterEquipmentSlot = -1;
 	TArray<FName> StarterDeck;
 };
@@ -253,19 +449,97 @@ struct FMatterFluxFragmentationSettings
 	int32 MinDetachedAreaPixels = 1;
 };
 
+enum class EMatterFluxCustomMapStampShape : uint8
+{
+	Rectangle,
+	Circle
+};
+
+/** 一次有序的地图填充操作；后声明的 Stamp 覆盖先声明的 Stamp。 */
+struct FMatterFluxCustomMapStampDefinition
+{
+	EMatterFluxCustomMapStampShape Shape =
+		EMatterFluxCustomMapStampShape::Rectangle;
+	FName MaterialId;
+	FIntPoint MinimumCell = FIntPoint::ZeroValue;
+	FIntPoint MaximumCellInclusive = FIntPoint::ZeroValue;
+	FIntPoint CenterCell = FIntPoint::ZeroValue;
+	int32 RadiusCells = 0;
+};
+
+/** 自定义地图中的稳定命名位置，可供出生、镜头与测试查询共用。 */
+struct FMatterFluxCustomMapMarkerDefinition
+{
+	FName Id;
+	FIntPoint Cell = FIntPoint::ZeroValue;
+};
+
+/** 自定义地图中的静态三维场景盒；所有数值均以地图格为单位。 */
+struct FMatterFluxCustomMapSceneBoxDefinition
+{
+	FName Id;
+	FName MaterialId;
+	FVector CenterCells = FVector::ZeroVector;
+	FVector SizeCells = FVector::OneVector;
+	/** 是否参与角色和物理物体碰撞；纯背景与液体装饰保持关闭。 */
+	bool bCollision = false;
+};
+
+/** 自定义地图中的透视验收相机；位置和目标均以地图格为单位。 */
+struct FMatterFluxCustomMapCameraDefinition
+{
+	FName Id;
+	FVector LocationCells = FVector::ZeroVector;
+	FVector TargetCells = FVector::ZeroVector;
+	float FieldOfViewDegrees = 42.0f;
+};
+
+/** 游戏内倾倒测试使用的确定性体素容器配置；所有空间值均以地图格为单位。 */
+struct FMatterFluxCustomMapPourContainerDefinition
+{
+	FName Id;
+	FName ContainerMaterialId;
+	FName LiquidMaterialId;
+	FVector CenterCells = FVector::ZeroVector;
+	FIntVector InteriorSizeCells = FIntVector(7, 5, 5);
+	int32 StartStep = 12;
+	int32 TiltDurationSteps = 36;
+	float TiltDegrees = 72.0f;
+	int32 PourCellsPerStep = 8;
+};
+
+/** Lua 编译得到的有界、确定性自定义材料地图。 */
+struct FMatterFluxCustomMapDefinition
+{
+	FName Id;
+	FString DisplayName;
+	FIntPoint MinimumCell = FIntPoint(-32, 0);
+	FIntPoint MaximumCellExclusive = FIntPoint(32, 32);
+	float CellSizeCentimeters = 28.0f;
+	float MaterialDepthCells = 3.0f;
+	TArray<FMatterFluxCustomMapStampDefinition> Stamps;
+	TArray<FMatterFluxCustomMapMarkerDefinition> Markers;
+	TArray<FMatterFluxCustomMapSceneBoxDefinition> SceneBoxes;
+	TArray<FMatterFluxCustomMapCameraDefinition> Cameras;
+	TArray<FMatterFluxCustomMapPourContainerDefinition> PourContainers;
+};
+
 struct FMatterFluxContentRegistry
 {
 	FMatterFluxContentManifest Manifest;
 	FMatterFluxFragmentationSettings Fragmentation;
 	TMap<FName, FMatterFluxMaterialDefinition> Materials;
 	TMap<FName, FMatterFluxReactionDefinition> Reactions;
-	TMap<FName, FMatterFluxCombustionDefinition> Combustions;
 	TMap<FName, FMatterFluxDecoratorDefinition> Decorators;
 	TMap<FName, FMatterFluxEntityDefinition> Entities;
+	TMap<FName, FMatterFluxCreatureDefinition> Creatures;
+	TMap<FName, FMatterFluxDialogueDefinition> Dialogues;
+	TMap<FName, FMatterFluxShopDefinition> Shops;
 	TMap<FName, FMatterFluxSpellDefinition> Spells;
 	TMap<FName, FMatterFluxWandDefinition> Wands;
 	TMap<FName, FMatterFluxItemDefinition> Items;
 	TMap<FName, FMatterFluxQuestDefinition> Quests;
+	TMap<FName, FMatterFluxCustomMapDefinition> CustomMaps;
 };
 
 using FMatterFluxContentRegistryPtr =

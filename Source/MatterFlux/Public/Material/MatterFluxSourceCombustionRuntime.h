@@ -9,6 +9,8 @@ namespace MatterFlux::Combustion
 	{
 		float StepSeconds = 0.1f;
 		int32 MaxStepsPerAdvance = 3;
+		/** Limits the deterministic fire front instead of igniting an entire crown at once. */
+		int32 MaxSpreadIgnitionsPerStep = 1;
 
 		bool IsValid() const;
 	};
@@ -47,13 +49,13 @@ namespace MatterFlux::Combustion
 		bool Initialize(
 			const FSourceRuntimeSettings& Settings,
 			const FFragmentSourceMask& SourceMask,
-			const FMatterFluxCombustionDefinition& Rule,
+			const FMatterFluxReactionDefinition& Rule,
 			int32 Seed,
 			FString& OutError);
 		bool RestoreState(
 			const FSourceRuntimeSettings& Settings,
 			const FSourceRuntimeSnapshot& State,
-			const FMatterFluxCombustionDefinition& Rule,
+			const FMatterFluxReactionDefinition& Rule,
 			FString& OutError);
 		bool CaptureState(FSourceRuntimeSnapshot& OutState) const;
 		void Reset();
@@ -70,7 +72,7 @@ namespace MatterFlux::Combustion
 		const TArray<uint8>& GetFuelMask() const;
 		const TArray<uint8>& GetResidueMask() const;
 		const TArray<uint8>& GetBurningMask() const;
-		const FMatterFluxCombustionDefinition* GetRule() const
+		const FMatterFluxReactionDefinition* GetRule() const
 		{
 			return Simulation ? &Simulation->GetRule() : nullptr;
 		}

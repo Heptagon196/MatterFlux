@@ -245,6 +245,30 @@ namespace MatterFlux::Material
 		return bSeeded;
 	}
 
+	int32 FSimulationRuntime::DisplaceLiquids(
+		const TConstArrayView<FIntPoint> OccupiedCells,
+		const int32 MaxSearchRadius)
+	{
+		const int32 Moved = MaterialWorld
+			? MaterialWorld->DisplaceLiquids(
+				OccupiedCells, MaxSearchRadius)
+			: 0;
+		bReplicationDirty |= Moved > 0;
+		return Moved;
+	}
+
+	int32 FSimulationRuntime::DisplaceLiquids(
+		const TConstArrayView<FLiquidDisplacementConstraint> Constraints,
+		const int32 MaxSearchRadius)
+	{
+		const int32 Moved = MaterialWorld
+			? MaterialWorld->DisplaceLiquids(
+				Constraints, MaxSearchRadius)
+			: 0;
+		bReplicationDirty |= Moved > 0;
+		return Moved;
+	}
+
 	void FSimulationRuntime::SetFocuses(
 		const TConstArrayView<FIntPoint> Focuses)
 	{
@@ -279,9 +303,25 @@ namespace MatterFlux::Material
 			: NAME_None;
 	}
 
+	bool FSimulationRuntime::TryGetCellSnapshot(
+		const FIntPoint& WorldCell,
+		FCellSnapshot& OutSnapshot) const
+	{
+		OutSnapshot = {};
+		return MaterialWorld
+			&& MaterialWorld->TryGetCellSnapshot(WorldCell, OutSnapshot);
+	}
+
 	int32 FSimulationRuntime::CountMaterial(const FName MaterialId) const
 	{
 		return MaterialWorld ? MaterialWorld->CountMaterial(MaterialId) : 0;
+	}
+
+	int64 FSimulationRuntime::SumMaterialAmount(const FName MaterialId) const
+	{
+		return MaterialWorld
+			? MaterialWorld->SumMaterialAmount(MaterialId)
+			: 0;
 	}
 
 	int32 FSimulationRuntime::GetResidentChunkCount() const
@@ -306,6 +346,16 @@ namespace MatterFlux::Material
 		if (MaterialWorld)
 		{
 			MaterialWorld->GetActiveCells(OutCells);
+		}
+	}
+
+	void FSimulationRuntime::GetAllCells(
+		TArray<FCellSnapshot>& OutCells) const
+	{
+		OutCells.Reset();
+		if (MaterialWorld)
+		{
+			MaterialWorld->GetAllCells(OutCells);
 		}
 	}
 }

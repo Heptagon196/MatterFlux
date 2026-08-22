@@ -5,6 +5,7 @@
 #include "Fragment/Fragment2DSourceStreamingState.h"
 #include "Fragment/FragmentTypes.h"
 #include "Material/MatterFluxCombustion.h"
+#include "Rendering/MatterFluxSmokeVisualPool.h"
 #include "Fragment2DSourceActor.generated.h"
 
 class UFragment2DAsset;
@@ -51,10 +52,34 @@ public:
 		FName IgnitionMaterial = TEXT("fire"),
 		int32 EventSeed = 0);
 	void SetSourceCollisionEnabled(bool bEnabled);
+	/** Keep the logical source while another component owns its rendering. */
+	void SetSourceMeshProjectionEnabled(bool bEnabled);
 	void ConfigureAggregate(
 		const FGuid& InAggregateId,
 		bool bInAggregateRoot);
-	void TransferAggregateMembersTo(AActor& CarrierActor);
+	void TransferAggregateMembersTo(
+		AActor& CarrierActor,
+		const FFragmentDamageEvent* SharedDamageEvent = nullptr);
+	/**
+	 * 将参考切割投影到同一 aggregate 中平行、同尺寸的深度切片。
+	 * 这样方柱的前后两层会在完全相同的 mask 行被切断。
+	 */
+	bool BuildSynchronizedDamageEventFrom(
+		const AFragment2DSourceActor& ReferenceSource,
+		const FFragmentDamageEvent& ReferenceEvent,
+		FFragmentDamageEvent& OutEvent) const;
+	/**
+	 * 整体物体刚被切断时，动态载体与留下的根部仍可能发生接触。
+	 * 在两者真正分开前只关闭根部碰撞；视觉始终来自已提交的材质状态，
+	 * 不允许计时器稍后再把根部“变”出来。
+	 */
+	void BeginAggregateSeparationGracePeriod(
+		AActor& CarrierActor,
+		float MaxDurationSeconds = 2.0f);
+	bool IsAggregateSeparationCollisionSuppressed() const
+	{
+		return bAggregateSeparationCollisionSuppressed;
+	}
 	void MarkBroken();
 
 	int32 GetMaskWidth() const;
@@ -79,6 +104,9 @@ public:
 	bool IsCombusting() const;
 	FBox GetBurningWorldBounds() const;
 	FName GetCombustionFlameMaterial() const;
+	void GatherCombustionSmokeAnchors(
+		TArray<MatterFlux::Rendering::FSmokeEmissionAnchor>& OutAnchors,
+		int32 MaxAnchors) const;
 	bool HasCombustionRule() const
 	{
 		return FindCombustionRule() != nullptr;
@@ -133,6 +161,9 @@ public:
 	UPROPERTY(Replicated, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate")
 	bool bDetachedFromTerrain = false;
 
+	UPROPERTY(ReplicatedUsing = OnRep_AggregateSeparationCollisionSuppressed, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate")
+	bool bAggregateSeparationCollisionSuppressed = false;
+
 protected:
 	UFUNCTION()
 	void OnRep_Broken();
@@ -150,19 +181,25 @@ protected:
 	void OnRep_SourceCollision();
 
 	UFUNCTION()
+	void OnRep_AggregateSeparationCollisionSuppressed();
+
+	UFUNCTION()
 	void OnRep_CombustionState();
 
 	void ApplyBrokenState();
 	void ApplySourceCollisionState();
+	void UpdateAggregateSeparationGracePeriod();
+	void EndAggregateSeparationGracePeriod();
 	void ApplySourceMaterial();
 	void AdvanceCombustion(float DeltaSeconds);
 	void RebuildCombustionVisualization();
 	void RebuildResidueMesh();
 	void EnsureCombustionVisualComponents();
 	void AddSmokeEmissions(const TArray<FIntPoint>& Cells);
+	void MarkSharedSmokeVisualizationDirty() const;
 	FIntPoint WorldToMaskCell(const FVector& WorldLocation) const;
 	void PublishCombustionState();
-	const FMatterFluxCombustionDefinition* FindCombustionRule() const;
+	const FMatterFluxReactionDefinition* FindCombustionRule() const;
 	void EnsureInitialized();
 	bool RebuildSourceMesh();
 	void BuildDefaultMask(TArray<uint8>& OutMask) const;
@@ -187,9 +224,6 @@ protected:
 	TObjectPtr<UInstancedStaticMeshComponent> FlameInstances;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UInstancedStaticMeshComponent> SmokeInstances;
-
-	UPROPERTY(Transient)
 	TObjectPtr<UPointLightComponent> FireLight;
 
 	UPROPERTY(Transient)
@@ -198,8 +232,6 @@ protected:
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> FlameMaterialInstance;
 
-	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInstanceDynamic> SmokeMaterialInstance;
 
 	UPROPERTY(Replicated)
 	TArray<uint8> ReplicatedCombustionFuelMask;
@@ -228,22 +260,19 @@ private:
 	bool PrepareDamageEvent(const FFragmentDamageEvent& DamageEvent, FPreparedFragmentDamage& OutTransaction) const;
 	bool CommitPreparedDamage(FPreparedFragmentDamage& Transaction);
 
-	struct FSmokeParticle
-	{
-		FVector LocalPosition = FVector::ZeroVector;
-		FVector LocalVelocity = FVector::ZeroVector;
-		float RemainingLife = 0.0f;
-	};
-
 	TUniquePtr<MatterFlux::Combustion::FMaskCombustion>
 		CombustionSimulation;
 	TArray<uint8> ResidueMask;
 	TArray<uint8> VisibleBurningMask;
-	TArray<FSmokeParticle> SmokeParticles;
 	float CombustionAccumulator = 0.0f;
 	float CombustionVisualAccumulator = 0.0f;
 	int32 TotalSmokeEmissionCount = 0;
 	FGuid RegisteredPresenceSourceId;
+	TWeakObjectPtr<AActor> AggregateSeparationCarrier;
+	FTimerHandle AggregateSeparationTimerHandle;
+	double AggregateSeparationEarliestEndSeconds = 0.0;
+	double AggregateSeparationDeadlineSeconds = 0.0;
 	bool bCombustionVisualDirty = false;
 	bool bCombustionGeometryDirty = false;
+	bool bSourceMeshProjectionEnabled = true;
 };

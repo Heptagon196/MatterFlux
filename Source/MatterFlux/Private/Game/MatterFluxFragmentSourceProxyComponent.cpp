@@ -2,7 +2,10 @@
 
 #include "Fragment/FragmentGeometry.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "MatterFluxLog.h"
 #include "ProceduralMeshComponent.h"
+#include "Rendering/MatterFluxVoxelMaterialStyle.h"
+#include "Rendering/MatterFluxWholeObjectGeometry.h"
 
 namespace
 {
@@ -17,6 +20,7 @@ namespace
 		TArray<int32> Triangles;
 		TArray<FVector> Normals;
 		TArray<FVector2D> UVs;
+		TArray<FColor> VertexColors;
 	};
 
 	FString MakeGroupKey(
@@ -43,13 +47,16 @@ namespace
 		const TArray<FVector>& SourceNormals,
 		const TArray<FVector2D>& SourceUVs,
 		const int32 FirstIndex,
-		const int32 IndexCount)
+		const int32 IndexCount,
+		const TArray<FColor>* SourceVertexColors = nullptr)
 	{
 		if (FirstIndex < 0
 			|| IndexCount <= 0
 			|| FirstIndex > SourceTriangles.Num() - IndexCount
 			|| SourceNormals.Num() != SourceVertices.Num()
-			|| SourceUVs.Num() != SourceVertices.Num())
+			|| SourceUVs.Num() != SourceVertices.Num()
+			|| (SourceVertexColors
+				&& SourceVertexColors->Num() != SourceVertices.Num()))
 		{
 			return;
 		}
@@ -71,6 +78,8 @@ namespace
 		Group.Normals.Reserve(
 			Group.Normals.Num() + MaximumAddedVertexCount);
 		Group.UVs.Reserve(Group.UVs.Num() + MaximumAddedVertexCount);
+		Group.VertexColors.Reserve(
+			Group.VertexColors.Num() + MaximumAddedVertexCount);
 		Group.Triangles.Reserve(Group.Triangles.Num() + IndexCount);
 		TArray<int32, TInlineAllocator<256>> LocalVertexBySourceIndex;
 		LocalVertexBySourceIndex.Init(INDEX_NONE, SourceVertices.Num());
@@ -92,6 +101,9 @@ namespace
 						SourceNormals[SourceVertexIndex])
 						.GetSafeNormal());
 				Group.UVs.Add(SourceUVs[SourceVertexIndex]);
+				Group.VertexColors.Add(SourceVertexColors
+					? (*SourceVertexColors)[SourceVertexIndex]
+					: FColor::White);
 			}
 			Group.Triangles.Add(VertexOffset + LocalVertexIndex);
 		}
@@ -106,12 +118,18 @@ UMatterFluxFragmentSourceProxyComponent::
 
 void UMatterFluxFragmentSourceProxyComponent::Configure(
 	USceneComponent* InAttachParent,
-	UMaterialInterface* InMaterialTemplate)
+	UMaterialInterface* InMaterialTemplate,
+	UMaterialInterface* InLeafMaterialTemplate,
+	UMaterialInterface* InWoodMaterialTemplate)
 {
 	AttachParent = InAttachParent;
-	if (MaterialTemplate != InMaterialTemplate)
+	if (MaterialTemplate != InMaterialTemplate
+		|| LeafMaterialTemplate != InLeafMaterialTemplate
+		|| WoodMaterialTemplate != InWoodMaterialTemplate)
 	{
 		MaterialTemplate = InMaterialTemplate;
+		LeafMaterialTemplate = InLeafMaterialTemplate;
+		WoodMaterialTemplate = InWoodMaterialTemplate;
 		Materials.Reset();
 		for (const FIntPoint Chunk : VisibleChunks)
 		{
@@ -271,6 +289,21 @@ void UMatterFluxFragmentSourceProxyComponent::SetSourceMaterialized(
 	}
 }
 
+void UMatterFluxFragmentSourceProxyComponent::SetDebugIsolatedAggregate(
+	const FGuid& AggregateId)
+{
+	if (DebugIsolatedAggregateId == AggregateId)
+	{
+		return;
+	}
+	DebugIsolatedAggregateId = AggregateId;
+	for (const FIntPoint Chunk : VisibleChunks)
+	{
+		DirtyChunks.Add(Chunk);
+	}
+	FlushPendingChanges();
+}
+
 void UMatterFluxFragmentSourceProxyComponent::SetSourceCombustionActive(
 	const FGuid& SourceId,
 	const bool bActive)
@@ -384,9 +417,11 @@ UMatterFluxFragmentSourceProxyComponent::ApplySourceState(
 	{
 		DeferredCombustionChunks.Add(Locator->Chunk);
 	}
-	if (!bCombustionActive
-		&& !bWasCombustionActive
-		&& (bRuntimeChanged || bResidueChanged))
+	// 燃烧状态与可视网格必须在同一个批次内提交。旧逻辑会在燃烧期间
+	// 一直保留绿色的 chunk 网格，直到整份 source 燃尽才一次性变黑；
+	// DirtyChunks 本身是集合，因此同一模拟批次内多格、多 source 的变化
+	// 仍只会触发一次 chunk 重建。
+	if (bRuntimeChanged || bResidueChanged)
 	{
 		DirtyChunks.Add(Locator->Chunk);
 		DeferredCombustionChunks.Remove(Locator->Chunk);
@@ -436,6 +471,7 @@ void UMatterFluxFragmentSourceProxyComponent::ResetSources()
 	VisibleChunks.Reset();
 	CollisionChunks.Reset();
 	MaterializedSourceIds.Reset();
+	DebugIsolatedAggregateId.Invalidate();
 	CombustingSourceIds.Reset();
 	DirtyChunks.Reset();
 	DeferredCombustionChunks.Reset();
@@ -481,9 +517,432 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 	}
 
 	TMap<FString, FProxyMeshGroup> Groups;
+	TMap<FGuid, TArray<const MatterFlux::PlayableLevel::FLevelFragmentSource*>>
+		TreeSourcesByAggregate;
 	for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
 		: *Sources)
 	{
+		if (DebugIsolatedAggregateId.IsValid()
+			&& Source.AggregateId != DebugIsolatedAggregateId)
+		{
+			continue;
+		}
+		const bool bTreePart = Source.Name == TEXT("TreeTrunk")
+			|| Source.Name == TEXT("TreeBranch")
+			|| Source.Name == TEXT("TreeLeaves");
+		if (!MaterializedSourceIds.Contains(Source.SourceId)
+			&& bTreePart
+			&& Source.AggregateId.IsValid()
+			&& (Source.Name != TEXT("TreeLeaves")
+				|| (Source.MaterialId == TEXT("leaf")
+					&& Source.Mask.GeometryStyle
+						== EFragmentSourceGeometryStyle::VoxelBlocks)))
+		{
+			TreeSourcesByAggregate.FindOrAdd(Source.AggregateId).Add(&Source);
+		}
+	}
+
+	// 逻辑层仍保留可独立切割、燃烧的二维树干/枝条/叶片 source；
+	// 静态代理则把同一棵树还原到一套多材质三维体素占用中。每种材质
+	// 只输出朝向空气的面，木叶交界面以及重叠格都不会重复绘制。
+	// 重叠格由叶子取得显示优先级，避免树冠表面出现棕色 L 形穿插。
+	TSet<FGuid> VolumeRenderedTreeSourceIds;
+	for (const TPair<
+		FGuid,
+		TArray<const MatterFlux::PlayableLevel::FLevelFragmentSource*>>& Pair
+		: TreeSourcesByAggregate)
+	{
+		const TArray<const MatterFlux::PlayableLevel::FLevelFragmentSource*>&
+			TreeSources = Pair.Value;
+		if (TreeSources.IsEmpty())
+		{
+			continue;
+		}
+
+		// 新整体物体 Adapter：静态树与脱落后的动态树都把相同的
+		// mask 层交给 WholeObject 深模块。材料列表先按稳定键排序，
+		// 因而 TMap 遍历次序不会改变 section、顶点或三角形顺序。
+		struct FWholeObjectMaterial
+		{
+			FString StableKey;
+			FName MaterialId = NAME_None;
+			FLinearColor Color = FLinearColor::White;
+			bool bCollision = false;
+		};
+		TArray<FWholeObjectMaterial> WholeMaterials;
+		for (const MatterFlux::PlayableLevel::FLevelFragmentSource* TreeSource
+			: TreeSources)
+		{
+			if (!TreeSource)
+			{
+				continue;
+			}
+			const FString StableKey = MakeGroupKey(
+				TreeSource->MaterialId,
+				TreeSource->Color,
+				TreeSource->Mask.CellSize,
+				false,
+				TreeSource->bEnableCollision);
+			if (!WholeMaterials.ContainsByPredicate(
+				[&StableKey](const FWholeObjectMaterial& Existing)
+				{
+					return Existing.StableKey == StableKey;
+				}))
+			{
+				WholeMaterials.Add({
+					StableKey,
+					TreeSource->MaterialId,
+					TreeSource->Color,
+					TreeSource->bEnableCollision});
+			}
+		}
+		WholeMaterials.Sort([](
+			const FWholeObjectMaterial& A,
+			const FWholeObjectMaterial& B)
+		{
+			return A.StableKey < B.StableKey;
+		});
+		TArray<MatterFlux::WholeObject::FLayer> WholeLayers;
+		const MatterFlux::PlayableLevel::FLevelFragmentSource* AggregateRoot =
+			TreeSources[0];
+		for (const MatterFlux::PlayableLevel::FLevelFragmentSource* TreeSource
+			: TreeSources)
+		{
+			if (TreeSource && TreeSource->bAggregateRoot)
+			{
+				AggregateRoot = TreeSource;
+				break;
+			}
+		}
+		FTransform AggregateFrame = AggregateRoot
+			? AggregateRoot->Transform
+			: FTransform::Identity;
+		AggregateFrame.SetScale3D(FVector::OneVector);
+		for (const MatterFlux::PlayableLevel::FLevelFragmentSource* TreeSource
+			: TreeSources)
+		{
+			if (!TreeSource)
+			{
+				continue;
+			}
+			const FString StableKey = MakeGroupKey(
+				TreeSource->MaterialId,
+				TreeSource->Color,
+				TreeSource->Mask.CellSize,
+				false,
+				TreeSource->bEnableCollision);
+			const int32 MaterialIndex = WholeMaterials.IndexOfByPredicate(
+				[&StableKey](const FWholeObjectMaterial& Existing)
+				{
+					return Existing.StableKey == StableKey;
+				});
+			MatterFlux::WholeObject::FLayer& Layer =
+				WholeLayers.AddDefaulted_GetRef();
+			Layer.MaterialIndex = MaterialIndex;
+			Layer.Priority = TreeSource->MaterialId == TEXT("leaf") ? 100 : 10;
+			Layer.bEnableCollision = TreeSource->bEnableCollision;
+			Layer.Width = TreeSource->Mask.Width;
+			Layer.Height = TreeSource->Mask.Height;
+			Layer.CellSize = TreeSource->Mask.CellSize;
+			// 整棵树可以朝向镜头旋转，但编译器只需要处理树局部坐标中
+			// 的 90 度格点旋转。编译结束后再一次性应用 AggregateFrame。
+			Layer.LocalTransform =
+				TreeSource->Transform.GetRelativeTransform(AggregateFrame);
+			Layer.LocalTransform.SetScale3D(FVector::OneVector);
+			// 保留真实连接木体；若木叶占用同一体素，统一编译器会按
+			// leaf=100、wood=10 的优先级只输出叶片外壳。
+			Layer.SolidMask = TreeSource->Mask.SolidMask;
+		}
+		WholeLayers.RemoveAll(
+			[](const MatterFlux::WholeObject::FLayer& Layer)
+			{
+				return !Layer.SolidMask.Contains(1);
+			});
+		MatterFlux::WholeObject::FBuildResult WholeMesh;
+		FString WholeObjectError;
+		if (!WholeLayers.IsEmpty()
+			&& MatterFlux::WholeObject::BuildMesh(
+				WholeLayers,
+				WholeMesh,
+				&WholeObjectError))
+		{
+			for (const MatterFlux::WholeObject::FMeshSection& Section
+				: WholeMesh.Sections)
+			{
+				if (!WholeMaterials.IsValidIndex(Section.MaterialIndex))
+				{
+					continue;
+				}
+				const FWholeObjectMaterial& Material =
+					WholeMaterials[Section.MaterialIndex];
+				// 顶面必须使用基础颜色；旧代码把 Top/Bottom 一并当成
+				// Side 再压暗一次，导致斜俯视中本应朝上的亮面成为深色
+				// 菱形，整棵树看起来像向内凹。Bottom 已由法线材质压暗。
+				const bool bSide = Section.FaceRole
+					== MatterFlux::WholeObject::EFaceRole::Side;
+				const float CellSize = WholeLayers[0].CellSize;
+				const FString Key = MakeGroupKey(
+					Material.MaterialId,
+					Material.Color,
+					CellSize,
+					bSide,
+					Section.bEnableCollision);
+				FProxyMeshGroup& Group = Groups.FindOrAdd(Key);
+				Group.MaterialId = Material.MaterialId;
+				Group.Color = Material.Color;
+				Group.CellSize = CellSize;
+				Group.bSide = bSide;
+				Group.bCollision = Section.bEnableCollision;
+				AppendMeshPart(
+					Group,
+					AggregateFrame,
+					Section.Vertices,
+					Section.Triangles,
+					Section.Normals,
+					Section.UVs,
+					0,
+					Section.Triangles.Num(),
+					&Section.VertexColors);
+			}
+			for (const MatterFlux::PlayableLevel::FLevelFragmentSource* TreeSource
+				: TreeSources)
+			{
+				if (TreeSource)
+				{
+					VolumeRenderedTreeSourceIds.Add(TreeSource->SourceId);
+				}
+			}
+			continue;
+		}
+		UE_LOG(
+			LogMatterFlux,
+			Warning,
+			TEXT("Tree aggregate %s could not use unified voxel rendering: %s"),
+			*Pair.Key.ToString(),
+			*WholeObjectError);
+
+		const MatterFlux::PlayableLevel::FLevelFragmentSource& First =
+			*TreeSources[0];
+		const float CellSize = First.Mask.CellSize;
+		bool bCompatibleVolume = FMath::IsFinite(CellSize) && CellSize > 0.0f;
+		FVector Anchor = FVector::ZeroVector;
+		bool bHasAnchor = false;
+		for (const MatterFlux::PlayableLevel::FLevelFragmentSource* TreeSource
+			: TreeSources)
+		{
+			if (!TreeSource
+				|| !FMath::IsNearlyEqual(
+					TreeSource->Mask.CellSize, CellSize, KINDA_SMALL_NUMBER)
+				|| !TreeSource->Transform.GetScale3D().Equals(
+					FVector::OneVector, KINDA_SMALL_NUMBER))
+			{
+				bCompatibleVolume = false;
+				break;
+			}
+			for (int32 MaskY = 0;
+				!bHasAnchor && MaskY < TreeSource->Mask.Height;
+				++MaskY)
+			{
+				for (int32 MaskX = 0;
+					MaskX < TreeSource->Mask.Width;
+					++MaskX)
+				{
+					if (TreeSource->Mask.SolidMask[
+						MaskY * TreeSource->Mask.Width + MaskX] == 0)
+					{
+						continue;
+					}
+					const FVector LocalCenter(
+						(static_cast<float>(MaskX) + 0.5f
+							- static_cast<float>(TreeSource->Mask.Width) * 0.5f)
+							* CellSize,
+						0.0f,
+						(static_cast<float>(MaskY) + 0.5f
+							- static_cast<float>(TreeSource->Mask.Height) * 0.5f)
+							* CellSize);
+					Anchor = TreeSource->Transform.TransformPosition(LocalCenter);
+					bHasAnchor = true;
+					break;
+				}
+			}
+		}
+		if (!bCompatibleVolume || !bHasAnchor)
+		{
+			continue;
+		}
+
+		struct FTreeVoxelMaterial
+		{
+			FName MaterialId = NAME_None;
+			FLinearColor Color = FLinearColor::White;
+			bool bCollision = false;
+			bool bLeaf = false;
+			TSet<FIntVector> Cells;
+		};
+		TArray<FTreeVoxelMaterial> TreeMaterials;
+		TMap<FString, int32> MaterialIndexByKey;
+		TSet<FIntVector> AllOccupiedCells;
+		TSet<FIntVector> LeafCells;
+		for (const MatterFlux::PlayableLevel::FLevelFragmentSource* TreeSource
+			: TreeSources)
+		{
+			const bool bLeaf = TreeSource->Name == TEXT("TreeLeaves");
+			const FString MaterialKey = MakeGroupKey(
+				TreeSource->MaterialId,
+				TreeSource->Color,
+				CellSize,
+				false,
+				TreeSource->bEnableCollision);
+			int32* MaterialIndex = MaterialIndexByKey.Find(MaterialKey);
+			if (!MaterialIndex)
+			{
+				const int32 NewIndex = TreeMaterials.AddDefaulted();
+				MaterialIndexByKey.Add(MaterialKey, NewIndex);
+				TreeMaterials[NewIndex].MaterialId = TreeSource->MaterialId;
+				TreeMaterials[NewIndex].Color = TreeSource->Color;
+				TreeMaterials[NewIndex].bCollision = TreeSource->bEnableCollision;
+				TreeMaterials[NewIndex].bLeaf = bLeaf;
+				MaterialIndex = MaterialIndexByKey.Find(MaterialKey);
+			}
+			FTreeVoxelMaterial& Material = TreeMaterials[*MaterialIndex];
+			for (int32 MaskY = 0; MaskY < TreeSource->Mask.Height; ++MaskY)
+			{
+				for (int32 MaskX = 0; MaskX < TreeSource->Mask.Width; ++MaskX)
+				{
+					if (TreeSource->Mask.SolidMask[
+						MaskY * TreeSource->Mask.Width + MaskX] == 0)
+					{
+						continue;
+					}
+					const FVector LocalCenter(
+						(static_cast<float>(MaskX) + 0.5f
+							- static_cast<float>(TreeSource->Mask.Width) * 0.5f)
+							* CellSize,
+						0.0f,
+						(static_cast<float>(MaskY) + 0.5f
+							- static_cast<float>(TreeSource->Mask.Height) * 0.5f)
+							* CellSize);
+					const FVector GridPosition =
+						(TreeSource->Transform.TransformPosition(LocalCenter) - Anchor)
+						/ CellSize;
+					const FIntVector Cell(
+						FMath::RoundToInt(GridPosition.X),
+						FMath::RoundToInt(GridPosition.Y),
+						FMath::RoundToInt(GridPosition.Z));
+					if (!GridPosition.Equals(FVector(Cell), 0.01f))
+					{
+						bCompatibleVolume = false;
+						break;
+					}
+					Material.Cells.Add(Cell);
+					AllOccupiedCells.Add(Cell);
+					if (bLeaf)
+					{
+						LeafCells.Add(Cell);
+					}
+				}
+				if (!bCompatibleVolume)
+				{
+					break;
+				}
+			}
+			if (!bCompatibleVolume)
+			{
+				break;
+			}
+		}
+		if (!bCompatibleVolume)
+		{
+			continue;
+		}
+
+		const TArray<FIntVector> OccluderCells = AllOccupiedCells.Array();
+		for (FTreeVoxelMaterial& Material : TreeMaterials)
+		{
+			TArray<FIntVector> SurfaceCells;
+			for (const FIntVector& Cell : Material.Cells)
+			{
+				if (!Material.bLeaf && LeafCells.Contains(Cell))
+				{
+					continue;
+				}
+				const bool bExposed =
+					!AllOccupiedCells.Contains(Cell + FIntVector(1, 0, 0))
+					|| !AllOccupiedCells.Contains(Cell + FIntVector(-1, 0, 0))
+					|| !AllOccupiedCells.Contains(Cell + FIntVector(0, 1, 0))
+					|| !AllOccupiedCells.Contains(Cell + FIntVector(0, -1, 0))
+					|| !AllOccupiedCells.Contains(Cell + FIntVector(0, 0, 1))
+					|| !AllOccupiedCells.Contains(Cell + FIntVector(0, 0, -1));
+				if (bExposed)
+				{
+					SurfaceCells.Add(Cell);
+				}
+			}
+			if (SurfaceCells.IsEmpty())
+			{
+				continue;
+			}
+			FCachedSourceMesh VolumeMesh;
+			if (!MatterFlux::FragmentGeometry::
+				BuildVoxelBlockMeshFromCellsWithOccluders(
+					SurfaceCells,
+					OccluderCells,
+					CellSize,
+					VolumeMesh.Vertices,
+					VolumeMesh.Triangles,
+					VolumeMesh.Normals,
+					VolumeMesh.UVs,
+					VolumeMesh.FaceIndexCount))
+			{
+				bCompatibleVolume = false;
+				break;
+			}
+			for (const bool bSide : {false, true})
+			{
+				const FString Key = MakeGroupKey(
+					Material.MaterialId,
+					Material.Color,
+					CellSize,
+					bSide,
+					Material.bCollision);
+				FProxyMeshGroup& Group = Groups.FindOrAdd(Key);
+				Group.MaterialId = Material.MaterialId;
+				Group.Color = Material.Color;
+				Group.CellSize = CellSize;
+				Group.bSide = bSide;
+				Group.bCollision = Material.bCollision;
+				AppendMeshPart(
+					Group,
+					FTransform(Anchor),
+					VolumeMesh.Vertices,
+					VolumeMesh.Triangles,
+					VolumeMesh.Normals,
+					VolumeMesh.UVs,
+					bSide ? VolumeMesh.FaceIndexCount : 0,
+					bSide
+						? VolumeMesh.Triangles.Num() - VolumeMesh.FaceIndexCount
+						: VolumeMesh.FaceIndexCount);
+			}
+		}
+		if (!bCompatibleVolume)
+		{
+			continue;
+		}
+		for (const MatterFlux::PlayableLevel::FLevelFragmentSource* TreeSource
+			: TreeSources)
+		{
+			VolumeRenderedTreeSourceIds.Add(TreeSource->SourceId);
+		}
+	}
+
+	for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
+		: *Sources)
+	{
+		if (DebugIsolatedAggregateId.IsValid()
+			&& Source.AggregateId != DebugIsolatedAggregateId)
+		{
+			continue;
+		}
 		if (MaterializedSourceIds.Contains(Source.SourceId))
 		{
 			continue;
@@ -523,13 +982,16 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 							: Cached.FaceIndexCount);
 				}
 			};
-		if (const FCachedSourceMesh* Cached = FindOrBuildSourceMesh(Source))
+		if (!VolumeRenderedTreeSourceIds.Contains(Source.SourceId))
 		{
-			AppendSource(
-				*Cached,
-				Source.MaterialId,
-				Source.Color,
-				Source.bEnableCollision);
+			if (const FCachedSourceMesh* Cached = FindOrBuildSourceMesh(Source))
+			{
+				AppendSource(
+					*Cached,
+					Source.MaterialId,
+					Source.Color,
+					Source.bEnableCollision);
+			}
 		}
 		if (const FSourceResidueState* Residue =
 			SourceResidues.Find(Source.SourceId))
@@ -575,7 +1037,7 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 		Mesh->bUseComplexAsSimpleCollision = true;
 		Mesh->SetCollisionObjectType(ECC_WorldStatic);
 		Mesh->SetCanEverAffectNavigation(false);
-		Mesh->SetCastShadow(false);
+		Mesh->SetCastShadow(true);
 		Mesh->ComponentTags.AddUnique(
 			TEXT("MatterFluxFragmentSourceProxy"));
 		GetOwner()->AddInstanceComponent(Mesh);
@@ -602,7 +1064,7 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 			Group.Triangles,
 			Group.Normals,
 			Group.UVs,
-			TArray<FColor>(),
+			Group.VertexColors,
 			TArray<FProcMeshTangent>(),
 			Group.bCollision);
 		bHasCollision |= Group.bCollision;
@@ -651,20 +1113,48 @@ const UMatterFluxFragmentSourceProxyComponent::FCachedSourceMesh*
 		return nullptr;
 	}
 	FCachedSourceMesh Mesh;
-	if (!MatterFlux::FragmentGeometry::BuildExtrudedMesh(
-		Geometry.Vertices2D,
-		Geometry.TriangleIndices,
-		Geometry.OuterContours,
-		Geometry.HoleContours,
-		Source.Mask.CellSize,
-		Mesh.Vertices,
-		Mesh.Triangles,
-		Mesh.Normals,
-		Mesh.UVs))
+	const bool bBuilt = Source.Mask.GeometryStyle
+		== EFragmentSourceGeometryStyle::RadialColumn
+		? MatterFlux::FragmentGeometry::BuildRadialColumnMeshFromMask(
+			Source.Mask.SolidMask,
+			Source.Mask.Width,
+			Source.Mask.Height,
+			Source.Mask.CellSize,
+			Mesh.Vertices,
+			Mesh.Triangles,
+			Mesh.Normals,
+			Mesh.UVs,
+			Mesh.FaceIndexCount)
+		: Source.Mask.GeometryStyle == EFragmentSourceGeometryStyle::VoxelBlocks
+		? MatterFlux::FragmentGeometry::BuildVoxelBlockMeshFromMask(
+			Source.Mask.SolidMask,
+			Source.Mask.Width,
+			Source.Mask.Height,
+			Source.Mask.CellSize,
+			Mesh.Vertices,
+			Mesh.Triangles,
+			Mesh.Normals,
+			Mesh.UVs,
+			Mesh.FaceIndexCount)
+		: MatterFlux::FragmentGeometry::BuildExtrudedMesh(
+			Geometry.Vertices2D,
+			Geometry.TriangleIndices,
+			Geometry.OuterContours,
+			Geometry.HoleContours,
+			Source.Mask.CellSize,
+			Mesh.Vertices,
+			Mesh.Triangles,
+			Mesh.Normals,
+			Mesh.UVs);
+	if (!bBuilt)
 	{
 		return nullptr;
 	}
-	Mesh.FaceIndexCount = Geometry.TriangleIndices.Num() * 2;
+	if (Source.Mask.GeometryStyle
+		== EFragmentSourceGeometryStyle::ExtrudedMask)
+	{
+		Mesh.FaceIndexCount = Geometry.TriangleIndices.Num() * 2;
+	}
 	if (Mesh.FaceIndexCount <= 0
 		|| Mesh.FaceIndexCount >= Mesh.Triangles.Num())
 	{
@@ -694,20 +1184,48 @@ const UMatterFluxFragmentSourceProxyComponent::FCachedSourceMesh*
 		return nullptr;
 	}
 	FCachedSourceMesh Mesh;
-	if (!MatterFlux::FragmentGeometry::BuildExtrudedMesh(
-		Geometry.Vertices2D,
-		Geometry.TriangleIndices,
-		Geometry.OuterContours,
-		Geometry.HoleContours,
-		Source.Mask.CellSize,
-		Mesh.Vertices,
-		Mesh.Triangles,
-		Mesh.Normals,
-		Mesh.UVs))
+	const bool bBuilt = Source.Mask.GeometryStyle
+		== EFragmentSourceGeometryStyle::RadialColumn
+		? MatterFlux::FragmentGeometry::BuildRadialColumnMeshFromMask(
+			Residue.Mask,
+			Source.Mask.Width,
+			Source.Mask.Height,
+			Source.Mask.CellSize,
+			Mesh.Vertices,
+			Mesh.Triangles,
+			Mesh.Normals,
+			Mesh.UVs,
+			Mesh.FaceIndexCount)
+		: Source.Mask.GeometryStyle == EFragmentSourceGeometryStyle::VoxelBlocks
+		? MatterFlux::FragmentGeometry::BuildVoxelBlockMeshFromMask(
+			Residue.Mask,
+			Source.Mask.Width,
+			Source.Mask.Height,
+			Source.Mask.CellSize,
+			Mesh.Vertices,
+			Mesh.Triangles,
+			Mesh.Normals,
+			Mesh.UVs,
+			Mesh.FaceIndexCount)
+		: MatterFlux::FragmentGeometry::BuildExtrudedMesh(
+			Geometry.Vertices2D,
+			Geometry.TriangleIndices,
+			Geometry.OuterContours,
+			Geometry.HoleContours,
+			Source.Mask.CellSize,
+			Mesh.Vertices,
+			Mesh.Triangles,
+			Mesh.Normals,
+			Mesh.UVs);
+	if (!bBuilt)
 	{
 		return nullptr;
 	}
-	Mesh.FaceIndexCount = Geometry.TriangleIndices.Num() * 2;
+	if (Source.Mask.GeometryStyle
+		== EFragmentSourceGeometryStyle::ExtrudedMask)
+	{
+		Mesh.FaceIndexCount = Geometry.TriangleIndices.Num() * 2;
+	}
 	if (Mesh.FaceIndexCount <= 0
 		|| Mesh.FaceIndexCount >= Mesh.Triangles.Num())
 	{
@@ -742,7 +1260,15 @@ UMaterialInstanceDynamic*
 		const float CellSize,
 		const bool bSide)
 {
-	if (!MaterialTemplate)
+	const bool bLeaf = MaterialId == TEXT("leaf");
+	const bool bWood = MaterialId == TEXT("wood");
+	UMaterialInterface* SelectedTemplate =
+		bLeaf && LeafMaterialTemplate
+			? LeafMaterialTemplate.Get()
+			: (bWood && WoodMaterialTemplate
+				? WoodMaterialTemplate.Get()
+				: MaterialTemplate.Get());
+	if (!SelectedTemplate)
 	{
 		return nullptr;
 	}
@@ -756,39 +1282,16 @@ UMaterialInstanceDynamic*
 		return Existing;
 	}
 	UMaterialInstanceDynamic* Material =
-		UMaterialInstanceDynamic::Create(MaterialTemplate, this);
-	const bool bLeaf = MaterialId == TEXT("leaf");
-	const bool bGrass = MaterialId == TEXT("grass");
-	const bool bFlower =
-		MaterialId == TEXT("flower_pink")
-		|| MaterialId == TEXT("flower_gold")
-		|| MaterialId == TEXT("flower_blue");
-	const bool bStone = MaterialId == TEXT("stone");
-	const bool bSoftDecoration = bLeaf || bGrass || bFlower;
-	const float SideBrightness = bSoftDecoration ? 0.88f : 0.78f;
-	const FLinearColor FinalColor = bSide
-		? FLinearColor(
-			Color.R * SideBrightness,
-			Color.G * SideBrightness,
-			Color.B * SideBrightness,
-			Color.A)
-		: Color;
-	Material->SetVectorParameterValue(TEXT("Color"), FinalColor);
-	Material->SetScalarParameterValue(
-		TEXT("FaceContrast"),
-		bFlower ? 0.42f
-			: (bLeaf ? 0.56f : (bGrass ? 0.52f : (bStone ? 0.72f : 0.70f))));
-	Material->SetScalarParameterValue(
-		TEXT("ColorVariation"),
-		bFlower ? 0.012f : (bLeaf ? 0.022f : 0.03f));
-	Material->SetScalarParameterValue(TEXT("PixelSize"), FMath::Max(CellSize, 4.0f));
-	Material->SetScalarParameterValue(
-		TEXT("Roughness"),
-		bStone ? 0.96f : (bLeaf ? 0.88f : 0.82f));
-	Material->SetScalarParameterValue(
-		TEXT("ShadowLift"),
-		bFlower ? 0.38f
-			: (bLeaf ? 0.32f : (bGrass ? 0.28f : (bStone ? 0.12f : 0.18f))));
+		UMaterialInstanceDynamic::Create(SelectedTemplate, this);
+	MatterFlux::Rendering::ApplyVoxelMaterialProjection(
+		*Material,
+		MatterFlux::Rendering::ResolveVoxelMaterialProjection(
+			Color,
+			MaterialId,
+			CellSize,
+			bSide
+				? MatterFlux::Rendering::EVoxelMaterialFaceRole::Side
+				: MatterFlux::Rendering::EVoxelMaterialFaceRole::Primary));
 	Materials.Add(Key, Material);
 	return Material;
 }

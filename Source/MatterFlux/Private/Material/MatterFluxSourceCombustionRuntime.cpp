@@ -16,7 +16,9 @@ namespace MatterFlux::Combustion
 		return FMath::IsFinite(StepSeconds)
 			&& StepSeconds > 0.0f
 			&& MaxStepsPerAdvance > 0
-			&& MaxStepsPerAdvance <= 64;
+			&& MaxStepsPerAdvance <= 64
+			&& MaxSpreadIgnitionsPerStep > 0
+			&& MaxSpreadIgnitionsPerStep <= 64;
 	}
 
 	FSourceCombustionRuntime::FSourceCombustionRuntime() = default;
@@ -25,7 +27,7 @@ namespace MatterFlux::Combustion
 	bool FSourceCombustionRuntime::Initialize(
 		const FSourceRuntimeSettings& Settings,
 		const FFragmentSourceMask& SourceMask,
-		const FMatterFluxCombustionDefinition& Rule,
+		const FMatterFluxReactionDefinition& Rule,
 		const int32 Seed,
 		FString& OutError)
 	{
@@ -52,7 +54,7 @@ namespace MatterFlux::Combustion
 	bool FSourceCombustionRuntime::RestoreState(
 		const FSourceRuntimeSettings& Settings,
 		const FSourceRuntimeSnapshot& State,
-		const FMatterFluxCombustionDefinition& Rule,
+		const FMatterFluxReactionDefinition& Rule,
 		FString& OutError)
 	{
 		OutError.Reset();
@@ -197,7 +199,8 @@ namespace MatterFlux::Combustion
 			StepAccumulator = FMath::Max(
 				0.0f,
 				StepAccumulator - RuntimeSettings.StepSeconds);
-			const FStepStats Stats = Simulation->Step();
+			const FStepStats Stats = Simulation->Step(
+				RuntimeSettings.MaxSpreadIgnitionsPerStep);
 			Result.bStateChanged |= !Stats.ChangedCellIndices.IsEmpty();
 			Result.bGeometryChanged |= Stats.ConsumedFuelCells > 0;
 			Result.SmokeEmissionCells.Append(Stats.SmokeEmissionCells);

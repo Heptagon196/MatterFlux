@@ -1,5 +1,6 @@
 #include "GAS/GA_CastWand.h"
 
+#include "AbilitySystemComponent.h"
 #include "Game/MatterFluxPlayerState.h"
 #include "Game/MatterFluxCharacter.h"
 #include "GameFramework/CharacterMovementComponent.h"

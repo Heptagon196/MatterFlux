@@ -132,6 +132,14 @@ void UMatterFluxQuestTrackerWidget::InitializeForPlayer(
 	RefreshTracker();
 }
 
+void UMatterFluxQuestTrackerWidget::SetSuppressedByFrontEnd(
+	const bool bSuppressed)
+{
+	SetVisibility(bSuppressed
+		? ESlateVisibility::Collapsed
+		: ESlateVisibility::SelfHitTestInvisible);
+}
+
 UMatterFluxProgressionComponent*
 UMatterFluxQuestTrackerWidget::ResolveProgression() const
 {

@@ -443,7 +443,7 @@ namespace MatterFluxNetworkScaleTests
 					|| !ASC->AbilityActorInfo->IsLocallyControlled()
 					|| !Inventory
 					|| Inventory->GetOwnedWands().Num()
-						!= UGA_CastWand::EquipmentSlotCount
+						!= UGA_CastWand::EquipmentSlotCount + 2
 					|| !FindWandAbilitySpec(ASC, 0)
 					|| !FindWandAbilitySpec(ASC, 1)
 					|| !FindWandAbilitySpec(ASC, 2)

@@ -1,11 +1,15 @@
 #include "Camera/CameraComponent.h"
+#include "Components/BoxComponent.h"
+#include "Components/CapsuleComponent.h"
 #include "Components/DirectionalLightComponent.h"
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/SkyLightComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "EnhancedInputComponent.h"
+#include "Engine/Texture2D.h"
 #include "EngineUtils.h"
+#include "Creatures/MatterFluxCreatureActor.h"
 #include "Fragment/Fragment2DActor.h"
 #include "Fragment/Fragment2DSourceActor.h"
 #include "Fragment/FragmentGeometry.h"
@@ -25,8 +29,13 @@
 #include "Materials/MaterialInterface.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialExpressionCustom.h"
+#include "Materials/MaterialInstanceDynamic.h"
+#include "Material/MatterFluxBuoyancyComponent.h"
+#include "Material/MatterFluxLiquidBuoyancy.h"
 #include "MaterialShared.h"
 #include "Misc/AutomationTest.h"
+#include "Misc/ConfigCacheIni.h"
+#include "ProceduralMeshComponent.h"
 
 #include <limits>
 #include "ProceduralMeshComponent.h"
@@ -75,6 +84,7 @@ bool AreLayoutsEqual(
 		const MatterFlux::PlayableLevel::FLevelLayer& Left = A.Layers[Index];
 		const MatterFlux::PlayableLevel::FLevelLayer& Right = B.Layers[Index];
 		if (Left.Name != Right.Name
+			|| Left.MaterialId != Right.MaterialId
 			|| Left.Primitive != Right.Primitive
 			|| Left.RenderMode != Right.RenderMode
 			|| Left.Color != Right.Color
@@ -103,6 +113,7 @@ bool AreLayoutsEqual(
 			|| Left.Mask.CellSize != Right.Mask.CellSize
 			|| Left.Mask.MinFragmentAreaPixels != Right.Mask.MinFragmentAreaPixels
 			|| Left.Mask.MaxFragmentsPerBreak != Right.Mask.MaxFragmentsPerBreak
+			|| Left.Mask.GeometryStyle != Right.Mask.GeometryStyle
 			|| Left.Mask.SolidMask != Right.Mask.SolidMask)
 		{
 			return false;
@@ -110,6 +121,554 @@ bool AreLayoutsEqual(
 	}
 	return true;
 }
+
+bool IsSolidRegionOneRectangle(const FFragmentSourceMask& Mask)
+{
+	int32 MinX = Mask.Width;
+	int32 MinY = Mask.Height;
+	int32 MaxX = INDEX_NONE;
+	int32 MaxY = INDEX_NONE;
+	for (int32 Y = 0; Y < Mask.Height; ++Y)
+	{
+		for (int32 X = 0; X < Mask.Width; ++X)
+		{
+			if (Mask.SolidMask[Y * Mask.Width + X] == 0)
+			{
+				continue;
+			}
+			MinX = FMath::Min(MinX, X);
+			MinY = FMath::Min(MinY, Y);
+			MaxX = FMath::Max(MaxX, X);
+			MaxY = FMath::Max(MaxY, Y);
+		}
+	}
+	if (MaxX < MinX || MaxY < MinY)
+	{
+		return false;
+	}
+	for (int32 Y = MinY; Y <= MaxY; ++Y)
+	{
+		for (int32 X = MinX; X <= MaxX; ++X)
+		{
+			if (Mask.SolidMask[Y * Mask.Width + X] == 0)
+			{
+				return false;
+			}
+		}
+	}
+	return true;
+}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxTreeCanopyVolumeTest,
+	"MatterFlux.Playable.Tree.CanopyUsesExtrusionDepthInsteadOfPlanarStretch",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxTreeCanopyVolumeTest::RunTest(const FString& Parameters)
+{
+	MatterFlux::PlayableLevel::FLevelLayout Layout;
+	if (!TestTrue(TEXT("Reference forest layout builds"),
+		MatterFlux::PlayableLevel::BuildLevelLayout(1337, Layout)))
+	{
+		return false;
+	}
+	int32 LeafClusterCount = 0;
+	int32 InPlaneStretchCount = 0;
+	int32 NonVoxelDepthCount = 0;
+	TMap<FGuid, TSet<int32>> DepthSlicesPerTree;
+	TMap<FGuid, FTransform> RootTransforms;
+	for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
+		: Layout.FragmentSources)
+	{
+		if (Source.Name == TEXT("TreeTrunk") && Source.bAggregateRoot)
+		{
+			RootTransforms.Add(Source.AggregateId, Source.Transform);
+		}
+	}
+	for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
+		: Layout.FragmentSources)
+	{
+		if (Source.Name != TEXT("TreeLeaves"))
+		{
+			continue;
+		}
+		++LeafClusterCount;
+		const FVector Scale = Source.Transform.GetScale3D();
+		InPlaneStretchCount += FMath::IsNearlyEqual(Scale.Z, 1.0f) ? 0 : 1;
+		NonVoxelDepthCount += FMath::IsNearlyEqual(Scale.Y, 1.0f) ? 0 : 1;
+		if (const FTransform* RootTransform =
+			RootTransforms.Find(Source.AggregateId))
+		{
+			const FVector RelativeLocation =
+				RootTransform->InverseTransformPosition(
+					Source.Transform.GetLocation());
+			DepthSlicesPerTree.FindOrAdd(Source.AggregateId).Add(
+				FMath::RoundToInt(
+					RelativeLocation.Y / Source.Mask.CellSize));
+		}
+	}
+	TestTrue(TEXT("Reference forest contains leaf clusters"),
+		LeafClusterCount > 20);
+	TestEqual(TEXT("No leaf outline is stretched inside its mask plane"),
+		InPlaneStretchCount, 0);
+	TestEqual(TEXT("Every leaf slice is exactly one voxel deep"),
+		NonVoxelDepthCount, 0);
+	for (const TPair<FGuid, TSet<int32>>& Pair : DepthSlicesPerTree)
+	{
+		TestTrue(TEXT("Each canopy occupies five real voxel-depth slices"),
+			Pair.Value.Num() >= 5);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxMinecraftTreeStyleTest,
+	"MatterFlux.Playable.Tree.MinecraftBlockSilhouetteAndRenderBudget",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxMinecraftTreeStyleTest::RunTest(const FString& Parameters)
+{
+	MatterFlux::PlayableLevel::FLevelLayout Layout;
+	if (!TestTrue(TEXT("Reference forest layout builds"),
+		MatterFlux::PlayableLevel::BuildLevelLayout(1337, Layout)))
+	{
+		return false;
+	}
+
+	TMap<FGuid, int32> PartsPerTree;
+	TMap<FGuid, int32> TrunkSlicesPerTree;
+	TMap<FGuid, int32> LeafSlicesPerTree;
+	TMap<FGuid, TSet<int32>> LeafDepthsPerTree;
+	TMap<FGuid, TMap<int32, int32>> LeafCellsByTreeHeight;
+	TSet<uint32> LeafColors;
+	TMap<FGuid, FVector> TreeGridAnchors;
+	TMap<FGuid, FQuat> TreeGridRotations;
+	TArray<FVector2D> TreeTrunkLocations;
+	int32 UnevenTreeFootprints = 0;
+	int32 TreeRootsInsufficientlyEmbedded = 0;
+	for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
+		: Layout.FragmentSources)
+	{
+		if (Source.Name != TEXT("TreeTrunk") || !Source.bAggregateRoot)
+		{
+			continue;
+		}
+		// 2x2 树干旋转 45 度后，方形截面的世界轴外接范围为一格乘 sqrt(2)。
+		const float HalfFootprint = Source.Mask.CellSize * FMath::Sqrt(2.0f);
+		const FVector TrunkCenter = Source.Transform.GetLocation();
+		// aggregate root 是后侧深度切片；向局部 +Y 移半格才是 2x2
+		// 截面的几何中心，必须围绕这个点核对完整占地。
+		const FVector FootprintCenter = TrunkCenter
+			+ Source.Transform.GetUnitAxis(EAxis::Y)
+				* Source.Mask.CellSize * 0.5f;
+		TreeGridRotations.Add(
+			Source.AggregateId,
+			Source.Transform.GetRotation());
+		TreeTrunkLocations.Emplace(FootprintCenter.X, FootprintCenter.Y);
+		const int32 MinTerrainX = FMath::Clamp(
+			FMath::RoundToInt(
+				(FootprintCenter.X - HalfFootprint
+					- Layout.Terrain.FirstCellCenter.X)
+				/ Layout.Terrain.CellSize),
+			0,
+			Layout.Terrain.Width - 1);
+		const int32 MaxTerrainX = FMath::Clamp(
+			FMath::RoundToInt(
+				(FootprintCenter.X + HalfFootprint
+					- Layout.Terrain.FirstCellCenter.X)
+				/ Layout.Terrain.CellSize),
+			0,
+			Layout.Terrain.Width - 1);
+		const int32 MinTerrainY = FMath::Clamp(
+			FMath::RoundToInt(
+				(FootprintCenter.Y - HalfFootprint
+					- Layout.Terrain.FirstCellCenter.Y)
+				/ Layout.Terrain.CellSize),
+			0,
+			Layout.Terrain.Height - 1);
+		const int32 MaxTerrainY = FMath::Clamp(
+			FMath::RoundToInt(
+				(FootprintCenter.Y + HalfFootprint
+					- Layout.Terrain.FirstCellCenter.Y)
+				/ Layout.Terrain.CellSize),
+			0,
+			Layout.Terrain.Height - 1);
+		const float TerrainHeight = Layout.Terrain.HeightAt(
+			MinTerrainX, MinTerrainY);
+		bool bFlatFootprint = true;
+		for (int32 TerrainY = MinTerrainY;
+			TerrainY <= MaxTerrainY;
+			++TerrainY)
+		{
+			for (int32 TerrainX = MinTerrainX;
+				TerrainX <= MaxTerrainX;
+				++TerrainX)
+			{
+				bFlatFootprint &= FMath::IsNearlyEqual(
+					Layout.Terrain.HeightAt(TerrainX, TerrainY),
+					TerrainHeight);
+			}
+		}
+		UnevenTreeFootprints += bFlatFootprint ? 0 : 1;
+		const float TrunkBottom = TrunkCenter.Z
+			- static_cast<float>(Source.Mask.Height)
+				* Source.Mask.CellSize * 0.5f;
+		// 斜俯视会看见未埋入地面的方柱近角，底边因透视形成向内收的
+		// V 形。保留一个完整地下根体素，让平坦地形切过连续侧面，
+		// 而不是仅靠不足以覆盖阶梯误差的亚像素偏移。
+		TreeRootsInsufficientlyEmbedded +=
+			TerrainHeight - TrunkBottom
+				>= Source.Mask.CellSize - KINDA_SMALL_NUMBER
+				? 0 : 1;
+		for (int32 Y = 0; Y < Source.Mask.Height; ++Y)
+		{
+			for (int32 X = 0; X < Source.Mask.Width; ++X)
+			{
+				if (Source.Mask.SolidMask[Y * Source.Mask.Width + X] == 0)
+				{
+					continue;
+				}
+				const FVector LocalCenter(
+					(static_cast<float>(X) + 0.5f
+						- static_cast<float>(Source.Mask.Width) * 0.5f)
+						* Source.Mask.CellSize,
+					0.0f,
+					(static_cast<float>(Y) + 0.5f
+						- static_cast<float>(Source.Mask.Height) * 0.5f)
+						* Source.Mask.CellSize);
+				TreeGridAnchors.Add(
+					Source.AggregateId,
+					Source.Transform.TransformPosition(LocalCenter));
+				break;
+			}
+			if (TreeGridAnchors.Contains(Source.AggregateId))
+			{
+				break;
+			}
+		}
+	}
+	int32 NonRectangularWoodParts = 0;
+	TMap<FGuid, int32> NonRectangularLeafSlicesPerTree;
+	int32 NonBlockGeometryParts = 0;
+	int32 NonAxisAlignedParts = 0;
+	int32 InvalidBlockSilhouettes = 0;
+	int32 OversizedTrunkParts = 0;
+	int32 OverlongBranchParts = 0;
+	int32 OffGridTreeVoxelCells = 0;
+	float TreeCellSize = 0.0f;
+	for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
+		: Layout.FragmentSources)
+	{
+		const bool bTreePart = Source.Name == TEXT("TreeTrunk")
+			|| Source.Name == TEXT("TreeBranch")
+			|| Source.Name == TEXT("TreeLeaves");
+		if (!bTreePart)
+		{
+			continue;
+		}
+		PartsPerTree.FindOrAdd(Source.AggregateId)++;
+		if (Source.Name == TEXT("TreeTrunk"))
+		{
+			TrunkSlicesPerTree.FindOrAdd(Source.AggregateId)++;
+		}
+		if (const FVector* Anchor = TreeGridAnchors.Find(Source.AggregateId))
+		{
+			const FQuat AggregateRotation =
+				TreeGridRotations.FindRef(Source.AggregateId);
+			for (int32 Y = 0; Y < Source.Mask.Height; ++Y)
+			{
+				for (int32 X = 0; X < Source.Mask.Width; ++X)
+				{
+					if (Source.Mask.SolidMask[
+						Y * Source.Mask.Width + X] == 0)
+					{
+						continue;
+					}
+					const FVector LocalCenter(
+						(static_cast<float>(X) + 0.5f
+							- static_cast<float>(Source.Mask.Width) * 0.5f)
+							* Source.Mask.CellSize,
+						0.0f,
+						(static_cast<float>(Y) + 0.5f
+							- static_cast<float>(Source.Mask.Height) * 0.5f)
+							* Source.Mask.CellSize);
+					const FVector GridDelta =
+						AggregateRotation.UnrotateVector(
+							Source.Transform.TransformPosition(LocalCenter)
+								- *Anchor)
+						/ Source.Mask.CellSize;
+					const FVector Snapped(
+						FMath::RoundToFloat(GridDelta.X),
+						FMath::RoundToFloat(GridDelta.Y),
+						FMath::RoundToFloat(GridDelta.Z));
+					OffGridTreeVoxelCells += GridDelta.Equals(Snapped, 0.01f)
+						? 0 : 1;
+					if (Source.Name == TEXT("TreeLeaves"))
+					{
+						LeafCellsByTreeHeight.FindOrAdd(Source.AggregateId)
+							.FindOrAdd(FMath::RoundToInt(GridDelta.Z))++;
+					}
+				}
+			}
+		}
+		if (Source.Name == TEXT("TreeLeaves"))
+		{
+			LeafSlicesPerTree.FindOrAdd(Source.AggregateId)++;
+			if (const FVector* Anchor =
+				TreeGridAnchors.Find(Source.AggregateId))
+			{
+				const FVector RelativeLocation =
+					TreeGridRotations.FindRef(Source.AggregateId).UnrotateVector(
+						Source.Transform.GetLocation() - *Anchor);
+				LeafDepthsPerTree.FindOrAdd(Source.AggregateId).Add(
+					FMath::RoundToInt(
+						RelativeLocation.Y / Source.Mask.CellSize));
+			}
+			TestTrue(TEXT("Leaf geometry is one voxel slice, never a thick slab"),
+				FMath::IsNearlyEqual(
+					Source.Transform.GetScale3D().Y,
+					1.0f));
+		}
+		else if (Source.Name == TEXT("TreeTrunk"))
+		{
+			for (int32 Row = 0; Row < Source.Mask.Height; ++Row)
+			{
+				int32 SolidCellsInRow = 0;
+				for (int32 Column = 0; Column < Source.Mask.Width; ++Column)
+				{
+					SolidCellsInRow += Source.Mask.SolidMask[
+						Row * Source.Mask.Width + Column] != 0 ? 1 : 0;
+				}
+				OversizedTrunkParts += SolidCellsInRow != 2 ? 1 : 0;
+			}
+			OversizedTrunkParts += FMath::IsNearlyEqual(
+				Source.Transform.GetScale3D().Y, 1.0f) ? 0 : 1;
+		}
+		else if (Source.Name == TEXT("TreeBranch"))
+		{
+			int32 SolidBranchCells = 0;
+			for (const uint8 Cell : Source.Mask.SolidMask)
+			{
+				SolidBranchCells += Cell != 0 ? 1 : 0;
+			}
+			OverlongBranchParts += SolidBranchCells > 2 ? 1 : 0;
+		}
+		LeafColors.Add(Source.Name == TEXT("TreeLeaves")
+			? Source.Color.ToFColor(false).DWColor() : 0u);
+		const bool bRectangle = IsSolidRegionOneRectangle(Source.Mask);
+		if (Source.Name == TEXT("TreeLeaves"))
+		{
+			NonRectangularLeafSlicesPerTree.FindOrAdd(Source.AggregateId) +=
+				bRectangle ? 0 : 1;
+		}
+		else
+		{
+			NonRectangularWoodParts += bRectangle ? 0 : 1;
+		}
+		const EFragmentSourceGeometryStyle ExpectedGeometryStyle =
+			EFragmentSourceGeometryStyle::VoxelBlocks;
+		NonBlockGeometryParts += Source.Mask.GeometryStyle
+			== ExpectedGeometryStyle ? 0 : 1;
+		const FRotator Rotation = Source.Transform.Rotator();
+		const float RootYaw = TreeGridRotations.Contains(Source.AggregateId)
+			? TreeGridRotations.FindRef(Source.AggregateId).Rotator().Yaw
+			: Rotation.Yaw;
+		const float RelativeYaw = FMath::FindDeltaAngleDegrees(
+			RootYaw,
+			Rotation.Yaw);
+		const float SnappedYaw = FMath::GridSnap(RelativeYaw, 90.0f);
+		NonAxisAlignedParts +=
+			FMath::IsNearlyZero(Rotation.Pitch, 0.01f)
+			&& FMath::IsNearlyZero(Rotation.Roll, 0.01f)
+			&& FMath::IsNearlyEqual(RelativeYaw, SnappedYaw, 0.01f)
+				? 0 : 1;
+		TreeCellSize = TreeCellSize <= 0.0f
+			? Source.Mask.CellSize : TreeCellSize;
+		TestEqual(TEXT("Every tree part shares one voxel size for batching"),
+			Source.Mask.CellSize, TreeCellSize);
+
+		MatterFlux::FragmentGeometry::FFragmentGeometry2D Geometry;
+		if (MatterFlux::FragmentGeometry::BuildFragmentGeometryFromMask(
+			Source.Mask.SolidMask,
+			Source.Mask.Width,
+			Source.Mask.Height,
+			Source.Mask.CellSize,
+			Geometry))
+		{
+			bool bValidBlockSilhouettes = !Geometry.OuterContours.IsEmpty();
+			for (const FFragmentContour& Contour : Geometry.OuterContours)
+			{
+				bValidBlockSilhouettes &= Contour.Vertices.Num() >= 4;
+			}
+			InvalidBlockSilhouettes += bValidBlockSilhouettes ? 0 : 1;
+		}
+		else
+		{
+			++InvalidBlockSilhouettes;
+		}
+	}
+
+	TestTrue(TEXT("Reference forest contains deterministic tree aggregates"),
+		PartsPerTree.Num() >= 10);
+	TestEqual(TEXT("Trunks and branches remain rectangular voxel prisms"),
+		NonRectangularWoodParts, 0);
+	TestEqual(TEXT("Every tree part uses per-voxel cube geometry"),
+		NonBlockGeometryParts, 0);
+	TestEqual(TEXT("Trunks, branches, and leaf boxes stay grid aligned"),
+		NonAxisAlignedParts, 0);
+	TestEqual(TEXT("Every trunk slice is exactly two voxel columns wide"),
+		OversizedTrunkParts, 0);
+	TestEqual(TEXT("Branches remain buried inside the canopy core"),
+		OverlongBranchParts, 0);
+	TestEqual(TEXT("Every tree part occupies one shared integer voxel lattice"),
+		OffGridTreeVoxelCells, 0);
+	for (const TPair<FGuid, FQuat>& Pair : TreeGridRotations)
+	{
+		const FVector CameraFacingDirection(
+			-FMath::InvSqrt(2.0f),
+			FMath::InvSqrt(2.0f),
+			0.0f);
+		TestTrue(
+			TEXT("A square canopy face, not its near corner, faces the 2.5D camera"),
+			Pair.Value.GetAxisY().Equals(CameraFacingDirection, 0.01f));
+	}
+	TestEqual(TEXT("Every square trunk is placed on a flat terrain footprint"),
+		UnevenTreeFootprints, 0);
+	TestEqual(TEXT("Every tree root includes a complete underground voxel"),
+		TreeRootsInsufficientlyEmbedded, 0);
+	int32 OverlappingTreePairs = 0;
+	for (int32 Left = 0; Left < TreeTrunkLocations.Num(); ++Left)
+	{
+		for (int32 Right = Left + 1;
+			Right < TreeTrunkLocations.Num();
+			++Right)
+		{
+			OverlappingTreePairs += FVector2D::Distance(
+				TreeTrunkLocations[Left], TreeTrunkLocations[Right])
+				< 252.0f - KINDA_SMALL_NUMBER ? 1 : 0;
+		}
+	}
+	TestEqual(TEXT("Tree crowns never overlap into a false concave silhouette"),
+		OverlappingTreePairs, 0);
+	TestEqual(TEXT("Every merged tree part retains its block-grid silhouette"),
+		InvalidBlockSilhouettes, 0);
+	int32 InvalidLayeredCanopies = 0;
+	for (const TPair<FGuid, int32>& Pair : PartsPerTree)
+	{
+		TestEqual(TEXT("Each tree uses a fixed nine-source logic budget"),
+			Pair.Value, 9);
+		TestEqual(TEXT("Each trunk has two depth slices for a real 2x2 section"),
+			TrunkSlicesPerTree.FindRef(Pair.Key), 2);
+		TestEqual(TEXT("Each tree canopy is represented by five voxel slices"),
+			LeafSlicesPerTree.FindRef(Pair.Key), 5);
+		TestEqual(TEXT("Each tree canopy spans five distinct depth positions"),
+			LeafDepthsPerTree.FindRef(Pair.Key).Num(), 5);
+		TestTrue(TEXT("A canopy contains stepped non-rectangular voxel slices"),
+			NonRectangularLeafSlicesPerTree.FindRef(Pair.Key) >= 3);
+		TArray<int32> LeafHeights;
+		LeafCellsByTreeHeight.FindChecked(Pair.Key).GenerateKeyArray(LeafHeights);
+		LeafHeights.Sort();
+		const TMap<int32, int32>& CellsByHeight =
+			LeafCellsByTreeHeight.FindChecked(Pair.Key);
+		InvalidLayeredCanopies += LeafHeights.Num() != 5
+			|| CellsByHeight.FindRef(LeafHeights[0]) <= CellsByHeight.FindRef(LeafHeights[4])
+			|| CellsByHeight.FindRef(LeafHeights[1]) <= CellsByHeight.FindRef(LeafHeights[3])
+				? 1 : 0;
+	}
+	TestEqual(TEXT("Canopies step from a broad block base to a small top cross"),
+		InvalidLayeredCanopies, 0);
+	LeafColors.Remove(0u);
+	TestEqual(TEXT("Leaf shader variation keeps one batchable base color"),
+		LeafColors.Num(), 1);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxOpaqueVoxelLeafMaterialTest,
+	"MatterFlux.Playable.Tree.LeafMaterialUsesOpaqueVoxelFaces",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxOpaqueVoxelLeafMaterialTest::RunTest(const FString& Parameters)
+{
+	const UMaterial* LeafMaterial = LoadObject<UMaterial>(
+		nullptr,
+		TEXT("/Game/MatterFlux/Materials/M_VoxelLeaf.M_VoxelLeaf"));
+	if (!TestNotNull(TEXT("Voxel leaf material exists"), LeafMaterial))
+	{
+		return false;
+	}
+	TestEqual(TEXT("Leaf blocks use the opaque Minecraft fast-leaves path"),
+		LeafMaterial->GetBlendMode(), BLEND_Opaque);
+	TestFalse(TEXT("Closed leaf cubes do not render their back faces"),
+		LeafMaterial->IsTwoSided());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxVoxelWoodMaterialTest,
+	"MatterFlux.Playable.Tree.WoodMaterialUsesPerVoxelPixelTexture",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxVoxelWoodMaterialTest::RunTest(const FString& Parameters)
+{
+	const UMaterial* WoodMaterial = LoadObject<UMaterial>(
+		nullptr,
+		TEXT("/Game/MatterFlux/Materials/M_VoxelWood.M_VoxelWood"));
+	const UTexture2D* WoodTexture = LoadObject<UTexture2D>(
+		nullptr,
+		TEXT("/Game/MatterFlux/Materials/T_WoodPixels.T_WoodPixels"));
+	if (!TestNotNull(TEXT("Dedicated voxel wood material exists"), WoodMaterial)
+		|| !TestNotNull(TEXT("Per-voxel wood pixel texture exists"), WoodTexture))
+	{
+		return false;
+	}
+	TestEqual(TEXT("Wood cubes use an opaque material"),
+		WoodMaterial->GetBlendMode(), BLEND_Opaque);
+	TestFalse(TEXT("Closed wood cubes do not render their back faces"),
+		WoodMaterial->IsTwoSided());
+	TestEqual(TEXT("Wood pixels use nearest-neighbour filtering"),
+		WoodTexture->Filter, TF_Nearest);
+	const FIntPoint ImportedSize = WoodTexture->GetImportedSize();
+	TestEqual(TEXT("Each voxel repeats one 16x16 bark tile"),
+		ImportedSize.X, 16);
+	TestEqual(TEXT("Bark tile stays square"), ImportedSize.Y, 16);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxProceduralTerrainDisablesHardwareRayTracingTest,
+	"MatterFlux.Playable.ProceduralTerrainDisablesHardwareRayTracing",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxProceduralTerrainDisablesHardwareRayTracingTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	bool bRayTracingEnabled = true;
+	bool bRayTracingProxiesEnabled = true;
+	TestTrue(
+		TEXT("Renderer configuration contains r.RayTracing"),
+		GConfig->GetBool(
+			TEXT("/Script/Engine.RendererSettings"),
+			TEXT("r.RayTracing"),
+			bRayTracingEnabled,
+			GEngineIni));
+	TestTrue(
+		TEXT("Renderer configuration contains ray-tracing proxy setting"),
+		GConfig->GetBool(
+			TEXT("/Script/Engine.RendererSettings"),
+			TEXT("r.RayTracing.RayTracingProxies.ProjectEnabled"),
+			bRayTracingProxiesEnabled,
+			GEngineIni));
+	TestFalse(
+		TEXT("Runtime procedural terrain does not enter the unstable hardware ray-tracing path"),
+		bRayTracingEnabled);
+	TestFalse(
+		TEXT("Procedural mesh ray-tracing proxies remain disabled"),
+		bRayTracingProxiesEnabled);
+	return true;
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -450,9 +1009,45 @@ bool FMatterFluxPlayableCharacterDefaultsTest::RunTest(const FString& Parameters
 				->GetPathName().Contains(TEXT("/Cube.")));
 	TestFalse(TEXT("The character can explore both X and Y dimensions"),
 		Character->GetCharacterMovement()->bConstrainToPlane);
-	TestFalse(
-		TEXT("Character movement does not apply its extra high-force physics push to detached terrain"),
-		Character->GetCharacterMovement()->bEnablePhysicsInteraction);
+	const AMatterFluxCreatureActor* Creature =
+		GetDefault<AMatterFluxCreatureActor>();
+	const UCharacterMovementComponent* PlayerMovement =
+		Character->GetCharacterMovement();
+	const UCharacterMovementComponent* CreatureMovement = Creature
+		? Creature->GetCharacterMovement()
+		: nullptr;
+	TestNotNull(TEXT("Creature movement defaults exist"), CreatureMovement);
+	TestTrue(TEXT("Player contact can push simulated objects"),
+		PlayerMovement->bEnablePhysicsInteraction);
+	TestTrue(TEXT("Creature contact can push simulated objects"),
+		CreatureMovement && CreatureMovement->bEnablePhysicsInteraction);
+	TestTrue(TEXT("Character pushes scale with body mass instead of launching light debris"),
+		PlayerMovement->bPushForceScaledToMass
+			&& CreatureMovement
+			&& CreatureMovement->bPushForceScaledToMass);
+	TestTrue(TEXT("Initial contact push is deliberately bounded"),
+		PlayerMovement->InitialPushForceFactor <= 200.0f
+			&& CreatureMovement
+			&& CreatureMovement->InitialPushForceFactor <= 200.0f);
+	TestTrue(TEXT("Continuous contact push is deliberately bounded"),
+		PlayerMovement->PushForceFactor <= 2000.0f
+			&& CreatureMovement
+			&& CreatureMovement->PushForceFactor <= 2000.0f);
+	if (CreatureMovement)
+	{
+		TestEqual(TEXT("Player and creature use the same initial push"),
+			PlayerMovement->InitialPushForceFactor,
+			CreatureMovement->InitialPushForceFactor);
+		TestEqual(TEXT("Player and creature use the same continuous push"),
+			PlayerMovement->PushForceFactor,
+			CreatureMovement->PushForceFactor);
+		TestEqual(TEXT("Player and creature use the same touch push"),
+			PlayerMovement->TouchForceFactor,
+			CreatureMovement->TouchForceFactor);
+		TestEqual(TEXT("Player and creature use the same overlap repulsion"),
+			PlayerMovement->RepulsionForce,
+			CreatureMovement->RepulsionForce);
+	}
 	TestFalse(TEXT("The character does not inherit controller yaw"),
 		Character->bUseControllerRotationYaw);
 	TestTrue(TEXT("The camera uses a useful three-quarter distance"),
@@ -462,6 +1057,15 @@ bool FMatterFluxPlayableCharacterDefaultsTest::RunTest(const FString& Parameters
 		FMath::Abs(CameraRotation.Yaw) >= 35.0f && FMath::Abs(CameraRotation.Yaw) <= 55.0f);
 	TestTrue(TEXT("The 2.5D camera looks down onto the terrain"),
 		CameraRotation.Pitch <= -40.0f);
+	TestEqual(TEXT("The 2.5D camera keeps perspective projection while using a fixed diagonal view"),
+		static_cast<uint8>(Character->FollowCamera
+			? Character->FollowCamera->ProjectionMode.GetValue()
+			: ECameraProjectionMode::Orthographic),
+		static_cast<uint8>(ECameraProjectionMode::Perspective));
+	TestTrue(TEXT("The perspective camera keeps the restrained voxel-scene field of view"),
+		Character->FollowCamera
+		&& Character->FollowCamera->FieldOfView >= 42.0f
+		&& Character->FollowCamera->FieldOfView <= 52.0f);
 	TestTrue(TEXT("The 2.5D camera uses stable manual exposure"),
 		Character->FollowCamera
 		&& Character->FollowCamera->PostProcessSettings.bOverride_AutoExposureMethod
@@ -631,13 +1235,18 @@ bool FMatterFluxRandomLevelLayoutTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("The same seed produces every layer identically"), AreLayoutsEqual(A, B));
 	const MatterFlux::PlayableLevel::FLevelLayer* Soil = A.FindLayer(TEXT("Soil"));
 	const MatterFlux::PlayableLevel::FLevelLayer* Stream = A.FindLayer(TEXT("Stream"));
+	const MatterFlux::PlayableLevel::FLevelLayer* Lake = A.FindLayer(TEXT("Lake"));
 	const MatterFlux::PlayableLevel::FLevelLayer* Backdrop =
 		A.FindLayer(TEXT("Backdrop"));
+	const MatterFlux::PlayableLevel::FLevelLayer* HorizonFloor =
+		A.FindLayer(TEXT("HorizonFloor"));
 	if (!TestNotNull(TEXT("Layout has a soil layer"), Soil)
 		|| !TestTrue(TEXT("Layout has a fine terrain heightfield"),
 			A.Terrain.IsValid())
 		|| !TestNotNull(TEXT("Layout has a stream layer"), Stream)
-		|| !TestNotNull(TEXT("Layout has a visual backdrop"), Backdrop))
+		|| !TestNotNull(TEXT("Layout has a large lake layer"), Lake)
+		|| !TestNotNull(TEXT("Layout has a visual backdrop"), Backdrop)
+		|| !TestNotNull(TEXT("Layout has a far horizon floor"), HorizonFloor))
 	{
 		return false;
 	}
@@ -677,18 +1286,133 @@ bool FMatterFluxRandomLevelLayoutTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Only structural terrain layers enable collision"),
 		Soil->bEnableCollision
 		&& !Stream->bEnableCollision
-		&& !Backdrop->bEnableCollision);
-	TestTrue(TEXT("The visual backdrop extends beyond both playable dimensions"),
-		Backdrop->Instances.Num() == 1
-		&& Backdrop->Instances[0].GetScale3D().X
-			> Soil->Instances[0].GetScale3D().X
-		&& Backdrop->Instances[0].GetScale3D().Y
-			> Soil->Instances[0].GetScale3D().Y
-		&& Backdrop->Instances[0].GetLocation().Z
+		&& !Backdrop->bEnableCollision
+		&& !HorizonFloor->bEnableCollision);
+	TestEqual(TEXT("The finite soil collider cannot expose a rendered world edge"),
+		Soil->RenderMode,
+		MatterFlux::PlayableLevel::ELevelLayerRenderMode::CollisionOnly);
+	TestTrue(TEXT("The visual backdrop is a bounded set of cheap coarse proxies"),
+		Backdrop->Primitive
+			== MatterFlux::PlayableLevel::ELayerPrimitive::Cube
+		&& Backdrop->Instances.Num() >= 64
+		&& Backdrop->Instances.Num() <= 1024);
+	FBox BackdropBounds(ForceInit);
+	TSet<int32> BackdropTopCentimeters;
+	float MaximumBackdropIntrusion = -TNumericLimits<float>::Max();
+	for (const FTransform& Instance : Backdrop->Instances)
+	{
+		const FVector Extent = Instance.GetScale3D() * 50.0f;
+		BackdropBounds += FBox(
+			Instance.GetLocation() - Extent,
+			Instance.GetLocation() + Extent);
+		BackdropTopCentimeters.Add(FMath::RoundToInt(
+			Instance.GetLocation().Z + Extent.Z));
+		const float BackdropTop = Instance.GetLocation().Z + Extent.Z;
+		const int64 FirstWorldCellX = FMath::FloorToInt64(
+			A.Terrain.FirstCellCenter.X / A.Terrain.CellSize);
+		const int64 FirstWorldCellY = FMath::FloorToInt64(
+			A.Terrain.FirstCellCenter.Y / A.Terrain.CellSize);
+		const int64 MinimumWorldCellX = FirstWorldCellX
+			+ FMath::FloorToInt64(
+				(Instance.GetLocation().X - Extent.X
+					- A.Terrain.FirstCellCenter.X)
+				/ A.Terrain.CellSize);
+		const int64 MaximumWorldCellX = FirstWorldCellX
+			+ FMath::CeilToInt64(
+				(Instance.GetLocation().X + Extent.X
+					- A.Terrain.FirstCellCenter.X)
+				/ A.Terrain.CellSize);
+		const int64 MinimumWorldCellY = FirstWorldCellY
+			+ FMath::FloorToInt64(
+				(Instance.GetLocation().Y - Extent.Y
+					- A.Terrain.FirstCellCenter.Y)
+				/ A.Terrain.CellSize);
+		const int64 MaximumWorldCellY = FirstWorldCellY
+			+ FMath::CeilToInt64(
+				(Instance.GetLocation().Y + Extent.Y
+					- A.Terrain.FirstCellCenter.Y)
+				/ A.Terrain.CellSize);
+		for (int64 WorldCellY = MinimumWorldCellY;
+			WorldCellY <= MaximumWorldCellY;
+			++WorldCellY)
+		{
+			for (int64 WorldCellX = MinimumWorldCellX;
+				WorldCellX <= MaximumWorldCellX;
+				++WorldCellX)
+			{
+				float TerrainHeight = 0.0f;
+				uint8 ColorBand = 0;
+				if (A.Terrain.TrySampleWorldCell(
+					WorldCellX,
+					WorldCellY,
+					TerrainHeight,
+					ColorBand))
+				{
+					MaximumBackdropIntrusion = FMath::Max(
+						MaximumBackdropIntrusion,
+						BackdropTop - TerrainHeight);
+				}
+			}
+		}
+	}
+	TestTrue(TEXT("The proxy background extends beyond the cached terrain"),
+		BackdropBounds.GetSize().X
+			> Soil->Instances[0].GetScale3D().X * 100.0f
+		&& BackdropBounds.GetSize().Y
+			> Soil->Instances[0].GetScale3D().Y * 100.0f);
+	TestTrue(TEXT("The proxy horizon has deterministic rolling variation"),
+		BackdropTopCentimeters.Num() >= 8);
+	TestTrue(
+		TEXT("The coarse backdrop stays below every streamed terrain cell in its footprint"),
+		MaximumBackdropIntrusion <= -8.0f);
+	TestTrue(TEXT("A single non-colliding floor hides the remote proxy edge"),
+		HorizonFloor->Instances.Num() == 1
+		&& HorizonFloor->Instances[0].GetScale3D().X >= 400.0f
+		&& HorizonFloor->Instances[0].GetScale3D().Y >= 400.0f
+		&& HorizonFloor->Instances[0].GetLocation().Z
 			< Soil->Instances[0].GetLocation().Z);
 	TestTrue(TEXT("Stream retains hard-face voxel lighting"),
 		Stream->RenderMode
-			== MatterFlux::PlayableLevel::ELevelLayerRenderMode::VoxelLit);
+			== MatterFlux::PlayableLevel::ELevelLayerRenderMode::Liquid);
+	TestEqual(TEXT("The lake resolves its visual properties from Lua water"),
+		Lake->MaterialId, FName(TEXT("water")));
+	TestTrue(TEXT("The lake uses the dedicated liquid rendering path"),
+		Lake->RenderMode
+			== MatterFlux::PlayableLevel::ELevelLayerRenderMode::Liquid);
+	FBox2D LakeBounds(ForceInit);
+	int32 ShallowLakeCellCount = 0;
+	int32 DeepLakeCellCount = 0;
+	for (const FTransform& Instance : Lake->Instances)
+	{
+		const FVector Location = Instance.GetLocation();
+		LakeBounds += FVector2D(Location);
+		const int32 TerrainX = FMath::Clamp(
+			FMath::RoundToInt(
+				(Location.X - A.Terrain.FirstCellCenter.X)
+					/ A.Terrain.CellSize),
+			0,
+			A.Terrain.Width - 1);
+		const int32 TerrainY = FMath::Clamp(
+			FMath::RoundToInt(
+				(Location.Y - A.Terrain.FirstCellCenter.Y)
+					/ A.Terrain.CellSize),
+			0,
+			A.Terrain.Height - 1);
+		const float WaterSurface = Location.Z
+			+ Instance.GetScale3D().Z * 50.0f;
+		const float Depth = WaterSurface
+			- A.Terrain.HeightAt(TerrainX, TerrainY);
+		ShallowLakeCellCount += Depth <= 32.0f ? 1 : 0;
+		DeepLakeCellCount += Depth >= 100.0f ? 1 : 0;
+	}
+	TestTrue(TEXT("The lake is visibly larger than the narrow stream"),
+		Lake->Instances.Num() >= 1200
+		&& LakeBounds.GetSize().X >= 320.0f
+		&& LakeBounds.GetSize().Y >= 220.0f);
+	TestTrue(TEXT("The lake exposes shallow edges for transparency comparison"),
+		ShallowLakeCellCount >= 64);
+	TestTrue(TEXT("The lake exposes a deep center for opacity comparison"),
+		DeepLakeCellCount >= 64);
 	TestEqual(TEXT("The level is a complete 2D terrain grid"),
 		A.Terrain.Heights.Num(),
 		MatterFlux::PlayableLevel::TerrainCellsX
@@ -720,11 +1444,16 @@ bool FMatterFluxRandomLevelLayoutTest::RunTest(const FString& Parameters)
 	TMap<FName, int32> FragmentSourceCounts;
 	TMap<FGuid, int32> TreeAggregateMemberCounts;
 	TMap<FGuid, int32> TreeAggregateRootCounts;
+	TSet<uint32> LeafPaletteColors;
 	int32 CollisionEnabledFragmentSourceCount = 0;
 	for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
 		: A.FragmentSources)
 	{
 		FragmentSourceCounts.FindOrAdd(Source.Name)++;
+		if (Source.Name == TEXT("TreeLeaves"))
+		{
+			LeafPaletteColors.Add(Source.Color.ToFColor(false).DWColor());
+		}
 		CollisionEnabledFragmentSourceCount += Source.bEnableCollision ? 1 : 0;
 		TestEqual(
 			TEXT("Only tree trunks opt into decoration collision"),
@@ -777,9 +1506,8 @@ bool FMatterFluxRandomLevelLayoutTest::RunTest(const FString& Parameters)
 		}
 		const bool bTreeSource =
 			Source.Name == TEXT("TreeTrunk")
-			|| Source.Name == TEXT("TreeCanopyBack")
-			|| Source.Name == TEXT("TreeCanopy")
-			|| Source.Name == TEXT("TreeCanopyFront");
+			|| Source.Name == TEXT("TreeBranch")
+			|| Source.Name == TEXT("TreeLeaves");
 		TestEqual(
 			TEXT("Only tree parts declare aggregate membership"),
 			Source.AggregateId.IsValid(),
@@ -789,10 +1517,12 @@ bool FMatterFluxRandomLevelLayoutTest::RunTest(const FString& Parameters)
 			TreeAggregateMemberCounts.FindOrAdd(Source.AggregateId)++;
 			TreeAggregateRootCounts.FindOrAdd(Source.AggregateId) +=
 				Source.bAggregateRoot ? 1 : 0;
+			TestTrue(TEXT("The aggregate root is always a trunk slice"),
+				!Source.bAggregateRoot || Source.Name == TEXT("TreeTrunk"));
 			TestEqual(
-				TEXT("Only the trunk is an aggregate root"),
-				Source.bAggregateRoot,
-				Source.Name == TEXT("TreeTrunk"));
+				TEXT("Every tree part uses per-cell voxel-block geometry"),
+				Source.Mask.GeometryStyle,
+				EFragmentSourceGeometryStyle::VoxelBlocks);
 		}
 		TestTrue(TEXT("Every decoration mask contains solid cells"),
 			Source.Mask.SolidMask.Contains(1));
@@ -832,25 +1562,26 @@ bool FMatterFluxRandomLevelLayoutTest::RunTest(const FString& Parameters)
 					&& AcrossCamera < 260.0f);
 		}
 	}
-	const int32 TreeCount = FragmentSourceCounts.FindRef(TEXT("TreeTrunk"));
-	TestEqual(TEXT("Every tree contributes exactly one collidable source"),
+	const int32 TreeCount = TreeAggregateRootCounts.Num();
+	TestEqual(TEXT("Every 2x2 tree contributes two collidable trunk slices"),
 		CollisionEnabledFragmentSourceCount,
-		TreeCount);
-	TestTrue(TEXT("Tree trunks and layered tree canopies are MatterFlux mask sources"),
+		TreeCount * 2);
+	TestTrue(TEXT("Tree trunks, branches, and leaf clusters are MatterFlux mask sources"),
 		TreeCount >= 10
-		&& FragmentSourceCounts.FindRef(TEXT("TreeCanopyBack")) == TreeCount
-		&& FragmentSourceCounts.FindRef(TEXT("TreeCanopy")) == TreeCount
-		&& FragmentSourceCounts.FindRef(TEXT("TreeCanopyFront")) == TreeCount);
+		&& FragmentSourceCounts.FindRef(TEXT("TreeBranch")) >= TreeCount * 2
+		&& FragmentSourceCounts.FindRef(TEXT("TreeLeaves"))
+			>= FragmentSourceCounts.FindRef(TEXT("TreeBranch")));
+	TestTrue(
+		TEXT("Leaf color variation remains batchable for the procedural proxy"),
+		LeafPaletteColors.Num() == 1);
 	TestEqual(
 		TEXT("Every generated tree has one deterministic aggregate"),
 		TreeAggregateMemberCounts.Num(),
 		TreeCount);
 	for (const TPair<FGuid, int32>& Pair : TreeAggregateMemberCounts)
 	{
-		TestEqual(
-			TEXT("Tree aggregate contains trunk and three canopy layers"),
-			Pair.Value,
-			4);
+		TestTrue(TEXT("Tree aggregate contains a trunk, branches, and leaves"),
+			Pair.Value >= 7);
 		TestEqual(
 			TEXT("Tree aggregate contains exactly one root"),
 			TreeAggregateRootCounts.FindRef(Pair.Key),
@@ -869,52 +1600,44 @@ bool FMatterFluxRandomLevelLayoutTest::RunTest(const FString& Parameters)
 		A.FragmentSources.FindByPredicate(
 			[](const MatterFlux::PlayableLevel::FLevelFragmentSource& Source)
 			{
-				return Source.Name == TEXT("TreeTrunk");
+				return Source.Name == TEXT("TreeTrunk")
+					&& Source.bAggregateRoot;
 			});
-	const MatterFlux::PlayableLevel::FLevelFragmentSource* Canopy =
+	const MatterFlux::PlayableLevel::FLevelFragmentSource* Leaves =
 		A.FragmentSources.FindByPredicate(
 			[](const MatterFlux::PlayableLevel::FLevelFragmentSource& Source)
 			{
-				return Source.Name == TEXT("TreeCanopy");
+				return Source.Name == TEXT("TreeLeaves");
 			});
-	const MatterFlux::PlayableLevel::FLevelFragmentSource* CanopyBack =
+	const MatterFlux::PlayableLevel::FLevelFragmentSource* Branch =
 		A.FragmentSources.FindByPredicate(
 			[](const MatterFlux::PlayableLevel::FLevelFragmentSource& Source)
 			{
-				return Source.Name == TEXT("TreeCanopyBack");
-			});
-	const MatterFlux::PlayableLevel::FLevelFragmentSource* CanopyFront =
-		A.FragmentSources.FindByPredicate(
-			[](const MatterFlux::PlayableLevel::FLevelFragmentSource& Source)
-			{
-				return Source.Name == TEXT("TreeCanopyFront");
+				return Source.Name == TEXT("TreeBranch");
 			});
 	TestTrue(TEXT("Tree trunk material remains visibly brown"),
 		Trunk && Trunk->Color.R >= 0.30f
 		&& Trunk->Color.R >= Trunk->Color.G * 1.8f
 		&& Trunk->Color.G >= Trunk->Color.B * 2.5f);
-	TestTrue(TEXT("Tree canopy material remains visibly green"),
-		Canopy && Canopy->Color.G >= 0.35f
-		&& Canopy->Color.G >= Canopy->Color.R * 3.0f
-		&& Canopy->Color.G >= Canopy->Color.B * 3.0f);
-	if (Trunk && CanopyBack && Canopy && CanopyFront)
+	TestTrue(TEXT("Tree leaf material remains visibly green"),
+		Leaves && Leaves->Color.G >= 0.35f
+		&& Leaves->Color.G >= Leaves->Color.R * 3.0f
+		&& Leaves->Color.G >= Leaves->Color.B * 3.0f);
+	if (Trunk && Branch && Leaves)
 	{
-		const float BackDepth = Trunk->Transform.InverseTransformPosition(
-			CanopyBack->Transform.GetLocation()).Y;
-		const float MainDepth = Trunk->Transform.InverseTransformPosition(
-			Canopy->Transform.GetLocation()).Y;
-		const float FrontDepth = Trunk->Transform.InverseTransformPosition(
-			CanopyFront->Transform.GetLocation()).Y;
-		TestTrue(TEXT("Tree layers have distinct depths and cannot Z-fight"),
-			BackDepth > 2.0f
-			&& MainDepth > BackDepth + 2.0f
-			&& FrontDepth > MainDepth + 2.0f);
-		TestTrue(TEXT("Tree crown uses nested voxel silhouettes"),
-			CanopyBack->Mask.Width > Canopy->Mask.Width
-			&& Canopy->Mask.Width > CanopyFront->Mask.Width);
-		TestTrue(TEXT("Tree crown depth layers use separate green shades"),
-			CanopyBack->Color != Canopy->Color
-			&& Canopy->Color != CanopyFront->Color);
+		const FRotator BranchRotation = Branch->Transform.Rotator();
+		const float RelativeBranchYaw = FMath::FindDeltaAngleDegrees(
+			Trunk->Transform.Rotator().Yaw,
+			BranchRotation.Yaw);
+		TestTrue(TEXT("Branches stay on the Minecraft-style world grid"),
+			FMath::IsNearlyZero(BranchRotation.Pitch, 0.01f)
+			&& FMath::IsNearlyZero(BranchRotation.Roll, 0.01f)
+			&& FMath::IsNearlyEqual(
+				RelativeBranchYaw,
+				FMath::GridSnap(RelativeBranchYaw, 90.0f),
+				0.01f));
+		TestTrue(TEXT("Each leaf slice is one voxel deep; aggregate slices form volume"),
+			FMath::IsNearlyEqual(Leaves->Transform.GetScale3D().Y, 1.0f));
 	}
 
 	FBox2D TerrainBounds(ForceInit);
@@ -1001,14 +1724,68 @@ bool FMatterFluxVoxelDecorationWorldTest::RunTest(const FString& Parameters)
 	TArray<UProceduralMeshComponent*> TerrainComponents;
 	WorldActor->GetComponents(TerrainComponents);
 	int32 VisibleTerrainComponentCount = 0;
+	int32 ContinuousLiquidSurfaceCount = 0;
 	bool bFoundBatchedSourceCollision = false;
-	for (const UProceduralMeshComponent* Component
+	for (UProceduralMeshComponent* Component
 		: TerrainComponents)
 	{
 		if (Component
 			&& Component->IsVisible()
 			&& Component->GetNumSections() > 0)
 		{
+			if (Component->ComponentHasTag(TEXT("MatterFluxLiquidSurface")))
+			{
+				++ContinuousLiquidSurfaceCount;
+				UMaterialInstanceDynamic* LiquidMaterial =
+					Cast<UMaterialInstanceDynamic>(Component->GetMaterial(0));
+				if (TestNotNull(
+					TEXT("Liquid surface uses a runtime material instance"),
+					LiquidMaterial))
+				{
+					const float ShallowOpacity =
+						LiquidMaterial->K2_GetScalarParameterValue(
+							TEXT("ShallowOpacity"));
+					const float DeepOpacity =
+						LiquidMaterial->K2_GetScalarParameterValue(
+							TEXT("DeepOpacity"));
+					TestTrue(
+						TEXT("Projected liquid surface does not reveal stepped terrain as false depth rings"),
+						FMath::IsNearlyEqual(
+							ShallowOpacity,
+							DeepOpacity));
+					TestEqual(
+						TEXT("Voxel liquid rendering uses neutral refraction without screen-space ghost copies"),
+						LiquidMaterial->K2_GetScalarParameterValue(
+							TEXT("RefractionIndex")),
+						1.0f);
+				}
+				TestEqual(
+					TEXT("Merged liquid surfaces never create blocking collision"),
+					Component->GetCollisionEnabled(),
+					ECollisionEnabled::NoCollision);
+				TestEqual(
+					TEXT("Each liquid layer renders in one continuous mesh section"),
+					Component->GetNumSections(),
+					1);
+				const FProcMeshSection* LiquidSection =
+					Component->GetProcMeshSection(0);
+				if (TestTrue(
+					TEXT("Liquid surface has indexed top geometry"),
+					LiquidSection
+						&& LiquidSection->ProcIndexBuffer.Num() >= 3))
+				{
+					const FVector A = LiquidSection->ProcVertexBuffer[
+						LiquidSection->ProcIndexBuffer[0]].Position;
+					const FVector B = LiquidSection->ProcVertexBuffer[
+						LiquidSection->ProcIndexBuffer[1]].Position;
+					const FVector C = LiquidSection->ProcVertexBuffer[
+						LiquidSection->ProcIndexBuffer[2]].Position;
+					TestTrue(
+						TEXT("Liquid triangles use UE's upward-facing winding"),
+						FVector::CrossProduct(B - A, C - A).Z < 0.0f);
+				}
+				continue;
+			}
 			if (Component->ComponentHasTag(
 				TEXT("MatterFluxFragmentSourceProxy")))
 			{
@@ -1038,6 +1815,13 @@ bool FMatterFluxVoxelDecorationWorldTest::RunTest(const FString& Parameters)
 	TestTrue(
 		TEXT("The world exposes visible merged terrain chunks"),
 		VisibleTerrainComponentCount > 0);
+	TestTrue(
+		TEXT("Active liquid materials expose canonical continuous surfaces"),
+		ContinuousLiquidSurfaceCount > 0);
+	TestEqual(
+		TEXT("World diagnostics count canonical liquid-material projections"),
+		WorldActor->GetGeneratedLiquidLayerCount(),
+		ContinuousLiquidSurfaceCount);
 	const int32 TerrainWindowDiameter =
 		WorldActor->GetTerrainStreamingChunkRadius() * 2 + 1;
 	const int32 SingleTerrainWindowChunks =
@@ -1069,17 +1853,22 @@ bool FMatterFluxVoxelDecorationWorldTest::RunTest(const FString& Parameters)
 		WorldActor->GetSimulatedMaterialCount(TEXT("steam")) > 0);
 	TestTrue(TEXT("Playable world seeds a reactive lava pool"),
 		WorldActor->GetSimulatedMaterialCount(TEXT("lava")) > 0);
+	TestTrue(TEXT("Playable world seeds the Lua-configured acid liquid"),
+		WorldActor->GetSimulatedMaterialCount(TEXT("acid")) > 0);
 	TestTrue(TEXT("Each active material has a voxel visualization layer"),
-		WorldActor->GetGeneratedMaterialLayerCount() >= 5);
+		WorldActor->GetGeneratedMaterialLayerCount() >= 6);
 	WorldActor->Tick(0.25f);
 	TestTrue(TEXT("Authority advances material simulation at a fixed step"),
 		WorldActor->GetMaterialSimulationStep() > 0);
+	TestTrue(TEXT("Seeded acid corrosion produces simulated gas"),
+		WorldActor->GetSimulatedMaterialCount(TEXT("acid_gas")) > 0);
 
 	const MatterFlux::PlayableLevel::FLevelFragmentSource* TrunkLayout =
 		Layout.FragmentSources.FindByPredicate(
 			[](const MatterFlux::PlayableLevel::FLevelFragmentSource& Source)
 			{
-				return Source.Name == TEXT("TreeTrunk");
+				return Source.Name == TEXT("TreeTrunk")
+					&& Source.bAggregateRoot;
 			});
 	if (!TestNotNull(
 		TEXT("The reference layout contains an interactive trunk"),
@@ -1163,7 +1952,8 @@ bool FMatterFluxVoxelDecorationWorldTest::RunTest(const FString& Parameters)
 			2);
 		if (!DamageTarget
 			&& SourceLayout
-			&& SourceLayout->Name == TEXT("TreeTrunk"))
+			&& SourceLayout->Name == TEXT("TreeTrunk")
+			&& SourceLayout->bAggregateRoot)
 		{
 			DamageTarget = *It;
 		}
@@ -1229,6 +2019,50 @@ bool FMatterFluxVoxelDecorationWorldTest::RunTest(const FString& Parameters)
 			* static_cast<float>(DamageTarget->GetMaskWidth() + 2);
 	Event.DamageShape.Thickness =
 		DamageTarget->GetCellSize() * 1.25f;
+	int32 ExpectedDetachedTreeCells = 0;
+	for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
+		: Layout.FragmentSources)
+	{
+		if (Source.AggregateId != TrunkLayout->AggregateId)
+		{
+			continue;
+		}
+		TArray<uint8> CandidateMask = Source.Mask.SolidMask;
+		FFragmentDamageShape LocalShape = Event.DamageShape;
+		LocalShape.WorldTransform = Event.DamageShape.WorldTransform
+			.GetRelativeTransform(Source.Transform);
+		MatterFlux::FragmentGeometry::ApplyDamageShape(
+			CandidateMask,
+			Source.Mask.Width,
+			Source.Mask.Height,
+			Source.Mask.CellSize,
+			LocalShape);
+		TArray<uint8> AnchorMask;
+		MatterFlux::FragmentGeometry::FFragmentSupportResult Support;
+		if (!TestTrue(
+			TEXT("Every tree layer can classify the same world-space cut"),
+			MatterFlux::FragmentGeometry::BuildSupportAnchorMask(
+				Source.Mask.SolidMask,
+				Source.Mask.Width,
+				Source.Mask.Height,
+				Source.Mask.SupportMode,
+				AnchorMask)
+			&& MatterFlux::FragmentGeometry::ClassifyMaskBySupport(
+				CandidateMask,
+				AnchorMask,
+				Source.Mask.Width,
+				Source.Mask.Height,
+				Source.Mask.SupportMode,
+				Support)))
+		{
+			return false;
+		}
+		for (const MatterFlux::FragmentGeometry::FFragmentComponent& Component
+			: Support.DetachedComponents)
+		{
+			ExpectedDetachedTreeCells += Component.Cells.Num();
+		}
+	}
 	UFragmentSimulationSubsystem* Subsystem =
 		World->GetSubsystem<UFragmentSimulationSubsystem>();
 	if (!TestNotNull(TEXT("Fragment subsystem exists"), Subsystem)
@@ -1252,16 +2086,28 @@ bool FMatterFluxVoxelDecorationWorldTest::RunTest(const FString& Parameters)
 		TEXT("Separating decoration cut advances revision"),
 		DamagedRevision,
 		1);
-	bool bDamagedSourceActorRemains = false;
+	AFragment2DSourceActor* ImmediateStumpProjection = nullptr;
 	for (TActorIterator<AFragment2DSourceActor> It(World); It; ++It)
 	{
-		bDamagedSourceActorRemains |=
-			It->SourceId == DamagedSourceId
-			&& !It->IsActorBeingDestroyed();
+		if (It->SourceId == DamagedSourceId
+			&& !It->IsActorBeingDestroyed())
+		{
+			ImmediateStumpProjection = *It;
+			break;
+		}
 	}
-	TestFalse(
-		TEXT("A supported static stump does not remain a per-object Actor"),
-		bDamagedSourceActorRemains);
+	if (TestNotNull(
+		TEXT("The committed stump is visible immediately during separation grace"),
+		ImmediateStumpProjection))
+	{
+		TestTrue(
+			TEXT("Immediate stump projection is visible and collision-suppressed"),
+			!ImmediateStumpProjection->IsHidden()
+				&& ImmediateStumpProjection->MeshComponent->IsVisible()
+				&& ImmediateStumpProjection
+					->IsAggregateSeparationCollisionSuppressed()
+				&& !ImmediateStumpProjection->GetActorEnableCollision());
+	}
 
 	int32 MatchingFragments = 0;
 	AFragment2DActor* TreeCarrier = nullptr;
@@ -1279,10 +2125,69 @@ bool FMatterFluxVoxelDecorationWorldTest::RunTest(const FString& Parameters)
 		TEXT("Felled generated tree has one physical carrier"),
 		TreeCarrier))
 	{
+		TestTrue(
+			TEXT("Detached trunk keeps a tall voxel mask instead of transposing width and height"),
+			TreeCarrier->SpawnPayload.DetachedVoxelMask.IsValid()
+				&& TreeCarrier->SpawnPayload.DetachedVoxelMask.Height
+					> TreeCarrier->SpawnPayload.DetachedVoxelMask.Width);
+		float MinimumVertexZ = TNumericLimits<float>::Max();
+		for (int32 SectionIndex = 0;
+			SectionIndex < TreeCarrier->MeshComponent->GetNumSections();
+			++SectionIndex)
+		{
+			if (const FProcMeshSection* Section =
+				TreeCarrier->MeshComponent->GetProcMeshSection(SectionIndex))
+			{
+				for (const FProcMeshVertex& Vertex : Section->ProcVertexBuffer)
+				{
+					MinimumVertexZ = FMath::Min(
+						MinimumVertexZ,
+						static_cast<float>(Vertex.Position.Z));
+				}
+			}
+		}
+		int32 HorizontalCutFaceVertices = 0;
+		for (int32 SectionIndex = 0;
+			SectionIndex < TreeCarrier->MeshComponent->GetNumSections();
+			++SectionIndex)
+		{
+			if (const FProcMeshSection* Section =
+				TreeCarrier->MeshComponent->GetProcMeshSection(SectionIndex))
+			{
+				for (const FProcMeshVertex& Vertex : Section->ProcVertexBuffer)
+				{
+					HorizontalCutFaceVertices +=
+						FMath::IsNearlyEqual(
+							static_cast<float>(Vertex.Position.Z),
+							MinimumVertexZ,
+							0.1f)
+						&& FVector::DotProduct(
+							TreeCarrier->GetActorTransform()
+								.TransformVectorNoScale(Vertex.Normal)
+								.GetSafeNormal(),
+							-FVector::UpVector) > 0.99f
+							? 1
+							: 0;
+				}
+			}
+		}
+		TestTrue(
+			TEXT("Horizontal felling cut produces a downward-facing horizontal cut surface on the rigid projection"),
+			HorizontalCutFaceVertices >= 4);
+		int32 ExpectedCarriedTreeParts = 0;
+		for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
+			: Layout.FragmentSources)
+		{
+			ExpectedCarriedTreeParts +=
+				Source.AggregateId == TrunkLayout->AggregateId
+				&& !Source.bAggregateRoot
+					? 1
+					: 0;
+		}
 		TestEqual(
-			TEXT("All three generated canopy layers become logical carrier members"),
+			TEXT("Every generated branch and leaf cluster becomes a logical carrier member"),
 			TreeCarrier->GetAggregateMemberCount(),
-			3);
+			ExpectedCarriedTreeParts);
 		for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
 			: Layout.FragmentSources)
 		{
@@ -1290,14 +2195,47 @@ bool FMatterFluxVoxelDecorationWorldTest::RunTest(const FString& Parameters)
 				&& !Source.bAggregateRoot)
 			{
 				TestTrue(
-					TEXT("Every canopy SourceId remains independently addressable"),
-					TreeCarrier->ContainsAggregateSource(Source.SourceId));
+					TEXT("Every tree part remains addressable either as a whole source or a cut layer"),
+					TreeCarrier->AggregateSources.ContainsByPredicate(
+						[&Source](
+							const FFragmentAggregateSourceState& Member)
+						{
+							return Member.SourceId == Source.SourceId
+								|| Member.DefinitionSourceId == Source.SourceId;
+						}));
 			}
 		}
+		const bool bCarriesWood =
+			TreeCarrier->SpawnPayload.MaterialId == TEXT("wood")
+			|| TreeCarrier->AggregateSources.ContainsByPredicate(
+				[](const FFragmentAggregateSourceState& Member)
+				{
+					return Member.MaterialId == TEXT("wood")
+						&& Member.SourceMask.SolidMask.Contains(1);
+				});
+		const bool bCarriesLeaves =
+			TreeCarrier->SpawnPayload.MaterialId == TEXT("leaf")
+			|| TreeCarrier->AggregateSources.ContainsByPredicate(
+				[](const FFragmentAggregateSourceState& Member)
+				{
+					return Member.MaterialId == TEXT("leaf")
+						&& Member.SourceMask.SolidMask.Contains(1);
+				});
 		TestTrue(
-			TEXT("Carrier mesh keeps trunk and canopy material sections"),
-			TreeCarrier->MeshComponent->GetNumSections() > 2);
+			TEXT("Carrier retains detached wood material cells"),
+			bCarriesWood);
+		TestTrue(
+			TEXT("Carrier retains detached leaf material cells"),
+			bCarriesLeaves);
+		TestTrue(
+			TEXT("Carrier mesh emits visible wood and leaf sections after batching"),
+			TreeCarrier->MeshComponent->GetNumSections() >= 2);
 		int32 CarriedSolidCells = 0;
+		for (const uint8 Cell
+			: TreeCarrier->SpawnPayload.DetachedVoxelMask.SolidMask)
+		{
+			CarriedSolidCells += Cell != 0 ? 1 : 0;
+		}
 		for (const FFragmentAggregateSourceState& Member
 			: TreeCarrier->AggregateSources)
 		{
@@ -1306,25 +2244,61 @@ bool FMatterFluxVoxelDecorationWorldTest::RunTest(const FString& Parameters)
 				CarriedSolidCells += Cell != 0 ? 1 : 0;
 			}
 		}
+		TestEqual(
+			TEXT("A felled tree contains exactly the cells detached by the cut, without reattaching intact lower layers"),
+			CarriedSolidCells,
+			ExpectedDetachedTreeCells);
 		TestTrue(
-			TEXT("Carrier physics mass includes its visual canopy members"),
+			TEXT("Carrier physics mass includes its visual branch and leaf members"),
 			TreeCarrier->SpawnPayload.Mass
-				> static_cast<float>(CarriedSolidCells) * 0.05f);
+				+ KINDA_SMALL_NUMBER
+				>= static_cast<float>(CarriedSolidCells) * 0.05f);
+		TestTrue(
+			TEXT("A root-felled tree receives a real sideways launch instead of restacking on its stump"),
+			FMath::Abs(TreeCarrier->SpawnPayload.InitialLinearVelocity.X)
+				>= 300.0f);
+		TestTrue(
+			TEXT("A root-felled tree receives enough pitch velocity to leave the upright equilibrium"),
+			FMath::Abs(TreeCarrier->SpawnPayload.InitialAngularVelocity.Y)
+				>= 300.0f);
 	}
-	int32 DetachedCanopyActorCount = 0;
+	int32 ProtectedStumpMemberActorCount = 0;
+	bool bUnexpectedCanopySourceRemains = false;
 	for (TActorIterator<AFragment2DSourceActor> It(World); It; ++It)
 	{
-		DetachedCanopyActorCount +=
-			!It->IsActorBeingDestroyed()
-			&& It->AggregateId == TrunkLayout->AggregateId
-			&& !It->bAggregateRoot
-				? 1
-				: 0;
+		if (It->IsActorBeingDestroyed()
+			|| It->AggregateId != TrunkLayout->AggregateId
+			|| It->bAggregateRoot)
+		{
+			continue;
+		}
+		const bool bProtectedStumpSlice =
+			It->SourceMaterialId == TEXT("wood")
+			&& It->GetRuntimeMask().Contains(1)
+			&& It->IsAggregateSeparationCollisionSuppressed()
+			&& !It->IsHidden()
+			&& It->MeshComponent->IsVisible()
+			&& !It->GetActorEnableCollision();
+		ProtectedStumpMemberActorCount += bProtectedStumpSlice ? 1 : 0;
+		bUnexpectedCanopySourceRemains |= !bProtectedStumpSlice;
+	}
+	int32 ExpectedProtectedStumpMemberActors = 0;
+	for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
+		: Layout.FragmentSources)
+	{
+		ExpectedProtectedStumpMemberActors +=
+			Source.AggregateId == TrunkLayout->AggregateId
+			&& Source.Name == TEXT("TreeTrunk")
+			&& !Source.bAggregateRoot
+				? 1 : 0;
 	}
 	TestEqual(
-		TEXT("Generated canopy layers no longer allocate detached Source Actors"),
-		DetachedCanopyActorCount,
-		0);
+		TEXT("Only the synchronized non-root trunk slice remains during separation grace"),
+		ProtectedStumpMemberActorCount,
+		ExpectedProtectedStumpMemberActors);
+	TestFalse(
+		TEXT("No branch or canopy Source Actor survives the aggregate handoff"),
+		bUnexpectedCanopySourceRemains);
 	FMatterFluxWorldSaveState AggregateSaveState;
 	FString AggregateSaveError;
 	if (TestTrue(
@@ -1337,25 +2311,38 @@ bool FMatterFluxVoxelDecorationWorldTest::RunTest(const FString& Parameters)
 		for (const FFragmentAggregateSourceState& Member
 			: TreeCarrier->AggregateSources)
 		{
-			TestTrue(
-				TEXT("Every carried SourceId has a persistent static-world tombstone"),
-				AggregateSaveState.RemovedFragmentSourceIds.Contains(
-					Member.SourceId));
+			if (Member.bOwnsLogicalSource)
+			{
+				TestTrue(
+					TEXT("Every fully carried SourceId has a persistent static-world tombstone"),
+					AggregateSaveState.RemovedFragmentSourceIds.Contains(
+						Member.SourceId));
+			}
+			else
+			{
+				TestFalse(
+					TEXT("A cut layer does not tombstone the supported remainder of its source"),
+					AggregateSaveState.RemovedFragmentSourceIds.Contains(
+						Member.DefinitionSourceId));
+			}
 			const FMatterFluxSavedFragmentSourceState* SavedTombstone =
 				AggregateSaveState.FragmentSources.FindByPredicate(
 					[&Member](
 						const FMatterFluxSavedFragmentSourceState& Saved)
 					{
-						return Saved.SourceId == Member.SourceId;
+						return Saved.SourceId == (Member.bOwnsLogicalSource
+							? Member.SourceId
+							: Member.DefinitionSourceId);
 					});
 			TestNotNull(
-				TEXT("Every carried SourceId saves a replicated mask tombstone"),
+				TEXT("Every carried layer saves either a tombstone or its supported remainder"),
 				SavedTombstone);
 			if (SavedTombstone)
 			{
-				TestFalse(
-					TEXT("Saved tombstone contains no pristine solid cells"),
-					SavedTombstone->RuntimeMask.Contains(1));
+				TestEqual(
+					TEXT("Save state distinguishes fully moved sources from partially cut sources"),
+					SavedTombstone->RuntimeMask.Contains(1),
+					!Member.bOwnsLogicalSource);
 			}
 		}
 	}
@@ -1542,6 +2529,776 @@ bool FMatterFluxMaterialSimulationCatchUpBudgetTest::RunTest(
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxPlayableAcidSourceContactTest,
+	"MatterFlux.Playable.Material.AcidContactCorrodesTreeAndEmitsGas",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxPlayableAcidSourceContactTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* WorldActor = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Playable world actor spawned"), WorldActor))
+	{
+		return false;
+	}
+	WorldActor->Regenerate(1337);
+	if (const FMatterFluxContentRegistryPtr Registry =
+		IMatterFluxScriptRuntime::Get().GetActiveRegistry();
+		Registry.IsValid())
+	{
+		const FMatterFluxMaterialDefinition* Acid =
+			Registry->Materials.Find(TEXT("acid"));
+		const FMatterFluxMaterialDefinition* Grassland =
+			Registry->Materials.Find(TEXT("grassland"));
+		TestNotNull(TEXT("Acid material is configured"), Acid);
+		TestNotNull(TEXT("Grassland material is configured"), Grassland);
+		if (Acid && Grassland)
+		{
+			const float ColorDistance =
+				FMath::Abs(Acid->Color.R - Grassland->Color.R)
+				+ FMath::Abs(Acid->Color.G - Grassland->Color.G)
+				+ FMath::Abs(Acid->Color.B - Grassland->Color.B);
+			TestTrue(
+				TEXT("Acid liquid color is visually distinct from grassland"),
+				ColorDistance >= 1.0f);
+		}
+	}
+
+	FGuid AggregateId;
+	FGuid RootSourceId;
+	FBox TreeBounds(ForceInit);
+	FTransform RootTransform;
+	if (!TestTrue(TEXT("Reference world contains a tree root"),
+		WorldActor->FindNearestTreeAggregateForVisualInspection(
+			FVector::ZeroVector,
+			AggregateId,
+			RootSourceId,
+			TreeBounds,
+			RootTransform)))
+	{
+		return false;
+	}
+	int32 InitialRevision = INDEX_NONE;
+	TArray<uint8> InitialMask;
+	if (!TestTrue(TEXT("Pristine tree state is queryable"),
+		WorldActor->GetFragmentSourceRuntimeState(
+			RootSourceId,
+			InitialRevision,
+			InitialMask)))
+	{
+		return false;
+	}
+	const int32 InitialGas =
+		WorldActor->GetSimulatedMaterialCount(TEXT("acid_gas"));
+	int32 InitialFragmentActors = 0;
+	for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+	{
+		++InitialFragmentActors;
+	}
+	TestTrue(TEXT("Acid can be injected through the shared material API"),
+		WorldActor->SetSimulatedMaterialAtWorldLocation(
+			RootTransform.GetLocation(),
+			TEXT("acid")));
+
+	for (int32 Frame = 0; Frame < 4; ++Frame)
+	{
+		WorldActor->Tick(0.25f);
+	}
+	int32 CorrodedRevision = INDEX_NONE;
+	TArray<uint8> CorrodedMask;
+	TestTrue(TEXT("Corroded tree state remains queryable"),
+		WorldActor->GetFragmentSourceRuntimeState(
+			RootSourceId,
+			CorrodedRevision,
+			CorrodedMask));
+	TestTrue(TEXT("Lua contact reaction commits tree mask damage"),
+		CorrodedRevision > InitialRevision
+			&& CorrodedMask.Num() == InitialMask.Num());
+	TestTrue(TEXT("Corroding a tree emits simulated acid gas"),
+		WorldActor->GetSimulatedMaterialCount(TEXT("acid_gas"))
+			> InitialGas);
+	int32 FinalFragmentActors = 0;
+	for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+	{
+		++FinalFragmentActors;
+	}
+	TestEqual(
+		TEXT("Repeated acid contact produces one aggregate carrier and dissolves later stump debris"),
+		FinalFragmentActors - InitialFragmentActors,
+		1);
+	AFragment2DSourceActor* RootSource = nullptr;
+	for (TActorIterator<AFragment2DSourceActor> It(World); It; ++It)
+	{
+		if (It->SourceId == RootSourceId)
+		{
+			RootSource = *It;
+			break;
+		}
+	}
+	TestNotNull(TEXT("Corroded aggregate root remains available as the stump"), RootSource);
+	if (RootSource)
+	{
+		TestTrue(
+			TEXT("Stump collision is suppressed while the detached carrier still overlaps it"),
+			RootSource->IsAggregateSeparationCollisionSuppressed());
+		TestTrue(
+			TEXT("Collision suppression never hides the committed stump state"),
+			!RootSource->IsHidden()
+				&& RootSource->MeshComponent->IsVisible());
+		TestFalse(
+			TEXT("Separation stump cannot snag the falling carrier"),
+			RootSource->GetActorEnableCollision());
+		int32 ProtectedStumpSlices = 0;
+		int32 ParallelTrunkSlices = 0;
+		for (TActorIterator<AFragment2DSourceActor> It(World); It; ++It)
+		{
+			if (It->AggregateId != RootSource->AggregateId
+				|| It->bDetachedFromTerrain
+				|| !It->GetRuntimeMask().Contains(1))
+			{
+				continue;
+			}
+			++ProtectedStumpSlices;
+			if (It->SourceMaterialId == TEXT("wood")
+				&& It->GetMaskWidth() == RootSource->GetMaskWidth()
+				&& It->GetMaskHeight() == RootSource->GetMaskHeight()
+				&& It->GetActorQuat().AngularDistance(
+					RootSource->GetActorQuat()) <= KINDA_SMALL_NUMBER)
+			{
+				++ParallelTrunkSlices;
+				TestEqual(
+					TEXT("Parallel trunk slices retain an identical stump silhouette"),
+					It->GetRuntimeMask(),
+					RootSource->GetRuntimeMask());
+			}
+			TestTrue(
+				TEXT("Every surviving trunk slice shares collision suppression"),
+				It->IsAggregateSeparationCollisionSuppressed());
+			TestTrue(
+				TEXT("Every surviving trunk slice remains continuously visible"),
+				!It->IsHidden() && It->MeshComponent->IsVisible());
+			TestFalse(
+				TEXT("Every protected trunk slice has collision disabled"),
+				It->GetActorEnableCollision());
+		}
+		TestTrue(
+			TEXT("At least one physical stump slice remains after corrosion"),
+			ProtectedStumpSlices > 0);
+		TestEqual(
+			TEXT("The square trunk keeps both synchronized depth slices"),
+			ParallelTrunkSlices,
+			2);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxPlayableSimulatedLiquidSurfaceRenderingTest,
+	"MatterFlux.Playable.Material.SimulatedLiquidUsesContinuousTopSurface",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxPlayableSimulatedLiquidSurfaceRenderingTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* WorldActor = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Playable world actor spawned"), WorldActor))
+	{
+		return false;
+	}
+	WorldActor->Regenerate(1337);
+	TestTrue(TEXT("Acid sample enters the material simulation"),
+		WorldActor->SetSimulatedMaterialAtWorldLocation(
+			FVector::ZeroVector,
+			TEXT("acid")));
+	WorldActor->Tick(0.11f);
+
+	TArray<UProceduralMeshComponent*> Components;
+	WorldActor->GetComponents(Components);
+	UProceduralMeshComponent* LiquidSurface = nullptr;
+	for (UProceduralMeshComponent* Component : Components)
+	{
+		if (Component && Component->ComponentHasTag(
+			TEXT("MatterFluxCanonicalLiquidSurface")))
+		{
+			LiquidSurface = Component;
+			break;
+		}
+	}
+	if (!TestNotNull(TEXT("Simulated liquid has a dedicated surface adapter"),
+		LiquidSurface))
+	{
+		return false;
+	}
+	const FProcMeshSection* SurfaceSection =
+		LiquidSurface->GetProcMeshSection(0);
+	TestTrue(TEXT("Simulated liquid renders indexed top quads"),
+		SurfaceSection
+			&& SurfaceSection->ProcVertexBuffer.Num() >= 4
+			&& SurfaceSection->ProcIndexBuffer.Num() >= 6);
+	TestEqual(TEXT("Liquid top surface remains non-blocking"),
+		LiquidSurface->GetCollisionEnabled(),
+		ECollisionEnabled::NoCollision);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxCanonicalLiquidSurfaceProjectionTest,
+	"MatterFlux.Playable.Liquid.CanonicalSimulationProjectsEveryActiveSurfaceCell",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxCanonicalLiquidSurfaceProjectionTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* WorldActor = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Playable world actor spawned"), WorldActor))
+	{
+		return false;
+	}
+	WorldActor->Regenerate(1337);
+	for (int32 Step = 0; Step < 30; ++Step)
+	{
+		WorldActor->Tick(0.1f);
+	}
+
+	const FVector ReportedGap(-151.39f, 50.64f, 0.0f);
+	MatterFlux::Liquid::FLiquidColumn Column;
+	if (!TestTrue(
+			TEXT("Reported visual gap is an active simulated liquid column"),
+			WorldActor->TrySampleLiquidColumnAtWorldLocation(
+				ReportedGap, Column)))
+	{
+		return false;
+	}
+
+	const FVector ExpectedSurfaceCenter(
+		(FMath::FloorToFloat(ReportedGap.X
+			/ MatterFlux::PlayableLevel::TerrainCellSize) + 0.5f)
+			* MatterFlux::PlayableLevel::TerrainCellSize,
+		(FMath::FloorToFloat(ReportedGap.Y
+			/ MatterFlux::PlayableLevel::TerrainCellSize) + 0.5f)
+			* MatterFlux::PlayableLevel::TerrainCellSize,
+		Column.SurfaceZ);
+	bool bShapeCoversCanonicalCell = false;
+	TArray<UProceduralMeshComponent*> Components;
+	WorldActor->GetComponents(Components);
+	for (UProceduralMeshComponent* Component : Components)
+	{
+		if (!Component || !Component->ComponentHasTag(
+			TEXT("MatterFluxCanonicalLiquidSurface")))
+		{
+			continue;
+		}
+		const FProcMeshSection* Section = Component->GetProcMeshSection(0);
+		if (!Section)
+		{
+			continue;
+		}
+		for (int32 Index = 0;
+			Index + 2 < Section->ProcIndexBuffer.Num();
+			Index += 3)
+		{
+			FVector Triangle[3];
+			bool bValidTriangle = true;
+			for (int32 Corner = 0; Corner < 3; ++Corner)
+			{
+				const int32 VertexIndex =
+					Section->ProcIndexBuffer[Index + Corner];
+				bValidTriangle &= Section->ProcVertexBuffer.IsValidIndex(
+					VertexIndex);
+				if (bValidTriangle)
+				{
+					Triangle[Corner] = Component->GetComponentTransform()
+						.TransformPosition(Section->ProcVertexBuffer[
+							VertexIndex].Position);
+				}
+			}
+			if (!bValidTriangle)
+			{
+				continue;
+			}
+			const auto SignedArea = [](const FVector& A,
+				const FVector& B, const FVector& Point)
+			{
+				return (Point.X - B.X) * (A.Y - B.Y)
+					- (A.X - B.X) * (Point.Y - B.Y);
+			};
+			const double First = SignedArea(
+				Triangle[0], Triangle[1], ExpectedSurfaceCenter);
+			const double Second = SignedArea(
+				Triangle[1], Triangle[2], ExpectedSurfaceCenter);
+			const double Third = SignedArea(
+				Triangle[2], Triangle[0], ExpectedSurfaceCenter);
+			const bool bHasNegative = First < -0.01
+				|| Second < -0.01 || Third < -0.01;
+			const bool bHasPositive = First > 0.01
+				|| Second > 0.01 || Third > 0.01;
+			if (!(bHasNegative && bHasPositive))
+			{
+				bShapeCoversCanonicalCell = true;
+				break;
+			}
+		}
+	}
+	TestTrue(
+		TEXT("The connected liquid shape covers every active canonical cell without requiring one quad per fact"),
+		bShapeCoversCanonicalCell);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxPlayableLakeInteriorCoverageTest,
+	"MatterFlux.Playable.Liquid.GeneratedLakeInteriorHasNoSurfaceGaps",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxPlayableLakeInteriorCoverageTest::RunTest(
+	const FString& Parameters)
+{
+	const FMatterFluxContentRegistryPtr Registry =
+		IMatterFluxScriptRuntime::Get().GetActiveRegistry();
+	MatterFlux::PlayableLevel::FLevelLayout Layout;
+	if (!TestTrue(
+			TEXT("Deterministic lake layout builds"),
+			MatterFlux::PlayableLevel::BuildLevelLayout(
+				1337, Layout, Registry.Get())))
+	{
+		return false;
+	}
+	const MatterFlux::PlayableLevel::FLevelLayer* Lake =
+		Layout.FindLayer(TEXT("Lake"));
+	if (!TestTrue(
+			TEXT("Deterministic layout contains a lake surface"),
+			Lake && !Lake->Instances.IsEmpty()))
+	{
+		return false;
+	}
+
+	TSet<FIntPoint> SurfaceCells;
+	FIntPoint Minimum(MAX_int32, MAX_int32);
+	FIntPoint Maximum(MIN_int32, MIN_int32);
+	for (const FTransform& Instance : Lake->Instances)
+	{
+		const FVector Location = Instance.GetLocation();
+		const FIntPoint Cell(
+			FMath::RoundToInt(Location.X
+				/ MatterFlux::PlayableLevel::TerrainCellSize),
+			FMath::RoundToInt(Location.Y
+				/ MatterFlux::PlayableLevel::TerrainCellSize));
+		SurfaceCells.Add(Cell);
+		Minimum.X = FMath::Min(Minimum.X, Cell.X);
+		Minimum.Y = FMath::Min(Minimum.Y, Cell.Y);
+		Maximum.X = FMath::Max(Maximum.X, Cell.X);
+		Maximum.Y = FMath::Max(Maximum.Y, Cell.Y);
+	}
+
+	const FVector2D Center(
+		(Minimum.X + Maximum.X) * 0.5f,
+		(Minimum.Y + Maximum.Y) * 0.5f);
+	const FVector2D LakeRadius(
+		(Maximum.X - Minimum.X) * 0.5f,
+		(Maximum.Y - Minimum.Y) * 0.5f);
+	int32 MissingCoreCells = 0;
+	for (int32 Y = Minimum.Y; Y <= Maximum.Y;
+		++Y)
+	{
+		for (int32 X = Minimum.X; X <= Maximum.X;
+			++X)
+		{
+			const float NormalizedX = (X - Center.X) / LakeRadius.X;
+			const float NormalizedY = (Y - Center.Y) / LakeRadius.Y;
+			if (NormalizedX * NormalizedX + NormalizedY * NormalizedY
+				> FMath::Square(0.95f))
+			{
+				continue;
+			}
+			MissingCoreCells += SurfaceCells.Contains(FIntPoint(X, Y)) ? 0 : 1;
+		}
+	}
+	TestEqual(
+		TEXT("The generated lake's inner basin has continuous surface coverage"),
+		MissingCoreCells,
+		0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxPlayableLakeSurfaceContinuityTest,
+	"MatterFlux.Playable.Liquid.AuthoredLakeSurfaceRemainsContinuous",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxPlayableLakeSurfaceContinuityTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* WorldActor = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Playable world actor spawned"), WorldActor))
+	{
+		return false;
+	}
+
+	const FMatterFluxContentRegistryPtr Registry =
+		IMatterFluxScriptRuntime::Get().GetActiveRegistry();
+	MatterFlux::PlayableLevel::FLevelLayout Layout;
+	if (!TestTrue(
+			TEXT("Deterministic lake layout builds"),
+			MatterFlux::PlayableLevel::BuildLevelLayout(
+				1337, Layout, Registry.Get())))
+	{
+		return false;
+	}
+	const MatterFlux::PlayableLevel::FLevelLayer* Lake =
+		Layout.FindLayer(TEXT("Lake"));
+	if (!TestTrue(
+			TEXT("Deterministic layout contains a lake surface"),
+			Lake && !Lake->Instances.IsEmpty()))
+	{
+		return false;
+	}
+
+	WorldActor->Regenerate(1337);
+	const auto CountDryAuthoredSurfaceCells = [&]()
+	{
+		int32 Count = 0;
+		for (const FTransform& Instance : Lake->Instances)
+		{
+			MatterFlux::Liquid::FLiquidColumn Column;
+			if (!WorldActor->TrySampleLiquidColumnAtWorldLocation(
+					Instance.GetLocation(), Column)
+				|| Column.MaterialId != Lake->MaterialId)
+			{
+				++Count;
+			}
+		}
+		return Count;
+	};
+	for (int32 Step = 0; Step < 180; ++Step)
+	{
+		WorldActor->Tick(0.1f);
+	}
+
+	const int32 DryAuthoredSurfaceCells =
+		CountDryAuthoredSurfaceCells();
+	TestEqual(
+		TEXT("A settled generated lake never develops empty authored edge cells"),
+		DryAuthoredSurfaceCells,
+		0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxPlayableLiquidBuoyancyIntegrationTest,
+	"MatterFlux.Playable.Liquid.CreatureSamplesRenderedColumnAndReceivesBuoyancy",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxPlayableLiquidBuoyancyIntegrationTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* WorldActor = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Playable world actor spawned"), WorldActor))
+	{
+		return false;
+	}
+
+	const FMatterFluxContentRegistryPtr Registry =
+		IMatterFluxScriptRuntime::Get().GetActiveRegistry();
+	MatterFlux::PlayableLevel::FLevelLayout Layout;
+	if (!TestTrue(TEXT("Liquid test layout builds"),
+		MatterFlux::PlayableLevel::BuildLevelLayout(
+			1337, Layout, Registry.Get())))
+	{
+		return false;
+	}
+	const MatterFlux::PlayableLevel::FLevelLayer* Stream =
+		Layout.FindLayer(TEXT("Stream"));
+	const MatterFlux::PlayableLevel::FLevelLayer* Lake =
+		Layout.FindLayer(TEXT("Lake"));
+	if (!TestTrue(TEXT("Layout contains a stream"),
+		Stream && !Stream->Instances.IsEmpty())
+		|| !TestTrue(TEXT("Layout contains a large lake"),
+			Lake && !Lake->Instances.IsEmpty()))
+	{
+		return false;
+	}
+
+	WorldActor->Regenerate(1337);
+	int32 MissingAuthoredLakeColumns = 0;
+	for (const FTransform& Instance : Lake->Instances)
+	{
+		MatterFlux::Liquid::FLiquidColumn AuthoredColumn;
+		if (!WorldActor->TrySampleLiquidColumnAtWorldLocation(
+				Instance.GetLocation(), AuthoredColumn)
+			|| AuthoredColumn.MaterialId != TEXT("water"))
+		{
+			++MissingAuthoredLakeColumns;
+		}
+	}
+	TestEqual(
+		TEXT("Every authored lake surface begins from the same water material state"),
+		MissingAuthoredLakeColumns,
+		0);
+	const FVector StreamLocation = Stream->Instances[
+		Stream->Instances.Num() / 2].GetLocation();
+	const FVector SampleLocation = StreamLocation;
+	MatterFlux::Liquid::FLiquidColumn Column;
+	if (!TestTrue(TEXT("Rendered stream maps to a liquid column"),
+		WorldActor->TrySampleLiquidColumnAtWorldLocation(
+			SampleLocation, Column)))
+	{
+		return false;
+	}
+	TestEqual(TEXT("Stream column resolves water"),
+		Column.MaterialId, FName(TEXT("water")));
+	TestEqual(TEXT("Stream column uses Lua water density"),
+		Column.Density, 1.0f);
+	TestTrue(TEXT("Rendered and physical liquid share column height"),
+		FMath::IsNearlyEqual(
+			Column.SurfaceZ - Column.BottomZ, 120.0f, 0.5f));
+
+	const FTransform* DeepestLakeCell = nullptr;
+	float DeepestLakeDepth = 0.0f;
+	for (const FTransform& Instance : Lake->Instances)
+	{
+		const FVector Location = Instance.GetLocation();
+		const int32 TerrainX = FMath::Clamp(
+			FMath::RoundToInt(
+				(Location.X - Layout.Terrain.FirstCellCenter.X)
+					/ Layout.Terrain.CellSize),
+			0,
+			Layout.Terrain.Width - 1);
+		const int32 TerrainY = FMath::Clamp(
+			FMath::RoundToInt(
+				(Location.Y - Layout.Terrain.FirstCellCenter.Y)
+					/ Layout.Terrain.CellSize),
+			0,
+			Layout.Terrain.Height - 1);
+		const float SurfaceZ = Location.Z
+			+ Instance.GetScale3D().Z * 50.0f;
+		const float Depth = SurfaceZ
+			- Layout.Terrain.HeightAt(TerrainX, TerrainY);
+		if (Depth > DeepestLakeDepth)
+		{
+			DeepestLakeDepth = Depth;
+			DeepestLakeCell = &Instance;
+		}
+	}
+	if (!TestNotNull(TEXT("Lake exposes a deepest physical column"),
+		DeepestLakeCell))
+	{
+		return false;
+	}
+	MatterFlux::Liquid::FLiquidColumn LakeColumn;
+	if (!TestTrue(TEXT("Deep rendered lake maps to a liquid column"),
+		WorldActor->TrySampleLiquidColumnAtWorldLocation(
+			DeepestLakeCell->GetLocation(), LakeColumn)))
+	{
+		return false;
+	}
+	TestEqual(TEXT("Lake column resolves water"),
+		LakeColumn.MaterialId, FName(TEXT("water")));
+	TestTrue(TEXT("Lake physical depth matches its carved deep center"),
+		LakeColumn.SurfaceZ - LakeColumn.BottomZ >= 100.0f
+			&& FMath::IsNearlyEqual(
+				LakeColumn.SurfaceZ - LakeColumn.BottomZ,
+				DeepestLakeDepth,
+				0.5f));
+	TestTrue(TEXT("Static lake cells do not overflow the replicated material budget"),
+		WorldActor->GetReplicatedMaterialStateByteCount() > 0
+			&& WorldActor->GetReplicatedMaterialStateByteCount()
+				<= FMatterFluxReplicatedMaterialState::MaximumCompressedBytes);
+
+	// Touching only the top centimetre of a deep liquid column must displace
+	// only that volume. Treating any Z overlap as occupancy of the entire
+	// column produces the conspicuous dry squares seen in the runtime lake.
+	const FVector ShallowContactLocation = Lake->Instances[
+		Lake->Instances.Num() / 3].GetLocation();
+	MatterFlux::Liquid::FLiquidColumn ShallowContactBefore;
+	if (TestTrue(TEXT("Shallow-contact lake cell begins as liquid"),
+		WorldActor->TrySampleLiquidColumnAtWorldLocation(
+			ShallowContactLocation, ShallowContactBefore)))
+	{
+		TestTrue(TEXT("Shallow body contact submits a displacement transaction"),
+			WorldActor->DisplaceLiquidInWorldBounds(
+				ShallowContactLocation,
+				FVector(2.0f, 2.0f, 0.0f),
+				ShallowContactBefore.SurfaceZ - 1.0f,
+				ShallowContactBefore.SurfaceZ + 20.0f));
+		MatterFlux::Liquid::FLiquidColumn ShallowContactAfter;
+		TestTrue(
+			TEXT("A one-centimetre surface overlap does not excavate the whole liquid column"),
+			WorldActor->TrySampleLiquidColumnAtWorldLocation(
+				ShallowContactLocation, ShallowContactAfter));
+	}
+
+	AMatterFluxCharacter* Character =
+		World->SpawnActor<AMatterFluxCharacter>();
+	if (!TestNotNull(TEXT("Playable character spawned"), Character))
+	{
+		return false;
+	}
+	Character->SetActorLocation(FVector(
+		SampleLocation.X,
+		SampleLocation.Y,
+		Column.BottomZ + 88.0f));
+	const int64 WaterAmountBeforeDisplacement =
+		WorldActor->GetSimulatedMaterialAmount(TEXT("water"));
+	Character->GetCharacterMovement()->Velocity = FVector::ZeroVector;
+	Character->BuoyancyComponent->TickComponent(
+		0.1f, LEVELTICK_All, nullptr);
+	WorldActor->Tick(0.0f);
+	TestTrue(TEXT("Character capsule is measurably submerged"),
+		Character->BuoyancyComponent->GetLastSubmergedFraction() > 0.1f);
+	TestTrue(TEXT("A light character receives upward buoyancy"),
+		Character->GetCharacterMovement()->Velocity.Z > 0.0f);
+	MatterFlux::Liquid::FLiquidColumn DisplacedCenterColumn;
+	TestFalse(TEXT("Character capsule vacates liquid at its occupied center"),
+		WorldActor->TrySampleLiquidColumnAtWorldLocation(
+			Character->GetActorLocation(), DisplacedCenterColumn));
+	TestEqual(TEXT("Character displacement conserves exact simulated water volume"),
+		WorldActor->GetSimulatedMaterialAmount(TEXT("water")),
+		WaterAmountBeforeDisplacement);
+	Character->BuoyancyComponent->TickComponent(
+		0.1f, LEVELTICK_All, nullptr);
+	WorldActor->Tick(0.1f);
+	TestTrue(TEXT("A displaced character keeps ambient liquid pressure next frame"),
+		Character->BuoyancyComponent->GetLastSubmergedFraction() > 0.1f);
+	TestFalse(TEXT("Ambient pressure does not put liquid back inside the capsule"),
+		WorldActor->TrySampleLiquidColumnAtWorldLocation(
+			Character->GetActorLocation(), DisplacedCenterColumn));
+
+	// A capsule must not clear the square corners of its axis-aligned bounds.
+	// At this depth the lake intersects only the lower round cap, so a point at
+	// (0.9 R, 0.9 R) is unambiguously outside the submerged body volume while
+	// still catching the old rectangular-footprint implementation.
+	const float CharacterRadius = Character->GetCapsuleComponent()
+		->GetScaledCapsuleRadius();
+	const FVector DeepCharacterLocation(
+		DeepestLakeCell->GetLocation().X,
+		DeepestLakeCell->GetLocation().Y,
+		LakeColumn.BottomZ + 88.0f);
+	Character->SetActorLocation(DeepCharacterLocation);
+	Character->GetCharacterMovement()->Velocity = FVector::ZeroVector;
+	const FVector OutsideCapsuleCorner = DeepCharacterLocation + FVector(
+		CharacterRadius * 0.9f,
+		CharacterRadius * 0.9f,
+		0.0f);
+	MatterFlux::Liquid::FLiquidColumn OutsideCornerBefore;
+	if (TestTrue(TEXT("Deep-water capsule corner begins as liquid"),
+		WorldActor->TrySampleLiquidColumnAtWorldLocation(
+			OutsideCapsuleCorner, OutsideCornerBefore)))
+	{
+		Character->BuoyancyComponent->TickComponent(
+			0.1f, LEVELTICK_All, nullptr);
+		WorldActor->Tick(0.0f);
+		MatterFlux::Liquid::FLiquidColumn OutsideCornerAfter;
+		TestTrue(
+			TEXT("Liquid surface remains filled outside the capsule's round footprint"),
+			WorldActor->TrySampleLiquidColumnAtWorldLocation(
+				OutsideCapsuleCorner, OutsideCornerAfter));
+	}
+
+	const FVector CreatureLiquidLocation = Stream->Instances[
+		Stream->Instances.Num() / 4].GetLocation();
+	MatterFlux::Liquid::FLiquidColumn CreatureColumn;
+	if (!TestTrue(TEXT("Creature test cell begins as liquid"),
+		WorldActor->TrySampleLiquidColumnAtWorldLocation(
+			CreatureLiquidLocation, CreatureColumn)))
+	{
+		return false;
+	}
+	AMatterFluxCreatureActor* Creature =
+		World->SpawnActor<AMatterFluxCreatureActor>();
+	if (!TestNotNull(TEXT("Creature spawned"), Creature))
+	{
+		return false;
+	}
+	Creature->SetActorLocation(FVector(
+		CreatureLiquidLocation.X,
+		CreatureLiquidLocation.Y,
+		CreatureColumn.BottomZ + 72.0f));
+	MatterFlux::Liquid::FLiquidColumn CreatureActualColumn;
+	TestTrue(TEXT("Creature actual capsule center begins in liquid"),
+		WorldActor->TrySampleLiquidColumnAtWorldLocation(
+			Creature->GetActorLocation(), CreatureActualColumn));
+	const int64 WaterBeforeCreature =
+		WorldActor->GetSimulatedMaterialAmount(TEXT("water"));
+	Creature->BuoyancyComponent->TickComponent(
+		0.1f, LEVELTICK_All, nullptr);
+	WorldActor->Tick(0.0f);
+	TestTrue(TEXT("Creature shared component detects submersion"),
+		Creature->BuoyancyComponent->GetLastSubmergedFraction() > 0.0f);
+	MatterFlux::Liquid::FLiquidColumn CreatureCenterAfter;
+	const bool bCreatureCenterStillLiquid =
+		WorldActor->TrySampleLiquidColumnAtWorldLocation(
+			Creature->GetActorLocation(), CreatureCenterAfter);
+	TestFalse(TEXT("Creature capsule vacates its occupied liquid"),
+		bCreatureCenterStillLiquid);
+	TestEqual(TEXT("Creature displacement conserves exact water volume"),
+		WorldActor->GetSimulatedMaterialAmount(TEXT("water")),
+		WaterBeforeCreature);
+
+	const FVector ObjectLiquidLocation = Stream->Instances[
+		Stream->Instances.Num() * 3 / 4].GetLocation();
+	MatterFlux::Liquid::FLiquidColumn ObjectColumn;
+	if (!TestTrue(TEXT("Physics-object test cell begins as liquid"),
+		WorldActor->TrySampleLiquidColumnAtWorldLocation(
+			ObjectLiquidLocation, ObjectColumn)))
+	{
+		return false;
+	}
+	AActor* PhysicsObject = World->SpawnActor<AActor>();
+	if (!TestNotNull(TEXT("Generic physics object spawned"), PhysicsObject))
+	{
+		return false;
+	}
+	UBoxComponent* PhysicsBox = NewObject<UBoxComponent>(
+		PhysicsObject, TEXT("LiquidDisplacementTestBody"));
+	PhysicsObject->SetRootComponent(PhysicsBox);
+	PhysicsObject->AddInstanceComponent(PhysicsBox);
+	PhysicsBox->SetBoxExtent(FVector(35.0f));
+	PhysicsBox->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+	PhysicsBox->RegisterComponent();
+	PhysicsBox->SetWorldLocation(FVector(
+		ObjectLiquidLocation.X,
+		ObjectLiquidLocation.Y,
+		ObjectColumn.BottomZ + 60.0f));
+	PhysicsBox->SetSimulatePhysics(true);
+	UMatterFluxBuoyancyComponent* ObjectBuoyancy =
+		NewObject<UMatterFluxBuoyancyComponent>(
+			PhysicsObject, TEXT("LiquidDisplacementTestBuoyancy"));
+	PhysicsObject->AddInstanceComponent(ObjectBuoyancy);
+	ObjectBuoyancy->SetTargetPrimitive(PhysicsBox);
+	ObjectBuoyancy->RegisterComponent();
+	const int64 WaterBeforeObject =
+		WorldActor->GetSimulatedMaterialAmount(TEXT("water"));
+	ObjectBuoyancy->TickComponent(0.1f, LEVELTICK_All, nullptr);
+	WorldActor->Tick(0.0f);
+	MatterFlux::Liquid::FLiquidColumn ObjectCenterAfter;
+	TestTrue(TEXT("A partly submerged rigid body does not excavate the whole column"),
+		WorldActor->TrySampleLiquidColumnAtWorldLocation(
+			PhysicsBox->GetComponentLocation(), ObjectCenterAfter));
+	TestTrue(TEXT("Rigid-body overlap lowers the local conserved liquid volume"),
+		ObjectCenterAfter.SurfaceZ < ObjectColumn.SurfaceZ
+			&& ObjectCenterAfter.SurfaceZ > ObjectCenterAfter.BottomZ);
+	TestEqual(TEXT("Rigid-body displacement conserves exact water volume"),
+		WorldActor->GetSimulatedMaterialAmount(TEXT("water")),
+		WaterBeforeObject);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxCombustionVisualHierarchyTest,
 	"MatterFlux.Playable.CombustionSmokeReadsAsSmokeNotGroundChunks",
 	EAutomationTestFlags::EditorContext
@@ -1565,7 +3322,10 @@ bool FMatterFluxCombustionVisualHierarchyTest::RunTest(
 	{
 		return false;
 	}
-	for (int32 Step = 0; Step < 4; ++Step)
+	// 烟雾是每 0.16 秒按 Lua 概率采样的纯表现；观察窗覆盖多次确定性
+	// 抽样，但仍短于 wood_burn 的 1.8 秒持续时间，避免把“前两次未命中”
+	// 错判成没有烟雾。
+	for (int32 Step = 0; Step < 12; ++Step)
 	{
 		WorldActor->Tick(0.1f);
 	}
@@ -1781,6 +3541,17 @@ bool FMatterFluxPlayableWorldDefaultsTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Voxel palette receives scene lighting"),
 		VoxelMaterial
 		&& VoxelMaterial->GetShadingModels().HasShadingModel(MSM_DefaultLit));
+	const UMaterialInterface* LiquidMaterial =
+		WorldActor->GetVoxelLiquidMaterialTemplate();
+	TestNotNull(TEXT("Liquids have a dedicated material template"),
+		LiquidMaterial);
+	TestTrue(TEXT("Liquid material is project-owned"),
+		LiquidMaterial
+		&& LiquidMaterial->GetPathName().Contains(
+			TEXT("/Game/MatterFlux/Materials/M_VoxelLiquid.")));
+	TestEqual(TEXT("Liquid material enables real translucency"),
+		LiquidMaterial ? LiquidMaterial->GetBlendMode() : BLEND_Opaque,
+		BLEND_Translucent);
 	TestNotNull(TEXT("World actor has a sky atmosphere"), WorldActor->SkyAtmosphere.Get());
 	TestNotNull(TEXT("External visual capture command is registered"),
 		IConsoleManager::Get().FindConsoleObject(TEXT("mf.Visual.Capture")));
@@ -1793,6 +3564,12 @@ bool FMatterFluxPlayableWorldDefaultsTest::RunTest(const FString& Parameters)
 	TestNotNull(TEXT("Frame stability capture command is registered"),
 		IConsoleManager::Get().FindConsoleObject(
 			TEXT("mf.Visual.StabilitySequence")));
+	TestNotNull(TEXT("Liquid-pool visual acceptance command is registered"),
+		IConsoleManager::Get().FindConsoleObject(
+			TEXT("mf.Visual.LiquidPool")));
+	TestNotNull(TEXT("Deep-liquid walk acceptance command is registered"),
+		IConsoleManager::Get().FindConsoleObject(
+			TEXT("mf.Visual.DeepLiquidWalk")));
 	const AMatterFluxGameMode* GameMode = GetDefault<AMatterFluxGameMode>();
 	TestTrue(TEXT("Default GameMode automatically spawns the playable world class"),
 		GameMode && GameMode->PlayableWorldClass == AMatterFluxPlayableWorldActor::StaticClass());

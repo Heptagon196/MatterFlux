@@ -1,5 +1,6 @@
 #include "Magic/MatterFluxMagicWorkbenchSlate.h"
 #include "Magic/MatterFluxMagicWorkbenchWidget.h"
+#include "Magic/MatterFluxMagicWorkbenchInteraction.h"
 #include "Magic/MatterFluxSpellProgramLayout.h"
 #include "UI/MatterFluxPaperStyle.h"
 #include "UI/MatterFluxPaperWindow.h"
@@ -123,6 +124,9 @@ namespace MatterFluxMagicUI
 		FName SpellId;
 		int32 SpellSlot = INDEX_NONE;
 		FText Label;
+		FText Badge;
+		FText Subtitle;
+		FLinearColor Tint = FLinearColor::White;
 
 		bool IsValid() const
 		{
@@ -145,21 +149,42 @@ namespace MatterFluxMagicUI
 			TSharedRef<FMagicDragDropOperation> Operation =
 				MakeShared<FMagicDragDropOperation>();
 			Operation->Payload = InPayload;
-			Operation->DecoratorWidget = SNew(SBorder)
-				.BorderImage(FCoreStyle::Get().GetBrush(TEXT("GenericWhiteBox")))
-				.BorderBackgroundColor(Ink)
-				.Padding(KeylineThickness)
+			Operation->DecoratorWidget = SNew(SBox)
+				.WidthOverride(SpellSlotSize)
+				.HeightOverride(SpellSlotSize)
 				[
 					SNew(SBorder)
 					.BorderImage(FCoreStyle::Get().GetBrush(TEXT("GenericWhiteBox")))
-					.BorderBackgroundColor(Paper)
-					.Padding(FMargin(12.0f, 8.0f))
+					.BorderBackgroundColor(Ink)
+					.Padding(KeylineThickness)
 					[
-						SNew(STextBlock)
-						.Text(InPayload.Label)
-						.Font(Font(12, true))
-						.Justification(ETextJustify::Center)
-						.ColorAndOpacity(Ink)
+						SNew(SBorder)
+						.BorderImage(FCoreStyle::Get().GetBrush(TEXT("GenericWhiteBox")))
+						.BorderBackgroundColor(InPayload.Tint)
+						.Padding(2.0f)
+						[
+							SNew(SOverlay)
+							+ SOverlay::Slot()
+							.HAlign(HAlign_Center)
+							.VAlign(VAlign_Center)
+							[
+								SNew(STextBlock)
+								.Text(InPayload.Badge.IsEmpty()
+									? InPayload.Label : InPayload.Badge)
+								.Font(Font(18, true))
+								.Justification(ETextJustify::Center)
+								.ColorAndOpacity(Ink)
+							]
+							+ SOverlay::Slot()
+							.HAlign(HAlign_Right)
+							.VAlign(VAlign_Bottom)
+							[
+								SNew(STextBlock)
+								.Text(InPayload.Subtitle)
+								.Font(Font(9, true))
+								.ColorAndOpacity(Ink)
+							]
+						]
 					]
 				];
 			Operation->Construct();
@@ -193,6 +218,7 @@ namespace MatterFluxMagicUI
 			SLATE_ARGUMENT(TFunction<void()>, OnLeftClick)
 			SLATE_ARGUMENT(TFunction<void()>, OnRightClick)
 			SLATE_ARGUMENT(TFunction<void()>, OnActivate)
+			SLATE_ARGUMENT(TFunction<bool(const FDragPayload&)>, CanAcceptPayload)
 			SLATE_ARGUMENT(TFunction<bool(const FDragPayload&)>, OnDropPayload)
 		SLATE_END_ARGS()
 
@@ -202,6 +228,7 @@ namespace MatterFluxMagicUI
 			OnLeftClick = Args._OnLeftClick;
 			OnRightClick = Args._OnRightClick;
 			OnActivate = Args._OnActivate;
+			CanAcceptPayload = Args._CanAcceptPayload;
 			OnDropPayload = Args._OnDropPayload;
 			BaseBorderColor = Line;
 			SetToolTipText(Args._ToolTip);
@@ -376,11 +403,40 @@ namespace MatterFluxMagicUI
 		{
 			const TSharedPtr<FMagicDragDropOperation> Operation =
 				Event.GetOperationAs<FMagicDragDropOperation>();
-			return Operation.IsValid()
+			const bool bAccepted = Operation.IsValid()
 				&& OnDropPayload
-				&& OnDropPayload(Operation->Payload)
-					? FReply::Handled()
-					: FReply::Unhandled();
+				&& OnDropPayload(Operation->Payload);
+			if (FocusBorder.IsValid())
+			{
+				FocusBorder->SetBorderBackgroundColor(BaseBorderColor);
+			}
+			return bAccepted ? FReply::Handled() : FReply::Unhandled();
+		}
+
+		virtual void OnDragEnter(
+			const FGeometry& Geometry,
+			const FDragDropEvent& Event) override
+		{
+			SCompoundWidget::OnDragEnter(Geometry, Event);
+			const TSharedPtr<FMagicDragDropOperation> Operation =
+				Event.GetOperationAs<FMagicDragDropOperation>();
+			if (Operation.IsValid() && FocusBorder.IsValid())
+			{
+				const bool bCanAccept = CanAcceptPayload
+					? CanAcceptPayload(Operation->Payload)
+					: static_cast<bool>(OnDropPayload);
+				FocusBorder->SetBorderBackgroundColor(
+					bCanAccept ? SRGB(35, 145, 82) : SRGB(188, 44, 44));
+			}
+		}
+
+		virtual void OnDragLeave(const FDragDropEvent& Event) override
+		{
+			if (FocusBorder.IsValid())
+			{
+				FocusBorder->SetBorderBackgroundColor(BaseBorderColor);
+			}
+			SCompoundWidget::OnDragLeave(Event);
 		}
 
 	private:
@@ -388,6 +444,7 @@ namespace MatterFluxMagicUI
 		TFunction<void()> OnLeftClick;
 		TFunction<void()> OnRightClick;
 		TFunction<void()> OnActivate;
+		TFunction<bool(const FDragPayload&)> CanAcceptPayload;
 		TFunction<bool(const FDragPayload&)> OnDropPayload;
 		TSharedPtr<SBorder> FocusBorder;
 		FLinearColor BaseBorderColor = Line;
@@ -1067,6 +1124,8 @@ private:
 			Payload.Source = EDragSource::Wand;
 			Payload.WandId = Wand.InstanceId;
 			Payload.Label = FText::FromString(Definition->DisplayName);
+			Payload.Badge = FText::FromString(TEXT("杖"));
+			Payload.Tint = FLinearColor::White;
 			const FGuid WandId = Wand.InstanceId;
 			WandGrid->AddSlot().Padding(3.0f)
 			[
@@ -1176,6 +1235,11 @@ private:
 					Owner->SelectWand(Dropped.WandId);
 					return true;
 				})
+				.CanAcceptPayload([](const FDragPayload& Dropped)
+				{
+					return Dropped.Source == EDragSource::Wand
+						&& Dropped.WandId.IsValid();
+				})
 			];
 		}
 		return SNew(SBox)
@@ -1199,6 +1263,10 @@ private:
 			Payload.Source = EDragSource::SpellInventory;
 			Payload.SpellId = OwnedSpell.SpellId;
 			Payload.Label = FText::FromString(Definition->DisplayName);
+			Payload.Badge = SpellBadge(Definition->Kind);
+			Payload.Subtitle = FText::FromString(
+				FString::Printf(TEXT("×%d"), OwnedSpell.Quantity));
+			Payload.Tint = SpellColor(Definition->Kind);
 			const FName SpellId = OwnedSpell.SpellId;
 			SpellGrid->AddSlot().Padding(3.0f)
 			[
@@ -1353,13 +1421,17 @@ private:
 				Payload.SpellId = SpellId;
 				Payload.SpellSlot = SlotIndex;
 				Payload.Label = FText::FromString(Spell->DisplayName);
+				Payload.Badge = SpellBadge(Spell->Kind);
+				Payload.Subtitle = FText::FromString(
+					FString::Printf(TEXT("%02d"), SlotIndex + 1));
+				Payload.Tint = SpellColor(Spell->Kind);
 			}
 			const FGuid WandId = Wand->InstanceId;
 			const int32 TargetIndex = SlotIndex;
 			return SNew(SMagicItemSlot)
 					.Badge(Spell
 						? SpellBadge(Spell->Kind)
-						: FText::FromString(TEXT("空")))
+						: FText::FromString(TEXT("＋")))
 					.Label(FText::FromString(Spell ? Spell->DisplayName : TEXT("+ 法术")))
 					.Subtitle(FText::FromString(FString::Printf(TEXT("%02d"), SlotIndex + 1)))
 					.ToolTip(Spell
@@ -1387,25 +1459,36 @@ private:
 						Edit.FromSpellSlot = TargetIndex;
 						Owner->SubmitEdit(Edit);
 					})
+					.CanAcceptPayload([WandId, TargetIndex](const FDragPayload& Dropped)
+					{
+						FMatterFluxMagicDragPayload StablePayload;
+						StablePayload.Source = Dropped.Source == EDragSource::SpellInventory
+							? EMatterFluxMagicDragSource::SpellInventory
+							: Dropped.Source == EDragSource::DeckSpell
+								? EMatterFluxMagicDragSource::WandSpellSlot
+								: EMatterFluxMagicDragSource::None;
+						StablePayload.WandId = Dropped.WandId;
+						StablePayload.SpellId = Dropped.SpellId;
+						StablePayload.SpellSlot = Dropped.SpellSlot;
+						FMatterFluxMagicEdit Ignored;
+						return FMatterFluxMagicWorkbenchInteraction::ResolveSpellDrop(
+							StablePayload, WandId, TargetIndex, Ignored);
+					})
 					.OnDropPayload([Owner = OwnerWidget, WandId, TargetIndex](const FDragPayload& Dropped)
 					{
 						if (!Owner.IsValid()) return false;
+						FMatterFluxMagicDragPayload StablePayload;
+						StablePayload.Source = Dropped.Source == EDragSource::SpellInventory
+							? EMatterFluxMagicDragSource::SpellInventory
+							: Dropped.Source == EDragSource::DeckSpell
+								? EMatterFluxMagicDragSource::WandSpellSlot
+								: EMatterFluxMagicDragSource::None;
+						StablePayload.WandId = Dropped.WandId;
+						StablePayload.SpellId = Dropped.SpellId;
+						StablePayload.SpellSlot = Dropped.SpellSlot;
 						FMatterFluxMagicEdit Edit;
-						Edit.WandId = WandId;
-						if (Dropped.Source == EDragSource::SpellInventory)
-						{
-							Edit.Type = EMatterFluxMagicEditType::AssignSpell;
-							Edit.SpellId = Dropped.SpellId;
-							Edit.ToSpellSlot = TargetIndex;
-						}
-						else if (Dropped.Source == EDragSource::DeckSpell
-							&& Dropped.WandId == WandId)
-						{
-							Edit.Type = EMatterFluxMagicEditType::SwapSpellSlots;
-							Edit.FromSpellSlot = Dropped.SpellSlot;
-							Edit.ToSpellSlot = TargetIndex;
-						}
-						else
+						if (!FMatterFluxMagicWorkbenchInteraction::ResolveSpellDrop(
+							StablePayload, WandId, TargetIndex, Edit))
 						{
 							return false;
 						}

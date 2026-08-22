@@ -17,6 +17,8 @@ namespace MatterFlux::Material
 		FIntPoint MinSurfaceCell = FIntPoint(-1024, -1024);
 		FIntPoint MaxSurfaceCellExclusive = FIntPoint(1024, 1024);
 		bool bCullOutsideSurfaceBounds = true;
+		/** Physical height represented by Amount=255 in surface-topology worlds. */
+		int32 LiquidFullColumnHeight = 255;
 
 		bool IsValid() const;
 	};
@@ -27,6 +29,8 @@ namespace MatterFlux::Material
 		int32 ReactedPairs = 0;
 		int32 CulledCells = 0;
 		int32 VisitedCells = 0;
+		/** Cells examined by the sparse body-wake restitution pass. */
+		int32 RestitutionVisitedCells = 0;
 	};
 
 	struct FCellSnapshot
@@ -34,6 +38,8 @@ namespace MatterFlux::Material
 		FIntPoint WorldCell = FIntPoint::ZeroValue;
 		FName MaterialId = NAME_None;
 		int32 SupportHeight = 0;
+		/** 物质格占用量；液体使用 1..255，其他相态保持 255。 */
+		uint8 Amount = 255;
 	};
 
 	struct FSeedCell
@@ -41,6 +47,19 @@ namespace MatterFlux::Material
 		FIntPoint WorldCell = FIntPoint::ZeroValue;
 		FName MaterialId = NAME_None;
 		int32 SupportHeight = 0;
+		/** Initial conserved occupancy for liquids; empty/static cells remain full. */
+		uint8 Amount = 255;
+	};
+
+	/**
+	 * Idempotent transient-body constraint for one liquid column. The solver
+	 * moves only the amount above MaximumRemainingAmount, so submitting the
+	 * same occupied volume every frame cannot progressively drain the column.
+	 */
+	struct FLiquidDisplacementConstraint
+	{
+		FIntPoint WorldCell = FIntPoint::ZeroValue;
+		uint8 MaximumRemainingAmount = 0;
 	};
 
 	class MATTERFLUX_API FChunkedMaterialWorld
@@ -60,12 +79,30 @@ namespace MatterFlux::Material
 		bool SetCell(const FIntPoint& WorldCell, FName MaterialId);
 		bool SetSupportHeight(const FIntPoint& WorldCell, int32 Height);
 		bool SeedSurface(const TArray<FSeedCell>& SeedCells);
+		/**
+		 * Atomically moves liquid out of transiently occupied surface cells.
+		 * Destinations are deterministic, empty, and outside the full occupied
+		 * footprint, so material identity and amount are conserved exactly.
+		 */
+		int32 DisplaceLiquids(
+			TConstArrayView<FIntPoint> OccupiedCells,
+			int32 MaxSearchRadius = 64);
+		int32 DisplaceLiquids(
+			TConstArrayView<FLiquidDisplacementConstraint> Constraints,
+			int32 MaxSearchRadius = 64);
 		FName GetMaterialAt(const FIntPoint& WorldCell) const;
+		/** 查询单格的材质和承托高度；空格或未初始化世界返回 false。 */
+		bool TryGetCellSnapshot(
+			const FIntPoint& WorldCell,
+			FCellSnapshot& OutSnapshot) const;
 		int32 CountMaterial(FName MaterialId) const;
+		int64 SumMaterialAmount(FName MaterialId) const;
 		int32 GetResidentChunkCount() const;
 		int32 GetArchivedChunkCount() const;
 		int32 GetSimulationFocusCount() const;
 		void GetActiveCells(TArray<FCellSnapshot>& OutCells) const;
+		/** Enumerates resident and archived facts for complete visual projection. */
+		void GetAllCells(TArray<FCellSnapshot>& OutCells) const;
 		bool ExportActiveState(
 			int32 LogicalStep,
 			TArray<uint8>& OutState,

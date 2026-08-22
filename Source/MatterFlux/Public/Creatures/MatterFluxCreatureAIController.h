@@ -1,0 +1,53 @@
+#pragma once
+
+#include "CoreMinimal.h"
+#include "AIController.h"
+#include "Creatures/MatterFluxCreatureBehaviorTree.h"
+#include "Creatures/MatterFluxCreatureActor.h"
+#include "MatterFluxCreatureAIController.generated.h"
+
+class AMatterFluxTwoStoreyHouseActor;
+
+/** Fixed-rate server-only interpreter for Lua creature AI programs. */
+UCLASS()
+class MATTERFLUX_API AMatterFluxCreatureAIController : public AAIController
+{
+	GENERATED_BODY()
+
+public:
+	AMatterFluxCreatureAIController();
+	virtual void Tick(float DeltaSeconds) override;
+
+protected:
+	virtual void OnPossess(APawn* InPawn) override;
+
+private:
+	AMatterFluxCreatureActor* GetCreature() const;
+	AActor* FindNearestPlayer(float Range, float& OutDistance) const;
+	void UpdateDecision(
+		AMatterFluxCreatureActor& Creature,
+		const FMatterFluxCreatureDefinition& Definition,
+		double Now);
+	void ApplyMovement(
+		AMatterFluxCreatureActor& Creature,
+		AActor* Target,
+		EMatterFluxCreatureRuntimeState State,
+		float DeltaSeconds);
+
+	TWeakObjectPtr<AActor> RememberedTarget;
+	double LastSeenTime = -DBL_MAX;
+	double LastAttackTime = -DBL_MAX;
+	double LastSkillTime = -DBL_MAX;
+	double LastPatrolTurnTime = -DBL_MAX;
+	double PatrolPauseUntil = -DBL_MAX;
+	double NextDecisionTime = -DBL_MAX;
+	float PatrolDirection = 1.0f;
+	float RecoveryDirection = 1.0f;
+	TWeakObjectPtr<AMatterFluxTwoStoreyHouseActor> PatrolHouse;
+	TWeakObjectPtr<AActor> MovementTarget;
+	EMatterFluxCreatureRuntimeState MovementState =
+		EMatterFluxCreatureRuntimeState::Passive;
+	int32 HousePatrolWaypointIndex = 0;
+	int32 BlockedDecisionCount = 0;
+	int32 DecisionSerial = 0;
+};

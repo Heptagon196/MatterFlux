@@ -10,6 +10,8 @@ class ULocalPlayer;
 class UMatterFluxMagicWorkbenchWidget;
 class UMatterFluxShellWidget;
 class UMatterFluxQuestTrackerWidget;
+class UMatterFluxInteractionWidget;
+class AMatterFluxCreatureActor;
 
 UCLASS()
 class MATTERFLUX_API AMatterFluxPlayerController : public APlayerController
@@ -41,6 +43,10 @@ public:
 	void ShowSaveMenu();
 	void ShowLoadMenu();
 	void CloseShellMenu();
+	/** 仅供项目内可视验收命令绕过前端菜单，不执行存档操作。 */
+	void EnterGameplayForVisualCapture();
+	/** 隐藏可视验收截图中的所有本地 UI，不改变实际游戏状态。 */
+	void HideUIForVisualCapture();
 	bool IsShellMenuOpen() const;
 	void HandleShellStateChanged(bool bMenuOpen, bool bOperationActive);
 	bool HostListenRoom(int32 SaveSlotIndex, FString& OutError);
@@ -52,6 +58,11 @@ public:
 		const FString& Address,
 		FString& OutNormalizedAddress,
 		FString& OutError);
+	void RequestCreaturePurchase(
+		AMatterFluxCreatureActor* Creature,
+		int32 OfferIndex,
+		int32 ExpectedProgressionRevision);
+	void CloseCreatureInteraction();
 
 protected:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Input|Debug")
@@ -70,12 +81,53 @@ private:
 	void CreateMagicWorkbench();
 	void CreateShell();
 	void CreateQuestTracker();
+	void CreateInteractionWidget();
 	void CloseMagicWorkbench();
+	void TryInteract();
 	void AddDebugMappingContext();
 	void GrantDebugAbilityIfEnabled();
 	void HandleDebugDamageInput();
 	UInputAction* GetOrCreateDebugDamageAction();
 	UInputMappingContext* GetOrCreateDebugMappingContext();
+
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerInteract(AMatterFluxCreatureActor* Creature);
+	bool ServerInteract_Validate(AMatterFluxCreatureActor* Creature);
+	void ServerInteract_Implementation(AMatterFluxCreatureActor* Creature);
+
+	UFUNCTION(Client, Reliable)
+	void ClientOpenCreatureInteraction(
+		AMatterFluxCreatureActor* Creature,
+		FName DialogueId);
+	void ClientOpenCreatureInteraction_Implementation(
+		AMatterFluxCreatureActor* Creature,
+		FName DialogueId);
+
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerPurchaseCreatureOffer(
+		AMatterFluxCreatureActor* Creature,
+		int32 OfferIndex,
+		int32 ExpectedProgressionRevision);
+	bool ServerPurchaseCreatureOffer_Validate(
+		AMatterFluxCreatureActor* Creature,
+		int32 OfferIndex,
+		int32 ExpectedProgressionRevision);
+	void ServerPurchaseCreatureOffer_Implementation(
+		AMatterFluxCreatureActor* Creature,
+		int32 OfferIndex,
+		int32 ExpectedProgressionRevision);
+
+	UFUNCTION(Client, Reliable)
+	void ClientCreaturePurchaseResult(
+		bool bSuccess,
+		int32 OfferIndex,
+		int32 RemainingPurchases,
+		const FString& Message);
+	void ClientCreaturePurchaseResult_Implementation(
+		bool bSuccess,
+		int32 OfferIndex,
+		int32 RemainingPurchases,
+		const FString& Message);
 
 	UPROPERTY(Transient)
 	TObjectPtr<UInputAction> RuntimeDebugDamageAction;
@@ -96,4 +148,7 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMatterFluxQuestTrackerWidget> QuestTracker;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMatterFluxInteractionWidget> InteractionWidget;
 };

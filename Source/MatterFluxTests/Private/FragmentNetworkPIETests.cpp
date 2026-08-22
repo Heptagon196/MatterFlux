@@ -14,9 +14,11 @@
 #include "HAL/PlatformTime.h"
 #include "IMatterFluxScriptRuntime.h"
 #include "Materials/Material.h"
+#include "Materials/MaterialInstanceDynamic.h"
 #include "MatterFluxGameplayTags.h"
 #include "Misc/AutomationTest.h"
 #include "ProceduralMeshComponent.h"
+#include "Rendering/MatterFluxVoxelMaterialStyle.h"
 #include "Settings/LevelEditorPlaySettings.h"
 #include "Tests/AutomationEditorCommon.h"
 #include "UObject/Package.h"
@@ -42,7 +44,12 @@ namespace
 	{
 		for (TActorIterator<AFragment2DSourceActor> It(World); It; ++It)
 		{
-			if (!ExpectedSourceId.IsValid() || It->SourceId == ExpectedSourceId)
+			// Destroy() 到下一次 GC 之间 Actor 仍会出现在 TActorIterator
+			// 中，但它已不是可交互/可复制的 Source。网络断言只统计
+			// 存活 Actor，避免把延迟 GC 当成逻辑树被重新实例化。
+			if (!It->IsActorBeingDestroyed()
+				&& (!ExpectedSourceId.IsValid()
+					|| It->SourceId == ExpectedSourceId))
 			{
 				return *It;
 			}
@@ -78,6 +85,47 @@ namespace
 			++Count;
 		}
 		return Count;
+	}
+
+	bool HasCanonicalFragmentProjection(AFragment2DActor* Fragment)
+	{
+		if (!Fragment || !Fragment->FragmentMaterial)
+		{
+			return false;
+		}
+		UMaterialInstanceDynamic* Projection =
+			Cast<UMaterialInstanceDynamic>(
+				Fragment->MeshComponent->GetMaterial(0));
+		if (!Projection
+			|| Projection->GetMaterial()
+				!= Fragment->FragmentMaterial->GetMaterial())
+		{
+			return false;
+		}
+		const float CellSize =
+			Fragment->SpawnPayload.DetachedVoxelMask.CellSize > 0.0f
+				? Fragment->SpawnPayload.DetachedVoxelMask.CellSize
+				: 12.0f;
+		const MatterFlux::Rendering::FVoxelMaterialProjection Expected =
+			MatterFlux::Rendering::ResolveVoxelMaterialProjection(
+				Fragment->FragmentColor,
+				Fragment->SpawnPayload.MaterialId,
+				CellSize,
+				MatterFlux::Rendering::EVoxelMaterialFaceRole::Primary);
+		return Projection->K2_GetVectorParameterValue(TEXT("Color"))
+				.Equals(Expected.ResolvedColor, 1.0e-4f)
+			&& FMath::IsNearlyEqual(
+				Projection->K2_GetScalarParameterValue(TEXT("FaceContrast")),
+				Expected.Style.FaceContrast)
+			&& FMath::IsNearlyEqual(
+				Projection->K2_GetScalarParameterValue(TEXT("ColorVariation")),
+				Expected.Style.ColorVariation)
+			&& FMath::IsNearlyEqual(
+				Projection->K2_GetScalarParameterValue(TEXT("Roughness")),
+				Expected.Style.Roughness)
+			&& FMath::IsNearlyEqual(
+				Projection->K2_GetScalarParameterValue(TEXT("ShadowLift")),
+				Expected.Style.ShadowLift);
 	}
 
 	APlayerController* FindLocalPlayerController(UWorld* World)
@@ -136,6 +184,8 @@ namespace
 			const FFragmentAggregateSourceState& Left = A.AggregateSources[Index];
 			const FFragmentAggregateSourceState& Right = B.AggregateSources[Index];
 			if (Left.SourceId != Right.SourceId
+				|| Left.DefinitionSourceId != Right.DefinitionSourceId
+				|| Left.bOwnsLogicalSource != Right.bOwnsLogicalSource
 				|| Left.Revision != Right.Revision
 				|| Left.SourceMask.Width != Right.SourceMask.Width
 				|| Left.SourceMask.Height != Right.SourceMask.Height
@@ -281,12 +331,20 @@ namespace
 					return FailOnTimeout(
 						TEXT("Logical source combustion Fast Array state did not converge on both clients."));
 				}
-				for (UWorld* NetworkWorld : { Server, Clients[0], Clients[1] })
+				UWorld* NetworkWorlds[] = {
+					Server, Clients[0], Clients[1]
+				};
+				for (int32 WorldIndex = 0; WorldIndex < 3; ++WorldIndex)
 				{
-					if (FindSource(NetworkWorld, FGuid()))
+					UWorld* NetworkWorld = NetworkWorlds[WorldIndex];
+					for (TActorIterator<AFragment2DSourceActor> It(
+						NetworkWorld); It; ++It)
 					{
-						return FailOnTimeout(
-							TEXT("Logical tree combustion allocated a Source Actor in a network world."));
+						if (!It->IsActorBeingDestroyed() && It->IsCombusting())
+						{
+							return FailOnTimeout(
+								TEXT("Logical tree combustion was incorrectly assigned to a materialized Source Actor."));
+						}
 					}
 				}
 				ServerWorldActor->SetActorTickEnabled(true);
@@ -297,6 +355,35 @@ namespace
 
 			if (!bRequestedAggregateFelling)
 			{
+				if (bAggregateCutCommitted)
+				{
+					for (TActorIterator<AFragment2DActor> It(Server); It; ++It)
+					{
+						if (It->GetAggregateMemberCount()
+							== ExpectedAggregateMemberCount)
+						{
+							AggregateCarrierId = It->SpawnPayload.FragmentId;
+							for (const FFragmentAggregateSourceState& Member
+								: It->AggregateSources)
+							{
+								AggregateSourceIds.Add(Member.SourceId);
+							}
+							It->bAlwaysRelevant = true;
+							It->ForceNetUpdate();
+							break;
+						}
+					}
+					if (!AggregateCarrierId.IsValid()
+						|| AggregateSourceIds.Num()
+							!= ExpectedAggregateMemberCount)
+					{
+						return FailOnTimeout(TEXT("Generated tree did not collapse into one complete aggregate carrier."));
+					}
+					bRequestedAggregateFelling = true;
+					BeginNextPhase();
+					return false;
+				}
+
 				AMatterFluxPlayableWorldActor* ServerWorldActor =
 					FindPlayableWorldActor(Server);
 				if (!ServerWorldActor)
@@ -344,10 +431,20 @@ namespace
 					if (Entry && *Entry && !(*Entry)->IsCombusting())
 					{
 						Root = *Entry;
+						ExpectedAggregateMemberCount = 0;
+						for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Member
+							: Layout.FragmentSources)
+						{
+							ExpectedAggregateMemberCount +=
+								Member.AggregateId == Definition.AggregateId ? 1 : 0;
+						}
+						// Carrier 的根部体素保存在 SpawnPayload /
+						// RootCombustionState；AggregateSources 只记录其余层。
+						--ExpectedAggregateMemberCount;
 						break;
 					}
 				}
-				if (!Root)
+				if (!Root || ExpectedAggregateMemberCount <= 1)
 				{
 					return FailOnTimeout(TEXT("A non-burning generated tree root could not be materialized."));
 				}
@@ -378,28 +475,7 @@ namespace
 				{
 					return FailOnTimeout(TEXT("Server could not fell a generated aggregate tree."));
 				}
-
-				for (TActorIterator<AFragment2DActor> It(Server); It; ++It)
-				{
-					if (It->GetAggregateMemberCount() == 3)
-					{
-						AggregateCarrierId = It->SpawnPayload.FragmentId;
-						for (const FFragmentAggregateSourceState& Member
-							: It->AggregateSources)
-						{
-							AggregateSourceIds.Add(Member.SourceId);
-						}
-						It->bAlwaysRelevant = true;
-						It->ForceNetUpdate();
-						break;
-					}
-				}
-				if (!AggregateCarrierId.IsValid()
-					|| AggregateSourceIds.Num() != 3)
-				{
-					return FailOnTimeout(TEXT("Generated tree did not collapse into one three-member carrier."));
-				}
-				bRequestedAggregateFelling = true;
+				bAggregateCutCommitted = true;
 				BeginNextPhase();
 				return false;
 			}
@@ -419,7 +495,8 @@ namespace
 				AFragment2DActor* ClientBCarrier =
 					FindFragmentById(ClientBFragments, AggregateCarrierId);
 				if (!ServerCarrier || !ClientACarrier || !ClientBCarrier
-					|| ServerCarrier->GetAggregateMemberCount() != 3
+					|| ServerCarrier->GetAggregateMemberCount()
+						!= ExpectedAggregateMemberCount
 					|| !AggregateSourcesEqual(*ServerCarrier, *ClientACarrier)
 					|| !AggregateSourcesEqual(*ServerCarrier, *ClientBCarrier)
 					|| ClientACarrier->MeshComponent->GetNumSections() <= 2
@@ -645,8 +722,8 @@ namespace
 						|| !PayloadGeometryEquals(ServerFragments[Index]->SpawnPayload, ClientBFragments[Index]->SpawnPayload)
 						|| ServerFragments[Index]->FragmentMaterial != ClientAFragments[Index]->FragmentMaterial
 						|| ServerFragments[Index]->FragmentMaterial != ClientBFragments[Index]->FragmentMaterial
-						|| ClientAFragments[Index]->MeshComponent->GetMaterial(0) != ClientAFragments[Index]->FragmentMaterial
-						|| ClientBFragments[Index]->MeshComponent->GetMaterial(0) != ClientBFragments[Index]->FragmentMaterial)
+						|| !HasCanonicalFragmentProjection(ClientAFragments[Index])
+						|| !HasCanonicalFragmentProjection(ClientBFragments[Index]))
 					{
 						Test->AddError(TEXT("Clients received different fragment ids, geometry, revisions, or materials."));
 						return true;
@@ -697,10 +774,30 @@ namespace
 						ClientASource ? ClientASource->bNetStartup : false,
 						ClientBSource ? ClientBSource->bNetStartup : false));
 				}
-				MovedFragmentId = ServerFragments[0]->SpawnPayload.FragmentId;
-				InitialServerLocation = ServerFragments[0]->GetActorLocation();
-				ServerFragments[0]->MeshComponent->SetPhysicsLinearVelocity(FVector(200.0, 0.0, 0.0));
-				ServerFragments[0]->ForceNetUpdate();
+				AFragment2DActor* ServerPhysicalFragment = nullptr;
+				for (AFragment2DActor* Fragment : ServerFragments)
+				{
+					if (Fragment
+						&& Fragment->SpawnPayload.bEnableCollision
+						&& Fragment->MeshComponent->IsSimulatingPhysics())
+					{
+						ServerPhysicalFragment = Fragment;
+						break;
+					}
+				}
+				if (!ServerPhysicalFragment)
+				{
+					return FailOnTimeout(
+						TEXT("No replicated fragment owned a dynamic rigid-body projection."));
+				}
+				MovedFragmentId =
+					ServerPhysicalFragment->SpawnPayload.FragmentId;
+				InitialServerLocation =
+					ServerPhysicalFragment->GetActorLocation();
+				ServerPhysicalFragment->MeshComponent->WakeAllRigidBodies();
+				ServerPhysicalFragment->MeshComponent->SetPhysicsLinearVelocity(
+					FVector(600.0, 0.0, 500.0));
+				ServerPhysicalFragment->ForceNetUpdate();
 				bComparedPayloads = true;
 				BeginNextPhase();
 				return false;
@@ -714,7 +811,25 @@ namespace
 			const bool bConverged = FVector::Distance(ServerMoved->GetActorLocation(), ClientAMoved->GetActorLocation()) < 75.0
 				&& FVector::Distance(ServerMoved->GetActorLocation(), ClientBMoved->GetActorLocation()) < 75.0;
 			if (bServerMoved && bConverged) return true;
-			return FailOnTimeout(TEXT("Replicated fragment movement did not converge on both clients."));
+			return FailOnTimeout(*FString::Printf(
+				TEXT("Replicated fragment movement did not converge. moved=%d converged=%d ")
+				TEXT("server=%s clientA=%s clientB=%s distanceA=%.2f distanceB=%.2f ")
+				TEXT("velocity=%s simulating=%d awake=%d."),
+				bServerMoved,
+				bConverged,
+				*ServerMoved->GetActorLocation().ToCompactString(),
+				*ClientAMoved->GetActorLocation().ToCompactString(),
+				*ClientBMoved->GetActorLocation().ToCompactString(),
+				FVector::Distance(
+					ServerMoved->GetActorLocation(),
+					ClientAMoved->GetActorLocation()),
+				FVector::Distance(
+					ServerMoved->GetActorLocation(),
+					ClientBMoved->GetActorLocation()),
+				*ServerMoved->MeshComponent->GetPhysicsLinearVelocity()
+					.ToCompactString(),
+				ServerMoved->MeshComponent->IsSimulatingPhysics(),
+				ServerMoved->MeshComponent->RigidBodyIsAwake()));
 		}
 
 	private:
@@ -737,6 +852,7 @@ namespace
 		bool bValidatedMaterialState = false;
 		bool bRequestedLogicalCombustion = false;
 		bool bValidatedLogicalCombustion = false;
+		bool bAggregateCutCommitted = false;
 		bool bRequestedAggregateFelling = false;
 		bool bValidatedAggregateCarrier = false;
 		bool bCleanedAggregateCarrier = false;
@@ -746,6 +862,7 @@ namespace
 		int32 MaxServerActorCount = 0;
 		int32 MaxClientAActorCount = 0;
 		int32 MaxClientBActorCount = 0;
+		int32 ExpectedAggregateMemberCount = 0;
 		FGuid TestSourceId;
 		FGuid AggregateCarrierId;
 		TArray<FGuid> AggregateSourceIds;

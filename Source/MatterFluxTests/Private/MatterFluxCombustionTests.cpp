@@ -7,14 +7,77 @@
 #include "Fragment/FragmentSimulationSubsystem.h"
 #include "Game/MatterFluxPlayableWorldActor.h"
 #include "Game/MatterFluxPlayableLevel.h"
+#include "GAS/GA_PlayerFlameJet.h"
 #include "IMatterFluxScriptRuntime.h"
+#include "Components/SceneComponent.h"
 #include "EngineUtils.h"
 #include "HAL/IConsoleManager.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/AutomationTest.h"
+#include "Rendering/MatterFluxSmokeVisualPool.h"
 #include "Tests/AutomationEditorCommon.h"
 
 #include <limits>
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxUnifiedSmokeVisualPoolTest,
+	"MatterFlux.Combustion.Visuals.SharedSmokePoolBuildsPersistentVoxelClouds",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxUnifiedSmokeVisualPoolTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::Rendering::FSmokeVisualSettings Settings;
+	Settings.SpawnIntervalSeconds = 0.1f;
+	Settings.MinimumLifetimeSeconds = 3.0f;
+	Settings.MaximumLifetimeSeconds = 3.0f;
+	Settings.MaximumParticles = 2;
+	Settings.MaximumNewParticlesPerStep = 2;
+	Settings.VoxelsPerParticle = 5;
+
+	MatterFlux::Rendering::FSmokeVisualPool Pool;
+	TestTrue(TEXT("Valid shared smoke settings are accepted"),
+		Pool.Configure(Settings));
+	MatterFlux::Rendering::FSmokeEmissionAnchor Anchor;
+	Anchor.WorldPosition = FVector(100.0f, 200.0f, 300.0f);
+	Anchor.CellSize = 20.0f;
+	Anchor.EmissionProbability = 1.0f;
+	Anchor.Seed = 1337;
+	Pool.SetEmissionAnchors(MakeArrayView(&Anchor, 1));
+	Pool.Advance(0.1f);
+
+	TestEqual(TEXT("One anchor emits one bounded smoke particle per interval"),
+		Pool.GetParticleCount(), 1);
+	TArray<FTransform> ClusterTransforms;
+	Pool.BuildInstanceTransforms(ClusterTransforms);
+	TestEqual(TEXT("A smoke puff is a voxel cluster rather than one grey cube"),
+		ClusterTransforms.Num(), Settings.VoxelsPerParticle);
+
+	const FVector BeforeRise = Pool.GetParticlePosition(0);
+	Pool.SetEmissionAnchors(TConstArrayView<
+		MatterFlux::Rendering::FSmokeEmissionAnchor>());
+	for (int32 Step = 0; Step < 20; ++Step)
+	{
+		Pool.Advance(0.1f);
+	}
+	TestEqual(TEXT("Smoke survives after its flame anchor disappears"),
+		Pool.GetParticleCount(), 1);
+	TestTrue(TEXT("Persistent smoke rises while it ages"),
+		Pool.GetParticlePosition(0).Z > BeforeRise.Z);
+	for (int32 Step = 0; Step < 11; ++Step)
+	{
+		Pool.Advance(0.1f);
+	}
+	TestEqual(TEXT("Smoke expires after the configured lifetime"),
+		Pool.GetParticleCount(), 0);
+
+	Pool.SetEmissionAnchors(MakeArrayView(&Anchor, 1));
+	Pool.Advance(1.0f);
+	TestEqual(TEXT("The world smoke budget is enforced"),
+		Pool.GetParticleCount(), Settings.MaximumParticles);
+	return true;
+}
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxSourceCombustionRuntimeFixedStepTest,
@@ -31,16 +94,16 @@ bool FMatterFluxSourceCombustionRuntimeFixedStepTest::RunTest(
 	Mask.CellSize = 4.0f;
 	Mask.SolidMask.Init(1, Mask.Width * Mask.Height);
 
-	FMatterFluxCombustionDefinition Rule;
+	FMatterFluxReactionDefinition Rule;
 	Rule.Id = TEXT("source_runtime_fire");
-	Rule.FuelMaterial = TEXT("wood");
-	Rule.FlameMaterial = TEXT("fire");
-	Rule.SmokeMaterial = TEXT("smoke");
-	Rule.ResidueMaterial = TEXT("charcoal");
-	Rule.IgnitionChancePermille = 1000;
-	Rule.SpreadChancePermille = 1000;
-	Rule.SmokeChancePermille = 1000;
-	Rule.BurnDurationSteps = 2;
+	Rule.InputA = TEXT("wood");
+	Rule.InputB = TEXT("fire");
+	Rule.EmissionMaterial = TEXT("smoke");
+	Rule.OutputA = TEXT("charcoal");
+	Rule.ChancePermille = 1000;
+	Rule.PropagationChancePermille = 1000;
+	Rule.EmissionChancePermille = 1000;
+	Rule.DurationSteps = 2;
 
 	MatterFlux::Combustion::FSourceRuntimeSettings Settings;
 	MatterFlux::Combustion::FSourceCombustionRuntime Original;
@@ -94,6 +157,107 @@ bool FMatterFluxSourceCombustionRuntimeFixedStepTest::RunTest(
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxSourceCombustionFrontBudgetTest,
+	"MatterFlux.Combustion.SourceRuntimeLimitsFireFrontPerFixedStep",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxSourceCombustionFrontBudgetTest::RunTest(
+	const FString& Parameters)
+{
+	FFragmentSourceMask Mask;
+	Mask.Width = 9;
+	Mask.Height = 9;
+	Mask.CellSize = 4.0f;
+	Mask.SolidMask.Init(1, Mask.Width * Mask.Height);
+
+	FMatterFluxReactionDefinition Rule;
+	Rule.Id = TEXT("bounded_leaf_fire");
+	Rule.InputA = TEXT("leaf");
+	Rule.InputB = TEXT("fire");
+	Rule.EmissionMaterial = TEXT("smoke");
+	Rule.OutputA = TEXT("charcoal");
+	Rule.ChancePermille = 1000;
+	Rule.PropagationChancePermille = 1000;
+	Rule.DurationSteps = 8;
+
+	MatterFlux::Combustion::FSourceRuntimeSettings Settings;
+	Settings.MaxSpreadIgnitionsPerStep = 1;
+	MatterFlux::Combustion::FSourceCombustionRuntime Runtime;
+	FString Error;
+	if (!TestTrue(
+		TEXT("Dense leaf crown runtime initializes"),
+		Runtime.Initialize(Settings, Mask, Rule, 2026, Error))
+		|| !TestTrue(
+			TEXT("Center leaf cell ignites"),
+			Runtime.IgniteNearest(FIntPoint(4, 4), TEXT("fire"))))
+	{
+		AddError(Error);
+		return false;
+	}
+	const MatterFlux::Combustion::FSourceAdvanceResult Result =
+		Runtime.AdvanceAuthority(Settings.StepSeconds);
+	int32 BurningCells = 0;
+	for (const uint8 Value : Runtime.GetBurningMask())
+	{
+		BurningCells += Value != 0 ? 1 : 0;
+	}
+	TestEqual(TEXT("One fixed step adds only one new burning cell"),
+		BurningCells,
+		2);
+	TestEqual(TEXT("The bounded front still performs one deterministic step"),
+		Result.Steps,
+		1);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxLeafFireUsesEdgeConnectedFrontTest,
+	"MatterFlux.Combustion.LeafFireUsesEdgeConnectedFront",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxLeafFireUsesEdgeConnectedFrontTest::RunTest(
+	const FString& Parameters)
+{
+	FFragmentSourceMask Mask;
+	Mask.Width = 2;
+	Mask.Height = 2;
+	Mask.CellSize = 4.0f;
+	Mask.SolidMask = {
+		1, 0,
+		0, 1
+	};
+
+	FMatterFluxReactionDefinition Rule;
+	Rule.Id = TEXT("edge_connected_leaf_fire");
+	Rule.InputA = TEXT("leaf");
+	Rule.InputB = TEXT("fire");
+	Rule.EmissionMaterial = TEXT("smoke");
+	Rule.OutputA = TEXT("ash");
+	Rule.ChancePermille = 1000;
+	Rule.PropagationChancePermille = 1000;
+	Rule.DurationSteps = 8;
+
+	MatterFlux::Combustion::FMaskCombustion Simulation;
+	if (!TestTrue(
+		TEXT("Diagonal leaf fixture initializes"),
+		Simulation.Initialize(Mask, Rule, 901))
+		|| !TestTrue(
+			TEXT("First leaf pixel ignites"),
+			Simulation.Ignite(FIntPoint(0, 0), TEXT("fire"))))
+	{
+		return false;
+	}
+	const MatterFlux::Combustion::FStepStats Step = Simulation.Step(1);
+	TestEqual(
+		TEXT("Fire cannot jump across a corner and create a disconnected flame point"),
+		Step.IgnitedCells,
+		0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxSourceCombustionSnapshotReuseTest,
 	"MatterFlux.Combustion.SourceSnapshotCaptureReusesCallerStorageTransactionally",
 	EAutomationTestFlags::EditorContext
@@ -111,15 +275,15 @@ bool FMatterFluxSourceCombustionSnapshotReuseTest::RunTest(
 	Mask.CellSize = 4.0f;
 	Mask.SolidMask.Init(1, CellCount);
 
-	FMatterFluxCombustionDefinition Rule;
+	FMatterFluxReactionDefinition Rule;
 	Rule.Id = TEXT("source_snapshot_reuse");
-	Rule.FuelMaterial = TEXT("wood");
-	Rule.FlameMaterial = TEXT("fire");
-	Rule.SmokeMaterial = TEXT("smoke");
-	Rule.ResidueMaterial = TEXT("charcoal");
-	Rule.IgnitionChancePermille = 1000;
-	Rule.SpreadChancePermille = 0;
-	Rule.BurnDurationSteps = 8;
+	Rule.InputA = TEXT("wood");
+	Rule.InputB = TEXT("fire");
+	Rule.EmissionMaterial = TEXT("smoke");
+	Rule.OutputA = TEXT("charcoal");
+	Rule.ChancePermille = 1000;
+	Rule.PropagationChancePermille = 0;
+	Rule.DurationSteps = 8;
 
 	MatterFlux::Combustion::FSourceCombustionRuntime Runtime;
 	FString Error;
@@ -222,15 +386,15 @@ bool FMatterFluxSourceStreamingMaskStorageTest::RunTest(
 	Mask.CellSize = 4.0f;
 	Mask.SolidMask.Init(1, CellCount);
 
-	FMatterFluxCombustionDefinition Rule;
+	FMatterFluxReactionDefinition Rule;
 	Rule.Id = TEXT("canonical_streaming_mask");
-	Rule.FuelMaterial = TEXT("wood");
-	Rule.FlameMaterial = TEXT("fire");
-	Rule.SmokeMaterial = TEXT("smoke");
-	Rule.ResidueMaterial = TEXT("charcoal");
-	Rule.IgnitionChancePermille = 1000;
-	Rule.SpreadChancePermille = 0;
-	Rule.BurnDurationSteps = 8;
+	Rule.InputA = TEXT("wood");
+	Rule.InputB = TEXT("fire");
+	Rule.EmissionMaterial = TEXT("smoke");
+	Rule.OutputA = TEXT("charcoal");
+	Rule.ChancePermille = 1000;
+	Rule.PropagationChancePermille = 0;
+	Rule.DurationSteps = 8;
 
 	MatterFlux::Combustion::FSourceCombustionRuntime Runtime;
 	FString Error;
@@ -291,16 +455,16 @@ bool FMatterFluxMaskCombustionConsumesFuelTest::RunTest(
 	Mask.MaxFragmentsPerBreak = 4;
 	Mask.SolidMask.Init(1, 3);
 
-	FMatterFluxCombustionDefinition Rule;
+	FMatterFluxReactionDefinition Rule;
 	Rule.Id = TEXT("test_burn");
-	Rule.FuelMaterial = TEXT("wood");
-	Rule.FlameMaterial = TEXT("fire");
-	Rule.SmokeMaterial = TEXT("smoke");
-	Rule.ResidueMaterial = TEXT("charcoal");
-	Rule.IgnitionChancePermille = 1000;
-	Rule.SpreadChancePermille = 1000;
-	Rule.BurnDurationSteps = 2;
-	Rule.SmokeChancePermille = 1000;
+	Rule.InputA = TEXT("wood");
+	Rule.InputB = TEXT("fire");
+	Rule.EmissionMaterial = TEXT("smoke");
+	Rule.OutputA = TEXT("charcoal");
+	Rule.ChancePermille = 1000;
+	Rule.PropagationChancePermille = 1000;
+	Rule.DurationSteps = 2;
+	Rule.EmissionChancePermille = 1000;
 
 	MatterFlux::Combustion::FMaskCombustion Simulation;
 	TestTrue(
@@ -344,16 +508,16 @@ bool FMatterFluxCombustionDamageConstraintTest::RunTest(
 	Mask.MaxFragmentsPerBreak = 4;
 	Mask.SolidMask.Init(1, 3);
 
-	FMatterFluxCombustionDefinition Rule;
+	FMatterFluxReactionDefinition Rule;
 	Rule.Id = TEXT("damage_constraint");
-	Rule.FuelMaterial = TEXT("wood");
-	Rule.FlameMaterial = TEXT("fire");
-	Rule.SmokeMaterial = TEXT("smoke");
-	Rule.ResidueMaterial = TEXT("charcoal");
-	Rule.IgnitionChancePermille = 1000;
-	Rule.SpreadChancePermille = 1000;
-	Rule.BurnDurationSteps = 3;
-	Rule.SmokeChancePermille = 0;
+	Rule.InputA = TEXT("wood");
+	Rule.InputB = TEXT("fire");
+	Rule.EmissionMaterial = TEXT("smoke");
+	Rule.OutputA = TEXT("charcoal");
+	Rule.ChancePermille = 1000;
+	Rule.PropagationChancePermille = 1000;
+	Rule.DurationSteps = 3;
+	Rule.EmissionChancePermille = 0;
 
 	MatterFlux::Combustion::FMaskCombustion Simulation;
 	TestTrue(TEXT("Fuel initializes"),
@@ -484,16 +648,16 @@ bool FMatterFluxLargeCombustionMaskTest::RunTest(
 	Mask.Height = MatterFlux::PlayableLevel::TerrainCellsY;
 	Mask.SolidMask.Init(1, Mask.Width * Mask.Height);
 
-	FMatterFluxCombustionDefinition Rule;
+	FMatterFluxReactionDefinition Rule;
 	Rule.Id = TEXT("large_ground_burn");
-	Rule.FuelMaterial = TEXT("grassland");
-	Rule.FlameMaterial = TEXT("fire");
-	Rule.SmokeMaterial = TEXT("smoke");
-	Rule.ResidueMaterial = TEXT("ash");
-	Rule.IgnitionChancePermille = 1000;
-	Rule.SpreadChancePermille = 25;
-	Rule.BurnDurationSteps = 8;
-	Rule.SmokeChancePermille = 420;
+	Rule.InputA = TEXT("grassland");
+	Rule.InputB = TEXT("fire");
+	Rule.EmissionMaterial = TEXT("smoke");
+	Rule.OutputA = TEXT("ash");
+	Rule.ChancePermille = 1000;
+	Rule.PropagationChancePermille = 25;
+	Rule.DurationSteps = 8;
+	Rule.EmissionChancePermille = 420;
 
 	MatterFlux::Combustion::FMaskCombustion Simulation;
 	TestTrue(
@@ -522,16 +686,16 @@ bool FMatterFluxGroundCombustionRuntimeChunkBatchTest::RunTest(
 	Mask.CellSize = 10.0f;
 	Mask.SolidMask.Init(1, Mask.Width * Mask.Height);
 
-	FMatterFluxCombustionDefinition Rule;
+	FMatterFluxReactionDefinition Rule;
 	Rule.Id = TEXT("ground_runtime_chunk_batch");
-	Rule.FuelMaterial = TEXT("grassland");
-	Rule.FlameMaterial = TEXT("fire");
-	Rule.SmokeMaterial = TEXT("smoke");
-	Rule.ResidueMaterial = TEXT("ash");
-	Rule.IgnitionChancePermille = 1000;
-	Rule.SpreadChancePermille = 0;
-	Rule.BurnDurationSteps = 2;
-	Rule.SmokeChancePermille = 0;
+	Rule.InputA = TEXT("grassland");
+	Rule.InputB = TEXT("fire");
+	Rule.EmissionMaterial = TEXT("smoke");
+	Rule.OutputA = TEXT("ash");
+	Rule.ChancePermille = 1000;
+	Rule.PropagationChancePermille = 0;
+	Rule.DurationSteps = 2;
+	Rule.EmissionChancePermille = 0;
 
 	MatterFlux::Combustion::FGroundRuntimeSettings Settings;
 	Settings.Width = Mask.Width;
@@ -547,7 +711,7 @@ bool FMatterFluxGroundCombustionRuntimeChunkBatchTest::RunTest(
 	}
 	TestTrue(
 		TEXT("Ignition marks the containing replication chunk"),
-		Runtime.Ignite(FIntPoint(65, 10), Rule.FlameMaterial));
+		Runtime.Ignite(FIntPoint(65, 10), Rule.InputB));
 	TArray<int32> BurningCellIndices;
 	Runtime.GatherBurningCellIndices(BurningCellIndices);
 	TestEqual(
@@ -568,7 +732,7 @@ bool FMatterFluxGroundCombustionRuntimeChunkBatchTest::RunTest(
 		BurningChunks == TArray<FIntPoint>({ FIntPoint(1, 0) }));
 	TestTrue(
 		TEXT("A second burning cell in the same chunk is accepted"),
-		Runtime.Ignite(FIntPoint(66, 10), Rule.FlameMaterial));
+		Runtime.Ignite(FIntPoint(66, 10), Rule.InputB));
 	Runtime.GatherBurningChunkCoordinates(BurningChunks);
 	TestTrue(
 		TEXT("Multiple burning cells in one chunk still produce one query region"),
@@ -649,15 +813,15 @@ bool FMatterFluxGroundCombustionRuntimeReplicationGuardTest::RunTest(
 	Mask.CellSize = 10.0f;
 	Mask.SolidMask.Init(1, Mask.Width * Mask.Height);
 
-	FMatterFluxCombustionDefinition Rule;
+	FMatterFluxReactionDefinition Rule;
 	Rule.Id = TEXT("ground_runtime_replication_guard");
-	Rule.FuelMaterial = TEXT("grassland");
-	Rule.FlameMaterial = TEXT("fire");
-	Rule.SmokeMaterial = TEXT("smoke");
-	Rule.ResidueMaterial = TEXT("ash");
-	Rule.IgnitionChancePermille = 1000;
-	Rule.SpreadChancePermille = 0;
-	Rule.BurnDurationSteps = 2;
+	Rule.InputA = TEXT("grassland");
+	Rule.InputB = TEXT("fire");
+	Rule.EmissionMaterial = TEXT("smoke");
+	Rule.OutputA = TEXT("ash");
+	Rule.ChancePermille = 1000;
+	Rule.PropagationChancePermille = 0;
+	Rule.DurationSteps = 2;
 
 	MatterFlux::Combustion::FGroundRuntimeSettings Settings;
 	Settings.Width = Mask.Width;
@@ -673,7 +837,7 @@ bool FMatterFluxGroundCombustionRuntimeReplicationGuardTest::RunTest(
 		AddError(Error);
 		return false;
 	}
-	Authority.Ignite(FIntPoint(2, 3), Rule.FlameMaterial);
+	Authority.Ignite(FIntPoint(2, 3), Rule.InputB);
 	Authority.AdvanceAuthority(Settings.StepSeconds);
 	TArray<FMatterFluxGroundStateChunk> Batch;
 	if (!TestTrue(TEXT("Authority publishes the changed state"),
@@ -743,7 +907,7 @@ bool FMatterFluxGroundCombustionRuntimeReplicationGuardTest::RunTest(
 		TEXT("Client accepts the maximum revision"),
 		WrappedClient.ApplyReplicatedChunk(WrappedBatch[0], Error),
 		MatterFlux::Combustion::EGroundChunkApplyResult::Applied);
-	WrappedAuthority.Ignite(FIntPoint(5, 5), Rule.FlameMaterial);
+	WrappedAuthority.Ignite(FIntPoint(5, 5), Rule.InputB);
 	WrappedAuthority.BuildPendingReplication(WrappedBatch, Error);
 	TestEqual(
 		TEXT("Revision wraps from MAX_int32 to zero"),
@@ -771,15 +935,15 @@ bool FMatterFluxGroundCombustionRuntimeSnapshotDebtTest::RunTest(
 	Mask.CellSize = 10.0f;
 	Mask.SolidMask.Init(1, Mask.Width * Mask.Height);
 
-	FMatterFluxCombustionDefinition Rule;
+	FMatterFluxReactionDefinition Rule;
 	Rule.Id = TEXT("ground_runtime_snapshot_debt");
-	Rule.FuelMaterial = TEXT("grassland");
-	Rule.FlameMaterial = TEXT("fire");
-	Rule.SmokeMaterial = TEXT("smoke");
-	Rule.ResidueMaterial = TEXT("ash");
-	Rule.IgnitionChancePermille = 1000;
-	Rule.SpreadChancePermille = 0;
-	Rule.BurnDurationSteps = 1;
+	Rule.InputA = TEXT("grassland");
+	Rule.InputB = TEXT("fire");
+	Rule.EmissionMaterial = TEXT("smoke");
+	Rule.OutputA = TEXT("ash");
+	Rule.ChancePermille = 1000;
+	Rule.PropagationChancePermille = 0;
+	Rule.DurationSteps = 1;
 
 	MatterFlux::Combustion::FGroundRuntimeSettings Settings;
 	Settings.Width = Mask.Width;
@@ -792,7 +956,7 @@ bool FMatterFluxGroundCombustionRuntimeSnapshotDebtTest::RunTest(
 		AddError(Error);
 		return false;
 	}
-	Original.Ignite(FIntPoint(4, 5), Rule.FlameMaterial);
+	Original.Ignite(FIntPoint(4, 5), Rule.InputB);
 	TestEqual(
 		TEXT("Half a fixed step performs no simulation step"),
 		Original.AdvanceAuthority(Settings.StepSeconds * 0.5f).Steps,
@@ -1009,8 +1173,19 @@ bool FMatterFluxMaterializedFireKeepsLogicalNeighborsTest::RunTest(
 		};
 	const FBox TrunkBounds = BuildWorldBounds(*Trunk);
 	const FBox LeafBounds = BuildWorldBounds(*Leaf);
+	const FVector LowerTrunkPoint =
+		(Trunk->Transform * WorldActor->GetActorTransform())
+			.TransformPosition(FVector(
+				0.0f,
+				0.0f,
+				-Trunk->Mask.Height * Trunk->Mask.CellSize * 0.3f));
+	const FBox TrunkSelectionBounds = FBox::BuildAABB(
+		LowerTrunkPoint,
+		FVector(Trunk->Mask.CellSize * 0.45f));
 	TArray<AFragment2DSourceActor*> Materialized;
-	WorldActor->GatherFragmentSourcesInBounds(TrunkBounds, Materialized);
+	WorldActor->GatherFragmentSourcesInBounds(
+		TrunkSelectionBounds,
+		Materialized);
 	AFragment2DSourceActor* TrunkActor = nullptr;
 	for (AFragment2DSourceActor* Source : Materialized)
 	{
@@ -1023,11 +1198,12 @@ bool FMatterFluxMaterializedFireKeepsLogicalNeighborsTest::RunTest(
 	{
 		return false;
 	}
-	for (AFragment2DSourceActor* Source : Materialized)
+	for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
+		: Layout.FragmentSources)
 	{
-		if (Source && Source != TrunkActor)
+		if (Source.SourceId != Trunk->SourceId)
 		{
-			WorldActor->DematerializeFragmentSource(Source->SourceId);
+			WorldActor->DematerializeFragmentSource(Source.SourceId);
 		}
 	}
 	const int32 MaterializedBeforePropagation =
@@ -1297,6 +1473,280 @@ bool FMatterFluxBurningAggregateMemberHandoffTest::RunTest(
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxDetachedTreeIgnitionTest,
+	"MatterFlux.Combustion.DetachedTreeWoodAndLeavesCanIgniteAfterFelling",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxDetachedTreeIgnitionTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* WorldActor =
+		World ? World->SpawnActor<AMatterFluxPlayableWorldActor>() : nullptr;
+	if (!TestNotNull(TEXT("Playable world spawns"), WorldActor))
+	{
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry =
+		IMatterFluxScriptRuntime::Get().GetActiveRegistry();
+	MatterFlux::PlayableLevel::FLevelLayout Layout;
+	if (!TestTrue(
+		TEXT("Reference forest layout builds"),
+		MatterFlux::PlayableLevel::BuildLevelLayout(
+			1337,
+			Layout,
+			Registry.Get())))
+	{
+		return false;
+	}
+	WorldActor->Regenerate(1337);
+
+	const MatterFlux::PlayableLevel::FLevelFragmentSource* Trunk =
+		Layout.FragmentSources.FindByPredicate(
+			[](const MatterFlux::PlayableLevel::FLevelFragmentSource& Source)
+			{
+				return Source.Name == TEXT("TreeTrunk")
+					&& Source.bAggregateRoot;
+			});
+	const MatterFlux::PlayableLevel::FLevelFragmentSource* Leaf = Trunk
+		? Layout.FragmentSources.FindByPredicate(
+			[Trunk](const MatterFlux::PlayableLevel::FLevelFragmentSource& Source)
+			{
+				return Source.AggregateId == Trunk->AggregateId
+					&& Source.MaterialId == TEXT("leaf")
+					&& !Source.bAggregateRoot;
+			})
+		: nullptr;
+	if (!TestNotNull(TEXT("Generated tree trunk exists"), Trunk)
+		|| !TestNotNull(TEXT("Generated tree leaf exists"), Leaf))
+	{
+		return false;
+	}
+	const auto BuildWorldBounds = [WorldActor](
+		const MatterFlux::PlayableLevel::FLevelFragmentSource& Source)
+	{
+		const FVector HalfExtent(
+			Source.Mask.Width * Source.Mask.CellSize * 0.5f,
+			Source.Mask.CellSize,
+			Source.Mask.Height * Source.Mask.CellSize * 0.5f);
+		return FBox(-HalfExtent, HalfExtent).TransformBy(
+			(Source.Transform * WorldActor->GetActorTransform())
+				.ToMatrixWithScale());
+	};
+	TArray<AFragment2DSourceActor*> Materialized;
+	WorldActor->GatherFragmentSourcesInBounds(
+		BuildWorldBounds(*Trunk),
+		Materialized);
+	AFragment2DSourceActor* TrunkActor = nullptr;
+	if (AFragment2DSourceActor** Found = Materialized.FindByPredicate(
+		[Trunk](const AFragment2DSourceActor* Source)
+		{
+			return Source && Source->SourceId == Trunk->SourceId;
+		}))
+	{
+		TrunkActor = *Found;
+	}
+	if (!TestNotNull(TEXT("Tree trunk materializes for cutting"), TrunkActor))
+	{
+		return false;
+	}
+
+	FFragmentDamageEvent Event;
+	Event.SourceId = TrunkActor->SourceId;
+	Event.BaseRevision = TrunkActor->Revision;
+	Event.EventSeed = 1913;
+	Event.DamagePower = 400.0f;
+	Event.DamageShape.Type = EFragmentDamageShapeType::Line;
+	Event.DamageShape.WorldTransform = TrunkActor->GetActorTransform();
+	Event.DamageShape.Extents.X = TrunkActor->GetCellSize()
+		* static_cast<float>(TrunkActor->GetMaskWidth() + 2);
+	Event.DamageShape.Thickness = TrunkActor->GetCellSize() * 1.25f;
+	UFragmentSimulationSubsystem* Subsystem =
+		World->GetSubsystem<UFragmentSimulationSubsystem>();
+	if (!TestNotNull(TEXT("Fragment subsystem exists"), Subsystem)
+		|| !TestTrue(
+			TEXT("Unlit tree can be felled"),
+			Subsystem->RequestFragmentDamage(TrunkActor, Event)))
+	{
+		return false;
+	}
+
+	AFragment2DActor* Carrier = nullptr;
+	for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+	{
+		if (It->ContainsAggregateSource(Leaf->SourceId))
+		{
+			Carrier = *It;
+			break;
+		}
+	}
+	if (!TestNotNull(
+		TEXT("Felled trunk and leaves share a detached carrier"),
+		Carrier))
+	{
+		return false;
+	}
+	const FFragmentAggregateSourceState* CutWoodLayer =
+		Carrier->AggregateSources.FindByPredicate(
+			[](const FFragmentAggregateSourceState& Layer)
+			{
+				return !Layer.bOwnsLogicalSource
+					&& Layer.MaterialId == TEXT("wood")
+					&& Layer.SourceMask.SolidMask.Contains(1);
+			});
+	if (!TestNotNull(
+		TEXT("The other trunk depth layer is cut instead of reattached whole"),
+		CutWoodLayer))
+	{
+		return false;
+	}
+	const FGuid CutWoodLayerId = CutWoodLayer->SourceId;
+	const int32 CutWoodCellIndex =
+		CutWoodLayer->SourceMask.SolidMask.IndexOfByKey(1);
+	const int32 CutWoodX =
+		CutWoodCellIndex % CutWoodLayer->SourceMask.Width;
+	const int32 CutWoodY =
+		CutWoodCellIndex / CutWoodLayer->SourceMask.Width;
+	const FVector CutWoodWorldLocation =
+		(CutWoodLayer->LocalTransform * Carrier->GetActorTransform())
+		.TransformPosition(FVector(
+			(static_cast<float>(CutWoodX) + 0.5f
+				- CutWoodLayer->SourceMask.Width * 0.5f)
+				* CutWoodLayer->SourceMask.CellSize,
+			0.0f,
+			(static_cast<float>(CutWoodY) + 0.5f
+				- CutWoodLayer->SourceMask.Height * 0.5f)
+				* CutWoodLayer->SourceMask.CellSize));
+	AActor* FlameAvatar = World->SpawnActor<AActor>();
+	if (!TestNotNull(TEXT("Flame test avatar spawns"), FlameAvatar))
+	{
+		return false;
+	}
+	USceneComponent* FlameRoot = NewObject<USceneComponent>(FlameAvatar);
+	FlameAvatar->SetRootComponent(FlameRoot);
+	FlameRoot->RegisterComponent();
+	TestEqual(
+		TEXT("Detached root preserves wood material identity"),
+		Carrier->RootCombustionState.MaterialId,
+		FName(TEXT("wood")));
+	TestTrue(
+		TEXT("Detached root exposes a valid combustible voxel mask"),
+		Carrier->RootCombustionState.IsValid());
+	const FBox CarrierBounds = Carrier->GetCombustibleWorldBounds();
+	TestTrue(
+		TEXT("Detached carrier exposes deterministic combustible bounds"),
+		CarrierBounds.IsValid != 0);
+	const FFragmentSourceMask& RootMask =
+		Carrier->RootCombustionState.SourceMask;
+	const FVector RootHalfExtent(
+		RootMask.Width * RootMask.CellSize * 0.5f,
+		RootMask.CellSize * 0.5f,
+		RootMask.Height * RootMask.CellSize * 0.5f);
+	const FBox RootBounds = FBox(-RootHalfExtent, RootHalfExtent).TransformBy(
+		Carrier->GetActorTransform().ToMatrixWithScale());
+	FlameAvatar->SetActorLocation(FVector(
+		RootBounds.Min.X - 240.0f,
+		RootBounds.GetCenter().Y,
+		RootBounds.Min.Z + Trunk->Mask.CellSize * 1.5f));
+	FlameAvatar->SetActorRotation(FRotator::ZeroRotator);
+	const int32 RootIgnitedTargets = UGA_PlayerFlameJet::ExecuteFlameJet(
+		*FlameAvatar,
+		600.0f,
+		35.0f,
+		90.0f,
+		TEXT("fire"),
+		2201);
+	AddInfo(FString::Printf(
+		TEXT("Detached root flame cone reported %d ignited targets"),
+		RootIgnitedTargets));
+	const bool bRootIgnitedByWand = Carrier->IsRootCombusting();
+	TestTrue(
+		TEXT("Normal wand fire ignites detached trunk fuel"),
+		bRootIgnitedByWand);
+	const bool bRootIgnitedAtCarrierSeam = bRootIgnitedByWand
+		|| Carrier->IgniteAtWorldLocation(
+			FVector(
+				CarrierBounds.GetCenter().X,
+				CarrierBounds.GetCenter().Y,
+				CarrierBounds.Min.Z + Trunk->Mask.CellSize),
+			TEXT("fire"),
+			2203);
+	TestTrue(
+		TEXT("Detached trunk carrier accepts the same fire reaction directly"),
+		bRootIgnitedAtCarrierSeam);
+	TestFalse(
+		TEXT("Igniting the trunk does not ignite the whole crown in the same event"),
+		Carrier->IsAnyAggregateMaterialCombusting(TEXT("leaf")));
+
+	FTransform LeafWorldTransform;
+	if (!TestTrue(
+		TEXT("Detached leaf retains its carrier-relative transform"),
+		Carrier->GetAggregateSourceWorldTransform(
+			Leaf->SourceId,
+			LeafWorldTransform)))
+	{
+		return false;
+	}
+	FlameAvatar->SetActorLocation(
+		LeafWorldTransform.GetLocation() - FVector(240.0f, 0.0f, 0.0f));
+	const int32 LeafIgnitedTargets = UGA_PlayerFlameJet::ExecuteFlameJet(
+		*FlameAvatar,
+		600.0f,
+		35.0f,
+		120.0f,
+		TEXT("fire"),
+		2202);
+	AddInfo(FString::Printf(
+		TEXT("Detached leaf flame cone reported %d ignited targets"),
+		LeafIgnitedTargets));
+	const bool bLeafIgnitedByWand =
+		Carrier->IsAnyAggregateMaterialCombusting(TEXT("leaf"));
+	TestTrue(
+		TEXT("A detached leaf part can be ignited after cutting"),
+		bLeafIgnitedByWand);
+	const bool bLeafIgnitedAtCarrierSeam = bLeafIgnitedByWand
+		|| Carrier->IgniteAtWorldLocation(
+			LeafWorldTransform.GetLocation(),
+			TEXT("fire"),
+			2204);
+	TestTrue(
+		TEXT("Detached leaf carrier accepts the same fire reaction directly"),
+		bLeafIgnitedAtCarrierSeam);
+	TestTrue(
+		TEXT("Wood cut from a secondary trunk layer can ignite independently"),
+		Carrier->IgniteAggregateSourceAtWorldLocation(
+			CutWoodLayerId,
+			CutWoodWorldLocation,
+			TEXT("fire"),
+			2199));
+	TestTrue(
+		TEXT("The cut wood layer owns a local deterministic combustion runtime"),
+		Carrier->IsAggregateSourceCombusting(CutWoodLayerId));
+
+	for (int32 Step = 0; Step < 60; ++Step)
+	{
+		Carrier->Tick(0.1f);
+		WorldActor->Tick(0.1f);
+	}
+	TestTrue(
+		TEXT("Detached trunk combustion advances into residue"),
+		Carrier->GetRootCombustionResidueCellCount() > 0);
+	TestTrue(
+		TEXT("Detached leaf combustion advances into residue"),
+		WorldActor->GetLogicalCombustionResidueCellCount(TEXT("leaf")) > 0);
+	FFragmentAggregateSourceState BurnedCutWoodLayer;
+	TestTrue(
+		TEXT("The cut wood layer remains addressable after burning"),
+		Carrier->GetAggregateSourceState(
+			CutWoodLayerId,
+			BurnedCutWoodLayer));
+	TestTrue(
+		TEXT("Wood separated from the tree advances into residue"),
+		BurnedCutWoodLayer.ResidueMask.SolidMask.Contains(1));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxDecorationCombustionIntegrationTest,
 	"MatterFlux.Combustion.DecorationMaskBurnsThroughLuaRule",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
@@ -1425,7 +1875,6 @@ bool FMatterFluxForestPlantCombustionTest::RunTest(
 	}
 	return true;
 }
-
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxCombustionStateRoundTripTest,
 	"MatterFlux.Combustion.StateSnapshotResumesDeterministically",
@@ -1440,16 +1889,16 @@ bool FMatterFluxCombustionStateRoundTripTest::RunTest(
 	Mask.Height = 4;
 	Mask.SolidMask.Init(1, Mask.Width * Mask.Height);
 
-	FMatterFluxCombustionDefinition Rule;
+	FMatterFluxReactionDefinition Rule;
 	Rule.Id = TEXT("snapshot_fire");
-	Rule.FuelMaterial = TEXT("wood");
-	Rule.FlameMaterial = TEXT("fire");
-	Rule.SmokeMaterial = TEXT("smoke");
-	Rule.ResidueMaterial = TEXT("charcoal");
-	Rule.IgnitionChancePermille = 1000;
-	Rule.SpreadChancePermille = 730;
-	Rule.SmokeChancePermille = 610;
-	Rule.BurnDurationSteps = 7;
+	Rule.InputA = TEXT("wood");
+	Rule.InputB = TEXT("fire");
+	Rule.EmissionMaterial = TEXT("smoke");
+	Rule.OutputA = TEXT("charcoal");
+	Rule.ChancePermille = 1000;
+	Rule.PropagationChancePermille = 730;
+	Rule.EmissionChancePermille = 610;
+	Rule.DurationSteps = 7;
 
 	MatterFlux::Combustion::FMaskCombustion Authority;
 	TestTrue(TEXT("Authority combustion initializes"),

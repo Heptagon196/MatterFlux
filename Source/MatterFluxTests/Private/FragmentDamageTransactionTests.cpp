@@ -2,6 +2,7 @@
 #include "Fragment/Fragment2DActor.h"
 #include "Fragment/Fragment2DDamageRequestActor.h"
 #include "Fragment/Fragment2DSourceActor.h"
+#include "Fragment/FragmentGeometry.h"
 #include "Fragment/FragmentSimulationSubsystem.h"
 #include "Fragment/FragmentSourceSpatialIndex.h"
 #include "FragmentTestActors.h"
@@ -10,9 +11,12 @@
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "Materials/Material.h"
+#include "Materials/MaterialInstanceDynamic.h"
+#include "Material/MatterFluxBuoyancyComponent.h"
 #include "Misc/AutomationTest.h"
 #include "ProceduralMeshComponent.h"
 #include "PhysicsEngine/BodySetup.h"
+#include "Rendering/MatterFluxVoxelMaterialStyle.h"
 #include "Tests/AutomationEditorCommon.h"
 
 #include <limits>
@@ -193,7 +197,7 @@ bool FMatterFluxNonCollidingSourceProducesNonCollidingFragmentsTest::RunTest(
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxLuaDetachedAreaThresholdTest,
-	"MatterFlux.Fragment.Support.LuaMinimumDiscardsTinyDetachedComponent",
+	"MatterFlux.Fragment.Support.LuaMinimumFadesTinyDetachedComponent",
 	EAutomationTestFlags::EditorContext
 		| EAutomationTestFlags::ProductFilter)
 
@@ -259,14 +263,23 @@ bool FMatterFluxLuaDetachedAreaThresholdTest::RunTest(
 		Subsystem->RequestFragmentDamage(Source, Event));
 
 	int32 DynamicCount = 0;
+	AFragment2DActor* TinyDebris = nullptr;
 	for (TActorIterator<AFragment2DActor> It(World); It; ++It)
 	{
+		TinyDebris = *It;
 		++DynamicCount;
 	}
 	TestEqual(
-		TEXT("Three-cell detached part is below Lua threshold four"),
+		TEXT("Three-cell detached part uses one bounded fade carrier"),
 		DynamicCount,
-		0);
+		1);
+	if (TestNotNull(TEXT("Tiny Lua-threshold debris remains visible briefly"), TinyDebris))
+	{
+		TestTrue(TEXT("Tiny Lua-threshold debris fades out"),
+			TinyDebris->SpawnPayload.FadeOutDuration > 0.0f);
+		TestFalse(TEXT("Tiny Lua-threshold debris has no collision"),
+			TinyDebris->SpawnPayload.bEnableCollision);
+	}
 	TestEqual(
 		TEXT("Supported lower three cells remain"),
 		static_cast<int32>(
@@ -406,6 +419,99 @@ bool FMatterFluxAggregateDetachmentTest::RunTest(
 	TestFalse(
 		TEXT("Ground-supported root remainder stays in terrain"),
 		Root->bBroken);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxVoxelAggregateUnifiedOcclusionTest,
+	"MatterFlux.Fragment.Aggregate.VoxelRootAndLeavesShareOneOccupancy",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxVoxelAggregateUnifiedOcclusionTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Voxel aggregate world exists"), World))
+	{
+		return false;
+	}
+
+	MatterFlux::FragmentGeometry::FFragmentComponent Component;
+	Component.Min = Component.Max = FIntPoint(0, 0);
+	Component.Cells = {FIntPoint(0, 0)};
+	TArray<FFragmentSpawnPayload> Payloads;
+	if (!TestTrue(
+		TEXT("Voxel root payload builds"),
+		MatterFlux::FragmentGeometry::BuildSpawnPayloadsFromComponents(
+			{Component},
+			FGuid::NewDeterministicGuid(TEXT("UnifiedVoxelRoot"), 1),
+			FTransform::Identity,
+			1,
+			1,
+			1,
+			10.0f,
+			1,
+			16,
+			FVector::ZeroVector,
+			0.0f,
+			1,
+			Payloads,
+			EFragmentSourceGeometryStyle::VoxelBlocks))
+		|| !TestEqual(TEXT("One voxel root payload exists"), Payloads.Num(), 1))
+	{
+		return false;
+	}
+	Payloads[0].MaterialId = TEXT("wood");
+	Payloads[0].bEnableCollision = false;
+
+	AFragment2DActor* Carrier = World->SpawnActor<AFragment2DActor>();
+	AFragment2DSourceActor* Leaves =
+		World->SpawnActor<AFragment2DSourceActor>();
+	if (!TestNotNull(TEXT("Voxel carrier spawns"), Carrier)
+		|| !TestNotNull(TEXT("Voxel leaf source spawns"), Leaves))
+	{
+		return false;
+	}
+	Carrier->FragmentColor = FLinearColor(0.32f, 0.12f, 0.04f);
+	if (!TestTrue(TEXT("Voxel carrier initializes"),
+		Carrier->InitializeFromPayload(Payloads[0])))
+	{
+		return false;
+	}
+	TestEqual(TEXT("Wood carrier inherits Lua material density"),
+		Carrier->BuoyancyComponent->GetBodyDensity(), 0.82f);
+
+	FFragmentSourceMask LeafMask;
+	LeafMask.Width = 1;
+	LeafMask.Height = 1;
+	LeafMask.CellSize = 10.0f;
+	LeafMask.MinFragmentAreaPixels = 1;
+	LeafMask.MaxFragmentsPerBreak = 4;
+	LeafMask.SupportMode = EFragmentSupportMode::None;
+	LeafMask.GeometryStyle = EFragmentSourceGeometryStyle::VoxelBlocks;
+	LeafMask.SolidMask = {1};
+	if (!TestTrue(
+		TEXT("Overlapping voxel leaf initializes"),
+		Leaves->InitializeFromProceduralMask(
+			LeafMask,
+			FGuid::NewDeterministicGuid(TEXT("UnifiedVoxelLeaf"), 1),
+			FLinearColor(0.08f, 0.55f, 0.12f),
+			TEXT("leaf")))
+		|| !TestTrue(TEXT("Leaf is absorbed into the carrier"),
+			Carrier->AbsorbAggregateSource(*Leaves)))
+	{
+		return false;
+	}
+	TestEqual(TEXT("Mixed carrier uses volume-weighted density"),
+		Carrier->BuoyancyComponent->GetBodyDensity(), 0.52f);
+
+	TestTrue(TEXT("Root payload keeps its cropped voxel mask"),
+		Carrier->SpawnPayload.DetachedVoxelMask.IsValid());
+	TestEqual(
+		TEXT("Leaf priority removes the overlapping wood voxel instead of drawing two meshes"),
+		Carrier->MeshComponent->GetNumSections(),
+		2);
 	return true;
 }
 
@@ -730,6 +836,225 @@ bool FMatterFluxWorldCutServiceTest::RunTest(
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxWorldCutTargetBudgetTest,
+	"MatterFlux.Fragment.Cut.WorldRequestCapsAndOrdersTargets",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxWorldCutTargetBudgetTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Target-budget world exists"), World))
+	{
+		return false;
+	}
+
+	FFragmentSourceMask Mask;
+	Mask.Width = 1;
+	Mask.Height = 1;
+	Mask.CellSize = 8.0f;
+	Mask.MinFragmentAreaPixels = 1;
+	Mask.MaxFragmentsPerBreak = 1;
+	Mask.SupportMode = EFragmentSupportMode::None;
+	Mask.SolidMask = {1};
+	TArray<AFragment2DSourceActor*> Sources;
+	for (int32 Index = 4; Index >= 0; --Index)
+	{
+		AFragment2DSourceActor* Source =
+			World->SpawnActor<AFragment2DSourceActor>(
+				FVector(Index * 20.0f, 0.0f, 0.0f),
+				FRotator::ZeroRotator);
+		if (!TestNotNull(TEXT("Budgeted cut target spawns"), Source))
+		{
+			return false;
+		}
+		Source->bDestroySourceOnFirstBreak = false;
+		if (!TestTrue(TEXT("Budgeted cut target initializes"),
+			Source->InitializeFromProceduralMask(
+				Mask,
+				FGuid::NewDeterministicGuid(
+					FString::Printf(TEXT("WorldCutBudget%d"), Index),
+					1))))
+		{
+			return false;
+		}
+		Sources.Insert(Source, 0);
+	}
+
+	FFragmentWorldCutRequest Request;
+	Request.CutShape.Type = EFragmentDamageShapeType::Circle;
+	Request.CutShape.WorldTransform = FTransform::Identity;
+	Request.CutShape.Radius = 120.0f;
+	Request.DamagePower = 0.0f;
+	Request.EventSeed = 905;
+	Request.MaxAffectedSources = 2;
+	TestEqual(TEXT("A bounded world cut commits only its target budget"),
+		UFragmentSimulationSubsystem::ExecuteWorldCut(World, Request),
+		2);
+	TestEqual(TEXT("Nearest source is cut first"), Sources[0]->Revision, 1);
+	TestEqual(TEXT("Second-nearest source is cut second"), Sources[1]->Revision, 1);
+	for (int32 Index = 2; Index < Sources.Num(); ++Index)
+	{
+		TestEqual(TEXT("Sources outside the target budget remain untouched"),
+			Sources[Index]->Revision,
+			0);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxWorldCutAggregateBudgetTest,
+	"MatterFlux.Fragment.Cut.WorldRequestTreatsAggregateAsOneTarget",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxWorldCutAggregateBudgetTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Aggregate cut world exists"), World))
+	{
+		return false;
+	}
+
+	FFragmentSourceMask Mask;
+	Mask.Width = 2;
+	Mask.Height = 8;
+	Mask.CellSize = 10.0f;
+	Mask.MinFragmentAreaPixels = 1;
+	Mask.MaxFragmentsPerBreak = 4;
+	Mask.SupportMode = EFragmentSupportMode::Bottom;
+	Mask.GeometryStyle = EFragmentSourceGeometryStyle::VoxelBlocks;
+	Mask.SolidMask.Init(1, Mask.Width * Mask.Height);
+
+	const FGuid AggregateId = FGuid::NewDeterministicGuid(
+		TEXT("WorldCutAggregateBudget"),
+		1);
+	const auto SpawnAggregateLayer =
+		[World, &Mask, &AggregateId](
+			const TCHAR* IdText,
+			const FVector& Location,
+			const bool bRoot)
+		{
+			AFragment2DSourceActor* Source =
+				World->SpawnActor<AFragment2DSourceActor>(
+					Location,
+					FRotator::ZeroRotator);
+			if (!Source
+				|| !Source->InitializeFromProceduralMask(
+					Mask,
+					FGuid::NewDeterministicGuid(IdText, 1),
+					FLinearColor::White,
+					TEXT("wood")))
+			{
+				return static_cast<AFragment2DSourceActor*>(nullptr);
+			}
+			Source->bDestroySourceOnFirstBreak = false;
+			Source->ConfigureAggregate(AggregateId, bRoot);
+			return Source;
+		};
+
+	// The front slice is closest to the broad-phase query center. The aggregate
+	// root deliberately sits behind it so the old per-source budget selected a
+	// non-root vertical slice and never executed the whole-tree transaction.
+	AFragment2DSourceActor* FrontSlice = SpawnAggregateLayer(
+		TEXT("WorldCutAggregateFront"),
+		FVector(0.0f, 0.0f, 0.0f),
+		false);
+	AFragment2DSourceActor* BackSlice = SpawnAggregateLayer(
+		TEXT("WorldCutAggregateBack"),
+		FVector(0.0f, 20.0f, 0.0f),
+		false);
+	AFragment2DSourceActor* Root = SpawnAggregateLayer(
+		TEXT("WorldCutAggregateRoot"),
+		FVector(0.0f, 40.0f, 0.0f),
+		true);
+	if (!TestNotNull(TEXT("Aggregate root spawns"), Root)
+		|| !TestNotNull(TEXT("Front aggregate slice spawns"), FrontSlice)
+		|| !TestNotNull(TEXT("Back aggregate slice spawns"), BackSlice))
+	{
+		return false;
+	}
+	FFragmentSourceMask DecoyMask = Mask;
+	DecoyMask.Width = 1;
+	DecoyMask.Height = 1;
+	DecoyMask.SupportMode = EFragmentSupportMode::None;
+	DecoyMask.SolidMask = {1};
+	AFragment2DSourceActor* CenterCloserDecoy =
+		World->SpawnActor<AFragment2DSourceActor>(
+			FVector(0.0f, 25.0f, 0.0f),
+			FRotator::ZeroRotator);
+	if (!TestNotNull(TEXT("Competing small cut target spawns"), CenterCloserDecoy)
+		|| !TestTrue(TEXT("Competing small cut target initializes"),
+			CenterCloserDecoy->InitializeFromProceduralMask(
+				DecoyMask,
+				FGuid::NewDeterministicGuid(
+					TEXT("WorldCutAggregateSurfaceDistanceDecoy"), 1))))
+	{
+		return false;
+	}
+	CenterCloserDecoy->bDestroySourceOnFirstBreak = false;
+
+	FFragmentWorldCutRequest Request;
+	Request.CutShape.Type = EFragmentDamageShapeType::Line;
+	Request.CutShape.WorldTransform = FTransform::Identity;
+	Request.CutShape.Extents.X = 80.0f;
+	Request.CutShape.Thickness = 11.0f;
+	Request.DamagePower = 0.0f;
+	Request.EventSeed = 906;
+	Request.TargetPadding = 60.0f;
+	Request.MaxAffectedSources = 1;
+
+	TestEqual(
+		TEXT("One aggregate consumes one world-cut target budget"),
+		UFragmentSimulationSubsystem::ExecuteWorldCut(World, Request),
+		1);
+	TestEqual(
+		TEXT("The aggregate root owns the horizontal cut transaction"),
+		Root->Revision,
+		1);
+	TestEqual(
+		TEXT("Target budget uses distance to the intersected object surface, not the aggregate root center"),
+		CenterCloserDecoy->Revision,
+		0);
+
+	AFragment2DActor* Carrier = nullptr;
+	for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+	{
+		if (It->AggregateSources.ContainsByPredicate(
+			[FrontSlice, BackSlice](
+				const FFragmentAggregateSourceState& Member)
+			{
+				return Member.DefinitionSourceId == FrontSlice->SourceId
+					|| Member.DefinitionSourceId == BackSlice->SourceId;
+			}))
+		{
+			Carrier = *It;
+			break;
+		}
+	}
+	if (TestNotNull(
+		TEXT("Horizontal root cut creates one carrier for the aggregate layers"),
+		Carrier))
+	{
+		TestTrue(
+			TEXT("The carrier contains both detached depth slices"),
+			Carrier->AggregateSources.ContainsByPredicate(
+				[FrontSlice](const FFragmentAggregateSourceState& Member)
+				{
+					return Member.DefinitionSourceId == FrontSlice->SourceId;
+				})
+				&& Carrier->AggregateSources.ContainsByPredicate(
+					[BackSlice](const FFragmentAggregateSourceState& Member)
+					{
+						return Member.DefinitionSourceId == BackSlice->SourceId;
+					}));
+	}
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMatterFluxNavigationDefaultsTest, "MatterFlux.Fragment.Actor.ProceduralMeshesDoNotAffectNavigation", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 
 bool FMatterFluxNavigationDefaultsTest::RunTest(const FString& Parameters)
@@ -914,11 +1239,36 @@ bool FMatterFluxFilteredBreakCommitTest::RunTest(const FString& Parameters)
 	FFragmentDamageEvent Event = MakeCircleEvent(*Source, Source->GetActorLocation(), 6.0f);
 	UFragmentSimulationSubsystem* Subsystem = World->GetSubsystem<UFragmentSimulationSubsystem>();
 	if (!TestNotNull(TEXT("Fragment subsystem exists"), Subsystem)) return false;
-	TestTrue(TEXT("Accepted damage reports committed even with zero payloads"), Subsystem->RequestFragmentDamage(Source, Event));
+	TestTrue(TEXT("Accepted damage reports committed with only fading debris"), Subsystem->RequestFragmentDamage(Source, Event));
 	TestEqual(TEXT("Committed damage increments revision"), Source->Revision, 1);
 	TestTrue(TEXT("Committed filtered break marks source broken"), Source->bBroken);
 	TestTrue(TEXT("Non-destroy source is hidden"), Source->IsHidden());
 	TestFalse(TEXT("Non-destroy source collision is disabled"), Source->GetActorEnableCollision());
+
+	AFragment2DActor* FadingDebris = nullptr;
+	int32 FragmentCount = 0;
+	for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+	{
+		FadingDebris = *It;
+		++FragmentCount;
+	}
+	TestEqual(TEXT("Filtered debris is merged into one bounded render carrier"), FragmentCount, 1);
+	if (TestNotNull(TEXT("Filtered debris remains visible briefly"), FadingDebris))
+	{
+		TestTrue(TEXT("Filtered debris has a finite fade duration"),
+			FadingDebris->SpawnPayload.FadeOutDuration > 0.0f
+			&& FMath::IsFinite(FadingDebris->SpawnPayload.FadeOutDuration));
+		TestFalse(TEXT("Filtered debris never creates a physics body"),
+			FadingDebris->SpawnPayload.bEnableCollision);
+		TestEqual(TEXT("Filtered debris collision is disabled"),
+			FadingDebris->MeshComponent->GetCollisionEnabled(),
+			ECollisionEnabled::NoCollision);
+		const float InitialAlpha = FadingDebris->GetTransientFadeAlpha();
+		FadingDebris->Tick(FadingDebris->SpawnPayload.FadeOutDuration * 0.5f);
+		TestTrue(TEXT("Filtered debris fades continuously before destruction"),
+			FadingDebris->GetTransientFadeAlpha() < InitialAlpha
+			&& FadingDebris->GetTransientFadeAlpha() > 0.0f);
+	}
 	return true;
 }
 
@@ -1011,8 +1361,45 @@ bool FMatterFluxFragmentMaterialTest::RunTest(const FString& Parameters)
 		++FragmentCount;
 		TestEqual(TEXT("Spawned fragment keeps the source material"),
 			It->FragmentMaterial.Get(), Source->FragmentMaterial.Get());
-		TestEqual(TEXT("Spawned fragment mesh uses the source material"),
-			It->MeshComponent->GetMaterial(0), Source->FragmentMaterial.Get());
+		UMaterialInstanceDynamic* FragmentProjection =
+			Cast<UMaterialInstanceDynamic>(
+				It->MeshComponent->GetMaterial(0));
+		if (TestNotNull(
+			TEXT("Spawned fragment mesh owns a canonical material projection"),
+			FragmentProjection))
+		{
+			TestEqual(
+				TEXT("Fragment projection retains the source parent material"),
+				FragmentProjection->GetMaterial(),
+				Source->FragmentMaterial->GetMaterial());
+			const float CellSize =
+				It->SpawnPayload.DetachedVoxelMask.CellSize > 0.0f
+					? It->SpawnPayload.DetachedVoxelMask.CellSize
+					: 12.0f;
+			const MatterFlux::Rendering::FVoxelMaterialProjection Expected =
+				MatterFlux::Rendering::ResolveVoxelMaterialProjection(
+					It->FragmentColor,
+					It->SpawnPayload.MaterialId,
+					CellSize,
+					MatterFlux::Rendering::EVoxelMaterialFaceRole::Primary);
+			TestTrue(
+				TEXT("Fragment projection resolves the canonical source color"),
+				FragmentProjection->K2_GetVectorParameterValue(TEXT("Color"))
+					.Equals(Expected.ResolvedColor, 1.0e-4f));
+			for (const TPair<FName, float>& Parameter : {
+				TPair<FName, float>(TEXT("FaceContrast"), Expected.Style.FaceContrast),
+				TPair<FName, float>(TEXT("ColorVariation"), Expected.Style.ColorVariation),
+				TPair<FName, float>(TEXT("Roughness"), Expected.Style.Roughness),
+				TPair<FName, float>(TEXT("ShadowLift"), Expected.Style.ShadowLift)})
+			{
+				TestEqual(
+					*FString::Printf(
+						TEXT("Fragment projection preserves canonical %s"),
+						*Parameter.Key.ToString()),
+					FragmentProjection->K2_GetScalarParameterValue(Parameter.Key),
+					Parameter.Value);
+			}
+		}
 	}
 	TestTrue(TEXT("At least one materialized fragment was inspected"), FragmentCount > 0);
 	return true;

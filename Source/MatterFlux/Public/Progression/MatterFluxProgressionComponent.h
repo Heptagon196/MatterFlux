@@ -234,6 +234,12 @@ public:
 	void RequestSelectQuest(FName QuestId);
 
 	bool AddItemAuthority(FName ItemId, int32 Delta, FString& OutError);
+	bool PurchaseOfferAuthority(
+		const FMatterFluxShopOfferDefinition& Offer,
+		FName OfferKey,
+		int32 ExpectedRevision,
+		int32& OutRemainingPurchases,
+		FString& OutError);
 	bool UseItemAuthority(FName ItemId, int32 ExpectedRevision, FString& OutError);
 	bool SelectQuestAuthority(FName QuestId, FString& OutError);
 	bool NotifyQuestEventAuthority(
@@ -292,6 +298,7 @@ private:
 	FDelegateHandle MagicInventoryChangedHandle;
 	FDelegateHandle ContentReloadedHandle;
 	FOnMatterFluxProgressionChanged ProgressionChanged;
+	TMap<FName, int32> ShopPurchaseCounts;
 	int32 LastEvaluatedMagicInventoryRevision = INDEX_NONE;
 	bool bMagicInventoryRefreshQueued = false;
 	bool bApplyingEffects = false;

@@ -169,7 +169,7 @@ namespace MatterFluxMagicNetworkTests
 					|| ClientInventory->GetInventoryRevision() <= 0
 					|| ClientInventory->GetInventoryRevision()
 						!= ServerInventory->GetInventoryRevision()
-					|| ClientInventory->GetOwnedWands().Num() != 4
+					|| ClientInventory->GetOwnedWands().Num() != 6
 					|| ClientInventory->GetEquippedWands().Num() != 4
 					|| !ClientInventory->GetActiveWandId().IsValid())
 				{

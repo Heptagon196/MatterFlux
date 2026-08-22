@@ -24,6 +24,7 @@ $RequiredMatterFluxTests = @(
     'MatterFlux.Project.VersionMetadata',
     'MatterFlux.Project.DefaultMapHasPlayerStart',
     'MatterFlux.Playable.CharacterHas2_5DDefaults',
+    'MatterFlux.Playable.ProceduralTerrainDisablesHardwareRayTracing',
     'MatterFlux.Playable.FineTerrainUsesMergedChunkMeshes',
     'MatterFlux.Playable.RandomLevelIsDeterministicAndTraversable',
     'MatterFlux.Playable.WorldActorHasLightingAndCollisionGeometry',

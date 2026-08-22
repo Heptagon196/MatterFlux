@@ -50,7 +50,8 @@ flowchart LR
    只保存 manifest；不再混放所有定义。
 2. `Content/Lua/MatterFluxEngine.lua`
    引擎设置，以及法术作者使用的能力 API。
-3. `Content/Lua/Materials`、`World`、`Spells`、`Wands`
+3. `Content/Lua/Materials`、`World`、`Spells`、`Wands`、`Items`、`Quests`、
+   `Creatures`、`Dialogues`、`Shops`
    默认内容模块；法术按内容库继续分成 `MatterFlux` 与 `PaperMagic`。
 4. `Plugins/MatterFluxLua/Source/MatterFluxLua/Public/IMatterFluxScriptRuntime.h`
    游戏模块唯一依赖的深模块接口。
@@ -65,17 +66,21 @@ flowchart LR
 9. `Source/MatterFluxTests/Private/MatterFluxLuaContentTests.cpp`
    最短、最可信的行为规格。
 
+需要编写可重复的材质测试场景时，继续阅读
+`docs/MatterFlux_Custom_Maps_Beginner_Guide.md`。自定义地图由 Lua 声明，自动化测试和
+截图命令从同一个地图 ID 构建世界。
+
 ## 4. Lua API
 
 ### 4.1 Manifest
 
 ```lua
-content.set_manifest("matterflux.default", 4, 1)
+content.set_manifest("matterflux.default", 12, 2)
 ```
 
 - `pack_id`：稳定 ID。
 - `revision`：内容作者递增的版本号。
-- `schema_version`：当前只能是 `1`。
+- `schema_version`：当前只能是 `2`。
 - 每次加载必须且只能调用一次。
 
 ### 4.2 材质
@@ -98,32 +103,42 @@ content.register_material(
 ### 4.3 化学反应
 
 ```lua
-content.register_reaction(
-    "water_lava_quench",
-    "water", "lava",
-    "steam", "stone",
-    1000)
+reaction.define {
+    id = "water_lava_quench",
+    trigger = "contact",
+    inputs = { "water", "lava" },
+    outputs = { "steam", "stone" },
+    chance = 1.0,
+}
+
+reaction.define {
+    id = "wood_burn",
+    trigger = "propagating",
+    inputs = { "wood", "fire" },
+    outputs = { "charcoal", "fire" },
+    chance = 1.0,
+    duration_steps = 18,
+    propagation = { chance = 0.72 },
+    emission = { material = "smoke", chance = 0.68 },
+}
 ```
 
-参数依次是稳定反应 ID、输入 A/B、输出 A/B 和千分比概率。输入必须引用已注册材质；
-输出还可以写 `empty` 表示该格被消耗。反应在 C++ 固定步长模拟中执行，Lua 只声明
-规则，不能直接修改世界或调用 UObject。
+`contact` 在两个相邻格接触时立即变换；`propagating` 被第二种输入激活后，持续若干
+固定步并向第一种输入的邻格传播。概率在 Lua 中写 `0..1`，加载时编译成整数千分比。
+输入必须引用已注册材质；输出可以写 `empty` 表示该格被消耗。传播规则的 `emission`
+可省略，因此酸蚀、结晶等规则不必伪装成会冒烟的燃烧。
 
-### 4.4 燃烧
+旧 `content.register_combustion` 已删除，避免规则分散到两个 registry。旧的六参数
+`content.register_reaction` 仅作为接触反应兼容入口保留；新内容应统一使用
+`reaction.define`。Lua 只声明数据，实际 mask 传播、表现、服务器权威和网络复制均由
+C++ 执行。
 
-```lua
-content.register_combustion(
-    "wood_burn",
-    "wood", "fire", "smoke", "charcoal",
-    1000, 650, 12, 700)
-```
+### 4.4 为什么不是在 Lua 每格执行回调
 
-参数依次是稳定规则 ID、燃料、火焰、烟雾、固体残留、点燃概率、蔓延概率、燃烧
-持续步数和产烟概率。三个概率都是 `0..1000`，持续步数是 `1..255`。所有材质都
-必须先注册；同一种燃料只能有一条燃烧规则。
-
-Lua 只声明“什么会烧成什么”。实际 mask 传播、烟雾实例、残留网格、服务器权威和
-网络复制都由 C++ 执行。默认规则让木头留下木炭，让树叶、草和花留下灰。
+热更新时 Lua 把易读 DSL 编译成不可变 C++ 数据；游戏 fixed step 不再调用 Lua。
+因此联机端能按相同 seed、tick、坐标和规则 ID 得到相同结果，也避免数万个格子跨
+Lua/C++ 边界。具体架构见
+[`MatterFlux_Material_Reaction_Engine_Beginner_Guide.md`](MatterFlux_Material_Reaction_Engine_Beginner_Guide.md)。
 
 ### 4.5 装饰物
 
@@ -140,7 +155,7 @@ content.register_decorator(
 - `material_id` 必须引用已注册材质。
 - `spawn_weight` 为未来的群落/生物群系选择保留。
 - `min_count`、`max_count` 控制确定性数量范围；单个 decorator 的 `max_count` 上限是 4096。
-- 每类定义（material、reaction、combustion、decorator、entity）最多注册 1024 个，超过上限时整包会事务性拒绝。
+- 每类定义（material、reaction、decorator、entity）最多注册 1024 个，超过上限时整包会事务性拒绝。
 - 最后一个可选布尔值控制生成出来的完整装饰是否启用碰撞；省略时默认为
   `false`，而且必须使用 Lua 的 `true`/`false`，不能写字符串。
 
@@ -162,6 +177,75 @@ content.register_entity(
 
 它声明实体 ID、行为 ID、最大生命值和移动速度。当前只完成内容注册；敌人 Actor/StateTree/GAS 消费端仍是后续工作。
 
+### 4.7 生物、对话与商店
+
+可交互 NPC 和敌人使用更完整的 `creature.define`，而不是上面的早期通用 entity：
+
+```lua
+creature.define({
+    id = "std.test_boss", name = "营地首领",
+    faction = "hostile", level = "boss",
+    health = 50, width = 95, height = 210,
+}, function(ai)
+    ai.tree({
+        sight = { range = 1500, memory_seconds = 15 },
+        locomotion = { speed = 380 },
+        root = ai.selector({
+            ai.sequence({
+                ai.condition("target_too_close", { distance = 320 }),
+                ai.action("retreat"),
+            }),
+            ai.sequence({
+                ai.condition("target_in_attack_range", { distance = 950 }),
+                ai.condition("skill_ready"),
+                ai.action("skill", {
+                    cooldown = 10, spell = "std.default",
+                    projectiles = 12, radial = true,
+                    projectile_interval = 0.2,
+                }),
+            }),
+            ai.sequence({
+                ai.condition("target_in_attack_range", { distance = 950 }),
+                ai.condition("attack_ready"),
+                ai.action("attack", {
+                    cooldown = 2, spell = "std.default", projectiles = 2,
+                }),
+            }),
+            ai.sequence({
+                ai.condition("has_target"),
+                ai.action("chase"),
+            }),
+            ai.action("patrol", { turn_seconds = 3, pause_seconds = 1 }),
+        }),
+    })
+end)
+```
+
+这里使用的是受限的行为树 DSL：
+
+- `selector` 从上到下尝试分支，因此越靠前优先级越高。
+- `sequence` 依次检查条件，最后选择一个动作；任一条件不成立就尝试下个分支。
+- `condition` 只能读取 C++ 提供的只读事实，例如是否看见目标、距离和冷却。
+- `action` 只能选择巡逻、追击、后撤、攻击、技能等服务器权威能力。
+
+旧的 `ai.configure({...})` 已从公开 DSL 删除。感知和移动能力位于树根，距离紧跟
+对应条件，冷却、法术和弹幕参数紧跟对应动作。生命值、阵营、外观、对话和商店仍
+属于生物定义，因为这些是身份/表现数据，不是决策逻辑。
+
+示例中“近身后撤”优先于技能，“技能”优先于普通攻击；没有可用攻击时追击，失去
+目标后巡逻。树限制为最多 64 个节点、8 层、每个组合节点 16 个子节点；循环、未知
+名称、错误的节点顺序和超预算内容都会使整次热重载失败，旧 registry 保持不变。
+
+Lua 在加载时把 builder 编译成不可变的 AI/施法数据，之后不保留 Lua 函数或表。
+服务器上的 `AMatterFluxCreatureAIController` 以固定 10 Hz 构造感知快照并执行纯 C++
+解释器，客户端只接收 Actor 状态与移动复制。Actor `TimerManager` 执行分时弹幕，
+对话图与商店报价也只保存数据；购买仍由服务器检查 revision、货币、限购和背包容量。
+
+目前白名单条件是 `has_visible_target`、`has_target`、`target_too_close`、
+`target_in_attack_range`、`attack_ready`、`skill_ready`；动作是 `passive`、
+`patrol`、`chase`、`retreat`、`attack`、`skill`。完整中文字段提示位于
+`Content/Lua/Annotations/MatterFluxApi.lua`，VS Code 的 Lua Language Server 会读取它。
+
 ## 5. 热重载到底发生了什么
 
 默认目录结构是：
@@ -175,10 +259,19 @@ Content/Lua/
 ├─ Spells/
 │  ├─ MatterFlux/
 │  └─ PaperMagic/
-└─ Wands/
+├─ Wands/
+├─ Items/
+├─ Quests/
+├─ Creatures/
+├─ Dialogues/
+└─ Shops/
 ```
 
-C++ 只递归扫描 `Materials`、`World`、`Spells`、`Wands` 四个白名单目录。执行顺序固定为引擎脚本、manifest、Materials、World、Spells、Wands；每组内部按规范化相对路径排序。文件名和顺序也进入 hash，因此不同机器不会因为文件系统枚举顺序不同而获得不同内容身份。`require`、`package`、`io` 和 `os` 均未开放。
+C++ 只递归扫描上面九个白名单模块目录。执行顺序固定为引擎脚本、manifest，再按
+`Materials`、`World`、`Spells`、`Wands`、`Items`、`Quests`、`Creatures`、
+`Dialogues`、`Shops` 加载；每组内部按规范化相对路径排序。文件名和顺序也进入
+hash，因此不同机器不会因为文件系统枚举顺序不同而获得不同内容身份。
+`require`、`package`、`io` 和 `os` 均未开放。
 
 开发构建每 0.5 秒重新计算默认 Lua bundle 的 hash：
 
@@ -301,6 +394,8 @@ Lua 测试：
 - 活动分块跨边界移动、休眠分块冻结、RLE 归档与恢复
 - 花草树木输出确定性 mask source，而不是旧 HISM 基础形状
 - 程序化 source 实际接受 damage，并把颜色传给动态碎片
+- Lua 行为树会确定性编译，非法树不会替换当前 registry
+- 行为树按作者顺序选择后撤、技能、攻击、追击和巡逻状态
 
 ## 10. 当前限制与下一步
 
@@ -316,3 +411,7 @@ Lua 测试：
 
 材质模拟实现和扩展路线请继续阅读
 [MatterFlux Noita 风格材质模拟：UE 初学者指南](MatterFlux_Material_Simulation_Beginner_Guide.md)。
+
+生物定义还支持 `density` 字段。它与材质的 `density` 一起决定主角、NPC、敌人和
+切割物体在液体中漂浮或下沉；配置示例和物理含义见
+[MatterFlux 液体浮力与密度：UE 初学者指南](MatterFlux_Liquid_Buoyancy_Beginner_Guide.md)。

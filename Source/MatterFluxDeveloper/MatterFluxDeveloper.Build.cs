@@ -14,7 +14,8 @@ public class MatterFluxDeveloper : ModuleRules
 			"Engine",
 			"GameplayAbilities",
 			"Json",
-			"MatterFlux"
+			"MatterFlux",
+			"MatterFluxLua"
 		});
 	}
 }

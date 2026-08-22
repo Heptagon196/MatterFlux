@@ -13,6 +13,7 @@ public class MatterFlux : ModuleRules
 			"Core",
 			"CoreUObject",
 			"Engine",
+			"AIModule",
 			"GameplayAbilities",
 			"GameplayTags",
 			"GameplayTasks",
