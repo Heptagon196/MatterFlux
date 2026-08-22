@@ -905,6 +905,114 @@ bool FMatterFluxWorldCutTargetBudgetTest::RunTest(
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxDetachedItemRepeatedCutTest,
+	"MatterFlux.Fragment.Cut.DetachedItemFadesAfterRepeatedCuts",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxDetachedItemRepeatedCutTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Detached-item cut world exists"), World))
+	{
+		return false;
+	}
+
+	MatterFlux::FragmentGeometry::FFragmentComponent Component;
+	for (int32 Y = 0; Y < 3; ++Y)
+	{
+		for (int32 X = 0; X < 3; ++X)
+		{
+			Component.Cells.Add(FIntPoint(X, Y));
+		}
+	}
+	Component.Min = FIntPoint::ZeroValue;
+	Component.Max = FIntPoint(2, 2);
+	TArray<FFragmentSpawnPayload> Payloads;
+	if (!TestTrue(
+		TEXT("Detached item payload builds from canonical cells"),
+		MatterFlux::FragmentGeometry::BuildSpawnPayloadsFromComponents(
+			{Component},
+			FGuid::NewDeterministicGuid(TEXT("RepeatedCutItem"), 1),
+			FTransform::Identity,
+			3,
+			3,
+			1,
+			10.0f,
+			1,
+			1,
+			FVector::ZeroVector,
+			0.0f,
+			907,
+			Payloads))
+		|| !TestEqual(TEXT("One item payload is produced"), Payloads.Num(), 1))
+	{
+		return false;
+	}
+	Payloads[0].MaterialId = TEXT("wood");
+	Payloads[0].bEnableCollision = true;
+	AFragment2DActor* Item = World->SpawnActor<AFragment2DActor>();
+	if (!TestNotNull(TEXT("Detached item actor spawns"), Item)
+		|| !TestTrue(
+			TEXT("Detached item initializes"),
+			Item->InitializeFromPayload(Payloads[0])))
+	{
+		return false;
+	}
+
+	FFragmentWorldCutRequest Request;
+	Request.CutShape.Type = EFragmentDamageShapeType::Line;
+	Request.CutShape.WorldTransform = Item->GetActorTransform();
+	Request.CutShape.Extents.X = 40.0f;
+	Request.CutShape.Thickness = 8.0f;
+	Request.DamagePower = 0.0f;
+	Request.EventSeed = 908;
+	Request.MaxAffectedSources = 1;
+	const int32 RequiredCuts = Item->GetCutsBeforeFade();
+	if (!TestTrue(TEXT("Detached items require multiple cuts"), RequiredCuts > 1))
+	{
+		return false;
+	}
+	for (int32 CutIndex = 0; CutIndex < RequiredCuts; ++CutIndex)
+	{
+		Request.EventSeed += CutIndex;
+		TestEqual(
+			TEXT("The world cut accepts the detached logical item"),
+			UFragmentSimulationSubsystem::ExecuteWorldCut(World, Request),
+			1);
+		TestEqual(
+			TEXT("One accepted cut advances item durability once"),
+			Item->GetAcceptedCutCount(),
+			CutIndex + 1);
+		if (CutIndex + 1 < RequiredCuts)
+		{
+			TestFalse(
+				TEXT("Item remains physical before its cut threshold"),
+				Item->IsCutFadeActive());
+		}
+	}
+	TestTrue(
+		TEXT("The threshold starts a fade instead of deleting immediately"),
+		Item->IsCutFadeActive());
+	TestTrue(TEXT("Threshold item is still present for the fade"), IsValid(Item));
+	TestEqual(
+		TEXT("Fading item no longer blocks or simulates physics"),
+		Item->MeshComponent->GetCollisionEnabled(),
+		ECollisionEnabled::NoCollision);
+	const float InitialAlpha = Item->GetTransientFadeAlpha();
+	Item->Tick(Item->GetCutFadeDuration() * 0.5f);
+	TestTrue(
+		TEXT("Repeated-cut item opacity decreases over time"),
+		Item->GetTransientFadeAlpha() < InitialAlpha);
+	TestEqual(
+		TEXT("A fading item does not consume another cut target"),
+		UFragmentSimulationSubsystem::ExecuteWorldCut(World, Request),
+		0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxWorldCutAggregateBudgetTest,
 	"MatterFlux.Fragment.Cut.WorldRequestTreatsAggregateAsOneTarget",
 	EAutomationTestFlags::EditorContext

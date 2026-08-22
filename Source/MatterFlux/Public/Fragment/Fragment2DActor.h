@@ -153,6 +153,16 @@ public:
 		int32 MaxVisualInstances) const;
 	float GetTransientFadeAlpha() const { return TransientFadeAlpha; }
 	float GetVisualDepthOffset() const { return VisualDepthOffset; }
+	/**
+	 * Applies one world-space cut to this detached logical item. The material
+	 * projection stays authoritative on the carrier and retires through the
+	 * shared fade path after the configured number of accepted cuts.
+	 */
+	bool TryAcceptWorldCut(const FFragmentDamageShape& CutShape);
+	int32 GetAcceptedCutCount() const { return AcceptedCutCount; }
+	int32 GetCutsBeforeFade() const { return CutsBeforeFade; }
+	float GetCutFadeDuration() const { return CutExhaustionFadeDuration; }
+	bool IsCutFadeActive() const { return ActiveCutFadeDuration > 0.0f; }
 
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
@@ -183,6 +193,22 @@ public:
 	UPROPERTY(ReplicatedUsing = OnRep_RootCombustionState, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Combustion")
 	FFragmentAggregateSourceState RootCombustionState;
 
+	/** Number of exact world cuts this detached logical item has accepted. */
+	UPROPERTY(ReplicatedUsing = OnRep_CutState, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Cut")
+	int32 AcceptedCutCount = 0;
+
+	/** Detached items remain physical until this many exact cuts are accepted. */
+	UPROPERTY(EditDefaultsOnly, Replicated, BlueprintReadOnly, Category = "Fragment|Cut", meta = (ClampMin = "1", UIMin = "1"))
+	int32 CutsBeforeFade = 3;
+
+	/** Fade time used when the detached item exhausts its cut durability. */
+	UPROPERTY(EditDefaultsOnly, Replicated, BlueprintReadOnly, Category = "Fragment|Cut", meta = (ClampMin = "0.05", UIMin = "0.05"))
+	float CutExhaustionFadeDuration = 0.8f;
+
+	/** Replicated runtime signal; SpawnPayload remains immutable initial state. */
+	UPROPERTY(ReplicatedUsing = OnRep_CutState, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Cut")
+	float ActiveCutFadeDuration = 0.0f;
+
 protected:
 	UFUNCTION()
 	void OnRep_SpawnPayload();
@@ -196,6 +222,9 @@ protected:
 	UFUNCTION()
 	void OnRep_RootCombustionState();
 
+	UFUNCTION()
+	void OnRep_CutState();
+
 	void ApplyFragmentMaterial();
 	bool RebuildMeshFromPayload();
 	bool RebuildSimpleCollision();
@@ -206,6 +235,8 @@ protected:
 		AFragment2DSourceActor* RetiredSource);
 	void NotifyWorldOfAggregateSources();
 	void ConfigureTransientFade();
+	void SynchronizeCutFadeState();
+	bool DoesCutShapeIntersect(const FFragmentDamageShape& CutShape) const;
 	void ApplyTransientFadeAlpha();
 	void InitializeRootCombustionState();
 	bool IgniteRootAtWorldLocation(

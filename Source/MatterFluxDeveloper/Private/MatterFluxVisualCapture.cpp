@@ -187,6 +187,8 @@ namespace
 		int32 EventSeed = 1337;
 		bool bQuitAfterCapture = true;
 		bool bBurnInspectionOnly = false;
+		bool bRepeatedItemCut = false;
+		bool bAccepted = false;
 		bool bRequestedTreeMaterialization = false;
 		FGuid PinnedSourceId;
 		FGuid AggregateId;
@@ -194,6 +196,7 @@ namespace
 		TWeakObjectPtr<AMatterFluxCharacter> Character;
 		TWeakObjectPtr<AActor> OriginalViewTarget;
 		TWeakObjectPtr<ACameraActor> CaptureCamera;
+		TWeakObjectPtr<AFragment2DActor> DetachedItem;
 		float OriginalCameraArmLength = 0.0f;
 		FVector OriginalCameraTargetOffset = FVector::ZeroVector;
 		bool bOriginalCharacterVisualVisible = true;
@@ -557,6 +560,8 @@ namespace
 				FPaths::ScreenShotDir(),
 				State->bBurnInspectionOnly
 					? TEXT("MatterFluxTreeBurn")
+					: State->bRepeatedItemCut
+						? TEXT("MatterFluxTreeItemCut")
 					: TEXT("MatterFluxTreeCut"),
 				FDateTime::Now().ToString(TEXT("%Y%m%d-%H%M%S")));
 			IFileManager::Get().MakeDirectory(
@@ -893,11 +898,147 @@ namespace
 					*State,
 					TEXT("12_Burning_4p0s_FrontRight45.png"));
 				State->NextActionAt = Now + 0.5;
+				State->Phase = 17;
 				break;
 			}
 			LogTreeCarrierPhysics(*World, TEXT("after-impact"));
 			RequestTreeCutScreenshot(*State, TEXT("12_AfterImpact45.png"));
 			State->NextActionAt = Now + 1.0;
+			if (!State->bRepeatedItemCut)
+			{
+				State->Phase = 17;
+			}
+			break;
+		case 14:
+		{
+			AFragment2DActor* Item = nullptr;
+			for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+			{
+				if (IsValid(*It)
+					&& It->ActorHasTag(TEXT("MatterFluxFragment")))
+				{
+					Item = *It;
+					break;
+				}
+			}
+			if (!Item)
+			{
+				UE_LOG(LogMatterFlux, Error,
+					TEXT("Repeated item-cut capture lost the detached carrier."));
+				State->Phase = 17;
+				State->NextActionAt = Now;
+				break;
+			}
+			State->DetachedItem = Item;
+			const FBox Bounds = Item->GetComponentsBoundingBox(true);
+			State->CameraFocus = Bounds.IsValid
+				? Bounds.GetCenter()
+				: Item->GetActorLocation();
+			PositionTreeCaptureCamera(
+				*State,
+				(State->CameraFront + State->CameraRight).GetSafeNormal(),
+				0.65f);
+			FFragmentWorldCutRequest ItemCut;
+			ItemCut.CutShape.Type = EFragmentDamageShapeType::Box;
+			ItemCut.CutShape.WorldTransform = FTransform(State->CameraFocus);
+			const FVector Extent = Bounds.IsValid
+				? Bounds.GetExtent()
+				: FVector(40.0f);
+			ItemCut.CutShape.Extents = FVector2D(
+				FMath::Max(Extent.X, 20.0),
+				FMath::Max(Extent.Z, 20.0));
+			ItemCut.DamagePower = 0.0f;
+			ItemCut.EventSeed = State->EventSeed + 1000;
+			ItemCut.MaxAffectedSources = 4;
+			for (int32 CutIndex = 0;
+				CutIndex < Item->GetCutsBeforeFade() - 1;
+				++CutIndex)
+			{
+				ItemCut.EventSeed += CutIndex;
+				UFragmentSimulationSubsystem::ExecuteWorldCut(World, ItemCut);
+			}
+			const UPrimitiveComponent* ItemBody =
+				Cast<UPrimitiveComponent>(Item->GetRootComponent());
+			const bool bPreFadeAccepted = ItemBody
+				&& Item->GetAcceptedCutCount()
+					== Item->GetCutsBeforeFade() - 1
+				&& !Item->IsCutFadeActive()
+				&& ItemBody->GetCollisionEnabled()
+					!= ECollisionEnabled::NoCollision;
+			UE_LOG(LogMatterFlux, Display,
+				TEXT("Repeated item-cut pre-fade: accepted=%s cuts=%d/%d collision=%d"),
+				bPreFadeAccepted ? TEXT("true") : TEXT("false"),
+				Item->GetAcceptedCutCount(),
+				Item->GetCutsBeforeFade(),
+				ItemBody
+					? static_cast<int32>(ItemBody->GetCollisionEnabled())
+					: -1);
+			State->bAccepted = bPreFadeAccepted;
+			RequestTreeCutScreenshot(
+				*State,
+				TEXT("13_DetachedItemBeforeFinalCut.png"));
+			State->NextActionAt = Now + 0.6;
+			break;
+		}
+		case 15:
+		{
+			AFragment2DActor* Item = State->DetachedItem.Get();
+			if (!Item)
+			{
+				State->bAccepted = false;
+				State->NextActionAt = Now;
+				break;
+			}
+			const FBox Bounds = Item->GetComponentsBoundingBox(true);
+			FFragmentWorldCutRequest FinalCut;
+			FinalCut.CutShape.Type = EFragmentDamageShapeType::Box;
+			FinalCut.CutShape.WorldTransform = FTransform(
+				Bounds.IsValid ? Bounds.GetCenter() : Item->GetActorLocation());
+			const FVector Extent = Bounds.IsValid
+				? Bounds.GetExtent()
+				: FVector(40.0f);
+			FinalCut.CutShape.Extents = FVector2D(
+				FMath::Max(Extent.X, 20.0),
+				FMath::Max(Extent.Z, 20.0));
+			FinalCut.DamagePower = 0.0f;
+			FinalCut.EventSeed = State->EventSeed + 2000;
+			FinalCut.MaxAffectedSources = 4;
+			UFragmentSimulationSubsystem::ExecuteWorldCut(World, FinalCut);
+			const UPrimitiveComponent* ItemBody =
+				Cast<UPrimitiveComponent>(Item->GetRootComponent());
+			State->bAccepted &= ItemBody
+				&& Item->IsCutFadeActive()
+				&& Item->GetAcceptedCutCount() == Item->GetCutsBeforeFade()
+				&& ItemBody->GetCollisionEnabled()
+					== ECollisionEnabled::NoCollision;
+			State->NextActionAt = Now + 0.2;
+			break;
+		}
+		case 16:
+		{
+			AFragment2DActor* Item = State->DetachedItem.Get();
+			State->bAccepted &= Item
+				&& Item->GetTransientFadeAlpha() < 0.99f;
+			UE_LOG(LogMatterFlux, Display,
+				TEXT("Repeated item-cut fade: accepted=%s alpha=%.3f aggregateLayers=%d"),
+				State->bAccepted ? TEXT("true") : TEXT("false"),
+				Item ? Item->GetTransientFadeAlpha() : -1.0f,
+				Item ? Item->GetAggregateMemberCount() : -1);
+			RequestTreeCutScreenshot(
+				*State,
+				TEXT("14_DetachedItemFading.png"));
+			State->NextActionAt = Now + 0.85;
+			break;
+		}
+		case 17:
+			State->bAccepted &= !State->DetachedItem.IsValid();
+			UE_LOG(LogMatterFlux, Display,
+				TEXT("Repeated item-cut retirement: accepted=%s"),
+				State->bAccepted ? TEXT("true") : TEXT("false"));
+			RequestTreeCutScreenshot(
+				*State,
+				TEXT("15_DetachedItemRetired.png"));
+			State->NextActionAt = Now + 0.5;
 			break;
 		default:
 			GTreeCutCapturePending = false;
@@ -909,7 +1050,9 @@ namespace
 				*State->OutputDirectory);
 			if (State->bQuitAfterCapture)
 			{
-				FPlatformMisc::RequestExit(false);
+				FPlatformMisc::RequestExitWithStatus(
+					false,
+					!State->bRepeatedItemCut || State->bAccepted ? 0 : 5);
 			}
 			return false;
 		}
@@ -1764,6 +1907,9 @@ namespace
 		State->bBurnInspectionOnly =
 			Args.Num() > 2
 			&& Args[2].Equals(TEXT("burn"), ESearchCase::IgnoreCase);
+		State->bRepeatedItemCut =
+			Args.Num() > 2
+			&& Args[2].Equals(TEXT("item"), ESearchCase::IgnoreCase);
 		GTreeCutCapturePending = true;
 		FTSTicker::GetCoreTicker().AddTicker(
 			FTickerDelegate::CreateLambda(
@@ -1778,12 +1924,14 @@ namespace
 			TEXT("Queued tree inspection sequence: seed=%d quit=%s mode=%s"),
 			State->EventSeed,
 			State->bQuitAfterCapture ? TEXT("true") : TEXT("false"),
-			State->bBurnInspectionOnly ? TEXT("burn") : TEXT("cut"));
+			State->bBurnInspectionOnly
+				? TEXT("burn")
+				: State->bRepeatedItemCut ? TEXT("item") : TEXT("cut"));
 	}
 
 	FAutoConsoleCommandWithWorldAndArgs GTreeCutCaptureCommand(
 		TEXT("mf.Visual.TreeCutSequence"),
-		TEXT("Capture one isolated tree from axis/45-degree/low angles, then cut or burn it: mf.Visual.TreeCutSequence [event-seed=1337] [quit-after=1] [cut|burn]"),
+		TEXT("Capture one isolated tree, then cut, repeatedly cut its detached item, or burn it: mf.Visual.TreeCutSequence [event-seed=1337] [quit-after=1] [cut|item|burn]"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
 			&QueueTreeCutCapture));
 

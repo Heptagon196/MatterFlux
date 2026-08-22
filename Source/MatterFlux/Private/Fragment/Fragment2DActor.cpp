@@ -92,6 +92,152 @@ namespace
 		}
 		return Count;
 	}
+
+	double Cross2D(
+		const FVector2D& A,
+		const FVector2D& B,
+		const FVector2D& C)
+	{
+		return FVector2D::CrossProduct(B - A, C - A);
+	}
+
+	bool IsPointInTriangle(
+		const FVector2D& Point,
+		const FVector2D& A,
+		const FVector2D& B,
+		const FVector2D& C)
+	{
+		const double AB = Cross2D(A, B, Point);
+		const double BC = Cross2D(B, C, Point);
+		const double CA = Cross2D(C, A, Point);
+		constexpr double Epsilon = 0.001;
+		return (AB >= -Epsilon && BC >= -Epsilon && CA >= -Epsilon)
+			|| (AB <= Epsilon && BC <= Epsilon && CA <= Epsilon);
+	}
+
+	bool DoSegmentsIntersect(
+		const FVector2D& A,
+		const FVector2D& B,
+		const FVector2D& C,
+		const FVector2D& D)
+	{
+		const double AB_C = Cross2D(A, B, C);
+		const double AB_D = Cross2D(A, B, D);
+		const double CD_A = Cross2D(C, D, A);
+		const double CD_B = Cross2D(C, D, B);
+		constexpr double Epsilon = 0.001;
+		const bool bProperCrossing =
+			((AB_C > Epsilon && AB_D < -Epsilon)
+				|| (AB_C < -Epsilon && AB_D > Epsilon))
+			&& ((CD_A > Epsilon && CD_B < -Epsilon)
+				|| (CD_A < -Epsilon && CD_B > Epsilon));
+		if (bProperCrossing)
+		{
+			return true;
+		}
+		const auto IsOnSegment = [](const FVector2D& Point,
+			const FVector2D& Start, const FVector2D& End)
+		{
+			constexpr double BoundsEpsilon = 0.001;
+			return FMath::Abs(Cross2D(Start, End, Point))
+					<= BoundsEpsilon
+				&& Point.X >= FMath::Min(Start.X, End.X) - BoundsEpsilon
+				&& Point.X <= FMath::Max(Start.X, End.X) + BoundsEpsilon
+				&& Point.Y >= FMath::Min(Start.Y, End.Y) - BoundsEpsilon
+				&& Point.Y <= FMath::Max(Start.Y, End.Y) + BoundsEpsilon;
+		};
+		return IsOnSegment(C, A, B)
+			|| IsOnSegment(D, A, B)
+			|| IsOnSegment(A, C, D)
+			|| IsOnSegment(B, C, D);
+	}
+
+	double PointSegmentDistanceSquared(
+		const FVector2D& Point,
+		const FVector2D& A,
+		const FVector2D& B)
+	{
+		const FVector2D Segment = B - A;
+		const double SegmentLengthSquared = Segment.SizeSquared();
+		if (SegmentLengthSquared <= UE_DOUBLE_SMALL_NUMBER)
+		{
+			return FVector2D::DistSquared(Point, A);
+		}
+		const double Along = FMath::Clamp(
+			FVector2D::DotProduct(Point - A, Segment)
+				/ SegmentLengthSquared,
+			0.0,
+			1.0);
+		return FVector2D::DistSquared(Point, A + Segment * Along);
+	}
+
+	bool DoesTriangleIntersectDamageShape(
+		const FVector2D& A,
+		const FVector2D& B,
+		const FVector2D& C,
+		const FFragmentDamageShape& Shape)
+	{
+		if (Shape.Type == EFragmentDamageShapeType::Circle)
+		{
+			const double RadiusSquared = FMath::Square(
+				static_cast<double>(Shape.Radius));
+			const FVector2D Center = FVector2D::ZeroVector;
+			return A.SizeSquared() <= RadiusSquared
+				|| B.SizeSquared() <= RadiusSquared
+				|| C.SizeSquared() <= RadiusSquared
+				|| IsPointInTriangle(Center, A, B, C)
+				|| PointSegmentDistanceSquared(Center, A, B)
+					<= RadiusSquared
+				|| PointSegmentDistanceSquared(Center, B, C)
+					<= RadiusSquared
+				|| PointSegmentDistanceSquared(Center, C, A)
+					<= RadiusSquared;
+		}
+
+		const FVector2D HalfExtent = Shape.Type
+			== EFragmentDamageShapeType::Line
+			? FVector2D(Shape.Extents.X * 0.5, Shape.Thickness * 0.5)
+			: Shape.Extents;
+		const auto IsInsideRect = [&HalfExtent](const FVector2D& Point)
+		{
+			return FMath::Abs(Point.X) <= HalfExtent.X
+				&& FMath::Abs(Point.Y) <= HalfExtent.Y;
+		};
+		if (IsInsideRect(A) || IsInsideRect(B) || IsInsideRect(C))
+		{
+			return true;
+		}
+		const FVector2D Corners[] =
+		{
+			FVector2D(-HalfExtent.X, -HalfExtent.Y),
+			FVector2D(HalfExtent.X, -HalfExtent.Y),
+			FVector2D(HalfExtent.X, HalfExtent.Y),
+			FVector2D(-HalfExtent.X, HalfExtent.Y)
+		};
+		for (const FVector2D& Corner : Corners)
+		{
+			if (IsPointInTriangle(Corner, A, B, C))
+			{
+				return true;
+			}
+		}
+		const FVector2D Triangle[] = {A, B, C};
+		for (int32 TriangleEdge = 0; TriangleEdge < 3; ++TriangleEdge)
+		{
+			for (int32 RectangleEdge = 0; RectangleEdge < 4; ++RectangleEdge)
+			{
+				if (DoSegmentsIntersect(
+					Triangle[TriangleEdge],
+					Triangle[(TriangleEdge + 1) % 3],
+					Corners[RectangleEdge],
+					Corners[(RectangleEdge + 1) % 4]))
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
 }
 
 bool FFragmentAggregateSourceState::IsValid() const
@@ -236,6 +382,8 @@ void AFragment2DActor::EndPlay(
 bool AFragment2DActor::InitializeFromPayload(const FFragmentSpawnPayload& Payload)
 {
 	SpawnPayload = Payload;
+	AcceptedCutCount = 0;
+	ActiveCutFadeDuration = 0.0f;
 	InitializeRootCombustionState();
 	RefreshBuoyancyDensity();
 	const bool bReady = RebuildMeshFromPayload();
@@ -272,6 +420,16 @@ void AFragment2DActor::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out
 	DOREPLIFETIME_CONDITION(AFragment2DActor, FragmentColor, COND_InitialOnly);
 	DOREPLIFETIME(AFragment2DActor, AggregateSources);
 	DOREPLIFETIME(AFragment2DActor, RootCombustionState);
+	DOREPLIFETIME(AFragment2DActor, AcceptedCutCount);
+	DOREPLIFETIME_CONDITION(
+		AFragment2DActor,
+		CutsBeforeFade,
+		COND_InitialOnly);
+	DOREPLIFETIME_CONDITION(
+		AFragment2DActor,
+		CutExhaustionFadeDuration,
+		COND_InitialOnly);
+	DOREPLIFETIME(AFragment2DActor, ActiveCutFadeDuration);
 }
 
 void AFragment2DActor::OnRep_SpawnPayload()
@@ -279,7 +437,11 @@ void AFragment2DActor::OnRep_SpawnPayload()
 	InitializeRootCombustionState();
 	RefreshBuoyancyDensity();
 	RebuildMeshFromPayload();
-	ConfigureTransientFade();
+	SynchronizeCutFadeState();
+	if (!IsCutFadeActive())
+	{
+		ConfigureTransientFade();
+	}
 }
 
 void AFragment2DActor::OnRep_FragmentMaterial()
@@ -306,6 +468,125 @@ void AFragment2DActor::OnRep_RootCombustionState()
 	SetActorTickEnabled(
 		SpawnPayload.FadeOutDuration > 0.0f || IsRootCombusting());
 	MarkCombustionVisualizationDirty();
+}
+
+void AFragment2DActor::OnRep_CutState()
+{
+	SynchronizeCutFadeState();
+}
+
+bool AFragment2DActor::DoesCutShapeIntersect(
+	const FFragmentDamageShape& CutShape) const
+{
+	const auto IntersectsMask = [&CutShape](
+		const FFragmentSourceMask& Mask,
+		const FTransform& MaskWorldTransform)
+	{
+		if (!Mask.IsValid() || !MaskWorldTransform.IsValid())
+		{
+			return false;
+		}
+		FFragmentDamageShape LocalShape = CutShape;
+		LocalShape.WorldTransform = CutShape.WorldTransform.GetRelativeTransform(
+			MaskWorldTransform);
+		TArray<uint8> CandidateMask = Mask.SolidMask;
+		return MatterFlux::FragmentGeometry::ApplyDamageShape(
+			CandidateMask,
+			Mask.Width,
+			Mask.Height,
+			Mask.CellSize,
+			LocalShape);
+	};
+
+	const FFragmentSourceMask* RootMask = nullptr;
+	if (RootCombustionState.IsValid())
+	{
+		RootMask = &RootCombustionState.SourceMask;
+	}
+	else if (SpawnPayload.DetachedVoxelMask.IsValid())
+	{
+		RootMask = &SpawnPayload.DetachedVoxelMask;
+	}
+	if (RootMask && IntersectsMask(*RootMask, GetActorTransform()))
+	{
+		return true;
+	}
+	for (const FFragmentAggregateSourceState& Source : AggregateSources)
+	{
+		if (Source.IsValid()
+			&& IntersectsMask(
+				Source.SourceMask,
+				Source.LocalTransform * GetActorTransform()))
+		{
+			return true;
+		}
+	}
+
+	// Non-voxel fragments already retain their canonical triangulated face in
+	// the spawn payload. Test that face directly so generic debris does not need
+	// a second raster mask merely to become cuttable.
+	for (int32 Index = 0;
+		Index + 2 < SpawnPayload.TriangleIndices.Num();
+		Index += 3)
+	{
+		const int32 Indices[] =
+		{
+			SpawnPayload.TriangleIndices[Index],
+			SpawnPayload.TriangleIndices[Index + 1],
+			SpawnPayload.TriangleIndices[Index + 2]
+		};
+		FVector2D ShapePoints[3];
+		bool bValidTriangle = true;
+		for (int32 PointIndex = 0; PointIndex < 3; ++PointIndex)
+		{
+			if (!SpawnPayload.Vertices2D.IsValidIndex(Indices[PointIndex]))
+			{
+				bValidTriangle = false;
+				break;
+			}
+			const FVector2D& Vertex =
+				SpawnPayload.Vertices2D[Indices[PointIndex]];
+			const FVector ShapeLocal = CutShape.WorldTransform
+				.InverseTransformPosition(
+					GetActorTransform().TransformPosition(
+						FVector(Vertex.X, 0.0f, Vertex.Y)));
+			ShapePoints[PointIndex] = FVector2D(ShapeLocal.X, ShapeLocal.Z);
+		}
+		if (bValidTriangle
+			&& DoesTriangleIntersectDamageShape(
+				ShapePoints[0],
+				ShapePoints[1],
+				ShapePoints[2],
+				CutShape))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+bool AFragment2DActor::TryAcceptWorldCut(
+	const FFragmentDamageShape& CutShape)
+{
+	if ((GetWorld() && GetWorld()->IsGameWorld() && !HasAuthority())
+		|| IsActorBeingDestroyed()
+		|| IsCutFadeActive()
+		|| CutsBeforeFade <= 0
+		|| !FMath::IsFinite(CutExhaustionFadeDuration)
+		|| CutExhaustionFadeDuration <= 0.0f
+		|| !DoesCutShapeIntersect(CutShape))
+	{
+		return false;
+	}
+
+	AcceptedCutCount = FMath::Min(AcceptedCutCount + 1, CutsBeforeFade);
+	if (AcceptedCutCount >= CutsBeforeFade)
+	{
+		ActiveCutFadeDuration = CutExhaustionFadeDuration;
+		SynchronizeCutFadeState();
+	}
+	ForceNetUpdate();
+	return true;
 }
 
 bool AFragment2DActor::ContainsAggregateSource(const FGuid& SourceId) const
@@ -2007,6 +2288,21 @@ void AFragment2DActor::ConfigureTransientFade()
 	ApplyTransientFadeAlpha();
 }
 
+void AFragment2DActor::SynchronizeCutFadeState()
+{
+	if (!FMath::IsFinite(ActiveCutFadeDuration)
+		|| ActiveCutFadeDuration <= 0.0f)
+	{
+		return;
+	}
+	SpawnPayload.FadeOutDuration = ActiveCutFadeDuration;
+	// Switching an already-visible rigid item to the translucent fade parent is
+	// a projection rebuild only; the canonical masks and aggregate layers remain
+	// untouched until the carrier retires at the end of the fade.
+	RebuildMeshFromPayload();
+	ConfigureTransientFade();
+}
+
 void AFragment2DActor::ApplyTransientFadeAlpha()
 {
 	if (DynamicFragmentMaterial)
@@ -2034,6 +2330,15 @@ void AFragment2DActor::ApplyTransientFadeAlpha()
 		DynamicFragmentSideMaterial->SetScalarParameterValue(
 			TEXT("Opacity"),
 			TransientFadeAlpha);
+	}
+	for (UMaterialInstanceDynamic* Dynamic : AggregateDynamicMaterials)
+	{
+		if (Dynamic)
+		{
+			Dynamic->SetScalarParameterValue(
+				TEXT("Opacity"),
+				TransientFadeAlpha);
+		}
 	}
 }
 
@@ -2616,9 +2921,12 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 			Group.VertexColors,
 			TArray<FProcMeshTangent>(),
 			false);
-		UMaterialInterface* Parent = Group.Material
-			? Group.Material.Get()
-			: FragmentMaterial.Get();
+		UMaterialInterface* Parent = SpawnPayload.FadeOutDuration > 0.0f
+			&& TransientFadeMaterial
+			? TransientFadeMaterial.Get()
+			: Group.Material
+				? Group.Material.Get()
+				: FragmentMaterial.Get();
 		if (Parent)
 		{
 			UMaterialInstanceDynamic* Dynamic =
@@ -2631,7 +2939,8 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 					Group.CellSize,
 					Group.bSide
 						? MatterFlux::Rendering::EVoxelMaterialFaceRole::Side
-						: MatterFlux::Rendering::EVoxelMaterialFaceRole::Primary));
+						: MatterFlux::Rendering::EVoxelMaterialFaceRole::Primary),
+				TransientFadeAlpha);
 			AggregateDynamicMaterials.Add(Dynamic);
 			MeshComponent->SetMaterial(SectionIndex, Dynamic);
 		}

@@ -473,6 +473,7 @@ int32 UFragmentSimulationSubsystem::ExecuteWorldCut(
 	{
 		FGuid StableId;
 		TObjectPtr<AFragment2DSourceActor> Root;
+		TObjectPtr<AFragment2DActor> DetachedItem;
 		TArray<TObjectPtr<AFragment2DSourceActor>> Sources;
 		double DistanceSquared = TNumericLimits<double>::Max();
 	};
@@ -510,6 +511,40 @@ int32 UFragmentSimulationSubsystem::ExecuteWorldCut(
 		}
 		FCutTargetGroup& Group = TargetGroups[*GroupIndex];
 		Group.Sources.AddUnique(Source);
+		Group.DistanceSquared = FMath::Min(
+			Group.DistanceSquared,
+			Bounds.ComputeSquaredDistanceToPoint(ShapeCenter));
+	}
+	// Detached rigid carriers are the moving projection of the same material
+	// facts, not terminal debris. Include them in the same deterministic target
+	// budget as static sources so a cut remains a generic world interaction after
+	// an object has changed projection.
+	for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+	{
+		AFragment2DActor* Item = *It;
+		if (!IsValid(Item)
+			|| Item->IsActorBeingDestroyed()
+			|| Item->IsCutFadeActive()
+			|| !Item->SpawnPayload.FragmentId.IsValid())
+		{
+			continue;
+		}
+		const FBox Bounds = Item->GetComponentsBoundingBox(true);
+		if (!Bounds.IsValid || !Bounds.Intersect(QueryBounds))
+		{
+			continue;
+		}
+		const FGuid StableId = Item->SpawnPayload.FragmentId;
+		int32* GroupIndex = TargetGroupIndices.Find(StableId);
+		if (!GroupIndex)
+		{
+			FCutTargetGroup& NewGroup = TargetGroups.AddDefaulted_GetRef();
+			NewGroup.StableId = StableId;
+			TargetGroupIndices.Add(StableId, TargetGroups.Num() - 1);
+			GroupIndex = TargetGroupIndices.Find(StableId);
+		}
+		FCutTargetGroup& Group = TargetGroups[*GroupIndex];
+		Group.DetachedItem = Item;
 		Group.DistanceSquared = FMath::Min(
 			Group.DistanceSquared,
 			Bounds.ComputeSquaredDistanceToPoint(ShapeCenter));
@@ -564,6 +599,12 @@ int32 UFragmentSimulationSubsystem::ExecuteWorldCut(
 		}
 		++AttemptedTargets;
 		bool bTargetAccepted = false;
+		if (IsValid(Group.DetachedItem))
+		{
+			bTargetAccepted = Group.DetachedItem->TryAcceptWorldCut(Shape);
+			AcceptedCuts += bTargetAccepted ? 1 : 0;
+			continue;
+		}
 		TMap<FGuid, int32> InitialRevisions;
 		for (AFragment2DSourceActor* Source : Group.Sources)
 		{
