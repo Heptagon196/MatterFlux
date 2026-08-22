@@ -14,6 +14,7 @@
 #include "Engine/StaticMeshActor.h"
 #include "EngineUtils.h"
 #include "Fragment/Fragment2DActor.h"
+#include "Fragment/FragmentGeometry.h"
 #include "Fragment/Fragment2DSourceActor.h"
 #include "Fragment/FragmentSimulationSubsystem.h"
 #include "GameFramework/SpringArmComponent.h"
@@ -55,6 +56,7 @@ namespace
 	bool GVisualCapturePending = false;
 	bool GOccludedPlayerCapturePending = false;
 	bool GTreeCutCapturePending = false;
+	bool GTreeBatchCutCapturePending = false;
 	bool GShellCapturePending = false;
 	bool GStabilityCapturePending = false;
 	bool GLiquidPoolCapturePending = false;
@@ -1784,6 +1786,424 @@ namespace
 		TEXT("Capture one isolated tree from axis/45-degree/low angles, then cut or burn it: mf.Visual.TreeCutSequence [event-seed=1337] [quit-after=1] [cut|burn]"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
 			&QueueTreeCutCapture));
+
+	struct FTreeBatchCutTarget
+	{
+		FGuid AggregateId;
+		FGuid RootSourceId;
+		FTransform RootTransform = FTransform::Identity;
+		FFragmentSourceMask RootMask;
+		TArray<FGuid> CanopySourceIds;
+		TWeakObjectPtr<AFragment2DActor> Carrier;
+		FVector DetachedLocation = FVector::ZeroVector;
+		bool bRootCutCommitted = false;
+	};
+
+	struct FTreeBatchCutCaptureState
+	{
+		double QueuedAt = 0.0;
+		double PhaseStartedAt = 0.0;
+		int32 Phase = 0;
+		int32 RequestedTreeCount = 12;
+		int32 AcceptedCutCount = 0;
+		bool bQuitAfterCapture = true;
+		bool bAccepted = false;
+		FString OutputDirectory;
+		TArray<FTreeBatchCutTarget> Targets;
+		TWeakObjectPtr<AMatterFluxPlayableWorldActor> PlayableWorld;
+		TWeakObjectPtr<ACameraActor> Camera;
+	};
+
+	void RequestTreeBatchCutScreenshot(
+		const FTreeBatchCutCaptureState& State,
+		const TCHAR* FileName)
+	{
+		IFileManager::Get().MakeDirectory(*State.OutputDirectory, true);
+		const FString Path = FPaths::Combine(State.OutputDirectory, FileName);
+		FScreenshotRequest::RequestScreenshot(Path, true, false, false);
+		UE_LOG(LogMatterFlux, Display,
+			TEXT("Requested batch tree-cut screenshot: %s"), *Path);
+	}
+
+	AFragment2DActor* FindTreeBatchCarrier(
+		UWorld& World,
+		const FTreeBatchCutTarget& Target)
+	{
+		for (TActorIterator<AFragment2DActor> It(&World); It; ++It)
+		{
+			AFragment2DActor* Candidate = *It;
+			for (const FGuid& SourceId : Target.CanopySourceIds)
+			{
+				if (Candidate->ContainsAggregateSource(SourceId))
+				{
+					return Candidate;
+				}
+			}
+		}
+		return nullptr;
+	}
+
+	bool TickTreeBatchCutCapture(
+		const TSharedRef<FTreeBatchCutCaptureState>& State)
+	{
+		UWorld* World = GEngine && GEngine->GameViewport
+			? GEngine->GameViewport->GetWorld()
+			: nullptr;
+		const double Now = FPlatformTime::Seconds();
+		if (!World || !World->IsGameWorld())
+		{
+			if (Now - State->QueuedAt > 30.0)
+			{
+				GTreeBatchCutCapturePending = false;
+				if (State->bQuitAfterCapture)
+				{
+					FPlatformMisc::RequestExitWithStatus(false, 4);
+				}
+				return false;
+			}
+			return true;
+		}
+
+		if (State->Camera.IsValid())
+		{
+			if (APlayerController* Controller = World->GetFirstPlayerController())
+			{
+				Controller->SetViewTarget(State->Camera.Get());
+			}
+		}
+
+		if (State->Phase == 0)
+		{
+			AMatterFluxPlayableWorldActor* PlayableWorld = nullptr;
+			for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
+			{
+				if (!It->IsGenerationInProgress()
+					&& It->GetCachedFragmentSourceCount() > 0)
+				{
+					PlayableWorld = *It;
+					break;
+				}
+			}
+			AMatterFluxPlayerController* Controller =
+				Cast<AMatterFluxPlayerController>(World->GetFirstPlayerController());
+			if (!PlayableWorld || !Controller)
+			{
+				if (Now - State->QueuedAt <= 30.0)
+				{
+					return true;
+				}
+				GTreeBatchCutCapturePending = false;
+				if (State->bQuitAfterCapture)
+				{
+					FPlatformMisc::RequestExitWithStatus(false, 4);
+				}
+				return false;
+			}
+			Controller->EnterGameplayForVisualCapture();
+			Controller->HideUIForVisualCapture();
+			if (GEngine)
+			{
+				GEngine->ClearOnScreenDebugMessages();
+				GEngine->Exec(World, TEXT("DisableAllScreenMessages"));
+			}
+
+			MatterFlux::PlayableLevel::FLevelLayout Layout;
+			const FMatterFluxContentRegistryPtr Registry =
+				IMatterFluxScriptRuntime::Get().GetActiveRegistry();
+			if (!MatterFlux::PlayableLevel::BuildLevelLayout(
+				PlayableWorld->GetMapSeed(),
+				Layout,
+				Registry.Get()))
+			{
+				GTreeBatchCutCapturePending = false;
+				if (State->bQuitAfterCapture)
+				{
+					FPlatformMisc::RequestExitWithStatus(false, 4);
+				}
+				return false;
+			}
+
+			FVector Focus = FVector::ZeroVector;
+			if (const APawn* Pawn = Controller->GetPawn())
+			{
+				Focus = Pawn->GetActorLocation();
+			}
+			TArray<const MatterFlux::PlayableLevel::FLevelFragmentSource*> Roots;
+			for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
+				: Layout.FragmentSources)
+			{
+				if (Source.bAggregateRoot
+					&& Source.Name == TEXT("TreeTrunk")
+					&& Source.AggregateId.IsValid())
+				{
+					Roots.Add(&Source);
+				}
+			}
+			Roots.Sort([Focus](const auto& A, const auto& B)
+			{
+				const double DistanceA = FVector::DistSquared(
+					A.Transform.GetLocation(), Focus);
+				const double DistanceB = FVector::DistSquared(
+					B.Transform.GetLocation(), Focus);
+				if (!FMath::IsNearlyEqual(DistanceA, DistanceB))
+				{
+					return DistanceA < DistanceB;
+				}
+				return A.SourceId.ToString(EGuidFormats::Digits)
+					< B.SourceId.ToString(EGuidFormats::Digits);
+			});
+			const int32 TreeCount = FMath::Min(
+				State->RequestedTreeCount,
+				Roots.Num());
+			FBox BatchBounds(ForceInit);
+			for (int32 Index = 0; Index < TreeCount; ++Index)
+			{
+				const auto& Root = *Roots[Index];
+				FTreeBatchCutTarget& Target = State->Targets.AddDefaulted_GetRef();
+				Target.AggregateId = Root.AggregateId;
+				Target.RootSourceId = Root.SourceId;
+				Target.RootTransform = Root.Transform;
+				Target.RootMask = Root.Mask;
+				for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Member
+					: Layout.FragmentSources)
+				{
+					if (Member.AggregateId != Root.AggregateId)
+					{
+						continue;
+					}
+					const FVector HalfExtent(
+						Member.Mask.Width * Member.Mask.CellSize * 0.5f,
+						Member.Mask.CellSize * 0.5f,
+						Member.Mask.Height * Member.Mask.CellSize * 0.5f);
+					BatchBounds += FBox(-HalfExtent, HalfExtent).TransformBy(
+						Member.Transform.ToMatrixWithScale());
+					if (Member.SourceId != Root.SourceId
+						&& (Member.Name == TEXT("TreeBranch")
+							|| Member.Name == TEXT("TreeLeaves")))
+					{
+						Target.CanopySourceIds.Add(Member.SourceId);
+					}
+				}
+			}
+
+			if (State->Targets.IsEmpty() || !BatchBounds.IsValid)
+			{
+				GTreeBatchCutCapturePending = false;
+				if (State->bQuitAfterCapture)
+				{
+					FPlatformMisc::RequestExitWithStatus(false, 4);
+				}
+				return false;
+			}
+			const FVector Center = BatchBounds.GetCenter();
+			const float Radius = FMath::Max(BatchBounds.GetExtent().Size2D(), 600.0f);
+			const FVector CameraLocation = Center
+				+ FVector(-0.75f, -0.75f, 1.15f).GetSafeNormal()
+					* Radius * 1.65f;
+			State->Camera = World->SpawnActor<ACameraActor>(
+				CameraLocation,
+				(Center - CameraLocation).Rotation());
+			if (!State->Camera.IsValid())
+			{
+				GTreeBatchCutCapturePending = false;
+				if (State->bQuitAfterCapture)
+				{
+					FPlatformMisc::RequestExitWithStatus(false, 4);
+				}
+				return false;
+			}
+			State->Camera->GetCameraComponent()->SetFieldOfView(55.0f);
+			Controller->SetViewTarget(State->Camera.Get());
+			State->PlayableWorld = PlayableWorld;
+			State->Phase = 1;
+			State->PhaseStartedAt = Now;
+			return true;
+		}
+
+		if (State->Phase == 1 && Now - State->PhaseStartedAt >= 0.8)
+		{
+			RequestTreeBatchCutScreenshot(*State, TEXT("01_ForestBeforeBatchCut.png"));
+			State->Phase = 2;
+			State->PhaseStartedAt = Now;
+			return true;
+		}
+
+		if (State->Phase == 2 && Now - State->PhaseStartedAt >= 0.7)
+		{
+			for (int32 Index = 0; Index < State->Targets.Num(); ++Index)
+			{
+				FTreeBatchCutTarget& Target = State->Targets[Index];
+				FFragmentWorldCutRequest CutRequest;
+				CutRequest.CutShape.Type = EFragmentDamageShapeType::Line;
+				CutRequest.CutShape.WorldTransform = Target.RootTransform;
+				const FVector RootLocalCut(
+					0.0f,
+					0.0f,
+					(-static_cast<float>(Target.RootMask.Height) * 0.5f + 1.5f)
+						* Target.RootMask.CellSize);
+				CutRequest.CutShape.WorldTransform.SetLocation(
+					Target.RootTransform.TransformPosition(RootLocalCut));
+				CutRequest.CutShape.Extents.X = Target.RootMask.CellSize * 2.2f;
+				CutRequest.CutShape.Thickness = Target.RootMask.CellSize * 1.1f;
+				CutRequest.DamagePower = 500.0f;
+				CutRequest.EventSeed = 1337 + Index * 101;
+				// Match the player ability. A one-target test is not representative:
+				// a flower sharing the cut volume can legitimately be the nearest
+				// target, while gameplay continues through up to four logical items.
+				CutRequest.MaxAffectedSources = 4;
+				UFragmentSimulationSubsystem::ExecuteWorldCut(World, CutRequest);
+				int32 RootRevision = INDEX_NONE;
+				TArray<uint8> RootRuntimeMask;
+				Target.bRootCutCommitted = State->PlayableWorld.IsValid()
+					&& State->PlayableWorld->GetFragmentSourceRuntimeState(
+						Target.RootSourceId,
+						RootRevision,
+						RootRuntimeMask)
+					&& RootRevision > 0
+					&& RootRuntimeMask.Contains(1);
+				State->AcceptedCutCount += Target.bRootCutCommitted ? 1 : 0;
+				Target.Carrier = FindTreeBatchCarrier(*World, Target);
+				if (Target.Carrier.IsValid())
+				{
+					Target.DetachedLocation = Target.Carrier->GetActorLocation();
+				}
+			}
+			State->Phase = 3;
+			State->PhaseStartedAt = Now;
+			return true;
+		}
+
+		if (State->Phase == 3 && Now - State->PhaseStartedAt >= 0.15)
+		{
+			RequestTreeBatchCutScreenshot(*State, TEXT("02_AllTreesJustDetached.png"));
+			State->Phase = 4;
+			State->PhaseStartedAt = Now;
+			return true;
+		}
+
+		if (State->Phase == 4 && Now - State->PhaseStartedAt >= 2.5)
+		{
+			int32 FailedTrees = 0;
+			for (int32 Index = 0; Index < State->Targets.Num(); ++Index)
+			{
+				FTreeBatchCutTarget& Target = State->Targets[Index];
+				AFragment2DActor* Carrier = Target.Carrier.Get();
+				if (!Carrier)
+				{
+					Carrier = FindTreeBatchCarrier(*World, Target);
+				}
+				int32 MissingCanopyMembers = 0;
+				for (const FGuid& SourceId : Target.CanopySourceIds)
+				{
+					MissingCanopyMembers +=
+						!Carrier || !Carrier->ContainsAggregateSource(SourceId) ? 1 : 0;
+				}
+				int32 StaticCanopyActors = 0;
+				for (TActorIterator<AFragment2DSourceActor> It(World); It; ++It)
+				{
+					if (It->AggregateId == Target.AggregateId
+						&& !It->IsActorBeingDestroyed()
+						&& Target.CanopySourceIds.Contains(It->SourceId)
+						&& It->GetRuntimeMask().Contains(1))
+					{
+						++StaticCanopyActors;
+					}
+				}
+				const float HorizontalTravel = Carrier
+					? FVector::Dist2D(Target.DetachedLocation, Carrier->GetActorLocation())
+					: 0.0f;
+				const float FallDistance = Carrier
+					? Target.DetachedLocation.Z - Carrier->GetActorLocation().Z
+					: 0.0f;
+				const float TiltDegrees = Carrier
+					? FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(
+						FMath::Abs(FVector::DotProduct(
+							Carrier->GetActorUpVector(), FVector::UpVector)),
+						0.0f,
+						1.0f)))
+					: 0.0f;
+				const bool bLeavesMovedWithCarrier = Target.bRootCutCommitted
+					&& Carrier
+					&& MissingCanopyMembers == 0
+					&& StaticCanopyActors == 0;
+				const bool bTreeLeftStandingProjection =
+					HorizontalTravel < 12.0f
+					&& FallDistance < 18.0f
+					&& TiltDegrees < 12.0f;
+				const bool bTreeAccepted = bLeavesMovedWithCarrier
+					&& !bTreeLeftStandingProjection;
+				FailedTrees += bTreeAccepted ? 0 : 1;
+				UE_LOG(LogMatterFlux, Display,
+					TEXT("Batch tree-cut [%02d]: accepted=%s carrier=%s missingCanopy=%d staticCanopy=%d horizontal=%.2f fall=%.2f tilt=%.2f"),
+					Index,
+					bTreeAccepted ? TEXT("true") : TEXT("false"),
+					Carrier ? *Carrier->GetName() : TEXT("none"),
+					MissingCanopyMembers,
+					StaticCanopyActors,
+					HorizontalTravel,
+					FallDistance,
+					TiltDegrees);
+			}
+			State->bAccepted = State->AcceptedCutCount == State->Targets.Num()
+				&& FailedTrees == 0;
+			UE_LOG(LogMatterFlux, Display,
+				TEXT("Batch tree-cut acceptance: accepted=%s requested=%d cut=%d failed=%d"),
+				State->bAccepted ? TEXT("true") : TEXT("false"),
+				State->Targets.Num(),
+				State->AcceptedCutCount,
+				FailedTrees);
+			RequestTreeBatchCutScreenshot(*State, TEXT("03_ForestAfterSettling.png"));
+			State->Phase = 5;
+			State->PhaseStartedAt = Now;
+			return true;
+		}
+
+		if (State->Phase == 5 && Now - State->PhaseStartedAt >= 0.8)
+		{
+			GTreeBatchCutCapturePending = false;
+			if (State->bQuitAfterCapture)
+			{
+				FPlatformMisc::RequestExitWithStatus(
+					false,
+					State->bAccepted ? 0 : 5);
+			}
+			return false;
+		}
+		return true;
+	}
+
+	void QueueTreeBatchCutCapture(const TArray<FString>& Args, UWorld*)
+	{
+		if (GTreeBatchCutCapturePending)
+		{
+			return;
+		}
+		GTreeBatchCutCapturePending = true;
+		const TSharedRef<FTreeBatchCutCaptureState> State =
+			MakeShared<FTreeBatchCutCaptureState>();
+		State->QueuedAt = FPlatformTime::Seconds();
+		State->PhaseStartedAt = State->QueuedAt;
+		State->RequestedTreeCount = Args.IsValidIndex(0)
+			? FMath::Clamp(FCString::Atoi(*Args[0]), 4, 24)
+			: 12;
+		State->bQuitAfterCapture = !Args.IsValidIndex(1)
+			|| FCString::Atoi(*Args[1]) != 0;
+		State->OutputDirectory = FPaths::Combine(
+			FPaths::ScreenShotDir(),
+			TEXT("MatterFluxTreeBatchCut"),
+			FDateTime::Now().ToString(TEXT("%Y%m%d-%H%M%S")));
+		FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateLambda([State](float)
+			{
+				return TickTreeBatchCutCapture(State);
+			}));
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs GTreeBatchCutCaptureCommand(
+		TEXT("mf.Visual.TreeBatchCut"),
+		TEXT("Batch-cut many generated trees and audit canopy transfer and fall: mf.Visual.TreeBatchCut [tree-count=12] [quit=1]"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+			&QueueTreeBatchCutCapture));
 
 	struct FVisualStabilityCaptureState
 	{
@@ -4723,13 +5143,79 @@ namespace
 		FString OutputDirectory;
 		FVector PlayerBodyStart = FVector::ZeroVector;
 		FVector CreatureBodyStart = FVector::ZeroVector;
+		FVector PlayerStart = FVector::ZeroVector;
+		FVector CreatureStart = FVector::ZeroVector;
 		TWeakObjectPtr<AMatterFluxCharacter> Character;
 		TWeakObjectPtr<AMatterFluxCreatureActor> Creature;
 		TWeakObjectPtr<AStaticMeshActor> Floor;
-		TWeakObjectPtr<AStaticMeshActor> PlayerBody;
-		TWeakObjectPtr<AStaticMeshActor> CreatureBody;
+		TWeakObjectPtr<AFragment2DActor> PlayerBody;
+		TWeakObjectPtr<AFragment2DActor> CreatureBody;
 		TWeakObjectPtr<ACameraActor> Camera;
 	};
+
+	AFragment2DActor* SpawnPhysicsPushFragment(
+		UWorld& World,
+		UMaterialInterface& PaletteMaterial,
+		const FVector& Location,
+		const FLinearColor& Color,
+		const TCHAR* StableId)
+	{
+		FFragmentSourceMask Mask;
+		Mask.Width = 4;
+		Mask.Height = 4;
+		Mask.CellSize = 18.0f;
+		Mask.SupportMode = EFragmentSupportMode::None;
+		Mask.GeometryStyle = EFragmentSourceGeometryStyle::VoxelBlocks;
+		Mask.SolidMask = {
+			1, 1, 1, 0,
+			1, 1, 1, 1,
+			1, 1, 1, 1,
+			0, 1, 1, 1
+		};
+		MatterFlux::FragmentGeometry::FFragmentGeometry2D Geometry;
+		if (!MatterFlux::FragmentGeometry::BuildFragmentGeometryFromMask(
+			Mask.SolidMask,
+			Mask.Width,
+			Mask.Height,
+			Mask.CellSize,
+			Geometry))
+		{
+			return nullptr;
+		}
+
+		FFragmentSpawnPayload Payload;
+		Payload.FragmentId = FGuid::NewDeterministicGuid(StableId, 1);
+		Payload.OuterContours = MoveTemp(Geometry.OuterContours);
+		Payload.HoleContours = MoveTemp(Geometry.HoleContours);
+		Payload.TriangleIndices = MoveTemp(Geometry.TriangleIndices);
+		Payload.Vertices2D = MoveTemp(Geometry.Vertices2D);
+		Payload.CollisionContours = MoveTemp(Geometry.CollisionContours);
+		Payload.DetachedVoxelMask = Mask;
+		Payload.MaterialId = TEXT("wood");
+		Payload.Thickness = Mask.CellSize;
+		Payload.InitialTransform = FTransform(Location);
+		Payload.Mass = 20.0f;
+
+		FActorSpawnParameters Parameters;
+		Parameters.SpawnCollisionHandlingOverride =
+			ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+		AFragment2DActor* Fragment = World.SpawnActor<AFragment2DActor>(
+			Location,
+			FRotator::ZeroRotator,
+			Parameters);
+		if (!Fragment)
+		{
+			return nullptr;
+		}
+		Fragment->FragmentMaterial = &PaletteMaterial;
+		Fragment->FragmentColor = Color;
+		if (!Fragment->InitializeFromPayload(Payload))
+		{
+			Fragment->Destroy();
+			return nullptr;
+		}
+		return Fragment;
+	}
 
 	AStaticMeshActor* SpawnPhysicsPushBox(
 		UWorld& World,
@@ -4823,6 +5309,17 @@ namespace
 				TEXT("/Game/MatterFlux/Materials/M_VoxelPalette.M_VoxelPalette"));
 			if (!Controller || !Character || !CubeMesh || !PaletteMaterial)
 			{
+				if (Now - State->QueuedAt > 30.0)
+				{
+					GPhysicsPushCapturePending = false;
+					UE_LOG(LogMatterFlux, Error,
+						TEXT("Physics-push capture timed out waiting for gameplay assets."));
+					if (State->bQuitAfterCapture)
+					{
+						FPlatformMisc::RequestExitWithStatus(false, 4);
+					}
+					return false;
+				}
 				return true;
 			}
 			Controller->EnterGameplayForVisualCapture();
@@ -4839,31 +5336,27 @@ namespace
 				*CubeMesh,
 				*PaletteMaterial,
 				FVector(0.0f, 0.0f, PlatformZ),
-				FVector(10.0f, 6.0f, 0.20f),
+				FVector(10.0f, 12.0f, 0.20f),
 				FLinearColor(0.12f, 0.16f, 0.18f),
 				false);
-			State->PlayerBody = SpawnPhysicsPushBox(
+			State->PlayerBody = SpawnPhysicsPushFragment(
 				*World,
-				*CubeMesh,
 				*PaletteMaterial,
-				FVector(-100.0f, -170.0f, PlatformZ + 70.0f),
-				FVector(0.70f),
+				FVector(-170.0f, -30.0f, PlatformZ + 46.0f),
 				FLinearColor(0.20f, 0.65f, 1.0f),
-				true);
-			State->CreatureBody = SpawnPhysicsPushBox(
+				TEXT("PhysicsPushPlayerFragment"));
+			State->CreatureBody = SpawnPhysicsPushFragment(
 				*World,
-				*CubeMesh,
 				*PaletteMaterial,
-				FVector(-100.0f, 170.0f, PlatformZ + 70.0f),
-				FVector(0.70f),
+				FVector(-100.0f, 170.0f, PlatformZ + 46.0f),
 				FLinearColor(1.0f, 0.28f, 0.62f),
-				true);
+				TEXT("PhysicsPushCreatureFragment"));
 
 			FActorSpawnParameters CreatureParameters;
 			CreatureParameters.SpawnCollisionHandlingOverride =
 				ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 			State->Creature = World->SpawnActor<AMatterFluxCreatureActor>(
-				FVector(-370.0f, 170.0f, PlatformZ + 108.0f),
+				FVector(-330.0f, 170.0f, PlatformZ + 108.0f),
 				FRotator::ZeroRotator,
 				CreatureParameters);
 			if (!State->Floor.IsValid()
@@ -4872,7 +5365,10 @@ namespace
 				|| !State->Creature.IsValid())
 			{
 				GPhysicsPushCapturePending = false;
-				FPlatformMisc::RequestExitWithStatus(false, 4);
+				if (State->bQuitAfterCapture)
+				{
+					FPlatformMisc::RequestExitWithStatus(false, 4);
+				}
 				return false;
 			}
 			if (AController* CreatureController = State->Creature->GetController())
@@ -4883,7 +5379,7 @@ namespace
 			State->Creature->GetCharacterMovement()->MaxWalkSpeed = 300.0f;
 			State->Character = Character;
 			Character->SetActorLocation(
-				FVector(-370.0f, -170.0f, PlatformZ + 116.0f),
+				FVector(-170.0f, -260.0f, PlatformZ + 116.0f),
 				false,
 				nullptr,
 				ETeleportType::TeleportPhysics);
@@ -4895,7 +5391,10 @@ namespace
 			if (!State->Camera.IsValid())
 			{
 				GPhysicsPushCapturePending = false;
-				FPlatformMisc::RequestExitWithStatus(false, 4);
+				if (State->bQuitAfterCapture)
+				{
+					FPlatformMisc::RequestExitWithStatus(false, 4);
+				}
 				return false;
 			}
 			const FVector CameraTarget(-40.0f, 0.0f, PlatformZ + 40.0f);
@@ -4912,6 +5411,8 @@ namespace
 		{
 			State->PlayerBodyStart = State->PlayerBody->GetActorLocation();
 			State->CreatureBodyStart = State->CreatureBody->GetActorLocation();
+			State->PlayerStart = State->Character->GetActorLocation();
+			State->CreatureStart = State->Creature->GetActorLocation();
 			RequestPhysicsPushScreenshot(*State, TEXT("01_BeforePush.png"));
 			State->Phase = 2;
 			State->PhaseStartedAt = Now;
@@ -4919,10 +5420,13 @@ namespace
 		}
 		if (State->Phase == 2)
 		{
-			if (Now - State->PhaseStartedAt < 2.0)
+			if (Now - State->PhaseStartedAt < 1.5)
 			{
-				State->Character->AddMovementInput(FVector::XAxisVector, 1.0f, true);
-				State->Creature->AddMovementInput(FVector::XAxisVector, 1.0f, true);
+				State->Character->AddMovementInput(FVector::YAxisVector, 1.0f, true);
+				State->Creature->GetCharacterMovement()->RequestDirectMove(
+					FVector::XAxisVector
+						* State->Creature->GetCharacterMovement()->MaxWalkSpeed,
+					false);
 				return true;
 			}
 			const float PlayerBodyDistance = FVector::Dist2D(
@@ -4931,10 +5435,22 @@ namespace
 			const float CreatureBodyDistance = FVector::Dist2D(
 				State->CreatureBodyStart,
 				State->CreatureBody->GetActorLocation());
-			const float PlayerBodySpeed = State->PlayerBody->GetStaticMeshComponent()
-				->GetPhysicsLinearVelocity().Size2D();
-			const float CreatureBodySpeed = State->CreatureBody->GetStaticMeshComponent()
-				->GetPhysicsLinearVelocity().Size2D();
+			const float PlayerDistance = FVector::Dist2D(
+				State->PlayerStart,
+				State->Character->GetActorLocation());
+			const float CreatureDistance = FVector::Dist2D(
+				State->CreatureStart,
+				State->Creature->GetActorLocation());
+			const UPrimitiveComponent* PlayerPrimitive = Cast<UPrimitiveComponent>(
+				State->PlayerBody->GetRootComponent());
+			const UPrimitiveComponent* CreaturePrimitive = Cast<UPrimitiveComponent>(
+				State->CreatureBody->GetRootComponent());
+			const float PlayerBodySpeed = PlayerPrimitive
+				? PlayerPrimitive->GetPhysicsLinearVelocity().Size2D()
+				: MAX_flt;
+			const float CreatureBodySpeed = CreaturePrimitive
+				? CreaturePrimitive->GetPhysicsLinearVelocity().Size2D()
+				: MAX_flt;
 			const float LargerDistance = FMath::Max(
 				PlayerBodyDistance,
 				CreatureBodyDistance);
@@ -4942,18 +5458,22 @@ namespace
 				? FMath::Min(PlayerBodyDistance, CreatureBodyDistance)
 					/ LargerDistance
 				: 0.0f;
-			State->bAccepted = PlayerBodyDistance >= 10.0f
+			State->bAccepted = PlayerDistance >= 150.0f
+				&& CreatureDistance >= 150.0f
+				&& PlayerBodyDistance >= 10.0f
 				&& CreatureBodyDistance >= 10.0f
 				&& PlayerBodyDistance <= 300.0f
 				&& CreatureBodyDistance <= 300.0f
 				&& PlayerBodySpeed <= 300.0f
 				&& CreatureBodySpeed <= 300.0f
-				&& DistanceRatio >= 0.5f;
+				&& DistanceRatio >= 0.4f;
 			UE_LOG(LogMatterFlux, Display,
-				TEXT("Physics-push acceptance: accepted=%s playerBodyDistance=%.2f playerBodySpeed=%.2f creatureBodyDistance=%.2f creatureBodySpeed=%.2f distanceRatio=%.3f"),
+				TEXT("Physics-push acceptance: accepted=%s playerDistance=%.2f playerBodyDistance=%.2f playerBodySpeed=%.2f creatureDistance=%.2f creatureBodyDistance=%.2f creatureBodySpeed=%.2f distanceRatio=%.3f"),
 				State->bAccepted ? TEXT("true") : TEXT("false"),
+				PlayerDistance,
 				PlayerBodyDistance,
 				PlayerBodySpeed,
+				CreatureDistance,
 				CreatureBodyDistance,
 				CreatureBodySpeed,
 				DistanceRatio);
@@ -5007,7 +5527,7 @@ namespace
 
 	FAutoConsoleCommandWithWorldAndArgs GPhysicsPushCaptureCommand(
 		TEXT("mf.Visual.PhysicsPush"),
-		TEXT("Capture player and creature pushing equal Chaos bodies: mf.Visual.PhysicsPush [quit=1]"),
+		TEXT("Capture player and creature pushing equal real cut-fragment bodies on both horizontal axes: mf.Visual.PhysicsPush [quit=1]"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
 			&QueuePhysicsPushCapture));
 

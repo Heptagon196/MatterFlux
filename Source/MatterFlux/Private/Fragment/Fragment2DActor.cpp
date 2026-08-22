@@ -12,6 +12,7 @@
 #include "EngineUtils.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Net/UnrealNetwork.h"
+#include "PhysicalMaterials/PhysicalMaterial.h"
 #include "ProceduralMeshComponent.h"
 #include "Rendering/MatterFluxVoxelMaterialStyle.h"
 #include "Rendering/MatterFluxWholeObjectGeometry.h"
@@ -145,6 +146,10 @@ AFragment2DActor::AFragment2DActor()
 	MeshComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 	MeshComponent->SetCollisionResponseToAllChannels(ECR_Block);
 	MeshComponent->SetCollisionResponseToChannel(ECC_PhysicsBody, ECR_Ignore);
+	// Detached material is a movable body, not a terrain step. Allowing
+	// CharacterMovement to StepUp makes tall creatures climb over a voxel hull
+	// after one contact frame instead of continuously pushing it sideways.
+	MeshComponent->CanCharacterStepUpOn = ECB_No;
 	MeshComponent->SetNotifyRigidBodyCollision(true);
 	MeshComponent->bUseComplexAsSimpleCollision = false;
 	MeshComponent->SetLinearDamping(1.25f);
@@ -153,7 +158,18 @@ AFragment2DActor::AFragment2DActor()
 	MeshComponent->BodyInstance.SleepFamily = ESleepFamily::Custom;
 	MeshComponent->BodyInstance.CustomSleepThresholdMultiplier = 2.5f;
 	MeshComponent->BodyInstance.StabilizationThresholdMultiplier = 2.0f;
-	MeshComponent->SetConstraintMode(EDOFMode::XZPlane);
+	// Gameplay takes place on the horizontal XY ground plane. Locking detached
+	// material to XZ was a legacy 2D assumption: it made a fragment immovable
+	// whenever a player approached along world Y and disagreed with the same
+	// canonical object's visible 3D orientation after a rotated cut.
+	MeshComponent->SetConstraintMode(EDOFMode::None);
+	FragmentPhysicalMaterial = CreateDefaultSubobject<UPhysicalMaterial>(
+		TEXT("FragmentPhysicalMaterial"));
+	FragmentPhysicalMaterial->Friction = 0.45f;
+	FragmentPhysicalMaterial->StaticFriction = 0.45f;
+	FragmentPhysicalMaterial->bOverrideFrictionCombineMode = true;
+	FragmentPhysicalMaterial->FrictionCombineMode = EFrictionCombineMode::Min;
+	FragmentPhysicalMaterial->Restitution = 0.0f;
 	BuoyancyComponent = CreateDefaultSubobject<UMatterFluxBuoyancyComponent>(
 		TEXT("BuoyancyComponent"));
 	BuoyancyComponent->SetTargetPrimitive(MeshComponent);
@@ -169,6 +185,10 @@ AFragment2DActor::~AFragment2DActor() = default;
 void AFragment2DActor::BeginPlay()
 {
 	Super::BeginPlay();
+	if (FragmentPhysicalMaterial)
+	{
+		MeshComponent->SetPhysMaterialOverride(FragmentPhysicalMaterial);
+	}
 	ConfigureTransientFade();
 }
 

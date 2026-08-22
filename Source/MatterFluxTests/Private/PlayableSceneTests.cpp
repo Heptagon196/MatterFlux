@@ -2255,11 +2255,11 @@ bool FMatterFluxVoxelDecorationWorldTest::RunTest(const FString& Parameters)
 				>= static_cast<float>(CarriedSolidCells) * 0.05f);
 		TestTrue(
 			TEXT("A root-felled tree receives a real sideways launch instead of restacking on its stump"),
-			FMath::Abs(TreeCarrier->SpawnPayload.InitialLinearVelocity.X)
+			TreeCarrier->SpawnPayload.InitialLinearVelocity.Size2D()
 				>= 300.0f);
 		TestTrue(
-			TEXT("A root-felled tree receives enough pitch velocity to leave the upright equilibrium"),
-			FMath::Abs(TreeCarrier->SpawnPayload.InitialAngularVelocity.Y)
+			TEXT("A root-felled tree receives enough horizontal-axis angular velocity to leave the upright equilibrium"),
+			TreeCarrier->SpawnPayload.InitialAngularVelocity.Size2D()
 				>= 300.0f);
 	}
 	int32 ProtectedStumpMemberActorCount = 0;
@@ -3598,6 +3598,12 @@ bool FMatterFluxPlayableWorldDefaultsTest::RunTest(const FString& Parameters)
 	TestNotNull(TEXT("Tree cut sequence capture command is registered"),
 		IConsoleManager::Get().FindConsoleObject(
 			TEXT("mf.Visual.TreeCutSequence")));
+	TestNotNull(TEXT("Batch tree cut capture command is registered"),
+		IConsoleManager::Get().FindConsoleObject(
+			TEXT("mf.Visual.TreeBatchCut")));
+	TestNotNull(TEXT("Real fragment push capture command is registered"),
+		IConsoleManager::Get().FindConsoleObject(
+			TEXT("mf.Visual.PhysicsPush")));
 	TestNotNull(TEXT("Frame stability capture command is registered"),
 		IConsoleManager::Get().FindConsoleObject(
 			TEXT("mf.Visual.StabilitySequence")));

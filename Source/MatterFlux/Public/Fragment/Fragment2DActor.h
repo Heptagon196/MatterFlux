@@ -9,6 +9,7 @@
 class UProceduralMeshComponent;
 class UMaterialInterface;
 class UMaterialInstanceDynamic;
+class UPhysicalMaterial;
 class UMatterFluxBuoyancyComponent;
 class AFragment2DSourceActor;
 struct FFragment2DSourceStreamingState;
@@ -157,6 +158,10 @@ public:
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment")
 	TObjectPtr<UProceduralMeshComponent> MeshComponent;
+
+	/** Shared contact profile keeps sharp voxel hulls pushable on terrain. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Physics")
+	TObjectPtr<UPhysicalMaterial> FragmentPhysicalMaterial;
 
 	/** 服务器对该碎片载体施加材质密度浮力。 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Liquid")

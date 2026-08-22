@@ -974,10 +974,16 @@ bool AFragment2DSourceActor::PrepareDamageEvent(
 					+ GetCellSize();
 		if (bTallFelledWood)
 		{
-			// Fragment bodies are constrained to the world XZ plane. Using the
-			// source's rotated local axis would discard its Y component and halve
-			// both launch and pitch for the common 45-degree tree orientation.
-			const FVector FallAxis = FVector::XAxisVector;
+			// Dynamic material is a full-3D projection of the same source state.
+			// Preserve the tree's authored horizontal orientation instead of
+			// collapsing every 45-degree tree onto an obsolete world-X lane.
+			const FVector FallAxis = FVector(
+				GetActorTransform().GetUnitAxis(EAxis::X).X,
+				GetActorTransform().GetUnitAxis(EAxis::X).Y,
+				0.0f).GetSafeNormal();
+			const FVector RotationAxis = FVector::CrossProduct(
+				FVector::UpVector,
+				FallAxis).GetSafeNormal();
 			const uint32 FallHash = HashCombineFast(
 				GetTypeHash(SourceId),
 				static_cast<uint32>(DamageEvent.EventSeed));
@@ -991,7 +997,7 @@ bool AFragment2DSourceActor::PrepareDamageEvent(
 			Payload.InitialLinearVelocity +=
 				FallAxis * FallSign * SideSpeed;
 
-			Payload.InitialAngularVelocity = FVector::YAxisVector
+			Payload.InitialAngularVelocity = RotationAxis
 				* (-FallSign * 360.0f);
 		}
 	}

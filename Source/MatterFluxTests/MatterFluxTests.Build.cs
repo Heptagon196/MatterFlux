@@ -28,6 +28,7 @@ public class MatterFluxTests : ModuleRules
 			"GameplayTags",
 			"EnhancedInput",
 			"InputCore",
+			"PhysicsCore",
 			"UMG",
 			"ProceduralMeshComponent"
 		});

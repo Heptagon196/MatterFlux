@@ -8,6 +8,7 @@
 #include "HAL/PlatformTime.h"
 #include "Misc/AutomationTest.h"
 #include "PhysicsEngine/BodySetup.h"
+#include "PhysicalMaterials/PhysicalMaterial.h"
 #include "ProceduralMeshComponent.h"
 #include "Tests/AutomationEditorCommon.h"
 
@@ -508,9 +509,22 @@ bool FMatterFluxTreeRepeatedMultiDirectionCutTest::RunTest(
 			TEXT("Felled tree has enough angular damping to prevent contact jitter"),
 			Carrier->MeshComponent->GetAngularDamping() >= 4.0f);
 		TestEqual(
-			TEXT("Felled tree stays on the 2.5D XZ physics plane"),
+			TEXT("Felled tree can be pushed and toppled on every world axis"),
 			Carrier->MeshComponent->BodyInstance.DOFMode.GetValue(),
-			EDOFMode::XZPlane);
+			EDOFMode::None);
+		TestEqual(
+			TEXT("Characters push detached material instead of stepping over it"),
+			Carrier->MeshComponent->CanCharacterStepUpOn.GetValue(),
+			ECB_No);
+		TestNotNull(
+			TEXT("Felled tree uses a deliberate voxel contact material"),
+			Carrier->FragmentPhysicalMaterial.Get());
+		if (Carrier->FragmentPhysicalMaterial)
+		{
+			TestTrue(
+				TEXT("Voxel contact friction stays low enough to clear terrain edges"),
+				Carrier->FragmentPhysicalMaterial->StaticFriction <= 0.5f);
+		}
 		TestEqual(
 			TEXT("Independent debris bodies do not depenetrate each other"),
 			Carrier->MeshComponent->GetCollisionResponseToChannel(ECC_PhysicsBody),

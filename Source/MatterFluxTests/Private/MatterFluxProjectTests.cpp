@@ -74,6 +74,8 @@ bool FMatterFluxDeveloperCaptureModuleTest::RunTest(
 		TEXT("mf.Visual.CaptureOccludedPlayer"),
 		TEXT("mf.UI.Capture"),
 		TEXT("mf.Visual.TreeCutSequence"),
+		TEXT("mf.Visual.TreeBatchCut"),
+		TEXT("mf.Visual.PhysicsPush"),
 		TEXT("mf.Visual.StabilitySequence"),
 		TEXT("mf.Player.Ability"),
 		TEXT("mf.Combustion.IgniteTree") })
