@@ -95,6 +95,7 @@ namespace MatterFlux::Material
 		int32 GetSimulationFocusCount() const;
 		void GetActiveCells(TArray<FCellSnapshot>& OutCells) const;
 		void GetAllCells(TArray<FCellSnapshot>& OutCells) const;
+		void ConsumeProjectionDirtyChunks(TArray<FIntPoint>& OutChunks);
 		int32 GetLogicalStep() const { return LogicalStep; }
 		int32 GetAppliedStateRevision() const { return AppliedStateRevision; }
 		bool NeedsReplicationPublish() const { return bReplicationDirty; }

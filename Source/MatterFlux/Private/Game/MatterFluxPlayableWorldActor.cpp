@@ -4,6 +4,7 @@
 
 #include "IMatterFluxScriptRuntime.h"
 #include "Async/Async.h"
+#include "Async/ParallelFor.h"
 #include "Components/DirectionalLightComponent.h"
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
@@ -86,6 +87,26 @@ namespace
 	// character/creature footprint while keeping work inside a compact dirty
 	// neighborhood. The conserved wake pass reconnects that local surplus later.
 	constexpr int32 BodyLiquidDisplacementSearchRadiusCells = 16;
+
+	FIntPoint ToMaterialRenderChunk(
+		const FIntPoint Cell,
+		const int32 ChunkSize)
+	{
+		return FIntPoint(
+			FMath::FloorToInt(static_cast<double>(Cell.X) / ChunkSize),
+			FMath::FloorToInt(static_cast<double>(Cell.Y) / ChunkSize));
+	}
+
+	FName MakeLiquidProjectionComponentKey(
+		const FName MaterialId,
+		const FIntPoint Chunk)
+	{
+		return FName(*FString::Printf(
+			TEXT("Liquid_%s_Chunk_%d_%d"),
+			*MaterialId.ToString(),
+			Chunk.X,
+			Chunk.Y));
+	}
 }
 
 bool FMatterFluxReplicatedFragmentSourceStateList::RebuildAuthorityCache()
@@ -6068,17 +6089,24 @@ void AMatterFluxPlayableWorldActor::SeedMaterialSimulation(
 		StreamIndex < Stream->Instances.Num();
 		++StreamIndex)
 	{
-		if (const int32* SeedIndex =
-			SeedIndices.Find(
-				ToCell(
-					Stream->Instances[StreamIndex].GetLocation())))
+		const FTransform& StreamTransform = Stream->Instances[StreamIndex];
+		if (const int32* SeedIndex = SeedIndices.Find(
+			ToCell(StreamTransform.GetLocation())))
 		{
-			SeedCells[*SeedIndex].MaterialId = TEXT("water");
-			SeedCells[*SeedIndex].Amount = static_cast<uint8>(FMath::Clamp(
+			MatterFlux::Material::FSeedCell& SeedCell = SeedCells[*SeedIndex];
+			const float AuthoredSurfaceZ = StreamTransform.GetLocation().Z
+				+ StreamTransform.GetScale3D().Z * 50.0f;
+			const uint8 AuthoredAmount = static_cast<uint8>(FMath::Clamp(
 				FMath::RoundToInt(
-					120.0f / MaterialLiquidColumnHeight * 255.0f),
+					(AuthoredSurfaceZ - static_cast<float>(SeedCell.SupportHeight))
+						/ MaterialLiquidColumnHeight * 255.0f),
 				1,
 				255));
+			const bool bAlreadyStream = SeedCell.MaterialId == TEXT("water");
+			SeedCell.MaterialId = TEXT("water");
+			SeedCell.Amount = bAlreadyStream
+				? FMath::Max(SeedCell.Amount, AuthoredAmount)
+				: AuthoredAmount;
 		}
 	}
 	if (Lake)
@@ -6153,18 +6181,6 @@ void AMatterFluxPlayableWorldActor::SeedMaterialSimulation(
 
 	if (!Stream->Instances.IsEmpty())
 	{
-		const int32 MiddleIndex = Stream->Instances.Num() / 2;
-		const FIntPoint StreamCell =
-			ToCell(Stream->Instances[MiddleIndex].GetLocation());
-		if (const int32* SeedIndex = SeedIndices.Find(StreamCell))
-		{
-			SeedCells[*SeedIndex].MaterialId = TEXT("water");
-			SeedCells[*SeedIndex].Amount = static_cast<uint8>(FMath::Clamp(
-				FMath::RoundToInt(
-					120.0f / MaterialLiquidColumnHeight * 255.0f),
-				1,
-				255));
-		}
 		// Do not seed reactive showcase materials beside the authored stream.
 		// The stream and lake are one connected water state, so a nearby lava
 		// sample becomes a permanent drain and turns shallow lake-edge cells
@@ -7240,16 +7256,9 @@ void AMatterFluxPlayableWorldActor::RebuildMaterialVisualization(
 			Pair.Value->SetHiddenInGame(true, true);
 		}
 	}
-	TSet<FName> ActiveLiquidMaterials;
 	for (TPair<FName, TArray<MatterFlux::Material::FCellSnapshot>>& Pair
 		: LiquidMaterialCells)
 	{
-		const FMatterFluxMaterialDefinition* Material =
-			Registry.Materials.Find(Pair.Key);
-		if (!Material)
-		{
-			continue;
-		}
 		Pair.Value.Sort([](
 			const MatterFlux::Material::FCellSnapshot& Left,
 			const MatterFlux::Material::FCellSnapshot& Right)
@@ -7258,26 +7267,212 @@ void AMatterFluxPlayableWorldActor::RebuildMaterialVisualization(
 				? Left.WorldCell.Y < Right.WorldCell.Y
 				: Left.WorldCell.X < Right.WorldCell.X;
 		});
-		ActiveLiquidMaterials.Add(Pair.Key);
-		BuildLiquidMaterialMesh(Pair.Key, *Material, Pair.Value);
 	}
-	TArray<FName> StaleLiquidMaterials;
-	for (const TPair<FName, TObjectPtr<UProceduralMeshComponent>>& Pair
-		: GeneratedLiquidLayerMeshes)
+
+	TArray<FIntPoint> DirtyLiquidChunks;
+	MaterialSimulation->ConsumeProjectionDirtyChunks(DirtyLiquidChunks);
+	TMap<FIntPoint, TSet<FName>> CurrentMaterialsByChunk;
+	for (const TPair<FName, TArray<MatterFlux::Material::FCellSnapshot>>& Pair
+		: LiquidMaterialCells)
+	{
+		for (const MatterFlux::Material::FCellSnapshot& Cell : Pair.Value)
+		{
+			CurrentMaterialsByChunk.FindOrAdd(ToMaterialRenderChunk(
+				Cell.WorldCell, MaterialSimulationChunkSize)).Add(Pair.Key);
+		}
+	}
+	if (GeneratedLiquidLayerMeshes.IsEmpty())
+	{
+		CurrentMaterialsByChunk.GetKeys(DirtyLiquidChunks);
+	}
+	else
+	{
+		TSet<FIntPoint> RenderableLiquidChunks;
+		CurrentMaterialsByChunk.GetKeys(RenderableLiquidChunks);
+		for (const TPair<FName, FIntPoint>& Existing : LiquidProjectionChunks)
+		{
+			RenderableLiquidChunks.Add(Existing.Value);
+		}
+		DirtyLiquidChunks.RemoveAll(
+			[&RenderableLiquidChunks](const FIntPoint Chunk)
+			{
+				return !RenderableLiquidChunks.Contains(Chunk);
+			});
+	}
+	DirtyLiquidChunks.Sort([](const FIntPoint A, const FIntPoint B)
+	{
+		return A.Y != B.Y ? A.Y < B.Y : A.X < B.X;
+	});
+	LastLiquidProjectionDirtyChunkCount = DirtyLiquidChunks.Num();
+	LastLiquidProjectionRebuiltChunkCount = 0;
+	LastLiquidProjectionCheckerboardPassCount = 0;
+
+	struct FLiquidChunkBuildJob
+	{
+		FName ComponentKey = NAME_None;
+		FName MaterialId = NAME_None;
+		FIntPoint Chunk = FIntPoint::ZeroValue;
+		TArray<MatterFlux::Material::FCellSnapshot> CellsWithHalo;
+		MatterFlux::Rendering::FLiquidSurfaceProjection Projection;
+	};
+	TArray<FLiquidChunkBuildJob> LiquidBuildJobs;
+	for (const FIntPoint DirtyChunk : DirtyLiquidChunks)
+	{
+		TSet<FName> MaterialsToBuild =
+			CurrentMaterialsByChunk.FindRef(DirtyChunk);
+		for (const TPair<FName, FIntPoint>& Existing : LiquidProjectionChunks)
+		{
+			if (Existing.Value == DirtyChunk)
+			{
+				MaterialsToBuild.Add(
+					LiquidProjectionMaterials.FindRef(Existing.Key));
+			}
+		}
+		TArray<FName> SortedMaterials = MaterialsToBuild.Array();
+		SortedMaterials.Sort(FNameLexicalLess());
+		const FIntPoint CoreMinimum =
+			DirtyChunk * MaterialSimulationChunkSize;
+		const FIntPoint HaloMinimum = CoreMinimum - FIntPoint(1, 1);
+		const FIntPoint HaloMaximum = CoreMinimum
+			+ FIntPoint(MaterialSimulationChunkSize + 1);
+		for (const FName MaterialId : SortedMaterials)
+		{
+			if (MaterialId.IsNone())
+			{
+				continue;
+			}
+			FLiquidChunkBuildJob& Job = LiquidBuildJobs.AddDefaulted_GetRef();
+			Job.ComponentKey = MakeLiquidProjectionComponentKey(
+				MaterialId, DirtyChunk);
+			Job.MaterialId = MaterialId;
+			Job.Chunk = DirtyChunk;
+			if (const TArray<MatterFlux::Material::FCellSnapshot>* LiquidCellsForMaterial =
+				LiquidMaterialCells.Find(MaterialId))
+			{
+				for (const MatterFlux::Material::FCellSnapshot& Cell
+					: *LiquidCellsForMaterial)
+				{
+					if (Cell.WorldCell.X >= HaloMinimum.X
+						&& Cell.WorldCell.Y >= HaloMinimum.Y
+						&& Cell.WorldCell.X < HaloMaximum.X
+						&& Cell.WorldCell.Y < HaloMaximum.Y)
+					{
+						Job.CellsWithHalo.Add(Cell);
+					}
+				}
+			}
+		}
+	}
+
+	TArray<FIntPoint> EvenChunks;
+	TArray<FIntPoint> OddChunks;
+	MatterFlux::Rendering::PartitionLiquidProjectionChunksCheckerboard(
+		DirtyLiquidChunks, EvenChunks, OddChunks);
+	TSet<FIntPoint> EvenChunkSet;
+	EvenChunkSet.Append(EvenChunks);
+	const float ProjectionCellSize = MaterialSimulationCellSize;
+	const float ProjectionColumnHeight = MaterialLiquidColumnHeight;
+	const int32 ProjectionChunkSize = MaterialSimulationChunkSize;
+	for (int32 Pass = 0; Pass < 2; ++Pass)
+	{
+		TArray<int32> PassJobs;
+		for (int32 JobIndex = 0; JobIndex < LiquidBuildJobs.Num(); ++JobIndex)
+		{
+			const bool bEven = EvenChunkSet.Contains(LiquidBuildJobs[JobIndex].Chunk);
+			if (bEven == (Pass == 0))
+			{
+				PassJobs.Add(JobIndex);
+			}
+		}
+		if (PassJobs.IsEmpty())
+		{
+			continue;
+		}
+		++LastLiquidProjectionCheckerboardPassCount;
+		ParallelFor(PassJobs.Num(), [&](const int32 PassJobIndex)
+		{
+			FLiquidChunkBuildJob& Job = LiquidBuildJobs[PassJobs[PassJobIndex]];
+			MatterFlux::Rendering::BuildLiquidSurfaceChunkProjection(
+				Job.CellsWithHalo,
+				ProjectionCellSize,
+				ProjectionColumnHeight,
+				Job.Chunk,
+				ProjectionChunkSize,
+				Job.Projection);
+		});
+	}
+	for (FLiquidChunkBuildJob& Job : LiquidBuildJobs)
+	{
+		const FMatterFluxMaterialDefinition* Material =
+			Registry.Materials.Find(Job.MaterialId);
+		if (!Material)
+		{
+			continue;
+		}
+		ApplyLiquidMaterialChunkMesh(
+			Job.ComponentKey, Job.MaterialId, Job.Chunk, *Material, Job.Projection);
+		++LastLiquidProjectionRebuiltChunkCount;
+	}
+
+	TSet<FName> ActiveLiquidMaterials;
+	for (const TPair<FName, TArray<MatterFlux::Material::FCellSnapshot>>& Pair
+		: LiquidMaterialCells)
+	{
+		ActiveLiquidMaterials.Add(Pair.Key);
+		FMatterFluxLiquidProjectionHeightAudit& Audit =
+			LiquidProjectionHeightAudits.FindOrAdd(Pair.Key);
+		TArray<float> CanonicalSurfaces;
+		CanonicalSurfaces.Reserve(Pair.Value.Num());
+		for (const MatterFlux::Material::FCellSnapshot& Cell : Pair.Value)
+		{
+			CanonicalSurfaces.Add(static_cast<float>(Cell.SupportHeight)
+				+ MaterialLiquidColumnHeight
+					* (static_cast<float>(Cell.Amount) / 255.0f));
+		}
+		CanonicalSurfaces.Sort();
+		const int32 Middle = CanonicalSurfaces.Num() / 2;
+		Audit.CanonicalMedianSurfaceZ = CanonicalSurfaces.IsEmpty()
+			? 0.0f
+			: (CanonicalSurfaces.Num() & 1) != 0
+				? CanonicalSurfaces[Middle]
+				: (CanonicalSurfaces[Middle - 1] + CanonicalSurfaces[Middle]) * 0.5f;
+		constexpr float LiquidSurfaceDepthBias = 2.0f;
+		Audit.RenderedMedianSurfaceZ = Audit.CanonicalMedianSurfaceZ
+			+ LiquidSurfaceDepthBias;
+		Audit.MedianOffset = LiquidSurfaceDepthBias;
+		Audit.MaximumAbsoluteLocalOffset = LiquidSurfaceDepthBias;
+		Audit.CanonicalCellCount = Pair.Value.Num();
+		Audit.ProjectedCellCount = 0;
+		Audit.MaximumTriangleHeightSpan = 0.0f;
+		Audit.SurfacePatchCount = 0;
+		for (const TPair<FName, FName>& Component : LiquidProjectionMaterials)
+		{
+			if (Component.Value != Pair.Key)
+			{
+				continue;
+			}
+			if (const FMatterFluxLiquidProjectionHeightAudit* ChunkAudit =
+				LiquidChunkProjectionHeightAudits.Find(Component.Key))
+			{
+				Audit.ProjectedCellCount += ChunkAudit->ProjectedCellCount;
+				Audit.MaximumTriangleHeightSpan = FMath::Max(
+					Audit.MaximumTriangleHeightSpan,
+					ChunkAudit->MaximumTriangleHeightSpan);
+				Audit.SurfacePatchCount += ChunkAudit->SurfacePatchCount;
+			}
+		}
+	}
+	TArray<FName> StaleLiquidAudits;
+	for (const TPair<FName, FMatterFluxLiquidProjectionHeightAudit>& Pair
+		: LiquidProjectionHeightAudits)
 	{
 		if (!ActiveLiquidMaterials.Contains(Pair.Key))
 		{
-			StaleLiquidMaterials.Add(Pair.Key);
+			StaleLiquidAudits.Add(Pair.Key);
 		}
 	}
-	for (const FName MaterialId : StaleLiquidMaterials)
+	for (const FName MaterialId : StaleLiquidAudits)
 	{
-		if (UProceduralMeshComponent* Component =
-			GeneratedLiquidLayerMeshes.FindRef(MaterialId))
-		{
-			Component->DestroyComponent();
-		}
-		GeneratedLiquidLayerMeshes.Remove(MaterialId);
 		LiquidProjectionHeightAudits.Remove(MaterialId);
 	}
 }
@@ -7304,7 +7499,13 @@ void AMatterFluxPlayableWorldActor::DestroyMaterialVisualization()
 		}
 	}
 	GeneratedLiquidLayerMeshes.Reset();
+	LiquidProjectionMaterials.Reset();
+	LiquidProjectionChunks.Reset();
 	LiquidProjectionHeightAudits.Reset();
+	LiquidChunkProjectionHeightAudits.Reset();
+	LastLiquidProjectionDirtyChunkCount = 0;
+	LastLiquidProjectionRebuiltChunkCount = 0;
+	LastLiquidProjectionCheckerboardPassCount = 0;
 	MaterialVisualizationHashes.Reset();
 	MaterialVisualizationMaterials.Reset();
 	bMaterialVisualizationDirty = false;
@@ -7986,7 +8187,8 @@ void AMatterFluxPlayableWorldActor::BuildLayerStreamingCache(
 	for (const TPair<FName, TObjectPtr<UProceduralMeshComponent>>& Pair
 		: GeneratedLiquidLayerMeshes)
 	{
-		if (!ActiveLiquidMaterialIds.Contains(Pair.Key))
+		if (!ActiveLiquidMaterialIds.Contains(
+			LiquidProjectionMaterials.FindRef(Pair.Key)))
 		{
 			StaleLiquidLayerNames.Add(Pair.Key);
 		}
@@ -7999,7 +8201,9 @@ void AMatterFluxPlayableWorldActor::BuildLayerStreamingCache(
 			Component->DestroyComponent();
 		}
 		GeneratedLiquidLayerMeshes.Remove(StaleLayerName);
-		LiquidProjectionHeightAudits.Remove(StaleLayerName);
+		LiquidProjectionMaterials.Remove(StaleLayerName);
+		LiquidProjectionChunks.Remove(StaleLayerName);
+		LiquidChunkProjectionHeightAudits.Remove(StaleLayerName);
 	}
 }
 
@@ -8797,21 +9001,34 @@ AMatterFluxPlayableWorldActor::FindOrCreateLayerComponent(
 	return Instances;
 }
 
-void AMatterFluxPlayableWorldActor::BuildLiquidMaterialMesh(
+void AMatterFluxPlayableWorldActor::ApplyLiquidMaterialChunkMesh(
+	const FName ComponentKey,
 	const FName MaterialId,
+	const FIntPoint ChunkCoordinate,
 	const FMatterFluxMaterialDefinition& MaterialDefinition,
-	const TConstArrayView<MatterFlux::Material::FCellSnapshot> Cells)
+	MatterFlux::Rendering::FLiquidSurfaceProjection& Projection)
 {
 	UProceduralMeshComponent* Mesh =
-		GeneratedLiquidLayerMeshes.FindRef(MaterialId);
+		GeneratedLiquidLayerMeshes.FindRef(ComponentKey);
+	if (GetNetMode() == NM_DedicatedServer
+		|| Projection.Triangles.IsEmpty())
+	{
+		if (Mesh)
+		{
+			Mesh->DestroyComponent();
+		}
+		GeneratedLiquidLayerMeshes.Remove(ComponentKey);
+		LiquidProjectionMaterials.Remove(ComponentKey);
+		LiquidProjectionChunks.Remove(ComponentKey);
+		LiquidChunkProjectionHeightAudits.Remove(ComponentKey);
+		return;
+	}
 	if (!Mesh)
 	{
 		const FName ComponentName = MakeUniqueObjectName(
 			this,
 			UProceduralMeshComponent::StaticClass(),
-			*FString::Printf(
-				TEXT("CanonicalLiquid_%s_Surface"),
-				*MaterialId.ToString()));
+			*ComponentKey.ToString());
 		Mesh = NewObject<UProceduralMeshComponent>(this, ComponentName);
 		Mesh->SetupAttachment(SceneRoot);
 		Mesh->SetMobility(EComponentMobility::Movable);
@@ -8823,22 +9040,10 @@ void AMatterFluxPlayableWorldActor::BuildLiquidMaterialMesh(
 			TEXT("MatterFluxCanonicalLiquidSurface"));
 		AddInstanceComponent(Mesh);
 		Mesh->RegisterComponent();
-		GeneratedLiquidLayerMeshes.Add(MaterialId, Mesh);
+		GeneratedLiquidLayerMeshes.Add(ComponentKey, Mesh);
 	}
-
-	Mesh->ClearAllMeshSections();
-	if (GetNetMode() == NM_DedicatedServer || Cells.IsEmpty())
-	{
-		Mesh->SetVisibility(false, true);
-		return;
-	}
-
-	MatterFlux::Rendering::FLiquidSurfaceProjection Projection;
-	MatterFlux::Rendering::BuildLiquidSurfaceProjection(
-		Cells,
-		MaterialSimulationCellSize,
-		MaterialLiquidColumnHeight,
-		Projection);
+	LiquidProjectionMaterials.Add(ComponentKey, MaterialId);
+	LiquidProjectionChunks.Add(ComponentKey, ChunkCoordinate);
 	// Keep the disposable free-surface projection just above coplanar voxel
 	// support faces. This is a render-space depth bias only: sampling, buoyancy,
 	// displacement, replication, and the projection history retain canonical Z.
@@ -8848,7 +9053,7 @@ void AMatterFluxPlayableWorldActor::BuildLiquidMaterialMesh(
 		Vertex.Z += LiquidSurfaceDepthBias;
 	}
 	FMatterFluxLiquidProjectionHeightAudit& Audit =
-		LiquidProjectionHeightAudits.FindOrAdd(MaterialId);
+		LiquidChunkProjectionHeightAudits.FindOrAdd(ComponentKey);
 	Audit.CanonicalMedianSurfaceZ =
 		Projection.CanonicalMedianSurfaceHeight;
 	Audit.RenderedMedianSurfaceZ =
@@ -8859,7 +9064,7 @@ void AMatterFluxPlayableWorldActor::BuildLiquidMaterialMesh(
 	Audit.MaximumAbsoluteLocalOffset =
 		Projection.MaximumAbsoluteCanonicalHeightOffset
 			+ LiquidSurfaceDepthBias;
-	Audit.CanonicalCellCount = Cells.Num();
+	Audit.CanonicalCellCount = Projection.ProjectedCellCount;
 	Audit.ProjectedCellCount = Projection.ProjectedCellCount;
 	float MaximumTriangleHeightSpan = 0.0f;
 	for (int32 TriangleIndex = 0;
@@ -8879,16 +9084,8 @@ void AMatterFluxPlayableWorldActor::BuildLiquidMaterialMesh(
 	}
 	Audit.MaximumTriangleHeightSpan = MaximumTriangleHeightSpan;
 	Audit.SurfacePatchCount = Projection.SurfacePatchCount;
-	if (Projection.Triangles.IsEmpty())
-	{
-		Mesh->SetVisibility(false, true);
-		return;
-	}
-
-	TArray<FVector> Normals;
 	TArray<FLinearColor> Colors;
 	TArray<FProcMeshTangent> Tangents;
-	Normals.Init(FVector::UpVector, Projection.Vertices.Num());
 	Colors.Init(FLinearColor::White, Projection.Vertices.Num());
 	Tangents.Init(
 		FProcMeshTangent(FVector::ForwardVector, false),
@@ -8897,7 +9094,7 @@ void AMatterFluxPlayableWorldActor::BuildLiquidMaterialMesh(
 		0,
 		Projection.Vertices,
 		Projection.Triangles,
-		Normals,
+		Projection.Normals,
 		Projection.UVs,
 		Colors,
 		Tangents,

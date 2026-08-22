@@ -358,4 +358,14 @@ namespace MatterFlux::Material
 			MaterialWorld->GetAllCells(OutCells);
 		}
 	}
+
+	void FSimulationRuntime::ConsumeProjectionDirtyChunks(
+		TArray<FIntPoint>& OutChunks)
+	{
+		OutChunks.Reset();
+		if (MaterialWorld)
+		{
+			MaterialWorld->ConsumeProjectionDirtyChunks(OutChunks);
+		}
+	}
 }

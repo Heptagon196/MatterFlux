@@ -3049,8 +3049,11 @@ bool FMatterFluxPlayableLiquidBuoyancyIntegrationTest::RunTest(
 		TEXT("Every authored lake surface begins from the same water material state"),
 		MissingAuthoredLakeColumns,
 		0);
-	const FVector StreamLocation = Stream->Instances[
-		Stream->Instances.Num() / 2].GetLocation();
+	// Sample an authored stream cell outside the lake overlap. The lake is
+	// intentionally allowed to provide the deeper canonical column where the
+	// two shapes meet, while the free stream must retain its thin authored depth.
+	const FTransform& AuthoredStreamTransform = Stream->Instances[0];
+	const FVector StreamLocation = AuthoredStreamTransform.GetLocation();
 	const FVector SampleLocation = StreamLocation;
 	MatterFlux::Liquid::FLiquidColumn Column;
 	if (!TestTrue(TEXT("Rendered stream maps to a liquid column"),
@@ -3063,11 +3066,32 @@ bool FMatterFluxPlayableLiquidBuoyancyIntegrationTest::RunTest(
 		Column.MaterialId, FName(TEXT("water")));
 	TestEqual(TEXT("Stream column uses Lua water density"),
 		Column.Density, 1.0f);
-	TestTrue(TEXT("Rendered and physical liquid share column height"),
+	const int32 StreamTerrainX = FMath::Clamp(
+		FMath::RoundToInt(
+			(StreamLocation.X - Layout.Terrain.FirstCellCenter.X)
+				/ Layout.Terrain.CellSize),
+		0,
+		Layout.Terrain.Width - 1);
+	const int32 StreamTerrainY = FMath::Clamp(
+		FMath::RoundToInt(
+			(StreamLocation.Y - Layout.Terrain.FirstCellCenter.Y)
+				/ Layout.Terrain.CellSize),
+		0,
+		Layout.Terrain.Height - 1);
+	const float AuthoredStreamSurfaceZ = StreamLocation.Z
+		+ AuthoredStreamTransform.GetScale3D().Z * 50.0f;
+	const float AuthoredStreamDepth = AuthoredStreamSurfaceZ
+		- Layout.Terrain.HeightAt(StreamTerrainX, StreamTerrainY);
+	TestTrue(TEXT("Canonical stream depth matches the authored terrain-attached layer"),
 		FMath::IsNearlyEqual(
-			Column.SurfaceZ - Column.BottomZ, 120.0f, 0.5f));
+			Column.SurfaceZ - Column.BottomZ,
+			AuthoredStreamDepth,
+			0.5f));
+	TestTrue(TEXT("A shallow stream cannot hover a metre above its terrain support"),
+		Column.SurfaceZ - Column.BottomZ < 25.0f);
 
 	const FTransform* DeepestLakeCell = nullptr;
+	TArray<const FTransform*> DeepLakeCells;
 	float DeepestLakeDepth = 0.0f;
 	for (const FTransform& Instance : Lake->Instances)
 	{
@@ -3088,6 +3112,10 @@ bool FMatterFluxPlayableLiquidBuoyancyIntegrationTest::RunTest(
 			+ Instance.GetScale3D().Z * 50.0f;
 		const float Depth = SurfaceZ
 			- Layout.Terrain.HeightAt(TerrainX, TerrainY);
+		if (Depth >= 100.0f)
+		{
+			DeepLakeCells.Add(&Instance);
+		}
 		if (Depth > DeepestLakeDepth)
 		{
 			DeepestLakeDepth = Depth;
@@ -3095,7 +3123,9 @@ bool FMatterFluxPlayableLiquidBuoyancyIntegrationTest::RunTest(
 		}
 	}
 	if (!TestNotNull(TEXT("Lake exposes a deepest physical column"),
-		DeepestLakeCell))
+		DeepestLakeCell)
+		|| !TestTrue(TEXT("Lake exposes several independent deep-water test cells"),
+			DeepLakeCells.Num() >= 3))
 	{
 		return false;
 	}
@@ -3148,10 +3178,18 @@ bool FMatterFluxPlayableLiquidBuoyancyIntegrationTest::RunTest(
 	{
 		return false;
 	}
+	MatterFlux::Liquid::FLiquidColumn CharacterColumn;
+	const FVector CharacterLakeLocation = DeepLakeCells[0]->GetLocation();
+	if (!TestTrue(TEXT("Character deep-water cell begins as liquid"),
+		WorldActor->TrySampleLiquidColumnAtWorldLocation(
+			CharacterLakeLocation, CharacterColumn)))
+	{
+		return false;
+	}
 	Character->SetActorLocation(FVector(
-		SampleLocation.X,
-		SampleLocation.Y,
-		Column.BottomZ + 88.0f));
+		CharacterLakeLocation.X,
+		CharacterLakeLocation.Y,
+		CharacterColumn.BottomZ + 88.0f));
 	const int64 WaterAmountBeforeDisplacement =
 		WorldActor->GetSimulatedMaterialAmount(TEXT("water"));
 	Character->GetCharacterMovement()->Velocity = FVector::ZeroVector;
@@ -3209,8 +3247,8 @@ bool FMatterFluxPlayableLiquidBuoyancyIntegrationTest::RunTest(
 				OutsideCapsuleCorner, OutsideCornerAfter));
 	}
 
-	const FVector CreatureLiquidLocation = Stream->Instances[
-		Stream->Instances.Num() / 4].GetLocation();
+	const FVector CreatureLiquidLocation = DeepLakeCells[
+		DeepLakeCells.Num() / 2]->GetLocation();
 	MatterFlux::Liquid::FLiquidColumn CreatureColumn;
 	if (!TestTrue(TEXT("Creature test cell begins as liquid"),
 		WorldActor->TrySampleLiquidColumnAtWorldLocation(
@@ -3249,8 +3287,7 @@ bool FMatterFluxPlayableLiquidBuoyancyIntegrationTest::RunTest(
 		WorldActor->GetSimulatedMaterialAmount(TEXT("water")),
 		WaterBeforeCreature);
 
-	const FVector ObjectLiquidLocation = Stream->Instances[
-		Stream->Instances.Num() * 3 / 4].GetLocation();
+	const FVector ObjectLiquidLocation = DeepLakeCells.Last()->GetLocation();
 	MatterFlux::Liquid::FLiquidColumn ObjectColumn;
 	if (!TestTrue(TEXT("Physics-object test cell begins as liquid"),
 		WorldActor->TrySampleLiquidColumnAtWorldLocation(

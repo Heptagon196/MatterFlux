@@ -44,6 +44,11 @@ namespace MatterFlux::Liquid
 	struct FLiquidColumn;
 }
 
+namespace MatterFlux::Rendering
+{
+	struct FLiquidSurfaceProjection;
+}
+
 UENUM(BlueprintType)
 enum class EMatterFluxWorldGenerationPhase : uint8
 {
@@ -132,6 +137,18 @@ public:
 	int32 GetGeneratedLiquidLayerCount() const
 	{
 		return GeneratedLiquidLayerMeshes.Num();
+	}
+	int32 GetLastLiquidProjectionDirtyChunkCount() const
+	{
+		return LastLiquidProjectionDirtyChunkCount;
+	}
+	int32 GetLastLiquidProjectionRebuiltChunkCount() const
+	{
+		return LastLiquidProjectionRebuiltChunkCount;
+	}
+	int32 GetLastLiquidProjectionCheckerboardPassCount() const
+	{
+		return LastLiquidProjectionCheckerboardPassCount;
 	}
 
 	UFUNCTION(BlueprintPure, Category = "Playable World")
@@ -579,10 +596,12 @@ private:
 	void DestroyTerrainChunkMeshes();
 	UHierarchicalInstancedStaticMeshComponent* FindOrCreateLayerComponent(
 		const MatterFlux::PlayableLevel::FLevelLayer& Layer);
-	void BuildLiquidMaterialMesh(
+	void ApplyLiquidMaterialChunkMesh(
+		FName ComponentKey,
 		FName MaterialId,
+		FIntPoint ChunkCoordinate,
 		const FMatterFluxMaterialDefinition& Material,
-		TConstArrayView<MatterFlux::Material::FCellSnapshot> Cells);
+		MatterFlux::Rendering::FLiquidSurfaceProjection& Projection);
 
 	struct FLayerStreamingCache
 	{
@@ -595,6 +614,8 @@ private:
 	TMap<FName, TObjectPtr<UHierarchicalInstancedStaticMeshComponent>> GeneratedLayerInstances;
 	UPROPERTY(Transient)
 	TMap<FName, TObjectPtr<UProceduralMeshComponent>> GeneratedLiquidLayerMeshes;
+	TMap<FName, FName> LiquidProjectionMaterials;
+	TMap<FName, FIntPoint> LiquidProjectionChunks;
 	TMap<FName, FLayerStreamingCache> LayerStreamingCaches;
 	TMap<FName, MatterFlux::PlayableLevel::FLevelLayer>
 		LiquidLayerDefinitions;
@@ -745,6 +766,11 @@ private:
 	/** Read-only diagnostics for proving the disposable mesh follows current facts. */
 	TMap<FName, FMatterFluxLiquidProjectionHeightAudit>
 		LiquidProjectionHeightAudits;
+	TMap<FName, FMatterFluxLiquidProjectionHeightAudit>
+		LiquidChunkProjectionHeightAudits;
+	int32 LastLiquidProjectionDirtyChunkCount = 0;
+	int32 LastLiquidProjectionRebuiltChunkCount = 0;
+	int32 LastLiquidProjectionCheckerboardPassCount = 0;
 	TUniquePtr<MatterFlux::Combustion::FGroundCombustionRuntime>
 		GroundCombustion;
 	TMap<FGuid, TUniquePtr<

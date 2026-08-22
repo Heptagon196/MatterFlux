@@ -103,6 +103,12 @@ namespace MatterFlux::Material
 		void GetActiveCells(TArray<FCellSnapshot>& OutCells) const;
 		/** Enumerates resident and archived facts for complete visual projection. */
 		void GetAllCells(TArray<FCellSnapshot>& OutCells) const;
+		/**
+		 * Moves the render-dirty material chunk set to the caller. Simulation dirty
+		 * rectangles remain private; this set tracks only neighborhoods whose facts
+		 * changed and therefore require disposable projection rebuilds.
+		 */
+		void ConsumeProjectionDirtyChunks(TArray<FIntPoint>& OutChunks);
 		bool ExportActiveState(
 			int32 LogicalStep,
 			TArray<uint8>& OutState,

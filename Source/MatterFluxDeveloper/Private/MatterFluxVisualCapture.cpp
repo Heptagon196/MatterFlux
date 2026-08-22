@@ -3090,6 +3090,9 @@ namespace
 		float CreatureTravelDistance = 0.0f;
 		float PlayerSubmergedAtTraversalEnd = 0.0f;
 		float CreatureSubmergedAtTraversalEnd = 0.0f;
+		int32 MaximumDirtyProjectionChunks = 0;
+		int32 MaximumRebuiltProjectionChunks = 0;
+		int32 MaximumCheckerboardPasses = 0;
 		bool bTravelTrackingInitialized = false;
 		FVector Focus = FVector::ZeroVector;
 		FVector PlayerStart = FVector::ZeroVector;
@@ -3422,6 +3425,20 @@ namespace
 			FPlatformMisc::RequestExitWithStatus(false, 4);
 			return false;
 		}
+		// Phase 1 includes the one-time projection bootstrap. Measure only the
+		// player/creature interaction and subsequent refill work.
+		if (State->Phase >= 2)
+		{
+			State->MaximumDirtyProjectionChunks = FMath::Max(
+				State->MaximumDirtyProjectionChunks,
+				State->PlayableWorld->GetLastLiquidProjectionDirtyChunkCount());
+			State->MaximumRebuiltProjectionChunks = FMath::Max(
+				State->MaximumRebuiltProjectionChunks,
+				State->PlayableWorld->GetLastLiquidProjectionRebuiltChunkCount());
+			State->MaximumCheckerboardPasses = FMath::Max(
+				State->MaximumCheckerboardPasses,
+				State->PlayableWorld->GetLastLiquidProjectionCheckerboardPassCount());
+		}
 		// The configured population timer may spawn roaming creatures after this
 		// capture has started. Remove every non-controlled creature continuously so
 		// the proof measures exactly the player and the one selected animal; an
@@ -3709,7 +3726,7 @@ namespace
 				&& bProjectionTracksCanonical
 				&& AbsoluteWaterAmountDelta <= AllowedWaterChemistryDrift;
 			UE_LOG(LogMatterFlux, Display,
-				TEXT("Deep-liquid walk acceptance: accepted=%s depth=%.1f playerDistance=%.1f creatureDistance=%.1f playerSubmerged=%.3f creatureSubmerged=%.3f currentLiquid=(%s,%s) locallyDisplaced=(%s,%s) trailRefilled=(%s,%s) startSurfaceDelta=(%.2f,%.2f) maxLift=%.2f projectionAudit=%s projectionMedianOffset=%.2f->%.2f projectionDrift=%.2f projectionLocalMax=%.2f maxTriangleSpan=%.2f surfacePatches=%d waterAmount=%lld/%lld drift=%lld allowed=%lld"),
+				TEXT("Deep-liquid walk acceptance: accepted=%s depth=%.1f playerDistance=%.1f creatureDistance=%.1f playerSubmerged=%.3f creatureSubmerged=%.3f currentLiquid=(%s,%s) locallyDisplaced=(%s,%s) trailRefilled=(%s,%s) startSurfaceDelta=(%.2f,%.2f) maxLift=%.2f projectionAudit=%s projectionMedianOffset=%.2f->%.2f projectionDrift=%.2f projectionLocalMax=%.2f maxTriangleSpan=%.2f surfacePatches=%d dirtyChunksMax=%d rebuiltChunksMax=%d checkerboardPassesMax=%d waterAmount=%lld/%lld drift=%lld allowed=%lld"),
 				bAccepted ? TEXT("true") : TEXT("false"),
 				State->MinimumStartingDepth,
 				PlayerDistance,
@@ -3732,6 +3749,9 @@ namespace
 				FinalProjectionAudit.MaximumAbsoluteLocalOffset,
 				FinalProjectionAudit.MaximumTriangleHeightSpan,
 				FinalProjectionAudit.SurfacePatchCount,
+				State->MaximumDirtyProjectionChunks,
+				State->MaximumRebuiltProjectionChunks,
+				State->MaximumCheckerboardPasses,
 				FinalWaterAmount,
 				State->InitialWaterAmount,
 				WaterAmountDelta,

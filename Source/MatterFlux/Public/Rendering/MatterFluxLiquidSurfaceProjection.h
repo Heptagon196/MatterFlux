@@ -14,6 +14,7 @@ namespace MatterFlux::Rendering
 	{
 		TArray<FVector> Vertices;
 		TArray<int32> Triangles;
+		TArray<FVector> Normals;
 		TArray<FVector2D> UVs;
 		TMap<FIntPoint, float> SurfaceHeights;
 		/** Number of leading triangle indices belonging to upward free surfaces. */
@@ -41,4 +42,23 @@ namespace MatterFlux::Rendering
 		float CellSize,
 		float FullColumnHeight,
 		FLiquidSurfaceProjection& OutProjection);
+
+	/**
+	 * Builds only the top/side faces owned by one render chunk. Cells may include
+	 * a one-cell halo; halo facts influence shared corners and exposed-edge tests
+	 * but never emit geometry into this chunk's mesh.
+	 */
+	MATTERFLUX_API void BuildLiquidSurfaceChunkProjection(
+		TConstArrayView<Material::FCellSnapshot> CellsWithHalo,
+		float CellSize,
+		float FullColumnHeight,
+		FIntPoint ChunkCoordinate,
+		int32 ChunkSize,
+		FLiquidSurfaceProjection& OutProjection);
+
+	/** Stable two-colour partition used by the projection task scheduler. */
+	MATTERFLUX_API void PartitionLiquidProjectionChunksCheckerboard(
+		TConstArrayView<FIntPoint> Chunks,
+		TArray<FIntPoint>& OutEvenChunks,
+		TArray<FIntPoint>& OutOddChunks);
 }

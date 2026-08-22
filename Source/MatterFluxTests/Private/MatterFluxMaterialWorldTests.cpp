@@ -180,6 +180,53 @@ bool FMatterFluxDynamicBodyLiquidDisplacementTest::RunTest(
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxProjectionDirtyChunksAreSparseAndConsumableTest,
+	"MatterFlux.Performance.LiquidProjectionDirtyChunksAreSparseAndConsumable",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxProjectionDirtyChunksAreSparseAndConsumableTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 8;
+	Settings.ActiveChunkRadius = 1;
+	Settings.MaxActiveChunks = 9;
+	Settings.bUseSurfaceTopology = true;
+	Settings.MinSurfaceCell = FIntPoint(0, 0);
+	Settings.MaxSurfaceCellExclusive = FIntPoint(16, 8);
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(TEXT("Dirty projection world initializes"),
+		World.Initialize(Settings, MakeLiquidRegistry(), 41, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	TestTrue(TEXT("Boundary liquid seed is accepted"), World.SeedSurface({
+		{ FIntPoint(7, 3), TEXT("water"), 0, 255 }
+	}));
+	TArray<FIntPoint> DirtyChunks;
+	World.ConsumeProjectionDirtyChunks(DirtyChunks);
+	TestTrue(TEXT("The owning render chunk becomes dirty"),
+		DirtyChunks.Contains(FIntPoint(0, 0)));
+	TestTrue(TEXT("The adjacent halo chunk becomes dirty at a changed boundary"),
+		DirtyChunks.Contains(FIntPoint(1, 0)));
+
+	World.ConsumeProjectionDirtyChunks(DirtyChunks);
+	TestTrue(TEXT("Consuming projection dirtiness is destructive"),
+		DirtyChunks.IsEmpty());
+	TestTrue(TEXT("A local canonical mutation is accepted"),
+		World.SetCell(FIntPoint(2, 2), TEXT("water")));
+	World.ConsumeProjectionDirtyChunks(DirtyChunks);
+	TestTrue(TEXT("A local mutation dirties its local render chunk"),
+		DirtyChunks.Contains(FIntPoint(0, 0)));
+	TestFalse(TEXT("A local mutation does not rebuild a distant render chunk"),
+		DirtyChunks.Contains(FIntPoint(1, 0)));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxPartialBodyLiquidDisplacementTest,
 	"MatterFlux.Material.PartialBodyDisplacementIsIdempotent",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)

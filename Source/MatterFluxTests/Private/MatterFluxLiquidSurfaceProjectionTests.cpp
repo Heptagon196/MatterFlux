@@ -4,6 +4,42 @@
 #if WITH_DEV_AUTOMATION_TESTS
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxLiquidSurfaceBuildsExposedSideWallsTest,
+	"MatterFlux.Playable.Liquid.SurfaceProjectionBuildsExposedSideWalls",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxLiquidSurfaceBuildsExposedSideWallsTest::RunTest(
+	const FString& Parameters)
+{
+	using MatterFlux::Material::FCellSnapshot;
+	const TArray<FCellSnapshot> Cells = {
+		{ FIntPoint(4, -2), TEXT("water"), 35, 128 }
+	};
+
+	MatterFlux::Rendering::FLiquidSurfaceProjection Projection;
+	MatterFlux::Rendering::BuildLiquidSurfaceProjection(
+		Cells,
+		10.0f,
+		100.0f,
+		Projection);
+
+	TestEqual(TEXT("One occupied column owns exactly two top triangles"),
+		Projection.TopTriangleIndexCount, 6);
+	TestTrue(TEXT("An exposed liquid column also owns vertical side triangles"),
+		Projection.Triangles.Num() > Projection.TopTriangleIndexCount);
+	float MinimumProjectedZ = TNumericLimits<float>::Max();
+	for (int32 VertexIndex = 0; VertexIndex < Projection.Vertices.Num();
+		++VertexIndex)
+	{
+		const FVector Vertex = Projection.Vertices[VertexIndex];
+		MinimumProjectedZ = FMath::Min(MinimumProjectedZ, Vertex.Z);
+	}
+	TestEqual(TEXT("The side envelope reaches the canonical support height"),
+		MinimumProjectedZ, 35.0f, 0.01f);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxLiquidSurfaceUsesConnectedShapeTest,
 	"MatterFlux.Playable.Liquid.SurfaceProjectionUsesConnectedShape",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
@@ -25,10 +61,10 @@ bool FMatterFluxLiquidSurfaceUsesConnectedShapeTest::RunTest(
 
 	TestEqual(TEXT("Adjacent liquid facts form one external shape"),
 		Projection.SurfacePatchCount, 1);
-	TestEqual(TEXT("Two adjacent cells share their two edge vertices"),
-		Projection.Vertices.Num(), 6);
+	TestTrue(TEXT("Two adjacent cells share top vertices and add only envelope vertices"),
+		Projection.Vertices.Num() >= 6);
 	TestEqual(TEXT("The connected shape retains both top faces"),
-		Projection.Triangles.Num(), 12);
+		Projection.TopTriangleIndexCount, 12);
 
 	FBox Bounds(ForceInit);
 	for (const FVector Vertex : Projection.Vertices)
@@ -41,10 +77,16 @@ bool FMatterFluxLiquidSurfaceUsesConnectedShapeTest::RunTest(
 		Bounds.GetSize().Y, 10.0);
 
 	int32 SharedEdgeVertexCount = 0;
-	for (const FVector Vertex : Projection.Vertices)
+	for (int32 VertexIndex = 0; VertexIndex < Projection.Vertices.Num();
+		++VertexIndex)
 	{
+		const FVector Vertex = Projection.Vertices[VertexIndex];
 		if (FMath::IsNearlyEqual(Vertex.X, 10.0f))
 		{
+			if (!Projection.Normals[VertexIndex].Equals(FVector::UpVector))
+			{
+				continue;
+			}
 			++SharedEdgeVertexCount;
 			TestTrue(
 				TEXT("Shared corners blend both column heights without a crack"),
@@ -78,10 +120,10 @@ bool FMatterFluxLiquidSurfaceSeparatesDisconnectedShapesTest::RunTest(
 
 	TestEqual(TEXT("Disconnected facts remain separate liquid shapes"),
 		Projection.SurfacePatchCount, 2);
-	TestEqual(TEXT("Separate droplets do not share projection vertices"),
-		Projection.Vertices.Num(), 8);
+	TestTrue(TEXT("Separate droplets do not collapse their projection vertices"),
+		Projection.Vertices.Num() >= 8);
 	TestEqual(TEXT("Each droplet owns two top triangles"),
-		Projection.Triangles.Num(), 12);
+		Projection.TopTriangleIndexCount, 12);
 	return true;
 }
 
@@ -107,8 +149,8 @@ bool FMatterFluxLiquidSurfaceSeparatesWaterfallHeightsTest::RunTest(
 
 	TestEqual(TEXT("A large fall becomes two continuous surface patches"),
 		Projection.SurfacePatchCount, 2);
-	TestEqual(TEXT("The fall cannot share vertices that stretch into shards"),
-		Projection.Vertices.Num(), 8);
+	TestTrue(TEXT("The fall cannot collapse its separate top patches"),
+		Projection.Vertices.Num() >= 8);
 	return true;
 }
 
@@ -201,7 +243,7 @@ bool FMatterFluxLiquidSurfacePreservesWideOpenTrailTest::RunTest(
 	TestEqual(TEXT("Projection preserves a wide shore-connected vacancy"),
 		Projection.ProjectedCellCount, 302);
 	TestEqual(TEXT("Current occupied columns render one face each"),
-		Projection.Triangles.Num(), 302 * 6);
+		Projection.TopTriangleIndexCount, 302 * 6);
 	return true;
 }
 
@@ -242,7 +284,84 @@ bool FMatterFluxLiquidSurfacePreservesShoreConnectedWakeTest::RunTest(
 	TestEqual(TEXT("Outer shape does not bridge a current shore-connected vacancy"),
 		Projection.ProjectedCellCount, 906);
 	TestEqual(TEXT("Only current occupied columns render top faces"),
-		Projection.Triangles.Num(), 906 * 6);
+		Projection.TopTriangleIndexCount, 906 * 6);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxLiquidSurfaceChunkUsesHaloWithoutBoundaryWallsTest,
+	"MatterFlux.Playable.Liquid.SurfaceChunkUsesHaloWithoutBoundaryWalls",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxLiquidSurfaceChunkUsesHaloWithoutBoundaryWallsTest::RunTest(
+	const FString& Parameters)
+{
+	using MatterFlux::Material::FCellSnapshot;
+	const TArray<FCellSnapshot> Cells = {
+		{ FIntPoint(3, 0), TEXT("water"), 0, 255 },
+		{ FIntPoint(4, 0), TEXT("water"), 0, 255 }
+	};
+	MatterFlux::Rendering::FLiquidSurfaceProjection LeftChunk;
+	MatterFlux::Rendering::BuildLiquidSurfaceChunkProjection(
+		Cells, 10.0f, 100.0f, FIntPoint(0, 0), 4, LeftChunk);
+
+	TestEqual(TEXT("Only the core cell emits a top face"),
+		LeftChunk.TopTriangleIndexCount, 6);
+	bool bHasFalseEastBoundaryWall = false;
+	for (int32 VertexIndex = 0; VertexIndex < LeftChunk.Vertices.Num();
+		++VertexIndex)
+	{
+		bHasFalseEastBoundaryWall |=
+			FMath::IsNearlyEqual(LeftChunk.Vertices[VertexIndex].X, 40.0f)
+			&& LeftChunk.Normals[VertexIndex].Equals(FVector::XAxisVector);
+	}
+	TestFalse(TEXT("A same-liquid halo cell suppresses the chunk seam wall"),
+		bHasFalseEastBoundaryWall);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxLiquidChunksPartitionDeterministicallyTest,
+	"MatterFlux.Playable.Liquid.ProjectionChunksUseCheckerboardPasses",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxLiquidChunksPartitionDeterministicallyTest::RunTest(
+	const FString& Parameters)
+{
+	const TArray<FIntPoint> Chunks = {
+		FIntPoint(1, 1), FIntPoint(0, 1), FIntPoint(1, 0),
+		FIntPoint(0, 0), FIntPoint(0, 0), FIntPoint(-1, 0)
+	};
+	TArray<FIntPoint> EvenChunks;
+	TArray<FIntPoint> OddChunks;
+	MatterFlux::Rendering::PartitionLiquidProjectionChunksCheckerboard(
+		Chunks, EvenChunks, OddChunks);
+	TestEqual(TEXT("Duplicate chunk requests collapse"),
+		EvenChunks.Num() + OddChunks.Num(), 5);
+	for (const FIntPoint Even : EvenChunks)
+	{
+		for (const FIntPoint Other : EvenChunks)
+		{
+			if (Even != Other)
+			{
+				TestTrue(TEXT("One checkerboard pass contains no cardinal neighbours"),
+					FMath::Abs(Even.X - Other.X)
+						+ FMath::Abs(Even.Y - Other.Y) != 1);
+			}
+		}
+	}
+	for (const FIntPoint Odd : OddChunks)
+	{
+		for (const FIntPoint Other : OddChunks)
+		{
+			if (Odd != Other)
+			{
+				TestTrue(TEXT("The second pass contains no cardinal neighbours"),
+					FMath::Abs(Odd.X - Other.X)
+						+ FMath::Abs(Odd.Y - Other.Y) != 1);
+			}
+		}
+	}
 	return true;
 }
 
@@ -349,8 +468,14 @@ bool FMatterFluxLiquidSurfacePreservesLocalCanonicalHeightsTest::RunTest(
 	TArray<float> LeftOuterHeights;
 	TArray<float> SharedEdgeHeights;
 	TArray<float> RightOuterHeights;
-	for (const FVector Vertex : Projection.Vertices)
+	for (int32 VertexIndex = 0; VertexIndex < Projection.Vertices.Num();
+		++VertexIndex)
 	{
+		if (!Projection.Normals[VertexIndex].Equals(FVector::UpVector))
+		{
+			continue;
+		}
+		const FVector Vertex = Projection.Vertices[VertexIndex];
 		if (FMath::IsNearlyEqual(Vertex.X, 0.0f))
 		{
 			LeftOuterHeights.Add(Vertex.Z);

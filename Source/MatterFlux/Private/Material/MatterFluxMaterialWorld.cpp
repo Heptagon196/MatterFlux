@@ -329,6 +329,8 @@ namespace MatterFlux::Material
 		TMap<FIntPoint, FArchivedChunk> BaselineChunks;
 		/** Sparse transient columns whose liquid volume was constrained by bodies. */
 		TSet<FIntPoint> BodyDisplacementVacancies;
+		/** Chunks whose canonical facts changed since the last render projection. */
+		TSet<FIntPoint> ProjectionDirtyChunks;
 		FIntPoint FocusCell = FIntPoint::ZeroValue;
 		TArray<FIntPoint> FocusCells;
 		TSet<FIntPoint> ActiveChunks;
@@ -862,6 +864,8 @@ namespace MatterFlux::Material
 						FIntPoint(X, Y),
 						Neighbor))
 					{
+						ProjectionDirtyChunks.Add(
+							ToChunkCoordinate(Neighbor));
 						MarkDirty(Neighbor);
 					}
 				}
@@ -2662,6 +2666,22 @@ namespace MatterFlux::Material
 		});
 	}
 
+	void FChunkedMaterialWorld::ConsumeProjectionDirtyChunks(
+		TArray<FIntPoint>& OutChunks)
+	{
+		OutChunks.Reset();
+		if (!Impl->bInitialized)
+		{
+			return;
+		}
+		OutChunks = Impl->ProjectionDirtyChunks.Array();
+		Impl->ProjectionDirtyChunks.Reset();
+		OutChunks.Sort([](const FIntPoint A, const FIntPoint B)
+		{
+			return A.Y != B.Y ? A.Y < B.Y : A.X < B.X;
+		});
+	}
+
 	bool FChunkedMaterialWorld::ExportActiveState(
 		const int32 LogicalStep,
 		TArray<uint8>& OutState,
@@ -3425,6 +3445,7 @@ namespace MatterFlux::Material
 				Impl->Settings.ChunkSize - 1,
 				Impl->Settings.ChunkSize - 1);
 			Pair.Value->bHasDirtyCells = true;
+			Impl->ProjectionDirtyChunks.Add(Pair.Key);
 		}
 		for (const FImportedChunk& ImportedChunk
 			: ImportedChunks)
@@ -3455,6 +3476,7 @@ namespace MatterFlux::Material
 				Impl->Settings.ChunkSize - 1,
 				Impl->Settings.ChunkSize - 1);
 			Chunk.bHasDirtyCells = true;
+			Impl->ProjectionDirtyChunks.Add(ImportedChunk.Coordinate);
 		}
 		Impl->Tick = SimulationTick;
 		OutLogicalStep = LogicalStep;
