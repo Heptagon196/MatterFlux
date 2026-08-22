@@ -62,6 +62,16 @@ namespace MatterFlux::Material
 		uint8 MaximumRemainingAmount = 0;
 	};
 
+	/** Deterministic work counters for the most recent body displacement solve. */
+	struct FLiquidDisplacementStats
+	{
+		int32 SourceCells = 0;
+		int32 ConnectedFootprints = 0;
+		int32 CandidateCellsVisited = 0;
+		int32 DestinationCellsChanged = 0;
+		int64 TransferredAmount = 0;
+	};
+
 	class MATTERFLUX_API FChunkedMaterialWorld
 	{
 	public:
@@ -81,8 +91,8 @@ namespace MatterFlux::Material
 		bool SeedSurface(const TArray<FSeedCell>& SeedCells);
 		/**
 		 * Atomically moves liquid out of transiently occupied surface cells.
-		 * Destinations are deterministic, empty, and outside the full occupied
-		 * footprint, so material identity and amount are conserved exactly.
+		 * Destinations are deterministic, material-compatible, and outside the
+		 * full occupied footprint, so identity and amount are conserved exactly.
 		 */
 		int32 DisplaceLiquids(
 			TConstArrayView<FIntPoint> OccupiedCells,
@@ -90,6 +100,7 @@ namespace MatterFlux::Material
 		int32 DisplaceLiquids(
 			TConstArrayView<FLiquidDisplacementConstraint> Constraints,
 			int32 MaxSearchRadius = 64);
+		const FLiquidDisplacementStats& GetLastLiquidDisplacementStats() const;
 		FName GetMaterialAt(const FIntPoint& WorldCell) const;
 		/** 查询单格的材质和承托高度；空格或未初始化世界返回 false。 */
 		bool TryGetCellSnapshot(

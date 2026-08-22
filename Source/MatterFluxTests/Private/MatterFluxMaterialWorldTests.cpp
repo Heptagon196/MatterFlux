@@ -955,6 +955,19 @@ bool FMatterFluxBodyWakeRestitutionWorkScaleTest::RunTest(
 	}
 	TestEqual(TEXT("Every occupied lake column is displaced"),
 		World.DisplaceLiquids(Constraints, 32), Constraints.Num());
+	const MatterFlux::Material::FLiquidDisplacementStats DisplacementStats =
+		World.GetLastLiquidDisplacementStats();
+	TestTrue(TEXT("A connected body footprint scans one bounded neighborhood"),
+		DisplacementStats.CandidateCellsVisited <= Seeds.Num() * 2);
+	TestEqual(TEXT("Adjacent constraints form one pressure transaction"),
+		DisplacementStats.ConnectedFootprints, 1);
+	TestEqual(TEXT("Every constrained source participates in the transaction"),
+		DisplacementStats.SourceCells, Constraints.Num());
+	TestEqual(TEXT("The displacement transaction moves every requested quantum"),
+		DisplacementStats.TransferredAmount,
+		static_cast<int64>(Constraints.Num()) * 120);
+	TestEqual(TEXT("The displacement transaction conserves every moved quantum"),
+		World.SumMaterialAmount(TEXT("water")), AmountBefore);
 
 	const MatterFlux::Material::FStepStats Stats = World.Step();
 	TestTrue(TEXT("Wake restitution performs useful transfers"),
