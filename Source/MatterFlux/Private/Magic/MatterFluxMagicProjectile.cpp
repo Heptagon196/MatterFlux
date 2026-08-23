@@ -1,6 +1,7 @@
 #include "Magic/MatterFluxMagicProjectile.h"
 
 #include "Components/SphereComponent.h"
+#include "Components/InstancedStaticMeshComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Creatures/MatterFluxCreatureActor.h"
 #include "EngineUtils.h"
@@ -13,6 +14,7 @@
 #include "GAS/MatterFluxPlayerAttributeSet.h"
 #include "Kismet/GameplayStatics.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "IMatterFluxScriptRuntime.h"
 #include "Misc/Crc.h"
 #include "Net/UnrealNetwork.h"
 #include "UObject/ConstructorHelpers.h"
@@ -53,6 +55,21 @@ AMatterFluxMagicProjectile::AMatterFluxMagicProjectile()
 	if (VoxelMaterial.Succeeded())
 	{
 		Visual->SetMaterial(0, VoxelMaterial.Object);
+	}
+
+	MaterialBody = CreateDefaultSubobject<UInstancedStaticMeshComponent>(
+		TEXT("MaterialBody"));
+	MaterialBody->SetupAttachment(Collision);
+	MaterialBody->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	MaterialBody->SetCastShadow(false);
+	MaterialBody->SetVisibility(false);
+	if (VoxelMesh.Succeeded())
+	{
+		MaterialBody->SetStaticMesh(VoxelMesh.Object);
+	}
+	if (VoxelMaterial.Succeeded())
+	{
+		MaterialBody->SetMaterial(0, VoxelMaterial.Object);
 	}
 
 	ProjectileMovement = CreateDefaultSubobject<UProjectileMovementComponent>(
@@ -152,13 +169,21 @@ void AMatterFluxMagicProjectile::InitializeProjectile(
 	Presentation.bOverrideColor = Plan.bOverrideColor;
 	Presentation.Color = Plan.Color;
 	Presentation.OrbitRadius = Plan.OrbitRadius;
+	Presentation.BodyMaterial = Plan.BodyMaterial;
 	Presentation.ImpactMaterial = Plan.ImpactMaterial;
+	// Deferred-spawned actors may not have entered BeginPlay yet (notably in
+	// editor worlds), but their immutable material body is already complete.
+	BuildMaterialBodyPresentation(
+		FMath::Clamp(Presentation.Radius, 2.0f, 100.0f));
 }
 
 void AMatterFluxMagicProjectile::ApplyPresentation()
 {
 	const float Radius = FMath::Clamp(Presentation.Radius, 2.0f, 100.0f);
 	Collision->SetSphereRadius(Radius);
+	const bool bUsesMaterialBody = !Presentation.BodyMaterial.IsNone();
+	Visual->SetVisibility(!bUsesMaterialBody);
+	MaterialBody->SetVisibility(bUsesMaterialBody);
 	Visual->SetRelativeScale3D(FVector(
 		Radius / 50.0f,
 		FMath::Max(0.08f, Radius / 80.0f),
@@ -184,14 +209,36 @@ void AMatterFluxMagicProjectile::ApplyPresentation()
 	{
 		const uint32 Hash = FCrc::StrCrc32(
 			*Presentation.SpellId.ToString());
+		FLinearColor MaterialColor = FLinearColor::White;
+		bool bHasMaterialColor = false;
+		if (bUsesMaterialBody
+			&& IMatterFluxScriptRuntime::IsAvailable())
+		{
+			const FMatterFluxContentRegistryPtr Registry =
+				IMatterFluxScriptRuntime::Get().GetActiveRegistry();
+			if (Registry.IsValid())
+			{
+				if (const FMatterFluxMaterialDefinition* Material =
+					Registry->Materials.Find(Presentation.BodyMaterial))
+				{
+					MaterialColor = Material->Color;
+					bHasMaterialColor = true;
+				}
+			}
+		}
 		const FLinearColor Color = Presentation.bOverrideColor
 			? Presentation.Color
-			: Presentation.ImpactMaterial == TEXT("fire")
-				? FLinearColor(1.0f, 0.12f, 0.015f)
-				: FLinearColor(
-				0.25f + static_cast<float>(Hash & 0xff) / 510.0f,
-				0.45f + static_cast<float>((Hash >> 8) & 0xff) / 510.0f,
-				0.70f + static_cast<float>((Hash >> 16) & 0xff) / 850.0f);
+			: bHasMaterialColor
+				? MaterialColor
+				: Presentation.ImpactMaterial == TEXT("fire")
+					? FLinearColor(1.0f, 0.12f, 0.015f)
+					: FLinearColor(
+						0.25f
+							+ static_cast<float>(Hash & 0xff) / 510.0f,
+						0.45f
+							+ static_cast<float>((Hash >> 8) & 0xff) / 510.0f,
+						0.70f
+							+ static_cast<float>((Hash >> 16) & 0xff) / 850.0f);
 		VisualMaterial->SetVectorParameterValue(TEXT("Color"), Color);
 		VisualMaterial->SetScalarParameterValue(TEXT("PixelSize"), 5.0f);
 		VisualMaterial->SetScalarParameterValue(TEXT("FaceContrast"), 0.72f);
@@ -200,7 +247,56 @@ void AMatterFluxMagicProjectile::ApplyPresentation()
 		{
 			Visual->SetMaterial(0, VisualMaterial);
 		}
+		if (MaterialBody->GetMaterial(0) != VisualMaterial)
+		{
+			MaterialBody->SetMaterial(0, VisualMaterial);
+		}
 	}
+	BuildMaterialBodyPresentation(Radius);
+}
+
+void AMatterFluxMagicProjectile::BuildMaterialBodyPresentation(
+	const float Radius)
+{
+	MaterialBody->ClearInstances();
+	if (Presentation.BodyMaterial.IsNone())
+	{
+		return;
+	}
+
+	// Keep one compact deterministic material body per projectile. The body is
+	// an in-flight projection; collision is still owned by the single sphere,
+	// and only impact hands material back to the falling-sand world.
+	const float Spacing = FMath::Max(5.0f, Radius * 0.45f);
+	const float BodyRadius = Radius * 0.92f;
+	const int32 StepCount = FMath::Max(
+		1,
+		FMath::CeilToInt(BodyRadius / Spacing));
+	const float VoxelScale = Spacing * 0.72f / 100.0f;
+	for (int32 X = -StepCount; X <= StepCount; ++X)
+	{
+		for (int32 Y = -StepCount; Y <= StepCount; ++Y)
+		{
+			for (int32 Z = -StepCount; Z <= StepCount; ++Z)
+			{
+				const FVector LocalPosition = FVector(X, Y, Z) * Spacing;
+				if (LocalPosition.SizeSquared()
+					> FMath::Square(BodyRadius))
+				{
+					continue;
+				}
+				MaterialBody->AddInstance(FTransform(
+					FQuat::Identity,
+					LocalPosition,
+					FVector(VoxelScale)));
+			}
+		}
+	}
+}
+
+int32 AMatterFluxMagicProjectile::GetMaterialBodyVoxelCount() const
+{
+	return MaterialBody ? MaterialBody->GetInstanceCount() : 0;
 }
 
 void AMatterFluxMagicProjectile::ApplyWorldImpact(const FHitResult& Hit)
@@ -210,18 +306,30 @@ void AMatterFluxMagicProjectile::ApplyWorldImpact(const FHitResult& Hit)
 	{
 		return;
 	}
-	FFragmentWorldCutRequest Request;
-	Request.CutShape.Type = EFragmentDamageShapeType::Circle;
-	Request.CutShape.WorldTransform = FTransform(Hit.ImpactPoint);
-	Request.CutShape.Radius = FMath::Max(2.0f, ServerPlan.Radius);
-	Request.DamagePower = FMath::Max(0.0f, ServerPlan.Damage * 100.0f);
-	Request.EventSeed = ServerEventSeed;
-	Request.TargetPadding = ServerPlan.Radius;
 	UFragmentSimulationSubsystem* Subsystem =
 		World->GetSubsystem<UFragmentSimulationSubsystem>();
-	if (Subsystem)
+	if (Subsystem && ServerPlan.Damage > 0.0f)
 	{
+		FFragmentWorldCutRequest Request;
+		Request.CutShape.Type = EFragmentDamageShapeType::Circle;
+		Request.CutShape.WorldTransform = FTransform(Hit.ImpactPoint);
+		Request.CutShape.Radius = FMath::Max(2.0f, ServerPlan.Radius);
+		Request.DamagePower = ServerPlan.Damage * 100.0f;
+		Request.EventSeed = ServerEventSeed;
+		Request.TargetPadding = ServerPlan.Radius;
 		Subsystem->RequestWorldCut(Request);
+	}
+
+	if (!ServerPlan.ImpactMaterial.IsNone())
+	{
+		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World);
+			It;
+			++It)
+		{
+			It->SetSimulatedMaterialAtWorldLocation(
+				Hit.ImpactPoint,
+				ServerPlan.ImpactMaterial);
+		}
 	}
 
 	if (ServerPlan.ImpactMaterial == TEXT("fire"))

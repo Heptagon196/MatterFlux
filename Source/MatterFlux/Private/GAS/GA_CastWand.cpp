@@ -4,8 +4,6 @@
 #include "Game/MatterFluxPlayerState.h"
 #include "Game/MatterFluxCharacter.h"
 #include "GameFramework/CharacterMovementComponent.h"
-#include "GAS/GA_PlayerCut.h"
-#include "GAS/GA_PlayerFlameJet.h"
 #include "Kismet/GameplayStatics.h"
 #include "Magic/MatterFluxMagicInventoryComponent.h"
 #include "Magic/MatterFluxMagicProjectile.h"
@@ -150,11 +148,11 @@ void UGA_CastWand::ActivateAbility(
 	}
 
 	UE_LOG(LogMatterFlux, Verbose,
-		TEXT("Wand %s in slot %d cast %d projectile(s) and %d world effect(s), mana spent %.1f"),
+		TEXT("Wand %s in slot %d cast %d projectile(s) and %d caster effect(s), mana spent %.1f"),
 		*WandId.ToString(EGuidFormats::Digits),
 		EquipmentSlot,
 		Plan.Projectiles.Num(),
-		Plan.WorldEffects.Num(),
+		Plan.CasterEffects.Num(),
 		Plan.ManaSpent);
 	EndAbility(Handle, ActorInfo, ActivationInfo, true, false);
 }
@@ -167,9 +165,9 @@ bool UGA_CastWand::SpawnCastPlan(
 	UWorld* World = Avatar.GetWorld();
 	if (!World
 		|| !Avatar.HasAuthority()
-		|| (Plan.Projectiles.IsEmpty() && Plan.WorldEffects.IsEmpty())
+		|| (Plan.Projectiles.IsEmpty() && Plan.CasterEffects.IsEmpty())
 		|| Plan.Projectiles.Num() > 32
-		|| Plan.WorldEffects.Num() > 32)
+		|| Plan.CasterEffects.Num() > 32)
 	{
 		return false;
 	}
@@ -190,32 +188,15 @@ bool UGA_CastWand::SpawnCastPlan(
 	{
 		return false;
 	}
-	for (const FMatterFluxMagicWorldEffectPlan& Effect : Plan.WorldEffects)
+	for (const FMatterFluxMagicCasterEffectPlan& Effect : Plan.CasterEffects)
 	{
 		const bool bCommonValid = !Effect.SpellId.IsNone();
 		const bool bTypeValid =
-			(Effect.Type == EMatterFluxMagicWorldEffectType::Cut
-				&& FMath::IsFinite(Effect.Range)
-				&& FMath::IsFinite(Effect.StartRadius)
-				&& Effect.Range > 0.0f
-				&& Effect.StartRadius > 0.0f
-				&& FMath::IsFinite(Effect.Thickness)
-				&& FMath::IsFinite(Effect.Power)
-				&& Effect.Thickness > 0.0f
-				&& Effect.Power >= 0.0f)
-			|| (Effect.Type == EMatterFluxMagicWorldEffectType::Flame
-				&& FMath::IsFinite(Effect.Range)
-				&& FMath::IsFinite(Effect.StartRadius)
-				&& Effect.Range > 0.0f
-				&& Effect.StartRadius > 0.0f
-				&& FMath::IsFinite(Effect.EndRadius)
-				&& Effect.EndRadius >= Effect.StartRadius
-				&& !Effect.Material.IsNone())
-			|| (Effect.Type == EMatterFluxMagicWorldEffectType::Jump
+			Effect.Type == EMatterFluxMagicCasterEffectType::Jump
 				&& FMath::IsFinite(Effect.VerticalImpulse)
 				&& Effect.VerticalImpulse > 0.0f
 				&& Effect.VerticalImpulse <= 5000.0f
-				&& Cast<AMatterFluxCharacter>(&Avatar) != nullptr);
+				&& Cast<AMatterFluxCharacter>(&Avatar) != nullptr;
 		if (!bCommonValid || !bTypeValid)
 		{
 			return false;
@@ -270,43 +251,11 @@ bool UGA_CastWand::SpawnCastPlan(
 	{
 		UGameplayStatics::FinishSpawningActor(Entry.Actor, Entry.Transform);
 	}
-	for (int32 Index = 0; Index < Plan.WorldEffects.Num(); ++Index)
+	for (int32 Index = 0; Index < Plan.CasterEffects.Num(); ++Index)
 	{
-		const FMatterFluxMagicWorldEffectPlan& Effect =
-			Plan.WorldEffects[Index];
-		if (Effect.Type == EMatterFluxMagicWorldEffectType::Cut)
-		{
-			UGA_PlayerCut::ExecuteForwardCut(
-				Avatar,
-				Effect.Range,
-				Effect.StartRadius,
-				Effect.Thickness,
-				Effect.Power,
-				EventSeed ^ (Index * 0x4f1 + 0x181));
-			if (AMatterFluxCharacter* Character =
-				Cast<AMatterFluxCharacter>(&Avatar))
-			{
-				Character->BroadcastAbilityEffect(
-					EMatterFluxPlayerAbilityEffect::Cut);
-			}
-		}
-		else if (Effect.Type == EMatterFluxMagicWorldEffectType::Flame)
-		{
-			UGA_PlayerFlameJet::ExecuteFlameJet(
-				Avatar,
-				Effect.Range,
-				Effect.StartRadius,
-				Effect.EndRadius,
-				Effect.Material,
-				EventSeed ^ (Index * 0x6d7 + 0x271));
-			if (AMatterFluxCharacter* Character =
-				Cast<AMatterFluxCharacter>(&Avatar))
-			{
-				Character->BroadcastAbilityEffect(
-					EMatterFluxPlayerAbilityEffect::FlameJet);
-			}
-		}
-		else if (AMatterFluxCharacter* Character =
+		const FMatterFluxMagicCasterEffectPlan& Effect =
+			Plan.CasterEffects[Index];
+		if (AMatterFluxCharacter* Character =
 			Cast<AMatterFluxCharacter>(&Avatar))
 		{
 			if (UCharacterMovementComponent* Movement =

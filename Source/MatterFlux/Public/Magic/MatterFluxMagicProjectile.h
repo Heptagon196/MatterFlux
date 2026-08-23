@@ -6,6 +6,7 @@
 #include "MatterFluxMagicProjectile.generated.h"
 
 class UProjectileMovementComponent;
+class UInstancedStaticMeshComponent;
 class USphereComponent;
 class UStaticMeshComponent;
 class UMaterialInstanceDynamic;
@@ -37,6 +38,9 @@ struct MATTERFLUX_API FMatterFluxMagicProjectilePresentation
 	float OrbitRadius = 0.0f;
 
 	UPROPERTY()
+	FName BodyMaterial;
+
+	UPROPERTY()
 	FName ImpactMaterial;
 };
 
@@ -63,6 +67,7 @@ public:
 	{
 		return Presentation;
 	}
+	int32 GetMaterialBodyVoxelCount() const;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Magic")
 	TObjectPtr<USphereComponent> Collision;
@@ -70,11 +75,16 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Magic")
 	TObjectPtr<UStaticMeshComponent> Visual;
 
+	/** Deterministic voxel projection used when the projectile has a body material. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Magic")
+	TObjectPtr<UInstancedStaticMeshComponent> MaterialBody;
+
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Magic")
 	TObjectPtr<UProjectileMovementComponent> ProjectileMovement;
 
 private:
 	void ApplyPresentation();
+	void BuildMaterialBodyPresentation(float Radius);
 	void ApplyWorldImpact(const FHitResult& Hit);
 	void SpawnTriggerPayload(
 		TConstArrayView<FMatterFluxMagicProjectilePlan> Payload,

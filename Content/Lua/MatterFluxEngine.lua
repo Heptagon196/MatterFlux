@@ -130,7 +130,8 @@ function map.define(metadata, build_map)
 end
 
 local projectile_fields = {
-	"damage", "speed", "lifetime", "radius", "impact_material",
+	"damage", "speed", "lifetime", "radius", "body_material",
+	"impact_material",
 	"cast_delay", "recharge_time"
 }
 local modifier_fields = {
@@ -201,28 +202,6 @@ function spell.define(metadata, build_program)
 		}, "trigger")
 	end
 
-	function api.cut(parameters)
-		if has_projectile or terminal_kind ~= nil then
-			error("a spell may declare only one primary action", 2)
-		end
-		terminal_kind = "cut"
-		copy_fields(compiled, parameters, {
-			"damage", "range", "radius", "thickness", "cast_delay",
-			"recharge_time"
-		}, "cut")
-	end
-
-	function api.flame(parameters)
-		if has_projectile or terminal_kind ~= nil then
-			error("a spell may declare only one primary action", 2)
-		end
-		terminal_kind = "flame"
-		copy_fields(compiled, parameters, {
-			"range", "radius", "end_radius", "impact_material",
-			"cast_delay", "recharge_time"
-		}, "flame")
-	end
-
 	function api.impulse(parameters)
 		if has_projectile or terminal_kind ~= nil then
 			error("a spell may declare only one primary action", 2)
@@ -237,7 +216,7 @@ function spell.define(metadata, build_program)
 
 	if terminal_kind ~= nil then
 		if has_trigger or has_modifier or explicit_draw then
-			error("world and avatar actions cannot own child operations yet", 2)
+			error("avatar actions cannot own child operations yet", 2)
 		end
 		compiled.kind = terminal_kind
 	elseif has_projectile then

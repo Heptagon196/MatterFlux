@@ -88,10 +88,6 @@ namespace MatterFluxMagicUI
 			return FText::FromString(TEXT("触"));
 		case EMatterFluxSpellKind::Jump:
 			return FText::FromString(TEXT("跃"));
-		case EMatterFluxSpellKind::Cut:
-			return FText::FromString(TEXT("切"));
-		case EMatterFluxSpellKind::Flame:
-			return FText::FromString(TEXT("火"));
 		default:
 			return FText::FromString(TEXT("弹"));
 		}
@@ -1825,9 +1821,9 @@ private:
 		}
 		const FString PreviewText = bPreviewValid
 			? FString::Printf(
-				TEXT("%d 枚飞弹  ·  %d 个世界效果\n消耗法力 %.0f   飞弹总伤害 %.0f\n施法 %.2f秒   充能 %.2f秒\n下一抽取位置 %d%s"),
+				TEXT("%d 枚飞弹  ·  %d 个施法者效果\n消耗法力 %.0f   飞弹总伤害 %.0f\n施法 %.2f秒   充能 %.2f秒\n下一抽取位置 %d%s"),
 				Preview.Projectiles.Num(),
-				Preview.WorldEffects.Num(),
+				Preview.CasterEffects.Num(),
 				Preview.ManaSpent,
 				RootDamage,
 				Preview.CastDelay,

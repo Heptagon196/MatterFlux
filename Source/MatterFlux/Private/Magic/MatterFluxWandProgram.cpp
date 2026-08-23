@@ -6,7 +6,7 @@ namespace MatterFluxWandProgram
 {
 	constexpr int32 MaximumInstructionsPerCast = 128;
 	constexpr int32 MaximumProjectilesPerCast = 32;
-	constexpr int32 MaximumWorldEffectsPerCast = 32;
+	constexpr int32 MaximumCasterEffectsPerCast = 32;
 	constexpr int32 MaximumTriggerDepth = 4;
 
 	struct FPendingModifiers
@@ -31,7 +31,7 @@ namespace MatterFluxWandProgram
 		FRandomStream Random;
 		int32 InstructionCount = 0;
 		int32 ProjectileCount = 0;
-		int32 WorldEffectCount = 0;
+		int32 CasterEffectCount = 0;
 		FString Error;
 
 		FEvaluationContext(
@@ -121,7 +121,7 @@ namespace MatterFluxWandProgram
 			int32 DrawCount,
 			const int32 TriggerDepth,
 			TArray<FMatterFluxMagicProjectilePlan>& OutProjectiles,
-			TArray<FMatterFluxMagicWorldEffectPlan>& OutWorldEffects)
+			TArray<FMatterFluxMagicCasterEffectPlan>& OutCasterEffects)
 		{
 			if (TriggerDepth > MaximumTriggerDepth)
 			{
@@ -174,25 +174,25 @@ namespace MatterFluxWandProgram
 				case EMatterFluxSpellKind::TriggerModifier:
 				{
 					TArray<FMatterFluxMagicProjectilePlan> CarrierProjectiles;
-					TArray<FMatterFluxMagicWorldEffectPlan> CarrierWorldEffects;
+					TArray<FMatterFluxMagicCasterEffectPlan> CarrierCasterEffects;
 					TArray<FMatterFluxMagicProjectilePlan> PayloadProjectiles;
-					TArray<FMatterFluxMagicWorldEffectPlan> PayloadWorldEffects;
+					TArray<FMatterFluxMagicCasterEffectPlan> PayloadCasterEffects;
 					if (!CompileSequence(
 						1,
 						TriggerDepth + 1,
 						CarrierProjectiles,
-						CarrierWorldEffects)
+						CarrierCasterEffects)
 						|| !CompileSequence(
 							1,
 							TriggerDepth + 1,
 							PayloadProjectiles,
-							PayloadWorldEffects))
+							PayloadCasterEffects))
 					{
 						return false;
 					}
 					if (CarrierProjectiles.IsEmpty()
-						|| !CarrierWorldEffects.IsEmpty()
-						|| !PayloadWorldEffects.IsEmpty())
+						|| !CarrierCasterEffects.IsEmpty()
+						|| !PayloadCasterEffects.IsEmpty())
 					{
 						Error = TEXT("trigger modifiers require projectile carrier and payload children");
 						return false;
@@ -265,21 +265,22 @@ namespace MatterFluxWandProgram
 								-Pending.SpreadDegrees,
 								Pending.SpreadDegrees);
 					Projectile.ImpactMaterial = Spell->ImpactMaterial;
+					Projectile.BodyMaterial = Spell->BodyMaterial;
 					Projectile.bOverrideColor = Pending.bOverrideColor;
 					Projectile.Color = Pending.Color;
 					Projectile.OrbitRadius = Pending.OrbitRadius;
-					TArray<FMatterFluxMagicWorldEffectPlan> TriggerWorldEffects;
+					TArray<FMatterFluxMagicCasterEffectPlan> TriggerCasterEffects;
 					if (Spell->Kind == EMatterFluxSpellKind::Trigger
 						&& (!CompileSequence(
 							Spell->TriggerDrawCount,
 							TriggerDepth + 1,
 							Projectile.OnImpactProjectiles,
-							TriggerWorldEffects)
-							|| !TriggerWorldEffects.IsEmpty()))
+							TriggerCasterEffects)
+							|| !TriggerCasterEffects.IsEmpty()))
 					{
 						if (Error.IsEmpty())
 						{
-							Error = TEXT("cut and flame spells cannot be trigger payloads");
+							Error = TEXT("avatar actions cannot be trigger payloads");
 						}
 						return false;
 					}
@@ -290,47 +291,18 @@ namespace MatterFluxWandProgram
 					break;
 				}
 
-				case EMatterFluxSpellKind::Cut:
-				case EMatterFluxSpellKind::Flame:
-				{
-					if (++WorldEffectCount > MaximumWorldEffectsPerCast)
-					{
-						Error = TEXT("wand program exceeded its world effect budget");
-						return false;
-					}
-					FMatterFluxMagicWorldEffectPlan Effect;
-					Effect.SpellId = Spell->Id;
-					Effect.Type = Spell->Kind == EMatterFluxSpellKind::Cut
-						? EMatterFluxMagicWorldEffectType::Cut
-						: EMatterFluxMagicWorldEffectType::Flame;
-					Effect.Range = Spell->Range;
-					Effect.StartRadius = Spell->Radius;
-					Effect.EndRadius = Spell->EndRadius;
-					Effect.Thickness = Spell->Thickness;
-					Effect.Power = FMath::Max(
-						0.0f,
-						(Spell->Damage + Pending.DamageAdd)
-							* Pending.DamageMultiplier);
-					Effect.Material = Spell->ImpactMaterial;
-					OutWorldEffects.Add(MoveTemp(Effect));
-					Pending = FPendingModifiers();
-					Pending.SpreadDegrees = Wand.Spread + SequenceSpreadDelta;
-					DrawCount += Spell->DrawCount;
-					break;
-				}
-
 				case EMatterFluxSpellKind::Jump:
 				{
-					if (++WorldEffectCount > MaximumWorldEffectsPerCast)
+					if (++CasterEffectCount > MaximumCasterEffectsPerCast)
 					{
-						Error = TEXT("wand program exceeded its world effect budget");
+						Error = TEXT("wand program exceeded its caster effect budget");
 						return false;
 					}
-					FMatterFluxMagicWorldEffectPlan Effect;
+					FMatterFluxMagicCasterEffectPlan Effect;
 					Effect.SpellId = Spell->Id;
-					Effect.Type = EMatterFluxMagicWorldEffectType::Jump;
+					Effect.Type = EMatterFluxMagicCasterEffectType::Jump;
 					Effect.VerticalImpulse = Spell->VerticalImpulse;
-					OutWorldEffects.Add(MoveTemp(Effect));
+					OutCasterEffects.Add(MoveTemp(Effect));
 					Pending = FPendingModifiers();
 					Pending.SpreadDegrees = Wand.Spread + SequenceSpreadDelta;
 					break;
@@ -398,13 +370,13 @@ bool FMatterFluxWandProgram::Evaluate(
 		Wand->DrawCount,
 		0,
 		Context.Plan.Projectiles,
-		Context.Plan.WorldEffects))
+		Context.Plan.CasterEffects))
 	{
 		OutError = Context.Error;
 		return false;
 	}
 	if (Context.Plan.Projectiles.IsEmpty()
-		&& Context.Plan.WorldEffects.IsEmpty())
+		&& Context.Plan.CasterEffects.IsEmpty())
 	{
 		OutError = TEXT("wand program emitted no cast actions");
 		return false;

@@ -13,7 +13,8 @@
 7. 右键装备槽会卸下法杖；右键法术槽会把法术退回背包。不方便拖放时，可以先单击背包法术，再单击目标槽。
 8. 关闭工作台后，左键、右键、`Q`、`E` 分别施放装备槽 1～4 的法杖。
 
-切割和喷火不再是角色硬编码的特殊能力。默认配置只是把“伐木法杖”装到左键槽，
+切割和喷火不再是角色硬编码的特殊能力。它们和普通飞弹一样先生成投射物，只有投射物
+命中后才把切割、点燃或材质写入交给世界系统。默认配置只是把“伐木法杖”装到左键槽，
 把“火舌法杖”装到右键槽；交换法杖或法术后，同一个键就会施放新的程序。
 
 ## 2. MatterFlux 参考了 PaperMagic 的哪些部分
@@ -44,14 +45,15 @@ flowchart LR
     ASC --> Ability["同一个 GA_CastWand\nServerOnly"]
     Inventory --> Compiler["WandProgram::Evaluate\n无副作用、确定性"]
     Registry --> Compiler
-    Compiler --> Plan["CastPlan\n投射物、世界效果、下一状态"]
+    Compiler --> Plan["CastPlan\n投射物、施法者效果、下一状态"]
     Plan --> Projectile["复制的 MagicProjectile"]
-    Plan --> Effect["Cut / Flame / Jump 世界效果执行器"]
-    Projectile --> World["通用 WorldCut / 点燃"]
+    Plan --> Effect["Jump 施法者效果执行器"]
+    Projectile --> World["命中后通用 WorldCut / 材质写入 / 点燃"]
     Plan --> Commit["生成全部成功后\n提交法力、牌序、冷却"]
 ```
 
 最重要的边界是：UI 不生成投射物，Lua 不调用 UObject，GAS 不解释 Lua 表，法术编译器也不修改 Actor。
+常规法术只能生成或修改投射物；跳跃这类只作用于施法者的能力是显式例外，不能作为触发器载荷。
 
 ## 4. 关键文件从哪里读
 
@@ -104,11 +106,10 @@ end)
 
 | Lua 能力 | 作用 |
 |---|---|
-| `api.projectile` | 声明投射物的伤害、速度、寿命、半径与命中材质 |
+| `api.projectile` | 声明投射物的伤害、速度、寿命、半径、本体材质与命中材质 |
 | `api.modify_projectile` | 修改后续投射物的伤害、速度、寿命、轨迹或颜色 |
 | `api.draw` | 抽取子法术；一次抽多张自然形成多重施法 |
 | `api.trigger` | 把子法术绑定到命中或消逝事件 |
-| `api.cut` / `api.flame` | 请求通用的地形切割或点燃能力 |
 | `api.impulse` | 请求对施法者施加受限冲量 |
 
 `content.register_spell` 仍存在于 C++ 和引擎脚本之间，但它只是私有编译格式；默认内容模块看不到也不调用它。内容作者面对的是 `spell.define(meta, function(api) ... end)`。回调在内容加载时执行并构造确定性程序，不会在客户端任意操作 Actor。
@@ -182,7 +183,7 @@ TimerManager 执行。Boss 因而能表达 PaperMagic 的双发攻击和分时�
 - 当前法力、牌序和施法序号；
 - 事件 seed。
 
-输出是 `FMatterFluxWandCastPlan`，包括根投射物、命中/消逝载荷、切割/火焰/跳跃世界效果、
+输出是 `FMatterFluxWandCastPlan`，包括根投射物、命中/消逝载荷、跳跃等施法者效果、
 消耗的法力、施法延迟、充能时间和下一份法杖状态。它不访问 World、不
 SpawnActor，也不改变传入状态。
 
@@ -215,30 +216,32 @@ UI 发出的每个编辑命令都带 `ExpectedRevision`。服务器只接受与�
 ## 8. GAS 施法与事务提交
 
 四个输入键分别寻找 `InputID = 0..3` 的 Ability Spec。四份 Spec 都使用同一个
-`UGA_CastWand` 类，因此输入层只选择装备槽，不知道里面是切割、火焰还是投射物。
+`UGA_CastWand` 类，因此输入层只选择装备槽，不知道里面是哪一种投射物或施法者效果。
 `UGA_CastWand` 使用 `ServerOnly`：真正的牌序计算和世界修改发生在权威服务器。
 
 一次成功施法的顺序是：
 
 1. 检查输入绑定的装备槽、Lua 定义、法力和服务器时间。
 2. 用当前状态运行纯编译器，得到候选计划。
-3. 先校验所有世界效果参数，再对所有根投射物调用 deferred spawn。
+3. 先校验所有投射物和施法者效果参数，再对所有根投射物调用 deferred spawn。
 4. 只要任何一个 Actor 分配失败，就销毁尚未完成的 Actor，候选计划不提交。
-5. 全部初始化成功后 `FinishSpawningActor`，再执行已验证的切割/火焰效果。
+5. 全部初始化成功后 `FinishSpawningActor`，再执行已验证的施法者效果。
 6. 最后提交 Mana、DeckCursor、CastSerial 和 NextCastServerTime。
 
 这与数据库事务的思路相同：副作用准备失败时，玩家不会白白消耗法力或跳过牌。
 
 ## 9. 投射物如何进入 MatterFlux 世界
 
-`AMatterFluxMagicProjectile` 由服务器生成，开启 movement replication。法术 ID、速度、寿命、半径和冲击材质使用 `COND_InitialOnly`，因为它们生成后不再变化。
+`AMatterFluxMagicProjectile` 由服务器生成，开启 movement replication。法术 ID、速度、寿命、半径、本体材质和冲击材质使用 `COND_InitialOnly`，因为它们生成后不再变化。投射物移动组件的重力缩放为 0；法术通过速度和寿命限定射程。
 
-客户端根据相同 presentation 建立体素方块外观；颜色使用法术字符串 ID 的稳定 CRC，而不是进程局部的 FName 索引。
+普通投射物仍使用紧凑体素外观；声明 `body_material` 的投射物则根据材质颜色建立确定性的
+多体素球。火焰喷流因此是一团向玩家前方移动、无重力的火焰材质球，而不是施法瞬间
+向锥形区域直接写世界。颜色回退使用法术字符串 ID 的稳定 CRC，而不是进程局部的 FName 索引。
 
 命中只在服务器处理：
 
 - 普通伤害构造 `FFragmentWorldCutRequest`，调用通用 `RequestWorldCut`；它不是法杖专用切割路径。
-- `impact_material = "fire"` 时还会点燃可燃 fragment source 和地面材质。
+- `impact_material` 在命中点进入材质世界；值为 `fire` 时还会点燃可燃 fragment source 和地面材质。
 - trigger 投射物按声明在命中点生成 `OnImpactProjectiles`，或在寿命结束位置生成 `OnExpireProjectiles`。
 - 圆形轨迹只在服务器推进，客户端接收 movement replication；红色覆盖随 InitialOnly presentation 一次复制。
 
@@ -281,7 +284,9 @@ Development/Editor 下修改默认 Lua 后，运行时会事务式替换 registr
 
 ### 12.2 增加新的法术语义
 
-如果想增加“传送”“召唤”“锯片”等新语义，不要在 Lua 中写直接操作 Actor 的函数。推荐步骤：
+如果想增加“传送”“召唤”“锯片”等新语义，不要在 Lua 中写直接操作 Actor 的函数。
+优先把新语义表达为投射物字段、投射物修饰器或命中策略；只有确实作用于施法者自身的能力
+才进入施法者效果通道。推荐步骤：
 
 1. 在引擎脚本的 `api` 上增加一个窄能力函数。
 2. 在私有编译格式与 registry builder 中校验所有字段和引用。
@@ -302,7 +307,8 @@ Automation RunTests MatterFlux.Magic
 当前覆盖：
 
 - Lua 法术/法杖注册和确定性计划；
-- 切割/火焰由 Lua 编译为世界效果，而不是默认角色能力；
+- 切割/火焰编译为投射物，直接注册 `cut`/`flame` 世界法术会被拒绝；
+- 火焰本体材质复制、确定性体素球表现与无重力前向运动；
 - modifier、multicast、trigger 的组合与失败回滚；
 - PaperMagic 9 个法术的清单、关键原始数值与逐项编译结果；
 - 全空法杖、并列投射物、修饰链、嵌套多重施法/触发器、缺失子节点和多个独立施法段；

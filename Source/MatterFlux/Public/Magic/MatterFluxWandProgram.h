@@ -29,6 +29,7 @@ struct MATTERFLUX_API FMatterFluxMagicProjectilePlan
 	bool bOverrideColor = false;
 	FLinearColor Color = FLinearColor::White;
 	float OrbitRadius = 0.0f;
+	FName BodyMaterial;
 	FName ImpactMaterial;
 	TArray<FMatterFluxMagicProjectilePlan> OnImpactProjectiles;
 	TArray<FMatterFluxMagicProjectilePlan> OnExpireProjectiles;
@@ -47,6 +48,7 @@ struct MATTERFLUX_API FMatterFluxMagicProjectilePlan
 			&& bOverrideColor == Other.bOverrideColor
 			&& Color == Other.Color
 			&& OrbitRadius == Other.OrbitRadius
+			&& BodyMaterial == Other.BodyMaterial
 			&& ImpactMaterial == Other.ImpactMaterial
 			&& OnImpactProjectiles == Other.OnImpactProjectiles
 			&& OnExpireProjectiles == Other.OnExpireProjectiles
@@ -54,44 +56,30 @@ struct MATTERFLUX_API FMatterFluxMagicProjectilePlan
 	}
 };
 
-enum class EMatterFluxMagicWorldEffectType : uint8
+enum class EMatterFluxMagicCasterEffectType : uint8
 {
-	Cut,
-	Flame,
 	Jump
 };
 
-struct MATTERFLUX_API FMatterFluxMagicWorldEffectPlan
+struct MATTERFLUX_API FMatterFluxMagicCasterEffectPlan
 {
 	FName SpellId;
-	EMatterFluxMagicWorldEffectType Type =
-		EMatterFluxMagicWorldEffectType::Cut;
-	float Range = 0.0f;
-	float StartRadius = 0.0f;
-	float EndRadius = 0.0f;
-	float Thickness = 0.0f;
-	float Power = 0.0f;
+	EMatterFluxMagicCasterEffectType Type =
+		EMatterFluxMagicCasterEffectType::Jump;
 	float VerticalImpulse = 0.0f;
-	FName Material;
 
-	bool operator==(const FMatterFluxMagicWorldEffectPlan& Other) const
+	bool operator==(const FMatterFluxMagicCasterEffectPlan& Other) const
 	{
 		return SpellId == Other.SpellId
 			&& Type == Other.Type
-			&& Range == Other.Range
-			&& StartRadius == Other.StartRadius
-			&& EndRadius == Other.EndRadius
-			&& Thickness == Other.Thickness
-			&& Power == Other.Power
-			&& VerticalImpulse == Other.VerticalImpulse
-			&& Material == Other.Material;
+			&& VerticalImpulse == Other.VerticalImpulse;
 	}
 };
 
 struct MATTERFLUX_API FMatterFluxWandCastPlan
 {
 	TArray<FMatterFluxMagicProjectilePlan> Projectiles;
-	TArray<FMatterFluxMagicWorldEffectPlan> WorldEffects;
+	TArray<FMatterFluxMagicCasterEffectPlan> CasterEffects;
 	FMatterFluxWandProgramState NextState;
 	float ManaSpent = 0.0f;
 	float CastDelay = 0.0f;
@@ -101,7 +89,7 @@ struct MATTERFLUX_API FMatterFluxWandCastPlan
 	bool operator==(const FMatterFluxWandCastPlan& Other) const
 	{
 		return Projectiles == Other.Projectiles
-			&& WorldEffects == Other.WorldEffects
+			&& CasterEffects == Other.CasterEffects
 			&& NextState == Other.NextState
 			&& ManaSpent == Other.ManaSpent
 			&& CastDelay == Other.CastDelay

@@ -981,9 +981,6 @@ namespace MatterFluxLua
 			&& IsFiniteNonNegative(Definition.Lifetime)
 			&& IsFiniteNonNegative(Definition.LifetimeMultiplier)
 			&& IsFiniteNonNegative(Definition.Radius)
-			&& IsFiniteNonNegative(Definition.EndRadius)
-			&& IsFiniteNonNegative(Definition.Range)
-			&& IsFiniteNonNegative(Definition.Thickness)
 			&& FMath::IsFinite(Definition.SpreadDelta)
 			&& FMath::IsFinite(Definition.CastDelayDelta)
 			&& FMath::IsFinite(Definition.RechargeTimeDelta)
@@ -1000,9 +997,7 @@ namespace MatterFluxLua
 			|| Definition.Kind == EMatterFluxSpellKind::Multicast
 			|| Definition.Kind == EMatterFluxSpellKind::Trigger
 			|| Definition.Kind == EMatterFluxSpellKind::TriggerModifier
-			|| Definition.Kind == EMatterFluxSpellKind::Jump
-			|| Definition.Kind == EMatterFluxSpellKind::Cut
-			|| Definition.Kind == EMatterFluxSpellKind::Flame;
+			|| Definition.Kind == EMatterFluxSpellKind::Jump;
 		const bool bValidColor = !Definition.bOverrideColor
 			|| (Definition.Color.R >= 0.0f && Definition.Color.R <= 1.0f
 				&& Definition.Color.G >= 0.0f && Definition.Color.G <= 1.0f
@@ -1071,27 +1066,6 @@ namespace MatterFluxLua
 		{
 			OutError = FString::Printf(
 				TEXT("jump spell '%s' requires positive vertical_impulse"),
-				*Id);
-			return false;
-		}
-		if (Definition.Kind == EMatterFluxSpellKind::Cut
-			&& (Definition.Range <= 0.0f
-				|| Definition.Radius <= 0.0f
-				|| Definition.Thickness <= 0.0f))
-		{
-			OutError = FString::Printf(
-				TEXT("cut spell '%s' requires positive range, radius, and thickness"),
-				*Id);
-			return false;
-		}
-		if (Definition.Kind == EMatterFluxSpellKind::Flame
-			&& (Definition.Range <= 0.0f
-				|| Definition.Radius <= 0.0f
-				|| Definition.EndRadius < Definition.Radius
-				|| Definition.ImpactMaterial.IsNone()))
-		{
-			OutError = FString::Printf(
-				TEXT("flame spell '%s' requires range, radii, and impact_material"),
 				*Id);
 			return false;
 		}
@@ -1543,14 +1517,23 @@ namespace MatterFluxLua
 		for (const TPair<FName, FMatterFluxSpellDefinition>& Pair
 			: Registry.Spells)
 		{
-			if (!Pair.Value.ImpactMaterial.IsNone()
-				&& !Registry.Materials.Contains(
-					Pair.Value.ImpactMaterial))
+			FName MissingMaterial = NAME_None;
+			if (!Pair.Value.BodyMaterial.IsNone()
+				&& !Registry.Materials.Contains(Pair.Value.BodyMaterial))
+			{
+				MissingMaterial = Pair.Value.BodyMaterial;
+			}
+			else if (!Pair.Value.ImpactMaterial.IsNone()
+				&& !Registry.Materials.Contains(Pair.Value.ImpactMaterial))
+			{
+				MissingMaterial = Pair.Value.ImpactMaterial;
+			}
+			if (!MissingMaterial.IsNone())
 			{
 				OutError = FString::Printf(
-					TEXT("spell '%s' references missing impact material '%s'"),
+					TEXT("spell '%s' references missing projectile material '%s'"),
 					*Pair.Key.ToString(),
-					*Pair.Value.ImpactMaterial.ToString());
+					*MissingMaterial.ToString());
 				return false;
 			}
 		}
@@ -3502,18 +3485,10 @@ namespace MatterFluxLua
 		{
 			OutKind = EMatterFluxSpellKind::Jump;
 		}
-		else if (Value == TEXT("cut"))
-		{
-			OutKind = EMatterFluxSpellKind::Cut;
-		}
-		else if (Value == TEXT("flame"))
-		{
-			OutKind = EMatterFluxSpellKind::Flame;
-		}
 		else
 		{
 			OutError =
-				TEXT("field 'kind' must be projectile, modifier, multicast, trigger, trigger_modifier, jump, cut, or flame");
+				TEXT("field 'kind' must be projectile, modifier, multicast, trigger, trigger_modifier, or jump");
 			return false;
 		}
 		return true;
@@ -3545,6 +3520,7 @@ namespace MatterFluxLua
 		FMatterFluxSpellDefinition Definition;
 		FString Id;
 		FString Kind;
+		FString BodyMaterial;
 		FString ImpactMaterial;
 		FString TriggerEvent;
 		if (!ReadTableStringField(State, 1, "id", Id, true, Error)
@@ -3578,12 +3554,6 @@ namespace MatterFluxLua
 			|| !ReadTableNumberField(
 				State, 1, "radius", Definition.Radius, Error)
 			|| !ReadTableNumberField(
-				State, 1, "end_radius", Definition.EndRadius, Error)
-			|| !ReadTableNumberField(
-				State, 1, "range", Definition.Range, Error)
-			|| !ReadTableNumberField(
-				State, 1, "thickness", Definition.Thickness, Error)
-			|| !ReadTableNumberField(
 				State, 1, "spread", Definition.SpreadDelta, Error)
 			|| !ReadTableNumberField(
 				State, 1, "cast_delay", Definition.CastDelayDelta, Error)
@@ -3610,6 +3580,8 @@ namespace MatterFluxLua
 			|| !ReadTableNumberField(
 				State, 1, "vertical_impulse", Definition.VerticalImpulse, Error)
 			|| !ReadTableStringField(
+				State, 1, "body_material", BodyMaterial, false, Error)
+			|| !ReadTableStringField(
 				State, 1, "impact_material", ImpactMaterial, false, Error)
 			|| !ReadTableIntegerField(
 				State, 1, "starter_count", Definition.StarterCount, Error)
@@ -3618,14 +3590,19 @@ namespace MatterFluxLua
 			return FailLuaCall(State, Error);
 		}
 		if (!IsValidContentId(Id)
+			|| (!BodyMaterial.IsEmpty()
+				&& !IsValidContentId(BodyMaterial))
 			|| (!ImpactMaterial.IsEmpty()
 				&& !IsValidContentId(ImpactMaterial)))
 		{
 			return FailLuaCall(
 				State,
-				TEXT("spell id or impact_material is invalid"));
+				TEXT("spell id or projectile material is invalid"));
 		}
 		Definition.Id = FName(*Id);
+		Definition.BodyMaterial = BodyMaterial.IsEmpty()
+			? NAME_None
+			: FName(*BodyMaterial);
 		Definition.ImpactMaterial = ImpactMaterial.IsEmpty()
 			? NAME_None
 			: FName(*ImpactMaterial);

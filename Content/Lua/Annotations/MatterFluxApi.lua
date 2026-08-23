@@ -94,6 +94,7 @@
 ---@field speed? number 投射物初速度，单位为 UE 单位/秒。
 ---@field lifetime? number 投射物最大存在时间，单位为秒。
 ---@field radius? number 投射物碰撞半径，单位为 UE 单位。
+---@field body_material? MatterFluxContentId 飞行中组成投射物体素球的材质 ID；留空使用普通投射物外观。
 ---@field impact_material? MatterFluxContentId 命中后写入世界的材质 ID；留空表示不写入。
 ---@field cast_delay? number 对当前轮施法间隔的增量，单位为秒。
 ---@field recharge_time? number 对法杖充能时间的增量，单位为秒。
@@ -124,22 +125,6 @@
 ---@field trigger_random_direction? boolean 是否为每个子法术生成随机方向。
 ---@field carrier_lifetime? number 触发载体的寿命覆盖值，单位为秒；0 表示使用投射物寿命。
 
----@class MatterFluxCutParameters
----@field damage? number 切割对可伤害对象造成的伤害。
----@field range? number 从施法点向前的切割距离，单位为 UE 单位。
----@field radius? number 切割范围的横向半径，单位为 UE 单位。
----@field thickness? number 切割写入 mask 时使用的厚度，单位为 UE 单位。
----@field cast_delay? number 施法后的额外间隔，单位为秒。
----@field recharge_time? number 对法杖充能时间的增量，单位为秒。
-
----@class MatterFluxFlameParameters
----@field range? number 火焰喷射距离，单位为 UE 单位。
----@field radius? number 火焰起点半径，单位为 UE 单位。
----@field end_radius? number 火焰末端半径，单位为 UE 单位。
----@field impact_material? MatterFluxContentId 喷射到世界中的材质 ID，通常为火焰材质。
----@field cast_delay? number 施法后的额外间隔，单位为秒。
----@field recharge_time? number 对法杖充能时间的增量，单位为秒。
-
 ---@class MatterFluxImpulseParameters
 ---@field vertical_impulse? number 施加给施法者的垂直冲量。
 ---@field cast_delay? number 施法后的额外间隔，单位为秒。
@@ -150,8 +135,6 @@
 ---@field modify_projectile fun(parameters: MatterFluxProjectileModifierParameters) 修改随后读取到的投射物法术。
 ---@field draw fun(count: integer, parameters?: MatterFluxDrawParameters) 同时读取指定数量的后续法术。
 ---@field trigger fun(parameters: MatterFluxTriggerParameters) 为投射物或后续法术声明触发器。
----@field cut fun(parameters: MatterFluxCutParameters) 声明一次世界 mask 切割动作。
----@field flame fun(parameters: MatterFluxFlameParameters) 声明一次锥形材质喷射动作。
 ---@field impulse fun(parameters: MatterFluxImpulseParameters) 声明一次作用于施法者的冲量动作。
 
 ---@class MatterFluxSpellNamespace

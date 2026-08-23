@@ -281,9 +281,7 @@ enum class EMatterFluxSpellKind : uint8
 	Multicast,
 	Trigger,
 	TriggerModifier,
-	Jump,
-	Cut,
-	Flame
+	Jump
 };
 
 enum class EMatterFluxSpellTriggerEvent : uint8
@@ -314,9 +312,6 @@ struct FMatterFluxSpellDefinition
 	float Lifetime = 0.0f;
 	float LifetimeMultiplier = 1.0f;
 	float Radius = 0.0f;
-	float EndRadius = 0.0f;
-	float Range = 0.0f;
-	float Thickness = 0.0f;
 	float SpreadDelta = 0.0f;
 	float CastDelayDelta = 0.0f;
 	float RechargeTimeDelta = 0.0f;
@@ -328,6 +323,8 @@ struct FMatterFluxSpellDefinition
 	bool bTriggerRandomDirection = false;
 	float CarrierLifetimeOverride = 0.0f;
 	float VerticalImpulse = 0.0f;
+	/** Optional material composing the projectile body while it is in flight. */
+	FName BodyMaterial;
 	FName ImpactMaterial;
 	int32 StarterCount = 0;
 };

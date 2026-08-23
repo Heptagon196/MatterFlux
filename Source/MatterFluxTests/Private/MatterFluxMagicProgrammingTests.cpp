@@ -3,6 +3,7 @@
 #include "EngineUtils.h"
 #include "GAS/GA_CastWand.h"
 #include "Game/MatterFluxCharacter.h"
+#include "Game/MatterFluxPlayableWorldActor.h"
 #include "GameFramework/ProjectileMovementComponent.h"
 #include "Magic/MatterFluxWandProgram.h"
 #include "Magic/MatterFluxSpellProgramLayout.h"
@@ -69,6 +70,28 @@ content.register_wand({
 	id = "wand.program", name = "Program Wand", capacity = 8,
 	shuffle = false, draw_count = 1, cast_delay = 0.1,
 	recharge_time = 0.3, mana_max = 20, mana_recharge = 5
+})
+)LUA");
+
+	const TCHAR* DirectCutPack = TEXT(R"LUA(
+content.set_manifest("magic.direct_cut", 1, 2)
+content.register_spell({
+	id = "spell.direct_cut", name = "Direct Cut", kind = "cut",
+	damage = 12, range = 500, radius = 60, thickness = 30
+})
+)LUA");
+
+	const TCHAR* DirectFlamePack = TEXT(R"LUA(
+content.set_manifest("magic.direct_flame", 1, 2)
+content.register_material({
+	id = "fire", density = 0.01, hardness = 0,
+	color_r = 1, color_g = 0.24, color_b = 0.01, color_a = 0.92,
+	phase = "gas"
+})
+content.register_spell({
+	id = "spell.direct_flame", name = "Direct Flame", kind = "flame",
+	range = 800, radius = 45, end_radius = 180,
+	impact_material = "fire"
 })
 )LUA");
 
@@ -645,13 +668,13 @@ bool FMatterFluxMagicPaperMagicSemanticsTest::RunTest(
 	FMatterFluxWandCastPlan JumpPlan;
 	if (Compile(TEXT("Jump compiles"), {TEXT("std.jump")}, JumpPlan))
 	{
-		TestEqual(TEXT("Jump emits one world effect"),
-			JumpPlan.WorldEffects.Num(), 1);
-		TestEqual(TEXT("Jump world effect type"),
-			JumpPlan.WorldEffects[0].Type,
-			EMatterFluxMagicWorldEffectType::Jump);
+		TestEqual(TEXT("Jump emits one caster effect"),
+			JumpPlan.CasterEffects.Num(), 1);
+		TestEqual(TEXT("Jump caster effect type"),
+			JumpPlan.CasterEffects[0].Type,
+			EMatterFluxMagicCasterEffectType::Jump);
 		TestEqual(TEXT("Jump impulse"),
-			JumpPlan.WorldEffects[0].VerticalImpulse, 600.0f);
+			JumpPlan.CasterEffects[0].VerticalImpulse, 600.0f);
 	}
 	return true;
 }
@@ -675,10 +698,10 @@ bool FMatterFluxMagicPaperMagicRuntimeEffectsTest::RunTest(
 	}
 
 	FMatterFluxWandCastPlan JumpPlan;
-	FMatterFluxMagicWorldEffectPlan& Jump =
-		JumpPlan.WorldEffects.AddDefaulted_GetRef();
+	FMatterFluxMagicCasterEffectPlan& Jump =
+		JumpPlan.CasterEffects.AddDefaulted_GetRef();
 	Jump.SpellId = TEXT("std.jump");
-	Jump.Type = EMatterFluxMagicWorldEffectType::Jump;
+	Jump.Type = EMatterFluxMagicCasterEffectType::Jump;
 	Jump.VerticalImpulse = 600.0f;
 	AActor* NonCharacter = World->SpawnActor<AActor>();
 	if (TestNotNull(TEXT("Non-character authority avatar spawns"), NonCharacter))
@@ -897,12 +920,12 @@ bool FMatterFluxMagicModifierMulticastTriggerTest::RunTest(
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FMatterFluxMagicWandWorldEffectsTest,
-	"MatterFlux.Magic.CutAndFlameCompileAsWandWorldEffects",
+	FMatterFluxMagicRegularWorldSpellProjectileTest,
+	"MatterFlux.Magic.RegularWorldSpellsCompileAsProjectiles",
 	EAutomationTestFlags::EditorContext
 		| EAutomationTestFlags::ProductFilter)
 
-bool FMatterFluxMagicWandWorldEffectsTest::RunTest(
+bool FMatterFluxMagicRegularWorldSpellProjectileTest::RunTest(
 	const FString& Parameters)
 {
 	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
@@ -946,15 +969,16 @@ bool FMatterFluxMagicWandWorldEffectsTest::RunTest(
 			7,
 			CutPlan,
 			Error));
-	TestEqual(TEXT("Cut emits no projectile"),
-		CutPlan.Projectiles.Num(), 0);
-	TestEqual(TEXT("Cut emits one world effect"),
-		CutPlan.WorldEffects.Num(), 1);
-	if (CutPlan.WorldEffects.Num() == 1)
+	TestEqual(TEXT("Cut emits one projectile"),
+		CutPlan.Projectiles.Num(), 1);
+	TestEqual(TEXT("Cut does not bypass the projectile layer"),
+		CutPlan.CasterEffects.Num(), 0);
+	if (CutPlan.Projectiles.Num() == 1)
 	{
-		TestEqual(TEXT("Cut effect type is preserved"),
-			CutPlan.WorldEffects[0].Type,
-			EMatterFluxMagicWorldEffectType::Cut);
+		TestTrue(TEXT("Cut projectile travels forward"),
+			CutPlan.Projectiles[0].Speed > 0.0f);
+		TestTrue(TEXT("Cut projectile can damage material on impact"),
+			CutPlan.Projectiles[0].Damage > 0.0f);
 	}
 
 	FMatterFluxWandCastPlan FlamePlan;
@@ -969,17 +993,197 @@ bool FMatterFluxMagicWandWorldEffectsTest::RunTest(
 			8,
 			FlamePlan,
 			Error));
-	TestEqual(TEXT("Flame emits one world effect"),
-		FlamePlan.WorldEffects.Num(), 1);
-	if (FlamePlan.WorldEffects.Num() == 1)
+	TestEqual(TEXT("Flame emits one projectile"),
+		FlamePlan.Projectiles.Num(), 1);
+	TestEqual(TEXT("Flame does not bypass the projectile layer"),
+		FlamePlan.CasterEffects.Num(), 0);
+	if (FlamePlan.Projectiles.Num() == 1)
 	{
-		TestEqual(TEXT("Flame effect type is preserved"),
-			FlamePlan.WorldEffects[0].Type,
-			EMatterFluxMagicWorldEffectType::Flame);
-		TestEqual(TEXT("Flame material comes from Lua"),
-			FlamePlan.WorldEffects[0].Material,
+		TestEqual(TEXT("Flame projectile body is made from fire material"),
+			FlamePlan.Projectiles[0].BodyMaterial,
 			FName(TEXT("fire")));
+		TestEqual(TEXT("Flame impact material comes from Lua"),
+			FlamePlan.Projectiles[0].ImpactMaterial,
+			FName(TEXT("fire")));
+		TestTrue(TEXT("Flame projectile travels forward"),
+			FlamePlan.Projectiles[0].Speed > 0.0f);
 	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxMagicDirectWorldSpellKindRejectionTest,
+	"MatterFlux.Magic.DirectWorldSpellKindsAreRejected",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxMagicDirectWorldSpellKindRejectionTest::RunTest(
+	const FString& Parameters)
+{
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	TestFalse(TEXT("A cut spell cannot bypass projectile compilation"),
+		Runtime.LoadContentPackFromSource(
+			MatterFluxMagicTests::DirectCutPack,
+			TEXT("DirectCutKindRejection"),
+			Error));
+	TestTrue(*FString::Printf(
+		TEXT("Cut rejection identifies the unsupported kind: %s"), *Error),
+		Error.Contains(TEXT("kind")));
+
+	Error.Reset();
+	TestFalse(TEXT("A flame spell cannot bypass projectile compilation"),
+		Runtime.LoadContentPackFromSource(
+			MatterFluxMagicTests::DirectFlamePack,
+			TEXT("DirectFlameKindRejection"),
+			Error));
+	TestTrue(*FString::Printf(
+		TEXT("Flame rejection identifies the unsupported kind: %s"), *Error),
+		Error.Contains(TEXT("kind")));
+	MatterFluxMagicTests::RestoreDefault(Runtime);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxMagicMaterialBodyProjectileTest,
+	"MatterFlux.Magic.MaterialBodyProjectileUsesVoxelSphereWithoutGravity",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxMagicMaterialBodyProjectileTest::RunTest(
+	const FString& Parameters)
+{
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(TEXT("Default content pack loads"),
+		Runtime.ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry = Runtime.GetActiveRegistry();
+	const FMatterFluxWandDefinition* FlameWand = Registry.IsValid()
+		? Registry->Wands.Find(TEXT("wand.flame"))
+		: nullptr;
+	if (!TestNotNull(TEXT("Flame wand exists"), FlameWand))
+	{
+		return false;
+	}
+	FMatterFluxWandProgramState State;
+	State.Mana = FlameWand->ManaMax;
+	FMatterFluxWandCastPlan Plan;
+	if (!TestTrue(TEXT("Flame wand compiles"),
+		FMatterFluxWandProgram::Evaluate(
+			*Registry,
+			FlameWand->Id,
+			FlameWand->StarterDeck,
+			State,
+			91,
+			Plan,
+			Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AActor* Avatar = World ? World->SpawnActor<AActor>() : nullptr;
+	if (!TestNotNull(TEXT("Authority avatar spawns"), Avatar)
+		|| !TestTrue(TEXT("Flame cast plan spawns"),
+			UGA_CastWand::SpawnCastPlan(*Avatar, Plan, 91)))
+	{
+		return false;
+	}
+	AMatterFluxMagicProjectile* FlameProjectile = nullptr;
+	for (TActorIterator<AMatterFluxMagicProjectile> It(World); It; ++It)
+	{
+		if (It->GetPresentation().SpellId == TEXT("spell.flame_jet"))
+		{
+			FlameProjectile = *It;
+			break;
+		}
+	}
+	if (!TestNotNull(TEXT("Flame projectile exists"), FlameProjectile))
+	{
+		return false;
+	}
+	const int32 FlameVoxelCount =
+		FlameProjectile->GetMaterialBodyVoxelCount();
+	TestTrue(*FString::Printf(
+		TEXT("Flame body contains multiple material voxels: %d"),
+		FlameVoxelCount),
+		FlameVoxelCount > 1);
+	TestEqual(TEXT("Flame body material is replicated presentation data"),
+		FlameProjectile->GetPresentation().BodyMaterial,
+		FName(TEXT("fire")));
+	TestEqual(TEXT("Flame projectile ignores gravity"),
+		FlameProjectile->ProjectileMovement->ProjectileGravityScale,
+		0.0f);
+	TestTrue(TEXT("Flame projectile moves forward"),
+		FVector::DotProduct(
+			FlameProjectile->ProjectileMovement->Velocity,
+			Avatar->GetActorForwardVector()) > 0.0f);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxMagicProjectileMaterialImpactTest,
+	"MatterFlux.Magic.ProjectileImpactHandsMaterialToFallingSandWorld",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxMagicProjectileMaterialImpactTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* MaterialWorld = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	AActor* Avatar = World ? World->SpawnActor<AActor>() : nullptr;
+	if (!TestNotNull(TEXT("Material world spawns"), MaterialWorld)
+		|| !TestNotNull(TEXT("Authority avatar spawns"), Avatar))
+	{
+		return false;
+	}
+	MaterialWorld->Regenerate(13579);
+	const int32 FireCellsBefore =
+		MaterialWorld->GetSimulatedMaterialCount(TEXT("fire"));
+
+	FMatterFluxWandCastPlan Plan;
+	FMatterFluxMagicProjectilePlan& ProjectilePlan =
+		Plan.Projectiles.AddDefaulted_GetRef();
+	ProjectilePlan.SpellId = TEXT("spell.material_impact_test");
+	ProjectilePlan.Speed = 800.0f;
+	ProjectilePlan.Lifetime = 1.0f;
+	ProjectilePlan.Radius = 20.0f;
+	ProjectilePlan.BodyMaterial = TEXT("fire");
+	ProjectilePlan.ImpactMaterial = TEXT("fire");
+	if (!TestTrue(TEXT("Material projectile spawns"),
+		UGA_CastWand::SpawnCastPlan(*Avatar, Plan, 502)))
+	{
+		return false;
+	}
+	AMatterFluxMagicProjectile* Projectile = nullptr;
+	for (TActorIterator<AMatterFluxMagicProjectile> It(World); It; ++It)
+	{
+		if (It->GetPresentation().SpellId
+			== TEXT("spell.material_impact_test"))
+		{
+			Projectile = *It;
+			break;
+		}
+	}
+	if (!TestNotNull(TEXT("Material projectile exists"), Projectile))
+	{
+		return false;
+	}
+	FHitResult Hit;
+	Hit.ImpactPoint = FVector::ZeroVector;
+	TestTrue(TEXT("Projectile resolves its material impact"),
+		Projectile->ResolveImpactAuthority(Hit));
+	TestTrue(TEXT("Impact material enters the falling-sand world"),
+		MaterialWorld->GetSimulatedMaterialCount(TEXT("fire"))
+			> FireCellsBefore);
 	return true;
 }
 
