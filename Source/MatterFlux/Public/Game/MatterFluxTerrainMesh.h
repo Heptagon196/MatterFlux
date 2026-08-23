@@ -20,6 +20,7 @@ namespace MatterFlux::TerrainMesh
 		FIntPoint ChunkCoordinate = FIntPoint::ZeroValue;
 		FIntRect CellBounds;
 		TArray<FSection> Sections;
+		FSection CollisionSurface;
 
 		bool IsValid() const;
 		int32 GetTriangleCount() const;

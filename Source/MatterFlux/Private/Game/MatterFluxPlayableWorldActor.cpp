@@ -2562,6 +2562,10 @@ int32 AMatterFluxPlayableWorldActor::GetVisibleTerrainTriangleCount() const
 			SectionIndex < Component->GetNumSections();
 			++SectionIndex)
 		{
+			if (!Component->IsMeshSectionVisible(SectionIndex))
+			{
+				continue;
+			}
 			if (const FProcMeshSection* Section =
 				Component->GetProcMeshSection(SectionIndex))
 			{
@@ -8837,7 +8841,7 @@ AMatterFluxPlayableWorldActor::CreateTerrainChunkComponent(
 			Section.UVs,
 			EmptyColors,
 			EmptyTangents,
-			true);
+			false);
 		if (ColorMaterialTemplate
 			&& TerrainHeightField.BandColors.IsValidIndex(SectionIndex))
 		{
@@ -8858,6 +8862,17 @@ AMatterFluxPlayableWorldActor::CreateTerrainChunkComponent(
 			Component->SetMaterial(SectionIndex, Material);
 		}
 	}
+	const int32 CollisionSectionIndex = Chunk.Sections.Num();
+	Component->CreateMeshSection_LinearColor(
+		CollisionSectionIndex,
+		Chunk.CollisionSurface.Vertices,
+		Chunk.CollisionSurface.Triangles,
+		Chunk.CollisionSurface.Normals,
+		Chunk.CollisionSurface.UVs,
+		EmptyColors,
+		EmptyTangents,
+		true);
+	Component->SetMeshSectionVisible(CollisionSectionIndex, false);
 	GeneratedTerrainChunks.Add(ChunkCoordinate, Component);
 	return Component;
 }

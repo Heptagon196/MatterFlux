@@ -19,6 +19,8 @@
 
 namespace
 {
+	constexpr float FragmentInitialOverlapMaxDepenetrationSpeed = 400.0f;
+
 	bool IsFiniteVector(const FVector& Value)
 	{
 		return FMath::IsFinite(Value.X) && FMath::IsFinite(Value.Y) && FMath::IsFinite(Value.Z);
@@ -301,6 +303,13 @@ AFragment2DActor::AFragment2DActor()
 	MeshComponent->SetLinearDamping(1.25f);
 	MeshComponent->SetAngularDamping(4.0f);
 	MeshComponent->BodyInstance.bUseCCD = true;
+	// If terrain streaming or a cut briefly creates an initial overlap, Chaos
+	// may otherwise convert the entire penetration depth into a single-frame
+	// launch. This cap affects only initial/teleport overlap correction, not
+	// normal collision response, forces, impulses, or character pushing.
+	MeshComponent->SetMaxDepenetrationVelocity(
+		NAME_None,
+		FragmentInitialOverlapMaxDepenetrationSpeed);
 	MeshComponent->BodyInstance.SleepFamily = ESleepFamily::Custom;
 	MeshComponent->BodyInstance.CustomSleepThresholdMultiplier = 2.5f;
 	MeshComponent->BodyInstance.StabilizationThresholdMultiplier = 2.0f;

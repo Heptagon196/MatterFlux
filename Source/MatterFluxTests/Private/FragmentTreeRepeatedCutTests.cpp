@@ -503,6 +503,15 @@ bool FMatterFluxTreeRepeatedMultiDirectionCutTest::RunTest(
 			TEXT("Felled tree uses continuous collision detection against a moving character"),
 			Carrier->MeshComponent->BodyInstance.bUseCCD);
 		TestTrue(
+			TEXT("Felled tree overrides initial-overlap depenetration velocity"),
+			Carrier->MeshComponent->BodyInstance.
+				GetOverrideMaxDepenetrationVelocity());
+		TestTrue(
+			TEXT("Initial overlap cannot launch detached material at extreme speed"),
+			Carrier->MeshComponent->GetMaxDepenetrationVelocity() > 0.0f
+			&& Carrier->MeshComponent->GetMaxDepenetrationVelocity()
+				<= 400.0f);
+		TestTrue(
 			TEXT("Felled tree has enough linear damping to reject push-force velocity spikes"),
 			Carrier->MeshComponent->GetLinearDamping() >= 1.0f);
 		TestTrue(

@@ -775,8 +775,30 @@ bool FMatterFluxFineTerrainChunkMeshTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("Chunk keeps three material bands"), Chunk.Sections.Num(), 3);
 	TestEqual(TEXT("Interior chunk covers 32 by 32 pixels"),
 		Chunk.CellBounds.Area(), 32 * 32);
+	TestTrue(TEXT("Chunk carries a dedicated smooth collision surface"),
+		Chunk.CollisionSurface.IsValid());
+	TestEqual(TEXT("Collision surface has two triangles per two-cell patch"),
+		Chunk.CollisionSurface.Triangles.Num() / 3,
+		FMath::DivideAndRoundUp(Chunk.CellBounds.Width(), 2)
+			* FMath::DivideAndRoundUp(Chunk.CellBounds.Height(), 2) * 2);
+	for (int32 TriangleIndex = 0;
+		TriangleIndex < Chunk.CollisionSurface.Triangles.Num();
+		TriangleIndex += 3)
+	{
+		const FVector& A = Chunk.CollisionSurface.Vertices[
+			Chunk.CollisionSurface.Triangles[TriangleIndex]];
+		const FVector& B = Chunk.CollisionSurface.Vertices[
+			Chunk.CollisionSurface.Triangles[TriangleIndex + 1]];
+		const FVector& C = Chunk.CollisionSurface.Vertices[
+			Chunk.CollisionSurface.Triangles[TriangleIndex + 2]];
+		TestTrue(
+			TEXT("Collision surface contains no vertical step faces"),
+			FMath::Abs(FVector::CrossProduct(B - A, C - A).Z)
+				> UE_SMALL_NUMBER);
+	}
 	double TopSurfaceArea = 0.0;
 	int32 TopTriangleCount = 0;
+	bool bHasVisibleVerticalStep = false;
 	for (const MatterFlux::TerrainMesh::FSection& Section : Chunk.Sections)
 	{
 		if (!Section.Vertices.IsEmpty())
@@ -802,6 +824,10 @@ bool FMatterFluxFineTerrainChunkMeshTest::RunTest(const FString& Parameters)
 						Section.Vertices[B] - Section.Vertices[A],
 						Section.Vertices[C] - Section.Vertices[A]).Z) * 0.5;
 				}
+				else
+				{
+					bHasVisibleVerticalStep = true;
+				}
 				TestTrue(
 					TEXT("Triangle winding faces the supplied Unreal mesh normal"),
 					FVector::DotProduct(WindingNormal, Section.Normals[A])
@@ -815,6 +841,53 @@ bool FMatterFluxFineTerrainChunkMeshTest::RunTest(const FString& Parameters)
 			* Terrain.CellSize * Terrain.CellSize);
 	TestTrue(TEXT("Coplanar top pixels are greedily merged"),
 		TopTriangleCount < Chunk.CellBounds.Area() * 2);
+	TestTrue(TEXT("Rendered terrain still contains the original step faces"),
+		bHasVisibleVerticalStep);
+
+	MatterFlux::TerrainMesh::FChunk EastChunk;
+	if (TestTrue(
+		TEXT("Adjacent terrain chunk builds"),
+		MatterFlux::TerrainMesh::BuildChunk(
+			Terrain,
+			FIntPoint(-7, -6),
+			32,
+			EastChunk)))
+	{
+		const double SeamX = -7.0 * 32.0 * Terrain.CellSize;
+		TMap<int32, double> WestEdgeHeights;
+		TMap<int32, double> EastEdgeHeights;
+		for (const FVector& Vertex : Chunk.CollisionSurface.Vertices)
+		{
+			if (FMath::IsNearlyEqual(Vertex.X, SeamX))
+			{
+				WestEdgeHeights.Add(
+					FMath::RoundToInt(Vertex.Y / Terrain.CellSize),
+					Vertex.Z);
+			}
+		}
+		for (const FVector& Vertex : EastChunk.CollisionSurface.Vertices)
+		{
+			if (FMath::IsNearlyEqual(Vertex.X, SeamX))
+			{
+				EastEdgeHeights.Add(
+					FMath::RoundToInt(Vertex.Y / Terrain.CellSize),
+					Vertex.Z);
+			}
+		}
+		TestEqual(TEXT("Adjacent collision surfaces expose the same seam vertices"),
+			WestEdgeHeights.Num(), EastEdgeHeights.Num());
+		for (const TPair<int32, double>& EdgeVertex : WestEdgeHeights)
+		{
+			const double* EastHeight = EastEdgeHeights.Find(EdgeVertex.Key);
+			TestNotNull(TEXT("Every west seam vertex has an east counterpart"),
+				EastHeight);
+			if (EastHeight)
+			{
+				TestTrue(TEXT("Adjacent collision surface heights are continuous"),
+					FMath::IsNearlyEqual(EdgeVertex.Value, *EastHeight));
+			}
+		}
+	}
 	MatterFlux::TerrainMesh::FChunk InvalidChunk;
 	TestFalse(
 		TEXT("Extreme chunk coordinates are rejected without integer overflow"),
@@ -1800,10 +1873,32 @@ bool FMatterFluxVoxelDecorationWorldTest::RunTest(const FString& Parameters)
 			}
 			++VisibleTerrainComponentCount;
 			TestTrue(
-				TEXT("Merged terrain has exact static-world collision"),
+				TEXT("Merged terrain has static-world collision"),
 				Component->GetCollisionEnabled()
 					== ECollisionEnabled::QueryAndPhysics
 				&& Component->bUseComplexAsSimpleCollision);
+			const int32 CollisionSectionIndex =
+				Component->GetNumSections() - 1;
+			const FProcMeshSection* CollisionSection =
+				Component->GetProcMeshSection(CollisionSectionIndex);
+			TestTrue(TEXT("Terrain collision uses a dedicated hidden mesh section"),
+				CollisionSection
+					&& CollisionSection->bEnableCollision
+					&& !Component->IsMeshSectionVisible(
+						CollisionSectionIndex));
+			for (int32 SectionIndex = 0;
+				SectionIndex < CollisionSectionIndex;
+				++SectionIndex)
+			{
+				const FProcMeshSection* RenderSection =
+					Component->GetProcMeshSection(SectionIndex);
+				if (RenderSection)
+				{
+					TestFalse(
+						TEXT("Visible stepped terrain sections do not participate in collision"),
+						RenderSection->bEnableCollision);
+				}
+			}
 			TestFalse(
 				TEXT("Streamed procedural terrain does not rebuild navigation"),
 				Component->CanEverAffectNavigation());
