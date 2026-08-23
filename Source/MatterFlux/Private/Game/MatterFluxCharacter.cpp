@@ -4,12 +4,15 @@
 #include "Camera/CameraComponent.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
+#include "Components/MeshComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
 #include "Engine/Engine.h"
 #include "Engine/LocalPlayer.h"
 #include "EngineUtils.h"
+#include "Fragment/Fragment2DActor.h"
+#include "Fragment/Fragment2DSourceActor.h"
 #include "Game/MatterFluxPlayableWorldActor.h"
 #include "Game/MatterFluxPlayerState.h"
 #include "Game/MatterFluxCharacterPhysicsInteraction.h"
@@ -25,11 +28,15 @@
 #include "MatterFluxLog.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Material/MatterFluxBuoyancyComponent.h"
+#include "ProceduralMeshComponent.h"
+#include "Rendering/MatterFluxItemOcclusion.h"
 #include "TimerManager.h"
 #include "UObject/ConstructorHelpers.h"
 
 AMatterFluxCharacter::AMatterFluxCharacter()
 {
+	PrimaryActorTick.bCanEverTick = true;
+	PrimaryActorTick.TickInterval = 0.08f;
 	bReplicates = true;
 	bUseControllerRotationPitch = false;
 	bUseControllerRotationYaw = false;
@@ -115,6 +122,12 @@ AMatterFluxCharacter::AMatterFluxCharacter()
 	{
 		PlayerOutlineMaterial = OutlineMaterial.Object;
 	}
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> GhostMaterial(
+		TEXT("/Game/MatterFlux/Materials/M_VoxelGas.M_VoxelGas"));
+	if (GhostMaterial.Succeeded())
+	{
+		ItemOcclusionGhostMaterial = GhostMaterial.Object;
+	}
 
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> EffectVoxelMesh(
 		TEXT("/Engine/BasicShapes/Cube.Cube"));
@@ -192,6 +205,12 @@ AMatterFluxCharacter::AMatterFluxCharacter()
 		FVector4(1.08f, 1.08f, 1.08f, 1.0f);
 }
 
+void AMatterFluxCharacter::Tick(const float DeltaSeconds)
+{
+	Super::Tick(DeltaSeconds);
+	UpdateItemOcclusionGhosting();
+}
+
 void AMatterFluxCharacter::BeginPlay()
 {
 	Super::BeginPlay();
@@ -259,6 +278,15 @@ void AMatterFluxCharacter::BeginPlay()
 void AMatterFluxCharacter::EndPlay(
 	const EEndPlayReason::Type EndPlayReason)
 {
+	RestoreItemOcclusionGhosts();
+	if (UWorld* World = GetWorld())
+	{
+		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
+		{
+			It->UpdateLocalFragmentItemOcclusion(
+				FVector::ZeroVector, FBox(ForceInit));
+		}
+	}
 	if (ULocalPlayer* LocalPlayer =
 		PlayableInputLocalPlayer.Get())
 	{
@@ -285,6 +313,205 @@ void AMatterFluxCharacter::EndPlay(
 		}
 	}
 	Super::EndPlay(EndPlayReason);
+}
+
+void AMatterFluxCharacter::UpdateItemOcclusionGhosting()
+{
+	UWorld* World = GetWorld();
+	if (!World || !IsLocallyControlled() || !FollowCamera
+		|| !GetCapsuleComponent())
+	{
+		RestoreItemOcclusionGhosts();
+		return;
+	}
+
+	const FVector CameraLocation = FollowCamera->GetComponentLocation();
+	const FVector ViewerCenter = GetCapsuleComponent()->GetComponentLocation();
+	const FVector ViewerExtent(
+		GetCapsuleComponent()->GetScaledCapsuleRadius(),
+		GetCapsuleComponent()->GetScaledCapsuleRadius(),
+		GetCapsuleComponent()->GetScaledCapsuleHalfHeight());
+	const FBox ViewerBounds(ViewerCenter - ViewerExtent, ViewerCenter + ViewerExtent);
+	for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
+	{
+		It->UpdateLocalFragmentItemOcclusion(CameraLocation, ViewerBounds);
+	}
+
+	TArray<MatterFlux::ItemOcclusion::FItem, TInlineAllocator<32>> Items;
+	TMap<FGuid, TPair<TWeakObjectPtr<AActor>, FLinearColor>> ActorsByItemId;
+	for (TActorIterator<AFragment2DSourceActor> It(World); It; ++It)
+	{
+		AFragment2DSourceActor* Source = *It;
+		if (!IsValid(Source) || Source->bBroken
+			|| Source->StructuralRole
+				!= EMatterFluxMaterialStructuralRole::None
+			|| !Source->SourceId.IsValid())
+		{
+			continue;
+		}
+		const FBox Bounds = Source->GetActiveWorldBounds();
+		if (!Bounds.IsValid)
+		{
+			continue;
+		}
+		Items.Add({
+			Source->SourceId,
+			Source->AggregateId,
+			Bounds,
+			Source->GetCellSize()});
+		ActorsByItemId.Add(
+			Source->SourceId,
+			TPair<TWeakObjectPtr<AActor>, FLinearColor>(
+				Source, Source->FragmentColor));
+	}
+	for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+	{
+		AFragment2DActor* Fragment = *It;
+		if (!IsValid(Fragment) || !Fragment->SpawnPayload.FragmentId.IsValid())
+		{
+			continue;
+		}
+		const FBox Bounds = Fragment->MeshComponent
+			? Fragment->MeshComponent->Bounds.GetBox()
+			: FBox(ForceInit);
+		if (!Bounds.IsValid)
+		{
+			continue;
+		}
+		const float CellSize = Fragment->SpawnPayload.DetachedVoxelMask.IsValid()
+			? Fragment->SpawnPayload.DetachedVoxelMask.CellSize
+			: FMath::Max(Fragment->SpawnPayload.Thickness, 1.0f);
+		Items.Add({
+			Fragment->SpawnPayload.FragmentId,
+			Fragment->SpawnPayload.FragmentId,
+			Bounds,
+			CellSize});
+		ActorsByItemId.Add(
+			Fragment->SpawnPayload.FragmentId,
+			TPair<TWeakObjectPtr<AActor>, FLinearColor>(
+				Fragment, Fragment->FragmentColor));
+	}
+
+	MatterFlux::ItemOcclusion::FResult Result;
+	MatterFlux::ItemOcclusion::Resolve(
+		CameraLocation, ViewerBounds, Items, Result);
+	TSet<TWeakObjectPtr<AActor>> DesiredActors;
+	for (const FGuid& ItemId : Result.GhostItemIds)
+	{
+		const TPair<TWeakObjectPtr<AActor>, FLinearColor>* Item =
+			ActorsByItemId.Find(ItemId);
+		AActor* Actor = Item ? Item->Key.Get() : nullptr;
+		UMeshComponent* ItemMesh = nullptr;
+		if (AFragment2DSourceActor* Source = Cast<AFragment2DSourceActor>(Actor))
+		{
+			ItemMesh = Source->MeshComponent.Get();
+		}
+		else if (AFragment2DActor* Fragment = Cast<AFragment2DActor>(Actor))
+		{
+			ItemMesh = Fragment->MeshComponent.Get();
+		}
+		if (Actor && ItemMesh)
+		{
+			DesiredActors.Add(TWeakObjectPtr<AActor>(Actor));
+			ApplyItemOcclusionGhost(*Actor, *ItemMesh, Item->Value);
+		}
+	}
+
+	for (auto It = ItemOcclusionGhostStates.CreateIterator(); It; ++It)
+	{
+		AActor* Actor = It.Key().Get();
+		if (Actor && DesiredActors.Contains(TWeakObjectPtr<AActor>(Actor)))
+		{
+			continue;
+		}
+		FItemOcclusionGhostState& State = It.Value();
+		if (UMeshComponent* ItemMesh = State.Mesh.Get())
+		{
+			for (int32 Slot = 0; Slot < State.SolidMaterials.Num(); ++Slot)
+			{
+				if (ItemMesh->GetMaterial(Slot) == State.GhostMaterials[Slot].Get())
+				{
+					ItemMesh->SetMaterial(Slot, State.SolidMaterials[Slot].Get());
+				}
+			}
+		}
+		It.RemoveCurrent();
+	}
+}
+
+void AMatterFluxCharacter::ApplyItemOcclusionGhost(
+	AActor& Actor,
+	UMeshComponent& ItemMesh,
+	const FLinearColor& Color)
+{
+	if (!ItemOcclusionGhostMaterial)
+	{
+		return;
+	}
+	const TWeakObjectPtr<AActor> ActorKey(&Actor);
+	if (FItemOcclusionGhostState* Existing =
+		ItemOcclusionGhostStates.Find(ActorKey))
+	{
+		if (Existing->Mesh.Get() == &ItemMesh)
+		{
+			const int32 ExistingSlotCount = FMath::Min(
+				Existing->SolidMaterials.Num(),
+				Existing->GhostMaterials.Num());
+			for (int32 Slot = 0; Slot < ExistingSlotCount; ++Slot)
+			{
+				UMaterialInterface* Ghost = Existing->GhostMaterials[Slot].Get();
+				if (Ghost && ItemMesh.GetMaterial(Slot) != Ghost)
+				{
+					// A reaction or mesh rebuild may replace its own material while
+					// occluded. Preserve that newest solid state before reapplying.
+					Existing->SolidMaterials[Slot] = ItemMesh.GetMaterial(Slot);
+					ItemMesh.SetMaterial(Slot, Ghost);
+				}
+			}
+		}
+		return;
+	}
+
+	FItemOcclusionGhostState& State = ItemOcclusionGhostStates.Add(ActorKey);
+	State.Mesh = &ItemMesh;
+	const int32 MaterialCount = ItemMesh.GetNumMaterials();
+	State.SolidMaterials.Reserve(MaterialCount);
+	State.GhostMaterials.Reserve(MaterialCount);
+	for (int32 Slot = 0; Slot < MaterialCount; ++Slot)
+	{
+		State.SolidMaterials.Add(ItemMesh.GetMaterial(Slot));
+		UMaterialInstanceDynamic* Ghost = UMaterialInstanceDynamic::Create(
+			ItemOcclusionGhostMaterial, this);
+		Ghost->SetVectorParameterValue(
+			TEXT("Color"), FLinearColor(Color.R, Color.G, Color.B, 1.0f));
+		Ghost->SetScalarParameterValue(TEXT("Opacity"), 0.075f);
+		Ghost->SetScalarParameterValue(TEXT("FaceContrast"), 0.68f);
+		Ghost->SetScalarParameterValue(TEXT("PixelSize"), 10.0f);
+		Ghost->SetScalarParameterValue(TEXT("Roughness"), 0.82f);
+		Ghost->SetScalarParameterValue(TEXT("ShadowLift"), 0.32f);
+		State.GhostMaterials.Add(Ghost);
+		ItemMesh.SetMaterial(Slot, Ghost);
+	}
+}
+
+void AMatterFluxCharacter::RestoreItemOcclusionGhosts()
+{
+	for (TPair<TWeakObjectPtr<AActor>, FItemOcclusionGhostState>& Pair
+		: ItemOcclusionGhostStates)
+	{
+		FItemOcclusionGhostState& State = Pair.Value;
+		if (UMeshComponent* ItemMesh = State.Mesh.Get())
+		{
+			for (int32 Slot = 0; Slot < State.SolidMaterials.Num(); ++Slot)
+			{
+				if (ItemMesh->GetMaterial(Slot) == State.GhostMaterials[Slot].Get())
+				{
+					ItemMesh->SetMaterial(Slot, State.SolidMaterials[Slot].Get());
+				}
+			}
+		}
+	}
+	ItemOcclusionGhostStates.Reset();
 }
 
 UAbilitySystemComponent* AMatterFluxCharacter::GetAbilitySystemComponent() const

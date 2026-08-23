@@ -15,6 +15,7 @@ class UInstancedStaticMeshComponent;
 class ULocalPlayer;
 class UMaterialInstanceDynamic;
 class UMaterialInterface;
+class UMeshComponent;
 class UMatterFluxBuoyancyComponent;
 class USpringArmComponent;
 class UStaticMeshComponent;
@@ -36,6 +37,7 @@ public:
 	AMatterFluxCharacter();
 
 	virtual void BeginPlay() override;
+	virtual void Tick(float DeltaSeconds) override;
 	virtual void EndPlay(
 		const EEndPlayReason::Type EndPlayReason) override;
 	virtual UAbilitySystemComponent* GetAbilitySystemComponent() const override;
@@ -123,6 +125,19 @@ private:
 		int32 IntegerValue = 0);
 	void ClearCutEffect();
 	void ClearFlameEffect();
+	void UpdateItemOcclusionGhosting();
+	void RestoreItemOcclusionGhosts();
+	void ApplyItemOcclusionGhost(
+		AActor& Actor,
+		UMeshComponent& ItemMesh,
+		const FLinearColor& Color);
+
+	struct FItemOcclusionGhostState
+	{
+		TWeakObjectPtr<UMeshComponent> Mesh;
+		TArray<TWeakObjectPtr<UMaterialInterface>> SolidMaterials;
+		TArray<TWeakObjectPtr<UMaterialInterface>> GhostMaterials;
+	};
 
 	UFUNCTION(NetMulticast, Unreliable)
 	void MulticastPlayAbilityEffect(
@@ -168,6 +183,12 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInterface> PlayerOutlineMaterial;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInterface> ItemOcclusionGhostMaterial;
+
+	TMap<TWeakObjectPtr<AActor>, FItemOcclusionGhostState>
+		ItemOcclusionGhostStates;
 
 	FTimerHandle CutEffectTimer;
 	FTimerHandle FlameEffectTimer;

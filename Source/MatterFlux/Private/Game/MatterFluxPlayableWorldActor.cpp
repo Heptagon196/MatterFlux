@@ -30,6 +30,7 @@
 #include "Net/UnrealNetwork.h"
 #include "ProceduralMeshComponent.h"
 #include "Rendering/MatterFluxInstanceVisuals.h"
+#include "Rendering/MatterFluxItemOcclusion.h"
 #include "Rendering/MatterFluxLiquidSurfaceProjection.h"
 #include "Stats/Stats.h"
 #include "UObject/ConstructorHelpers.h"
@@ -2600,6 +2601,58 @@ int32 AMatterFluxPlayableWorldActor::
 	return FragmentSourceProxy
 		? FragmentSourceProxy->GetVisibleSourceCount()
 		: 0;
+}
+
+void AMatterFluxPlayableWorldActor::UpdateLocalFragmentItemOcclusion(
+	const FVector& CameraLocation,
+	const FBox& ViewerBounds)
+{
+	if (!FragmentSourceProxy)
+	{
+		return;
+	}
+	if (CameraLocation.ContainsNaN() || !ViewerBounds.IsValid)
+	{
+		FragmentSourceProxy->SetGhostedSources(TSet<FGuid>());
+		return;
+	}
+
+	FBox QueryBounds(ForceInit);
+	QueryBounds += CameraLocation;
+	QueryBounds += ViewerBounds.Min;
+	QueryBounds += ViewerBounds.Max;
+	QueryBounds = QueryBounds.ExpandBy(260.0f);
+	TArray<const MatterFlux::PlayableLevel::FLevelFragmentSource*> Candidates;
+	GatherLogicalFragmentSourceCandidates(QueryBounds, Candidates);
+	TArray<MatterFlux::ItemOcclusion::FItem, TInlineAllocator<64>> Items;
+	Items.Reserve(Candidates.Num());
+	for (const MatterFlux::PlayableLevel::FLevelFragmentSource* Source
+		: Candidates)
+	{
+		if (!Source
+			|| RemovedFragmentSourceIds.Contains(Source->SourceId)
+			|| GeneratedFragmentSources.Contains(Source->SourceId)
+			|| DynamicAggregateCarriers.Contains(Source->SourceId))
+		{
+			continue;
+		}
+		const FBox WorldBounds = BuildFragmentSourceLocalBounds(*Source)
+			.TransformBy(GetActorTransform().ToMatrixWithScale());
+		if (!WorldBounds.IsValid)
+		{
+			continue;
+		}
+		Items.Add({
+			Source->SourceId,
+			Source->AggregateId,
+			WorldBounds,
+			Source->Mask.CellSize});
+	}
+
+	MatterFlux::ItemOcclusion::FResult Result;
+	MatterFlux::ItemOcclusion::Resolve(
+		CameraLocation, ViewerBounds, Items, Result);
+	FragmentSourceProxy->SetGhostedSources(Result.GhostItemIds);
 }
 
 void AMatterFluxPlayableWorldActor::SetFragmentSourceDebugIsolatedAggregate(

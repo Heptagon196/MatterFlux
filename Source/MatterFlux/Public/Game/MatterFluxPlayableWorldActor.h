@@ -191,6 +191,10 @@ public:
 
 	UFUNCTION(BlueprintPure, Category = "Playable World|Streaming")
 	int32 GetVisibleFragmentSourceProxyCount() const;
+	/** Updates the local camera-only ghost projection for merged material items. */
+	void UpdateLocalFragmentItemOcclusion(
+		const FVector& CameraLocation,
+		const FBox& ViewerBounds);
 	/** Restricts merged source presentation for deterministic visual QA. Invalid restores all. */
 	void SetFragmentSourceDebugIsolatedAggregate(const FGuid& AggregateId);
 	bool FindNearestTreeAggregateForVisualInspection(

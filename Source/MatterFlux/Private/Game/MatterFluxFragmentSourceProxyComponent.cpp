@@ -16,6 +16,7 @@ namespace
 		float CellSize = 1.0f;
 		bool bSide = false;
 		bool bCollision = false;
+		bool bGhost = false;
 		TArray<FVector> Vertices;
 		TArray<int32> Triangles;
 		TArray<FVector> Normals;
@@ -28,15 +29,17 @@ namespace
 		const FLinearColor& Color,
 		const float CellSize,
 		const bool bSide,
-		const bool bCollision = false)
+		const bool bCollision = false,
+		const bool bGhost = false)
 	{
 		return FString::Printf(
-			TEXT("%s|%08x|%08x|%s|%s"),
+			TEXT("%s|%08x|%08x|%s|%s|%s"),
 			*MaterialId.ToString(),
 			Color.ToFColor(false).DWColor(),
 			GetTypeHash(CellSize),
 			bSide ? TEXT("side") : TEXT("face"),
-			bCollision ? TEXT("collision") : TEXT("visual"));
+			bCollision ? TEXT("collision") : TEXT("visual"),
+			bGhost ? TEXT("ghost") : TEXT("solid"));
 	}
 
 	void AppendMeshPart(
@@ -114,6 +117,9 @@ UMatterFluxFragmentSourceProxyComponent::
 	UMatterFluxFragmentSourceProxyComponent()
 {
 	PrimaryComponentTick.bCanEverTick = false;
+	GhostMaterialTemplate = LoadObject<UMaterialInterface>(
+		nullptr,
+		TEXT("/Game/MatterFlux/Materials/M_VoxelGas.M_VoxelGas"));
 }
 
 void UMatterFluxFragmentSourceProxyComponent::Configure(
@@ -287,6 +293,44 @@ void UMatterFluxFragmentSourceProxyComponent::SetSourceMaterialized(
 		DirtyChunks.Add(Locator->Chunk);
 		DeferredCombustionChunks.Remove(Locator->Chunk);
 	}
+}
+
+void UMatterFluxFragmentSourceProxyComponent::SetGhostedSources(
+	const TSet<FGuid>& SourceIds)
+{
+	bool bUnchanged = GhostedSourceIds.Num() == SourceIds.Num();
+	if (bUnchanged)
+	{
+		for (const FGuid& SourceId : SourceIds)
+		{
+			if (!GhostedSourceIds.Contains(SourceId))
+			{
+				bUnchanged = false;
+				break;
+			}
+		}
+	}
+	if (bUnchanged)
+	{
+		return;
+	}
+	TSet<FGuid> ChangedSourceIds = GhostedSourceIds;
+	for (const FGuid& SourceId : SourceIds)
+	{
+		if (!ChangedSourceIds.Remove(SourceId))
+		{
+			ChangedSourceIds.Add(SourceId);
+		}
+	}
+	GhostedSourceIds = SourceIds;
+	for (const FGuid& SourceId : ChangedSourceIds)
+	{
+		if (const FSourceLocator* Locator = SourceLocatorById.Find(SourceId))
+		{
+			DirtyChunks.Add(Locator->Chunk);
+		}
+	}
+	FlushPendingChanges();
 }
 
 void UMatterFluxFragmentSourceProxyComponent::SetDebugIsolatedAggregate(
@@ -471,6 +515,7 @@ void UMatterFluxFragmentSourceProxyComponent::ResetSources()
 	VisibleChunks.Reset();
 	CollisionChunks.Reset();
 	MaterializedSourceIds.Reset();
+	GhostedSourceIds.Reset();
 	DebugIsolatedAggregateId.Invalidate();
 	CombustingSourceIds.Reset();
 	DirtyChunks.Reset();
@@ -479,6 +524,7 @@ void UMatterFluxFragmentSourceProxyComponent::ResetSources()
 	SourceResidues.Reset();
 	CachedResidueMeshes.Reset();
 	Materials.Reset();
+	GhostMaterials.Reset();
 }
 
 int32 UMatterFluxFragmentSourceProxyComponent::GetVisibleSourceCount() const
@@ -558,6 +604,12 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 		{
 			continue;
 		}
+		const bool bGhostAggregate = TreeSources.ContainsByPredicate(
+			[this](const MatterFlux::PlayableLevel::FLevelFragmentSource* Source)
+			{
+				return Source
+					&& GhostedSourceIds.Contains(Source->SourceId);
+			});
 
 		// 新整体物体 Adapter：静态树与脱落后的动态树都把相同的
 		// mask 层交给 WholeObject 深模块。材料列表先按稳定键排序，
@@ -686,13 +738,15 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 					Material.Color,
 					CellSize,
 					bSide,
-					Section.bEnableCollision);
+					Section.bEnableCollision,
+					bGhostAggregate);
 				FProxyMeshGroup& Group = Groups.FindOrAdd(Key);
 				Group.MaterialId = Material.MaterialId;
 				Group.Color = Material.Color;
 				Group.CellSize = CellSize;
 				Group.bSide = bSide;
 				Group.bCollision = Section.bEnableCollision;
+				Group.bGhost = bGhostAggregate;
 				AppendMeshPart(
 					Group,
 					AggregateFrame,
@@ -904,13 +958,15 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 					Material.Color,
 					CellSize,
 					bSide,
-					Material.bCollision);
+					Material.bCollision,
+					bGhostAggregate);
 				FProxyMeshGroup& Group = Groups.FindOrAdd(Key);
 				Group.MaterialId = Material.MaterialId;
 				Group.Color = Material.Color;
 				Group.CellSize = CellSize;
 				Group.bSide = bSide;
 				Group.bCollision = Material.bCollision;
+				Group.bGhost = bGhostAggregate;
 				AppendMeshPart(
 					Group,
 					FTransform(Anchor),
@@ -948,7 +1004,7 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 			continue;
 		}
 		const auto AppendSource =
-			[&Groups, &Source](
+			[this, &Groups, &Source](
 				const FCachedSourceMesh& Cached,
 				const FName MaterialId,
 				const FLinearColor& Color,
@@ -961,13 +1017,15 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 						Color,
 						Source.Mask.CellSize,
 						bSide,
-						bCollision);
+						bCollision,
+						GhostedSourceIds.Contains(Source.SourceId));
 					FProxyMeshGroup& Group = Groups.FindOrAdd(Key);
 					Group.MaterialId = MaterialId;
 					Group.Color = Color;
 					Group.CellSize = Source.Mask.CellSize;
 					Group.bSide = bSide;
 					Group.bCollision = bCollision;
+					Group.bGhost = GhostedSourceIds.Contains(Source.SourceId);
 					AppendMeshPart(
 						Group,
 						Source.Transform,
@@ -1070,11 +1128,13 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 		bHasCollision |= Group.bCollision;
 		Mesh->SetMaterial(
 			SectionIndex,
-			FindOrCreateMaterial(
-				Group.MaterialId,
-				Group.Color,
-				Group.CellSize,
-				Group.bSide));
+			Group.bGhost
+				? FindOrCreateGhostMaterial(Group.Color, Group.CellSize)
+				: FindOrCreateMaterial(
+					Group.MaterialId,
+					Group.Color,
+					Group.CellSize,
+					Group.bSide));
 		++SectionIndex;
 	}
 	Mesh->SetCollisionEnabled(
@@ -1293,5 +1353,36 @@ UMaterialInstanceDynamic*
 				? MatterFlux::Rendering::EVoxelMaterialFaceRole::Side
 				: MatterFlux::Rendering::EVoxelMaterialFaceRole::Primary));
 	Materials.Add(Key, Material);
+	return Material;
+}
+
+UMaterialInstanceDynamic*
+	UMatterFluxFragmentSourceProxyComponent::FindOrCreateGhostMaterial(
+		const FLinearColor& Color,
+		const float CellSize)
+{
+	if (!GhostMaterialTemplate)
+	{
+		return nullptr;
+	}
+	const FName Key(*FString::Printf(
+		TEXT("%08x_%08x"),
+		Color.ToFColor(false).DWColor(),
+		GetTypeHash(CellSize)));
+	if (UMaterialInstanceDynamic* Existing = GhostMaterials.FindRef(Key))
+	{
+		return Existing;
+	}
+	UMaterialInstanceDynamic* Material = UMaterialInstanceDynamic::Create(
+		GhostMaterialTemplate, this);
+	Material->SetVectorParameterValue(
+		TEXT("Color"), FLinearColor(Color.R, Color.G, Color.B, 1.0f));
+	Material->SetScalarParameterValue(TEXT("Opacity"), 0.075f);
+	Material->SetScalarParameterValue(TEXT("FaceContrast"), 0.68f);
+	Material->SetScalarParameterValue(
+		TEXT("PixelSize"), FMath::Max(CellSize, 10.0f));
+	Material->SetScalarParameterValue(TEXT("Roughness"), 0.82f);
+	Material->SetScalarParameterValue(TEXT("ShadowLift"), 0.32f);
+	GhostMaterials.Add(Key, Material);
 	return Material;
 }
