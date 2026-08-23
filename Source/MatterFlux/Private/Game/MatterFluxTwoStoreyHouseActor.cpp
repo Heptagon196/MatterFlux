@@ -29,6 +29,11 @@ namespace
 	constexpr float InteriorActorGhostOpacity = 0.48f;
 	constexpr float FadeSpeed = 4.5f;
 	constexpr float InteriorMargin = 46.0f;
+	// Entering a floor is precise, but leaving uses a Schmitt-trigger envelope.
+	// CharacterMovement may briefly depenetrate a capsule beyond the strict
+	// interior bounds at walls, stair lips and low-FPS floor corrections.
+	constexpr float CutawayExitPadding = 80.0f;
+	constexpr float CutawayExitGraceSeconds = 0.18f;
 	constexpr int32 RoofStepCount = 12;
 	constexpr float RoofRun = 36.0f;
 	constexpr float RoofRise = 18.0f;
@@ -195,15 +200,7 @@ void AMatterFluxTwoStoreyHouseActor::Tick(const float DeltaSeconds)
 	RefreshReplicatedCuttableStructureSources(DeltaSeconds);
 	RebuildCuttableWholeObjectMesh();
 	ACharacter* Viewer = ResolveLocalViewer();
-	const int32 NewFloor = Viewer ? ResolveViewerFloor(*Viewer) : INDEX_NONE;
-	if (NewFloor != INDEX_NONE || CurrentCutawayFloor == INDEX_NONE)
-	{
-		CurrentCutawayFloor = NewFloor;
-	}
-	else if (!Viewer || !IsInsideHouse(Viewer->GetActorLocation()))
-	{
-		CurrentCutawayFloor = INDEX_NONE;
-	}
+	UpdateCutawayFloor(Viewer, DeltaSeconds);
 	UpdateStructureFade(DeltaSeconds, false);
 
 	InteriorScanAccumulator += FMath::Max(DeltaSeconds, 0.0f);
@@ -1323,6 +1320,52 @@ int32 AMatterFluxTwoStoreyHouseActor::ResolveViewerFloor(
 	return GetFloorIndexAtWorldLocation(Feet);
 }
 
+bool AMatterFluxTwoStoreyHouseActor::IsInsideCutawayRetentionVolume(
+	const FVector& WorldLocation) const
+{
+	const FVector Local = GetActorTransform().InverseTransformPosition(
+		WorldLocation);
+	return FMath::Abs(Local.X) <= HalfSizeX + CutawayExitPadding
+		&& FMath::Abs(Local.Y) <= HalfSizeY + CutawayExitPadding
+		&& Local.Z >= -40.0f - CutawayExitPadding
+		&& Local.Z <= UpperFloorTop + WallHeight + 100.0f
+			+ CutawayExitPadding;
+}
+
+void AMatterFluxTwoStoreyHouseActor::UpdateCutawayFloor(
+	ACharacter* Viewer,
+	const float DeltaSeconds)
+{
+	const int32 NewFloor = Viewer ? ResolveViewerFloor(*Viewer) : INDEX_NONE;
+	if (NewFloor != INDEX_NONE)
+	{
+		CurrentCutawayFloor = NewFloor;
+		CutawayExitAccumulator = 0.0f;
+		return;
+	}
+
+	if (CurrentCutawayFloor == INDEX_NONE)
+	{
+		CutawayExitAccumulator = 0.0f;
+		return;
+	}
+
+	// Preserve the last unambiguous floor throughout stairs and near the house
+	// shell.  Only samples outside the wider exit envelope count as leaving.
+	if (Viewer && IsInsideCutawayRetentionVolume(Viewer->GetActorLocation()))
+	{
+		CutawayExitAccumulator = 0.0f;
+		return;
+	}
+
+	CutawayExitAccumulator += FMath::Max(DeltaSeconds, 0.0f);
+	if (CutawayExitAccumulator >= CutawayExitGraceSeconds)
+	{
+		CurrentCutawayFloor = INDEX_NONE;
+		CutawayExitAccumulator = 0.0f;
+	}
+}
+
 void AMatterFluxTwoStoreyHouseActor::SetCutawayViewerOverride(
 	ACharacter* Viewer)
 {
@@ -1333,6 +1376,7 @@ void AMatterFluxTwoStoreyHouseActor::RefreshCutawayImmediately()
 {
 	ACharacter* Viewer = ResolveLocalViewer();
 	CurrentCutawayFloor = Viewer ? ResolveViewerFloor(*Viewer) : INDEX_NONE;
+	CutawayExitAccumulator = 0.0f;
 	UpdateStructureFade(0.0f, true);
 	UpdateInteriorActorFade(0.0f, true);
 }

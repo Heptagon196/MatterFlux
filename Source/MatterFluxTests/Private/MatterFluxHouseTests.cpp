@@ -694,6 +694,66 @@ bool FMatterFluxHouseCutawayTest::RunTest(const FString& Parameters)
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxHouseCutawayBoundaryJitterTest,
+	"MatterFlux.Playable.House.UpperFloorCutawayRejectsSingleFrameBoundaryJitter",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxHouseCutawayBoundaryJitterTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxTwoStoreyHouseActor* House = World
+		? SpawnAlways<AMatterFluxTwoStoreyHouseActor>(*World, FVector::ZeroVector)
+		: nullptr;
+	if (!TestNotNull(TEXT("House spawns for cutaway stability test"), House))
+	{
+		return false;
+	}
+	StartTestWorld(*World);
+
+	const float UpperZ = House->GetFloorSurfaceWorldZ(1);
+	AMatterFluxCharacter* Viewer = SpawnAlways<AMatterFluxCharacter>(
+		*World, FVector(480.0f, 0.0f, UpperZ + 88.0f));
+	if (!TestNotNull(TEXT("Viewer spawns on the upper floor"), Viewer))
+	{
+		return false;
+	}
+
+	House->SetCutawayViewerOverride(Viewer);
+	House->RefreshCutawayImmediately();
+	TestEqual(TEXT("Upper-floor cutaway starts active"),
+		House->GetCurrentCutawayFloor(), 1);
+	const float StableOpacity = House->GetCurrentStructureOpacity();
+	constexpr float HouseTickSeconds = 0.05f;
+
+	// CharacterMovement can produce a one-frame depenetration / floor-edge
+	// correction close to an exterior wall.  A single ambiguous sample must not
+	// restore the whole facade and flash it opaque before the capsule settles.
+	Viewer->SetActorLocation(FVector(515.0f, 0.0f, UpperZ + 88.0f));
+	House->Tick(HouseTickSeconds);
+	TestEqual(TEXT("One boundary sample preserves the last stable floor"),
+		House->GetCurrentCutawayFloor(), 1);
+	TestEqual(TEXT("One boundary sample does not brighten the facade"),
+		House->GetCurrentStructureOpacity(), StableOpacity);
+
+	Viewer->SetActorLocation(FVector(480.0f, 0.0f, UpperZ + 88.0f));
+	House->Tick(HouseTickSeconds);
+	TestEqual(TEXT("Returning inside keeps the upper cutaway stable"),
+		House->GetCurrentCutawayFloor(), 1);
+
+	Viewer->SetActorLocation(FVector(1400.0f, 0.0f, UpperZ + 88.0f));
+	for (int32 Frame = 0; Frame < 4; ++Frame)
+	{
+		House->Tick(HouseTickSeconds);
+	}
+	TestEqual(TEXT("Sustained movement away still restores the facade"),
+		House->GetCurrentCutawayFloor(), INDEX_NONE);
+	TestTrue(TEXT("Confirmed exit starts restoring structure opacity"),
+		House->GetCurrentStructureOpacity() > StableOpacity);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxHouseStairTraversalTest,
 	"MatterFlux.Playable.House.PlayerAndCreatureTraverseBothStoreys",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)

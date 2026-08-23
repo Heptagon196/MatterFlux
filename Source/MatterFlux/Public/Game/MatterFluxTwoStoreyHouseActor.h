@@ -148,6 +148,8 @@ private:
 
 	ACharacter* ResolveLocalViewer() const;
 	int32 ResolveViewerFloor(const ACharacter& Viewer) const;
+	bool IsInsideCutawayRetentionVolume(const FVector& WorldLocation) const;
+	void UpdateCutawayFloor(ACharacter* Viewer, float DeltaSeconds);
 	void UpdateStructureFade(float DeltaSeconds, bool bImmediate);
 	void UpdateInteriorActorFade(float DeltaSeconds, bool bImmediate);
 	void TrackInteriorMesh(UMeshComponent& Mesh);
@@ -193,6 +195,7 @@ private:
 	TMap<TWeakObjectPtr<UMeshComponent>, FTrackedMeshFade> TrackedInteriorMeshes;
 	TWeakObjectPtr<ACharacter> CutawayViewerOverride;
 	int32 CurrentCutawayFloor = INDEX_NONE;
+	float CutawayExitAccumulator = 0.0f;
 	float CurrentStructureOpacity = 1.0f;
 	float InteriorScanAccumulator = 0.0f;
 	float CuttableSourceDiscoveryAccumulator = 0.0f;
