@@ -62,6 +62,8 @@ public:
 	float GetCurrentStructureOpacity() const { return CurrentStructureOpacity; }
 	/** 返回地板表面当前本地显示透明度，便于 UI/测试核对切面语义。 */
 	float GetFloorSurfaceOpacity(int32 FloorIndex) const;
+	/** 返回指定楼层家具投影的最低透明度；没有家具时返回 1。 */
+	float GetFurnitureOpacity(int32 FloorIndex) const;
 	int32 GetTrackedInteriorActorCount() const;
 
 	/** 自动测试与截图可显式指定观察者；传 nullptr 恢复本地玩家自动选择。 */
@@ -85,10 +87,12 @@ private:
 	{
 		TWeakObjectPtr<UMeshComponent> Component;
 		FLinearColor Color = FLinearColor::White;
+		FName MaterialId = NAME_None;
 		int32 FloorTier = 0;
 		bool bNeverFade = false;
 		bool bFloorSurface = false;
 		bool bCuttable = false;
+		bool bInteriorFixture = false;
 		/**
 		 * 透明结构会在屏幕空间反复叠加；屋顶、墙、地板和家具必须
 		 * 使用不同目标透明度，否则六层屋瓦叠在一起仍会完全遮住室内。
@@ -118,7 +122,9 @@ private:
 		bool bNeverFade = false,
 		bool bFloorSurface = false,
 		float GhostOpacity = 0.12f,
-		bool bCuttable = false);
+		bool bCuttable = false,
+		bool bInteriorFixture = false,
+		FName MaterialId = NAME_None);
 	void AddBox(
 		UInstancedStaticMeshComponent& Group,
 		const FVector& Center,
@@ -165,11 +171,11 @@ private:
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UMaterialInstanceDynamic>> HouseMaterials;
 
-	/** 墙体和屋顶使用真正的碎片 Source；HISM 只保留不可切结构。 */
+	/** 墙体、屋顶和家具使用真正的碎片 Source；HISM 只保留不可切结构。 */
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<AFragment2DSourceActor>> CuttableStructureSources;
 
-	/** 墙与屋顶逻辑 Source 的统一表现；Source 自身只保留碰撞和伤害状态。 */
+	/** 房屋可切 Source 的统一表现；Source 自身只保留碰撞和伤害状态。 */
 	UPROPERTY(VisibleAnywhere, Transient, Category = "House|Rendering")
 	TObjectPtr<UProceduralMeshComponent> CuttableWholeObjectMesh;
 

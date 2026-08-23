@@ -445,6 +445,182 @@ bool FMatterFluxHouseStructureCutTest::RunTest(const FString& Parameters)
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxHouseFurnitureCutTest,
+	"MatterFlux.Playable.House.FurnitureUsesRegisteredCuttableSources",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxHouseFurnitureCutTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxTwoStoreyHouseActor* House = World
+		? SpawnAlways<AMatterFluxTwoStoreyHouseActor>(*World, FVector::ZeroVector)
+		: nullptr;
+	if (!TestNotNull(TEXT("House spawns for furniture cut test"), House))
+	{
+		return false;
+	}
+	StartTestWorld(*World);
+	if (!House->HasActorBegunPlay())
+	{
+		House->DispatchBeginPlay();
+	}
+
+	TArray<AFragment2DSourceActor*> FurnitureSources;
+	for (TActorIterator<AFragment2DSourceActor> It(World); It; ++It)
+	{
+		if (It->GetOwner() == House
+			&& It->ActorHasTag(TEXT("MatterFluxHouseFurniture")))
+		{
+			FurnitureSources.Add(*It);
+		}
+	}
+	if (!TestTrue(*FString::Printf(
+		TEXT("Every authored furniture piece enters canonical cuttable state (found %d)"),
+		FurnitureSources.Num()),
+		FurnitureSources.Num() >= 12))
+	{
+		return false;
+	}
+
+	AFragment2DSourceActor* Target = FurnitureSources[0];
+	double BestTableDistanceSquared = TNumericLimits<double>::Max();
+	const FVector TableTopLocal(-115.0f, -120.0f, 118.0f);
+	for (AFragment2DSourceActor* Source : FurnitureSources)
+	{
+		TestTrue(TEXT("Furniture keeps a semantic wood or fabric material fact"),
+			Source->SourceMaterialId == TEXT("wood")
+				|| Source->SourceMaterialId == TEXT("fabric"));
+		TestFalse(TEXT("Furniture logical sources never double-render"),
+			Source->MeshComponent->IsVisible());
+		if (Source->ActorHasTag(
+			TEXT("MatterFluxHouseGroup.LowerFurnitureWood")))
+		{
+			const FVector SourceLocal = House->GetActorTransform()
+				.InverseTransformPosition(Source->GetActorLocation());
+			const double DistanceSquared = FVector::DistSquared(
+				SourceLocal, TableTopLocal);
+			if (DistanceSquared < BestTableDistanceSquared)
+			{
+				BestTableDistanceSquared = DistanceSquared;
+				Target = Source;
+			}
+		}
+	}
+
+	const int32 RevisionBefore = Target->Revision;
+	FFragmentWorldCutRequest Request;
+	Request.CutShape.Type = EFragmentDamageShapeType::Circle;
+	Request.CutShape.WorldTransform = Target->GetActorTransform();
+	Request.CutShape.Radius = Target->GetCellSize() * 1.15f;
+	Request.DamagePower = 1000.0f;
+	Request.EventSeed = 0x4655524E;
+	Request.TargetPadding = 1.0f;
+	Request.MaxAffectedSources = 1;
+	UFragmentSimulationSubsystem* Subsystem =
+		World->GetSubsystem<UFragmentSimulationSubsystem>();
+	if (!TestNotNull(TEXT("World cut service exists for furniture"), Subsystem))
+	{
+		return false;
+	}
+	TestEqual(TEXT("The generic world cut accepts one furniture target"),
+		Subsystem->RequestWorldCut(Request), 1);
+	TestEqual(TEXT("The furniture material revision advances once"),
+		Target->Revision, RevisionBefore + 1);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxHouseWallEnvelopeContinuityTest,
+	"MatterFlux.Playable.House.WallEnvelopeHasNoStoreySeams",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxHouseWallEnvelopeContinuityTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxTwoStoreyHouseActor* House = World
+		? SpawnAlways<AMatterFluxTwoStoreyHouseActor>(*World, FVector::ZeroVector)
+		: nullptr;
+	if (!TestNotNull(TEXT("House spawns for wall continuity test"), House))
+	{
+		return false;
+	}
+	StartTestWorld(*World);
+	if (!House->HasActorBegunPlay())
+	{
+		House->DispatchBeginPlay();
+	}
+
+	TArray<AFragment2DSourceActor*> LowerWalls;
+	TArray<AFragment2DSourceActor*> UpperWalls;
+	for (TActorIterator<AFragment2DSourceActor> It(World); It; ++It)
+	{
+		if (It->GetOwner() != House)
+		{
+			continue;
+		}
+		if (It->ActorHasTag(TEXT("MatterFluxHouseGroup.LowerWalls")))
+		{
+			LowerWalls.Add(*It);
+		}
+		else if (It->ActorHasTag(TEXT("MatterFluxHouseGroup.UpperWalls")))
+		{
+			UpperWalls.Add(*It);
+		}
+	}
+	if (!TestEqual(TEXT("Every upper wall piece has a lower-storey counterpart"),
+		UpperWalls.Num(), LowerWalls.Num())
+		|| UpperWalls.IsEmpty())
+	{
+		return false;
+	}
+	TestTrue(TEXT("Both storeys project the identical plaster material fact"),
+		UpperWalls[0]->FragmentColor.Equals(
+			LowerWalls[0]->FragmentColor, 1.0e-4f));
+
+	for (AFragment2DSourceActor* Upper : UpperWalls)
+	{
+		// 门窗上方的短横梁在上下层之间刻意留下开口，不属于承重
+		// 外壳的竖向连续面。这里只检查贯穿楼层的墙段和角柱。
+		if (Upper->GetMaskHeight() < 10)
+		{
+			continue;
+		}
+		AFragment2DSourceActor* MatchingLower = nullptr;
+		double BestPlanarDistance = TNumericLimits<double>::Max();
+		for (AFragment2DSourceActor* Lower : LowerWalls)
+		{
+			if (Lower->GetMaskHeight() < 10)
+			{
+				continue;
+			}
+			const FVector Delta =
+				Upper->GetActorLocation() - Lower->GetActorLocation();
+			const double PlanarDistance =
+				Delta.X * Delta.X + Delta.Y * Delta.Y;
+			if (PlanarDistance < BestPlanarDistance)
+			{
+				BestPlanarDistance = PlanarDistance;
+				MatchingLower = Lower;
+			}
+		}
+		if (!TestNotNull(TEXT("Upper wall resolves its lower counterpart"),
+			MatchingLower))
+		{
+			continue;
+		}
+		const FBox LowerBounds =
+			MatchingLower->GetComponentsBoundingBox(true);
+		const FBox UpperBounds = Upper->GetComponentsBoundingBox(true);
+		TestTrue(*FString::Printf(
+			TEXT("Wall envelope is continuous through the floor band; gap=%.2f"),
+			UpperBounds.Min.Z - LowerBounds.Max.Z),
+			UpperBounds.Min.Z <= LowerBounds.Max.Z + 0.5f);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxHouseCutawayTest,
 	"MatterFlux.Playable.House.LocalFloorCutawayFadesStructureAndCreatures",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
@@ -478,6 +654,11 @@ bool FMatterFluxHouseCutawayTest::RunTest(const FString& Parameters)
 	House->RefreshCutawayImmediately();
 	TestEqual(TEXT("Viewer feet select the ground floor cutaway"),
 		House->GetCurrentCutawayFloor(), 0);
+	TestEqual(TEXT("Furniture on the viewer's floor remains fully visible"),
+		House->GetFurnitureOpacity(0), 1.0f);
+	TestTrue(TEXT("Furniture above the viewer is hidden with the upper storey"),
+		House->GetFurnitureOpacity(1) > 0.0f
+			&& House->GetFurnitureOpacity(1) < 0.30f);
 	TestTrue(TEXT("Walls, furniture and upper structure use ghost opacity"),
 		House->GetCurrentStructureOpacity() > 0.0f
 			&& House->GetCurrentStructureOpacity() < 0.10f);
@@ -496,6 +677,8 @@ bool FMatterFluxHouseCutawayTest::RunTest(const FString& Parameters)
 		House->GetCurrentCutawayFloor(), 1);
 	TestEqual(TEXT("The floor beneath the viewer remains opaque"),
 		House->GetFloorSurfaceOpacity(1), 1.0f);
+	TestEqual(TEXT("Upper-floor furniture remains visible beside the viewer"),
+		House->GetFurnitureOpacity(1), 1.0f);
 	TestEqual(TEXT("Same-floor creature remains a cutaway participant"),
 		House->GetTrackedInteriorActorCount(), 1);
 

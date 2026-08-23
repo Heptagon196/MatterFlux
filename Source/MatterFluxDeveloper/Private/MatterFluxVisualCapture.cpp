@@ -2540,6 +2540,9 @@ namespace
 		float MaximumResidentFeetZ = -TNumericLimits<float>::Max();
 		float MinimumResidentFeetZAfterUpper = TNumericLimits<float>::Max();
 		int32 ExteriorCutCaptureStage = 0;
+		int32 FurnitureCutCaptureStage = 0;
+		TWeakObjectPtr<AFragment2DSourceActor> FurnitureCutTarget;
+		int32 FurnitureRevisionBeforeCut = INDEX_NONE;
 	};
 
 	void RequestHouseScreenshot(
@@ -2909,7 +2912,8 @@ namespace
 		{
 			House->SetCutawayViewerOverride(nullptr);
 			const float GroundZ = House->GetFloorSurfaceWorldZ(0);
-			const FVector Local(-170.0f, -120.0f,
+			// 站到桌子左后方，保持一楼剖视激活但不遮挡家具刀口。
+			const FVector Local(-350.0f, 20.0f,
 				GroundZ - House->GetActorLocation().Z + 91.0f);
 			Character->SetActorLocation(
 				House->GetActorTransform().TransformPosition(Local),
@@ -2922,11 +2926,124 @@ namespace
 		}
 
 		case 2:
-			if (Now - State->PhaseStartedAt < 1.5)
+			if (Now - State->PhaseStartedAt < 1.5
+				&& State->FurnitureCutCaptureStage == 0)
 			{
 				return true;
 			}
-			RequestHouseScreenshot(*State, TEXT("01_GroundFloorCutaway.png"));
+			if (State->FurnitureCutCaptureStage == 0)
+			{
+				RequestHouseScreenshot(
+					*State, TEXT("01_GroundFloorCutaway.png"));
+				State->FurnitureCutCaptureStage = 1;
+				State->PhaseStartedAt = Now;
+				return true;
+			}
+			if (State->FurnitureCutCaptureStage == 1)
+			{
+				AFragment2DSourceActor* TargetFurniture = nullptr;
+				double BestDistanceSquared =
+					TNumericLimits<double>::Max();
+				const FVector TableTopLocal(-115.0f, -120.0f, 118.0f);
+				for (TActorIterator<AFragment2DSourceActor> It(World); It; ++It)
+				{
+					AFragment2DSourceActor* Candidate = *It;
+					if (!IsValid(Candidate)
+						|| Candidate->GetOwner() != House
+						|| !Candidate->ActorHasTag(
+							TEXT("MatterFluxHouseGroup.LowerFurnitureWood")))
+					{
+						continue;
+					}
+					const FVector CandidateLocal = House->GetActorTransform()
+						.InverseTransformPosition(Candidate->GetActorLocation());
+					const double DistanceSquared = FVector::DistSquared(
+						CandidateLocal, TableTopLocal);
+					if (DistanceSquared < BestDistanceSquared)
+					{
+						BestDistanceSquared = DistanceSquared;
+						TargetFurniture = Candidate;
+					}
+				}
+				UFragmentSimulationSubsystem* FragmentSubsystem =
+					World->GetSubsystem<UFragmentSimulationSubsystem>();
+				if (!TargetFurniture || !FragmentSubsystem)
+				{
+					UE_LOG(LogMatterFlux, Error,
+						TEXT("House visual sequence could not find a lower-floor furniture cut target."));
+					RestoreHouseCapture(*State);
+					if (State->bQuitAfterCapture)
+					{
+						FPlatformMisc::RequestExitWithStatus(false, 4);
+					}
+					return false;
+				}
+				FFragmentWorldCutRequest Request;
+				Request.CutShape.Type = EFragmentDamageShapeType::Circle;
+				Request.CutShape.WorldTransform =
+					TargetFurniture->GetActorTransform();
+				Request.CutShape.Radius =
+					TargetFurniture->GetCellSize() * 2.6f;
+				Request.DamagePower = 1200.0f;
+				Request.EventSeed = 0x4655524E;
+				Request.TargetPadding = 1.0f;
+				// 前一阶段墙切割可能留下穿过桌面的动态碎片。视觉验收的
+				// 查询半径只有约 31 cm，应处理该小范围内全部投影，而不是
+				// 让一块瞬时碎片抢走人为的单目标预算。
+				Request.MaxAffectedSources = 0;
+				State->FurnitureCutTarget = TargetFurniture;
+				State->FurnitureRevisionBeforeCut =
+					TargetFurniture->Revision;
+				UE_LOG(LogMatterFlux, Display,
+					TEXT("House visual sequence selected furniture local=%s mask=%dx%d."),
+					*House->GetActorTransform().InverseTransformPosition(
+						TargetFurniture->GetActorLocation()).ToCompactString(),
+					TargetFurniture->GetMaskWidth(),
+					TargetFurniture->GetMaskHeight());
+				if (UFragmentSimulationSubsystem::ExecuteWorldCut(
+					World, Request) < 1)
+				{
+					UE_LOG(LogMatterFlux, Error,
+						TEXT("House visual sequence could not commit its furniture world cut."));
+					RestoreHouseCapture(*State);
+					if (State->bQuitAfterCapture)
+					{
+						FPlatformMisc::RequestExitWithStatus(false, 4);
+					}
+					return false;
+				}
+				State->FurnitureCutCaptureStage = 2;
+				State->PhaseStartedAt = Now;
+				return true;
+			}
+			if (State->FurnitureCutCaptureStage == 2)
+			{
+				if (Now - State->PhaseStartedAt < 1.25)
+				{
+					return true;
+				}
+				AFragment2DSourceActor* Target =
+					State->FurnitureCutTarget.Get();
+				if (!Target
+					|| Target->Revision
+						<= State->FurnitureRevisionBeforeCut)
+				{
+					UE_LOG(LogMatterFlux, Error,
+						TEXT("House visual sequence furniture cut did not advance its canonical revision."));
+					RestoreHouseCapture(*State);
+					if (State->bQuitAfterCapture)
+					{
+						FPlatformMisc::RequestExitWithStatus(false, 4);
+					}
+					return false;
+				}
+				RequestHouseScreenshot(
+					*State,
+					TEXT("01_GroundFloorFurnitureAfterCut.png"));
+				State->FurnitureCutCaptureStage = 3;
+				State->PhaseStartedAt = Now;
+				return true;
+			}
 			State->Phase = 3;
 			State->PhaseStartedAt = Now;
 			return true;

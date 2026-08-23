@@ -223,7 +223,9 @@ AMatterFluxTwoStoreyHouseActor::CreateVoxelGroup(
 	const bool bNeverFade,
 	const bool bFloorSurface,
 	const float GhostOpacity,
-	const bool bCuttable)
+	const bool bCuttable,
+	const bool bInteriorFixture,
+	const FName MaterialId)
 {
 	UInstancedStaticMeshComponent* Group =
 		CreateDefaultSubobject<UInstancedStaticMeshComponent>(Name);
@@ -243,10 +245,12 @@ AMatterFluxTwoStoreyHouseActor::CreateVoxelGroup(
 	FStructureFadeGroup& Fade = StructureFadeGroups.AddDefaulted_GetRef();
 	Fade.Component = Group;
 	Fade.Color = Color;
+	Fade.MaterialId = MaterialId;
 	Fade.FloorTier = FloorTier;
 	Fade.bNeverFade = bNeverFade;
 	Fade.bFloorSurface = bFloorSurface;
 	Fade.bCuttable = bCuttable;
+	Fade.bInteriorFixture = bInteriorFixture;
 	Fade.GhostOpacity = FMath::Clamp(GhostOpacity, 0.0f, 1.0f);
 	return Group;
 }
@@ -272,20 +276,23 @@ void AMatterFluxTwoStoreyHouseActor::BuildFoundationAndFloors()
 {
 	UInstancedStaticMeshComponent* Foundation = CreateVoxelGroup(
 		TEXT("Foundation"), true, 0,
-		FLinearColor(0.22f, 0.25f, 0.28f), true);
+		FLinearColor(0.22f, 0.25f, 0.28f), true, false, 0.12f,
+		false, false, TEXT("stone"));
 	AddBox(*Foundation, FVector(0.0f, 0.0f, -54.0f),
 		FVector(1160.0f, 880.0f, 142.0f));
 
 	UInstancedStaticMeshComponent* GroundFloor = CreateVoxelGroup(
 		TEXT("GroundFloor"), true, 0,
-		FLinearColor(0.48f, 0.25f, 0.095f), true, true);
+		FLinearColor(0.48f, 0.25f, 0.095f), true, true, 0.12f,
+		false, false, TEXT("wood"));
 	AddBox(*GroundFloor,
 		FVector(0.0f, 0.0f, GroundFloorTop - FloorThickness * 0.5f),
 		FVector(1080.0f, 800.0f, FloorThickness));
 
 	UInstancedStaticMeshComponent* UpperFloor = CreateVoxelGroup(
 		TEXT("UpperFloor"), true, 1,
-		FLinearColor(0.54f, 0.30f, 0.12f), false, true, 0.16f);
+		FLinearColor(0.54f, 0.30f, 0.12f), false, true, 0.16f,
+		false, false, TEXT("wood"));
 	// 二楼地板围绕楼梯井分成四块，避免视觉地板和坡面碰撞互相穿插。
 	AddBox(*UpperFloor, FVector(-410.0f, 0.0f,
 		UpperFloorTop - FloorThickness * 0.5f),
@@ -305,35 +312,37 @@ void AMatterFluxTwoStoreyHouseActor::BuildWallsAndRoof()
 {
 	const FLinearColor Plaster(0.82f, 0.70f, 0.48f);
 	UInstancedStaticMeshComponent* LowerWalls = CreateVoxelGroup(
-		TEXT("LowerWalls"), true, 0, Plaster, false, false, 0.055f, true);
+		TEXT("LowerWalls"), true, 0, Plaster, false, false, 0.055f,
+		true, false, TEXT("stone"));
 	UInstancedStaticMeshComponent* UpperWalls = CreateVoxelGroup(
-		TEXT("UpperWalls"), true, 1, Plaster * 1.04f,
-		false, false, 0.055f, true);
+		TEXT("UpperWalls"), true, 1, Plaster,
+		false, false, 0.055f, true, false, TEXT("stone"));
 
 	const auto AddStoreyWalls = [this](
 		UInstancedStaticMeshComponent& Group,
-		const float BaseZ)
+		const float BaseZ,
+		const float Height)
 	{
-		const float CenterZ = BaseZ + WallHeight * 0.5f;
+		const float CenterZ = BaseZ + Height * 0.5f;
 		// 背向镜头的两面完整承重墙。
 		AddBox(Group, FVector(HalfSizeX - WallThickness * 0.5f, 0.0f, CenterZ),
-			FVector(WallThickness, HalfSizeY * 2.0f, WallHeight));
+			FVector(WallThickness, HalfSizeY * 2.0f, Height));
 		AddBox(Group, FVector(0.0f, -HalfSizeY + WallThickness * 0.5f, CenterZ),
-			FVector(HalfSizeX * 2.0f, WallThickness, WallHeight));
+			FVector(HalfSizeX * 2.0f, WallThickness, Height));
 		// 朝镜头的两面保留门洞和大窗，形成可读的娃娃屋切面。
 		AddBox(Group, FVector(-HalfSizeX + WallThickness * 0.5f, -275.0f, CenterZ),
-			FVector(WallThickness, 255.0f, WallHeight));
+			FVector(WallThickness, 255.0f, Height));
 		AddBox(Group, FVector(-HalfSizeX + WallThickness * 0.5f, 315.0f, CenterZ),
-			FVector(WallThickness, 210.0f, WallHeight));
+			FVector(WallThickness, 210.0f, Height));
 		AddBox(Group, FVector(-HalfSizeX + WallThickness * 0.5f, 20.0f,
-			BaseZ + WallHeight - 38.0f),
+			BaseZ + Height - 38.0f),
 			FVector(WallThickness, 335.0f, 76.0f));
 		AddBox(Group, FVector(-320.0f, HalfSizeY - WallThickness * 0.5f, CenterZ),
-			FVector(430.0f, WallThickness, WallHeight));
+			FVector(430.0f, WallThickness, Height));
 		AddBox(Group, FVector(405.0f, HalfSizeY - WallThickness * 0.5f, CenterZ),
-			FVector(310.0f, WallThickness, WallHeight));
+			FVector(310.0f, WallThickness, Height));
 		AddBox(Group, FVector(45.0f, HalfSizeY - WallThickness * 0.5f,
-			BaseZ + WallHeight - 38.0f),
+			BaseZ + Height - 38.0f),
 			FVector(300.0f, WallThickness, 76.0f));
 		// 角柱让开放切面仍然清楚表现为完整建筑。
 		for (const FVector2D Corner : {
@@ -343,11 +352,14 @@ void AMatterFluxTwoStoreyHouseActor::BuildWallsAndRoof()
 			FVector2D(HalfSizeX - 26.0f, HalfSizeY - 26.0f) })
 		{
 			AddBox(Group, FVector(Corner, CenterZ),
-				FVector(52.0f, 52.0f, WallHeight));
+				FVector(52.0f, 52.0f, Height));
 		}
 	};
-	AddStoreyWalls(*LowerWalls, GroundFloorTop);
-	AddStoreyWalls(*UpperWalls, UpperFloorTop);
+	AddStoreyWalls(*LowerWalls, GroundFloorTop, WallHeight);
+	// 二楼墙从楼板底开始包住楼板边缘；它与一楼墙共享同一体素
+	// 边界，楼板不再作为一圈棕色接缝暴露在外立面上。
+	AddStoreyWalls(*UpperWalls,
+		UpperFloorTop - FloorThickness, StoreyHeight);
 
 	// 屋顶是两片一格厚的阶梯瓦壳，不是逐层填满的实心山墙。
 	// 每一级左右各一条贯穿长轴的瓦梁，最高一级合并成屋脊。
@@ -355,7 +367,8 @@ void AMatterFluxTwoStoreyHouseActor::BuildWallsAndRoof()
 		TEXT("Roof"), false, 2,
 		// 旧值接近纯黑，背光坡面会完全丢失体素层级。颜色仍保持
 		// 深红陶瓦，但给真实光照和顶点 AO 留出足够动态范围。
-		FLinearColor(0.34f, 0.085f, 0.035f), false, false, 0.025f, true);
+		FLinearColor(0.34f, 0.085f, 0.035f), false, false, 0.025f,
+		true, false, TEXT("roof"));
 	const float RoofBottom = UpperFloorTop + WallHeight;
 	for (int32 Step = 0; Step <= RoofStepCount; ++Step)
 	{
@@ -384,7 +397,8 @@ void AMatterFluxTwoStoreyHouseActor::BuildStairs()
 {
 	UInstancedStaticMeshComponent* Stairs = CreateVoxelGroup(
 		TEXT("Stairs"), false, 0,
-		FLinearColor(0.34f, 0.16f, 0.055f), true);
+		FLinearColor(0.34f, 0.16f, 0.055f), true, false, 0.12f,
+		false, false, TEXT("wood"));
 	constexpr int32 StepCount = 14;
 	constexpr float StartX = -330.0f;
 	constexpr float Run = 660.0f;
@@ -415,16 +429,20 @@ void AMatterFluxTwoStoreyHouseActor::BuildFurniture()
 {
 	UInstancedStaticMeshComponent* LowerWood = CreateVoxelGroup(
 		TEXT("LowerFurnitureWood"), false, 0,
-		FLinearColor(0.36f, 0.15f, 0.045f), false, false, 0.22f);
+		FLinearColor(0.36f, 0.15f, 0.045f), false, false, 0.22f,
+		true, true, TEXT("wood"));
 	UInstancedStaticMeshComponent* LowerAccent = CreateVoxelGroup(
 		TEXT("LowerFurnitureAccent"), false, 0,
-		FLinearColor(0.12f, 0.38f, 0.36f), false, false, 0.22f);
+		FLinearColor(0.12f, 0.38f, 0.36f), false, false, 0.22f,
+		true, true, TEXT("fabric"));
 	UInstancedStaticMeshComponent* UpperWood = CreateVoxelGroup(
 		TEXT("UpperFurnitureWood"), false, 1,
-		FLinearColor(0.40f, 0.19f, 0.07f), false, false, 0.22f);
+		FLinearColor(0.40f, 0.19f, 0.07f), false, false, 0.22f,
+		true, true, TEXT("wood"));
 	UInstancedStaticMeshComponent* UpperAccent = CreateVoxelGroup(
 		TEXT("UpperFurnitureAccent"), false, 1,
-		FLinearColor(0.64f, 0.16f, 0.24f), false, false, 0.22f);
+		FLinearColor(0.64f, 0.16f, 0.24f), false, false, 0.22f,
+		true, true, TEXT("fabric"));
 
 	// 一楼：长桌、凳子、书架和地毯。
 	AddBox(*LowerWood, FVector(-115.0f, -120.0f, 118.0f),
@@ -502,6 +520,10 @@ void AMatterFluxTwoStoreyHouseActor::SpawnCuttableStructureSources()
 			return;
 		}
 		Source->Tags.AddUnique(TEXT("MatterFluxHouseStructure"));
+		if (Group.bInteriorFixture)
+		{
+			Source->Tags.AddUnique(TEXT("MatterFluxHouseFurniture"));
+		}
 		Source->Tags.AddUnique(FName(*FString::Printf(
 			TEXT("MatterFluxHouseGroup.%s"),
 			*GroupName.ToString())));
@@ -526,7 +548,6 @@ void AMatterFluxTwoStoreyHouseActor::SpawnCuttableStructureSources()
 		{
 			continue;
 		}
-
 		// 可切结构由 Source Actor 负责显示和碰撞；原 HISM 必须同时
 		// 关闭，否则切口后仍会看见一层未损坏的“幽灵墙”。
 		const bool bWasCollidable = Instances->GetCollisionEnabled()
@@ -686,10 +707,12 @@ void AMatterFluxTwoStoreyHouseActor::SpawnCuttableStructureSources()
 
 			constexpr float StructureCellSize = 17.0f;
 			FFragmentSourceMask Mask;
+			// 每个独立盒体都向共同体素格的外侧取整。向最近格收缩会在
+			// 相邻墙段、墙与楼板包边之间留下至多一格的可见裂缝。
 			Mask.Width = FMath::Clamp(
-				FMath::RoundToInt(Width / StructureCellSize), 1, 256);
+				FMath::CeilToInt(Width / StructureCellSize), 1, 256);
 			Mask.Height = FMath::Clamp(
-				FMath::RoundToInt(Height / StructureCellSize), 1, 256);
+				FMath::CeilToInt(Height / StructureCellSize), 1, 256);
 			Mask.CellSize = StructureCellSize;
 			Mask.MinFragmentAreaPixels = 3;
 			Mask.MaxFragmentsPerBreak = 16;
@@ -718,7 +741,8 @@ void AMatterFluxTwoStoreyHouseActor::SpawnCuttableStructureSources()
 				bWasCollidable,
 				Group,
 				Instances->GetFName(),
-				TEXT("stone"));
+				Group.MaterialId.IsNone()
+					? TEXT("stone") : Group.MaterialId);
 		}
 	}
 }
@@ -786,6 +810,7 @@ void AMatterFluxTwoStoreyHouseActor::RebuildCuttableWholeObjectMesh(
 		FTransform LocalTransform = FTransform::Identity;
 		float CellSize = 0.0f;
 		int32 FloorTier = 0;
+		bool bInteriorFixture = false;
 	};
 	TArray<FSourceView> SourceViews;
 	for (AFragment2DSourceActor* Source : CuttableStructureSources)
@@ -810,7 +835,10 @@ void AMatterFluxTwoStoreyHouseActor::RebuildCuttableWholeObjectMesh(
 			Source,
 			LocalTransform,
 			Source->GetCellSize(),
-			FloorTier});
+			FloorTier,
+			Source->ActorHasTag(TEXT("MatterFluxHouseFurniture"))
+				|| Source->SourceMaterialId == TEXT("wood")
+				|| Source->SourceMaterialId == TEXT("fabric")});
 	}
 	SourceViews.Sort([](const FSourceView& A, const FSourceView& B)
 	{
@@ -846,6 +874,7 @@ void AMatterFluxTwoStoreyHouseActor::RebuildCuttableWholeObjectMesh(
 			FName MaterialId = NAME_None;
 			FLinearColor Color = FLinearColor::White;
 			int32 FloorTier = 0;
+			bool bInteriorFixture = false;
 		};
 		TArray<FMaterialInfo> Materials;
 		for (const FSourceView& View : SourceViews)
@@ -855,8 +884,9 @@ void AMatterFluxTwoStoreyHouseActor::RebuildCuttableWholeObjectMesh(
 				continue;
 			}
 			const FString StableKey = FString::Printf(
-				TEXT("%d|%s|%08x"),
+				TEXT("%d|%d|%s|%08x"),
 				View.FloorTier,
+				View.bInteriorFixture ? 1 : 0,
 				*View.Source->SourceMaterialId.ToString(),
 				View.Source->FragmentColor.ToFColor(false).DWColor());
 			if (!Materials.ContainsByPredicate(
@@ -870,7 +900,8 @@ void AMatterFluxTwoStoreyHouseActor::RebuildCuttableWholeObjectMesh(
 					View.Source->FragmentMaterial,
 					View.Source->SourceMaterialId,
 					View.Source->FragmentColor,
-					View.FloorTier});
+					View.FloorTier,
+					View.bInteriorFixture});
 			}
 		}
 		Materials.Sort([](const FMaterialInfo& A, const FMaterialInfo& B)
@@ -886,8 +917,9 @@ void AMatterFluxTwoStoreyHouseActor::RebuildCuttableWholeObjectMesh(
 				continue;
 			}
 			const FString StableKey = FString::Printf(
-				TEXT("%d|%s|%08x"),
+				TEXT("%d|%d|%s|%08x"),
 				View.FloorTier,
+				View.bInteriorFixture ? 1 : 0,
 				*View.Source->SourceMaterialId.ToString(),
 				View.Source->FragmentColor.ToFColor(false).DWColor());
 			const int32 MaterialIndex = Materials.IndexOfByPredicate(
@@ -984,6 +1016,8 @@ void AMatterFluxTwoStoreyHouseActor::RebuildCuttableWholeObjectMesh(
 			Fade.Color = Info.Color;
 			Fade.FloorTier = Info.FloorTier;
 			Fade.bCuttable = true;
+			Fade.bInteriorFixture = Info.bInteriorFixture;
+			Fade.MaterialId = Info.MaterialId;
 			Fade.GhostOpacity = Info.FloorTier == 2 ? 0.025f : 0.055f;
 			Fade.MaterialSlots.Add(SectionIndex);
 			Fade.SolidMaterials.Add(Solid);
@@ -1037,7 +1071,9 @@ void AMatterFluxTwoStoreyHouseActor::RegisterCuttableSourceFade(
 	FStructureFadeGroup& Fade = StructureFadeGroups.AddDefaulted_GetRef();
 	Fade.Component = Source.MeshComponent;
 	Fade.Color = TemplateGroup.Color;
+	Fade.MaterialId = TemplateGroup.MaterialId;
 	Fade.FloorTier = TemplateGroup.FloorTier;
+	Fade.bInteriorFixture = TemplateGroup.bInteriorFixture;
 	Fade.GhostOpacity = TemplateGroup.GhostOpacity;
 	for (int32 SlotIndex = 0;
 		SlotIndex < Source.MeshComponent->GetNumMaterials(); ++SlotIndex)
@@ -1133,12 +1169,13 @@ void AMatterFluxTwoStoreyHouseActor::ConfigureGroupMaterials()
 		}
 		UMaterialInstanceDynamic* Solid = UMaterialInstanceDynamic::Create(
 			SolidMaterialTemplate, this);
-		Solid->SetVectorParameterValue(TEXT("Color"), Group.Color);
-		Solid->SetScalarParameterValue(TEXT("FaceContrast"), 0.78f);
-		Solid->SetScalarParameterValue(TEXT("ColorVariation"), 0.025f);
-		Solid->SetScalarParameterValue(TEXT("PixelSize"), 10.0f);
-		Solid->SetScalarParameterValue(TEXT("Roughness"), 0.88f);
-		Solid->SetScalarParameterValue(TEXT("ShadowLift"), 0.24f);
+		MatterFlux::Rendering::ApplyVoxelMaterialProjection(
+			*Solid,
+			MatterFlux::Rendering::ResolveVoxelMaterialProjection(
+				Group.Color,
+				Group.MaterialId,
+				17.0f,
+				MatterFlux::Rendering::EVoxelMaterialFaceRole::Primary));
 		Group.SolidMaterials.Reset();
 		TArray<int32> TargetSlots = Group.MaterialSlots;
 		if (TargetSlots.IsEmpty())
@@ -1312,11 +1349,13 @@ void AMatterFluxTwoStoreyHouseActor::UpdateStructureFade(
 		{
 			continue;
 		}
-		// 地板本身在玩家站立的楼层保持实显；墙、家具和生物属于
-		// “地板上方物体”，从当前楼层开始虚化。更高楼层的地板
-		// 仍然需要虚化，才能看到一楼室内。
+		// 墙和屋顶是相机遮挡层，因此从观察者所在楼层开始虚化；
+		// 地板和家具是室内内容，只隐藏更高楼层。同层家具必须保持
+		// 实显，否则玩家一进房间，真正想观察/切割的内容反而消失。
+		const bool bOnlyFadeAboveViewer =
+			Group.bFloorSurface || Group.bInteriorFixture;
 		const bool bGhost = CurrentCutawayFloor != INDEX_NONE
-			&& (Group.bFloorSurface
+			&& (bOnlyFadeAboveViewer
 				? Group.FloorTier > CurrentCutawayFloor
 				: Group.FloorTier >= CurrentCutawayFloor);
 		UMaterialInstanceDynamic* Ghost = Group.GhostMaterial.Get();
@@ -1390,6 +1429,20 @@ float AMatterFluxTwoStoreyHouseActor::GetFloorSurfaceOpacity(
 		}
 	}
 	return 1.0f;
+}
+
+float AMatterFluxTwoStoreyHouseActor::GetFurnitureOpacity(
+	const int32 FloorIndex) const
+{
+	float Opacity = 1.0f;
+	for (const FStructureFadeGroup& Group : StructureFadeGroups)
+	{
+		if (Group.bInteriorFixture && Group.FloorTier == FloorIndex)
+		{
+			Opacity = FMath::Min(Opacity, Group.CurrentOpacity);
+		}
+	}
+	return Opacity;
 }
 
 void AMatterFluxTwoStoreyHouseActor::TrackInteriorMesh(UMeshComponent& Mesh)

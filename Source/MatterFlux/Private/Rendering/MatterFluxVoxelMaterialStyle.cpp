@@ -24,6 +24,14 @@ namespace MatterFlux::Rendering
 			Style.ShadowLift = 0.34f;
 			Style.SideBrightness = 1.0f;
 		}
+		else if (MaterialId == TEXT("fabric"))
+		{
+			Style.FaceContrast = 0.58f;
+			Style.ColorVariation = 0.018f;
+			Style.Roughness = 0.94f;
+			Style.ShadowLift = 0.38f;
+			Style.SideBrightness = 0.90f;
+		}
 		else if (MaterialId == TEXT("leaf"))
 		{
 			Style.FaceContrast = 0.50f;
