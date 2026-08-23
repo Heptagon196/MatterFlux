@@ -7,6 +7,29 @@
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Misc/Crc.h"
 
+namespace
+{
+	constexpr float BlockedSpeedThreshold = 8.0f;
+	constexpr float BlockedRecoveryDelaySeconds = 0.5f;
+}
+
+bool MatterFlux::Creatures::ShouldHoldCombatPosition(
+	const EMatterFluxCreatureRuntimeState State,
+	const bool bHasVisibleTarget,
+	const float TargetDistance,
+	const float AttackRange)
+{
+	if (State != EMatterFluxCreatureRuntimeState::Chase
+		|| !bHasVisibleTarget
+		|| !FMath::IsFinite(TargetDistance)
+		|| AttackRange <= 0.0f)
+	{
+		return false;
+	}
+
+	return TargetDistance <= AttackRange;
+}
+
 AMatterFluxCreatureAIController::AMatterFluxCreatureAIController()
 {
 	PrimaryActorTick.bCanEverTick = true;
@@ -26,7 +49,9 @@ void AMatterFluxCreatureAIController::OnPossess(APawn* InPawn)
 	LastPatrolTurnTime = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
 	NextDecisionTime = -DBL_MAX;
 	MovementTarget.Reset();
+	bMovementTargetVisible = false;
 	MovementState = EMatterFluxCreatureRuntimeState::Passive;
+	BlockedDurationSeconds = 0.0f;
 }
 
 void AMatterFluxCreatureAIController::Tick(const float DeltaSeconds)
@@ -119,6 +144,7 @@ void AMatterFluxCreatureAIController::UpdateDecision(
 			*BehaviorError);
 	}
 	MovementTarget = Target;
+	bMovementTargetVisible = VisibleTarget != nullptr;
 	MovementState = State;
 	Creature.SetRuntimeStateAuthority(State);
 	if (Target && State == EMatterFluxCreatureRuntimeState::Attack)
@@ -177,12 +203,26 @@ void AMatterFluxCreatureAIController::ApplyMovement(
 	if (State == EMatterFluxCreatureRuntimeState::Skill
 		&& Creature.IsCastSequenceActive())
 	{
+		BlockedDurationSeconds = 0.0f;
+		return;
+	}
+	if (Target
+		&& MatterFlux::Creatures::ShouldHoldCombatPosition(
+			State,
+			bMovementTargetVisible,
+			FVector::Dist(
+				Creature.GetActorLocation(), Target->GetActorLocation()),
+			Definition->AttackRange))
+	{
+		BlockedDurationSeconds = 0.0f;
+		Creature.GetCharacterMovement()->StopMovementImmediately();
 		return;
 	}
 	if (State == EMatterFluxCreatureRuntimeState::Attack
 		|| State == EMatterFluxCreatureRuntimeState::Skill
 		|| State == EMatterFluxCreatureRuntimeState::Passive)
 	{
+		BlockedDurationSeconds = 0.0f;
 		Creature.GetCharacterMovement()->StopMovementImmediately();
 		return;
 	}
@@ -262,15 +302,16 @@ void AMatterFluxCreatureAIController::ApplyMovement(
 	if (!Direction.IsNearlyZero())
 	{
 		UCharacterMovementComponent* Movement = Creature.GetCharacterMovement();
-		if (Movement->Velocity.SizeSquared2D() < FMath::Square(8.0f))
+		if (Movement->Velocity.SizeSquared2D()
+			< FMath::Square(BlockedSpeedThreshold))
 		{
-			++BlockedDecisionCount;
+			BlockedDurationSeconds += FMath::Max(DeltaSeconds, 0.0f);
 		}
 		else
 		{
-			BlockedDecisionCount = 0;
+			BlockedDurationSeconds = 0.0f;
 		}
-		if (BlockedDecisionCount >= 5)
+		if (BlockedDurationSeconds >= BlockedRecoveryDelaySeconds)
 		{
 			if (State == EMatterFluxCreatureRuntimeState::Patrol
 				&& PatrolHouse.IsValid())
@@ -293,12 +334,12 @@ void AMatterFluxCreatureAIController::ApplyMovement(
 			{
 				Creature.Jump();
 			}
-			BlockedDecisionCount = 0;
+			BlockedDurationSeconds = 0.0f;
 		}
 		Creature.AddMovementInput(Direction, 1.0f);
 	}
 	else
 	{
-		BlockedDecisionCount = 0;
+		BlockedDurationSeconds = 0.0f;
 	}
 }

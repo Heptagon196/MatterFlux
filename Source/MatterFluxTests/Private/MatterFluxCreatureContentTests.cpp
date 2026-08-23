@@ -413,6 +413,37 @@ bool FMatterFluxCreatureAIDecisionTest::RunTest(const FString& Parameters)
 			Program, Context, State, Error));
 	TestEqual(TEXT("Ready ranged target selects attack"),
 		State, EMatterFluxCreatureRuntimeState::Attack);
+	Context.bAttackReady = false;
+	TestTrue(TEXT("Cooling-down attack tree evaluates"),
+		FMatterFluxCreatureBehaviorTreeEvaluator::Evaluate(
+			Program, Context, State, Error));
+	TestEqual(TEXT("Cooling-down ranged target falls through to chase"),
+		State, EMatterFluxCreatureRuntimeState::Chase);
+	TestTrue(TEXT("Chase input holds inside the attack band"),
+		MatterFlux::Creatures::ShouldHoldCombatPosition(
+			State,
+			Context.bHasVisibleTarget,
+			Context.TargetDistance,
+			Context.AttackRange));
+	TestFalse(TEXT("Remembered-only targets are still chased"),
+		MatterFlux::Creatures::ShouldHoldCombatPosition(
+			State,
+			false,
+			Context.TargetDistance,
+			Context.AttackRange));
+	Context.TargetDistance = 100.0f;
+	TestTrue(TEXT("Too-close cooldown tree evaluates"),
+		FMatterFluxCreatureBehaviorTreeEvaluator::Evaluate(
+			Program, Context, State, Error));
+	TestEqual(TEXT("Too-close target still selects retreat"),
+		State, EMatterFluxCreatureRuntimeState::Retreat);
+	TestFalse(TEXT("Retreat is never replaced by combat hold"),
+		MatterFlux::Creatures::ShouldHoldCombatPosition(
+			State,
+			Context.bHasVisibleTarget,
+			Context.TargetDistance,
+			Context.AttackRange));
+	Context.TargetDistance = 400.0f;
 	Context.bSkillReady = true;
 	TestTrue(TEXT("Skill tree evaluates"),
 		FMatterFluxCreatureBehaviorTreeEvaluator::Evaluate(

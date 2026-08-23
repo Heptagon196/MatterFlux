@@ -8,6 +8,16 @@
 
 class AMatterFluxTwoStoreyHouseActor;
 
+namespace MatterFlux::Creatures
+{
+	/** True when chase input should pause inside the configured combat band. */
+	MATTERFLUX_API bool ShouldHoldCombatPosition(
+		EMatterFluxCreatureRuntimeState State,
+		bool bHasVisibleTarget,
+		float TargetDistance,
+		float AttackRange);
+}
+
 /** Fixed-rate server-only interpreter for Lua creature AI programs. */
 UCLASS()
 class MATTERFLUX_API AMatterFluxCreatureAIController : public AAIController
@@ -45,9 +55,10 @@ private:
 	float RecoveryDirection = 1.0f;
 	TWeakObjectPtr<AMatterFluxTwoStoreyHouseActor> PatrolHouse;
 	TWeakObjectPtr<AActor> MovementTarget;
+	bool bMovementTargetVisible = false;
 	EMatterFluxCreatureRuntimeState MovementState =
 		EMatterFluxCreatureRuntimeState::Passive;
 	int32 HousePatrolWaypointIndex = 0;
-	int32 BlockedDecisionCount = 0;
+	float BlockedDurationSeconds = 0.0f;
 	int32 DecisionSerial = 0;
 };
