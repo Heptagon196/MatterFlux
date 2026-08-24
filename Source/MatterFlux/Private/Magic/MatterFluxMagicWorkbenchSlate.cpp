@@ -1,4 +1,5 @@
 #include "Magic/MatterFluxMagicWorkbenchSlate.h"
+#include "Magic/MatterFluxMagicIconResolver.h"
 #include "Magic/MatterFluxMagicWorkbenchWidget.h"
 #include "Magic/MatterFluxMagicWorkbenchInteraction.h"
 #include "Magic/MatterFluxSpellProgramLayout.h"
@@ -12,6 +13,8 @@
 #include "Progression/MatterFluxProgressionComponent.h"
 #include "IMatterFluxScriptRuntime.h"
 #include "Framework/Application/SlateApplication.h"
+#include "Brushes/SlateDynamicImageBrush.h"
+#include "Input/DragAndDrop.h"
 #include "InputCoreTypes.h"
 #include "Input/Reply.h"
 #include "Rendering/DrawElementTypes.h"
@@ -24,11 +27,11 @@
 #include "Widgets/Layout/SGridPanel.h"
 #include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Layout/SSeparator.h"
-#include "Widgets/Layout/SUniformGridPanel.h"
 #include "Widgets/Layout/SWrapBox.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/SOverlay.h"
 #include "Widgets/SNullWidget.h"
+#include "Widgets/SToolTip.h"
 #include "Widgets/Text/STextBlock.h"
 
 namespace MatterFluxMagicUI
@@ -58,16 +61,30 @@ namespace MatterFluxMagicUI
 	const FLinearColor SpellProjectile = FLinearColor::Black;
 	const FLinearColor SpellMulticast = FLinearColor::Black;
 	const FLinearColor SpellTrigger = FLinearColor::Black;
+	const FLinearColor ToolTipValue = SRGB(12, 132, 38);
 	constexpr float KeylineThickness = 2.0f;
 	// One outer size for every spell slot, regardless of whether it is shown in
 	// the inventory, a program tree, or the reserve list.  Keeping the size on
 	// the slot itself prevents parent layout panels from changing its geometry.
-	constexpr float SpellSlotSize = 58.0f;
-	constexpr float ProgramNodeWidth = 100.0f;
-	constexpr float ProgramNodeHeight = 78.0f;
-	constexpr float ProgramNodeLabelHeight = 14.0f;
-	constexpr float ProgramHorizontalGap = 36.0f;
-	constexpr float ProgramVerticalGap = 12.0f;
+	const FVector2D SpellSlotDimensions =
+		FMatterFluxMagicWorkbenchInteraction::GetSpellSlotSize();
+	const float SpellSlotWidth = static_cast<float>(SpellSlotDimensions.X);
+	const float SpellSlotHeight = static_cast<float>(SpellSlotDimensions.Y);
+	constexpr float WorkbenchUiScale = 1.25f;
+	constexpr float SpellIconSize = 58.0f;
+	const float ProgramNodeWidth = SpellSlotWidth;
+	const float ProgramNodeHeight = SpellSlotHeight;
+	constexpr float ProgramHorizontalGap = 45.0f;
+	constexpr float ProgramVerticalGap = 15.0f;
+
+	FSlateFontInfo WorkbenchFont(
+		const int32 BaseSize,
+		const bool bBold = false)
+	{
+		return Font(
+			FMath::RoundToInt(BaseSize * WorkbenchUiScale),
+			bBold);
+	}
 
 	FLinearColor SpellColor(const EMatterFluxSpellKind Kind)
 	{
@@ -105,6 +122,215 @@ namespace MatterFluxMagicUI
 		}
 	}
 
+	FString EquipmentKeyBadge(const int32 EquipmentSlot)
+	{
+		switch (EquipmentSlot)
+		{
+		case 0: return TEXT("L");
+		case 1: return TEXT("R");
+		case 2: return TEXT("Q");
+		case 3: return TEXT("E");
+		default: return TEXT("?");
+		}
+	}
+
+	TSharedRef<SWidget> ItemVisual(
+		const FSlateBrush* IconBrush,
+		const FText& FallbackBadge)
+	{
+		if (IconBrush)
+		{
+			return SNew(SBox)
+				.WidthOverride(SpellIconSize)
+				.HeightOverride(SpellIconSize)
+				.HAlign(HAlign_Center)
+				.VAlign(VAlign_Center)
+				[
+					SNew(SImage)
+					.Image(IconBrush)
+					.ColorAndOpacity(FLinearColor::White)
+				];
+		}
+		return SNew(STextBlock)
+			.Text(FallbackBadge)
+			.Font(WorkbenchFont(18, true))
+			.Justification(ETextJustify::Center)
+			.ColorAndOpacity(Ink);
+	}
+
+	TSharedRef<SWidget> BuildSpellItemFrame(
+		const FSlateBrush* IconBrush,
+		const FText& Badge,
+		const FText& Subtitle,
+		const FLinearColor& FillColor,
+		TSharedPtr<SBorder>* OutFocusBorder = nullptr)
+	{
+		TSharedRef<SBorder> Keyline = SNew(SBorder)
+			.BorderImage(FCoreStyle::Get().GetBrush(TEXT("GenericWhiteBox")))
+			.BorderBackgroundColor(Line)
+			.Padding(KeylineThickness)
+			[
+				SNew(SBorder)
+				.BorderImage(FCoreStyle::Get().GetBrush(TEXT("GenericWhiteBox")))
+				.BorderBackgroundColor(FillColor)
+				.Padding(2.0f)
+				[
+					SNew(SOverlay)
+					+ SOverlay::Slot()
+					.HAlign(HAlign_Center)
+					.VAlign(VAlign_Center)
+					[
+						ItemVisual(IconBrush, Badge)
+					]
+					+ SOverlay::Slot()
+					.HAlign(HAlign_Right)
+					.VAlign(VAlign_Bottom)
+					[
+						SNew(STextBlock)
+						.Text(Subtitle)
+						.Font(WorkbenchFont(9, true))
+						.ColorAndOpacity(Ink)
+					]
+				]
+			];
+		if (OutFocusBorder)
+		{
+			*OutFocusBorder = Keyline;
+		}
+		return SNew(SBox)
+			.WidthOverride(SpellSlotWidth)
+			.HeightOverride(SpellSlotHeight)
+			[Keyline];
+	}
+
+	FText SpellKindDisplayName(const EMatterFluxSpellKind Kind)
+	{
+		switch (Kind)
+		{
+		case EMatterFluxSpellKind::Modifier:
+			return FText::FromString(TEXT("修饰法术"));
+		case EMatterFluxSpellKind::Multicast:
+			return FText::FromString(TEXT("多重施法"));
+		case EMatterFluxSpellKind::Trigger:
+			return FText::FromString(TEXT("触发投射物"));
+		case EMatterFluxSpellKind::TriggerModifier:
+			return FText::FromString(TEXT("触发器"));
+		case EMatterFluxSpellKind::Jump:
+			return FText::FromString(TEXT("施法者动作"));
+		default:
+			return FText::FromString(TEXT("投射物"));
+		}
+	}
+
+	TSharedRef<SWidget> BuildSpellToolTipContent(
+		const FMatterFluxSpellDefinition& Definition)
+	{
+		TSharedRef<SGridPanel> Stats = SNew(SGridPanel);
+		int32 Row = 0;
+		const auto AddStat = [&Stats, &Row](
+			const FString& Label,
+			const FText& Value)
+		{
+			Stats->AddSlot(0, Row)
+			.Padding(0.0f, 2.0f, 18.0f, 2.0f)
+			.VAlign(VAlign_Center)
+			[
+				SNew(STextBlock)
+				.Text(FText::FromString(Label + TEXT("：")))
+				.Font(WorkbenchFont(12))
+				.ColorAndOpacity(Ink)
+			];
+			Stats->AddSlot(1, Row)
+			.Padding(0.0f, 2.0f)
+			.VAlign(VAlign_Center)
+			[
+				SNew(STextBlock)
+				.Text(Value)
+				.Font(WorkbenchFont(12, true))
+				.ColorAndOpacity(ToolTipValue)
+			];
+			++Row;
+		};
+
+		AddStat(TEXT("法术类型"), SpellKindDisplayName(Definition.Kind));
+		if (Definition.Kind == EMatterFluxSpellKind::Modifier
+			&& !FMath::IsNearlyZero(Definition.DamageAdd))
+		{
+			AddStat(TEXT("增加伤害"), FText::AsNumber(Definition.DamageAdd));
+		}
+		else if (Definition.Kind == EMatterFluxSpellKind::Projectile
+			|| Definition.Kind == EMatterFluxSpellKind::Trigger)
+		{
+			AddStat(TEXT("造成伤害"), FText::AsNumber(Definition.Damage));
+		}
+		if (Definition.Kind == EMatterFluxSpellKind::Multicast)
+		{
+			AddStat(TEXT("分支数量"), FText::AsNumber(Definition.DrawCount));
+		}
+		else if (Definition.DrawCount > 0)
+		{
+			AddStat(TEXT("抽取数量"), FText::AsNumber(Definition.DrawCount));
+		}
+		if (Definition.TriggerDrawCount > 0)
+		{
+			AddStat(TEXT("载荷数量"),
+				FText::AsNumber(Definition.TriggerDrawCount));
+		}
+		if (Definition.Kind == EMatterFluxSpellKind::Jump)
+		{
+			AddStat(TEXT("垂直冲量"),
+				FText::AsNumber(Definition.VerticalImpulse));
+		}
+		AddStat(TEXT("消耗法力"), FText::AsNumber(Definition.ManaCost));
+		if (!FMath::IsNearlyZero(Definition.CastDelayDelta))
+		{
+			AddStat(TEXT("施法延迟"), FText::FromString(FString::Printf(
+				TEXT("%+.2f 秒"), Definition.CastDelayDelta)));
+		}
+		if (!FMath::IsNearlyZero(Definition.RechargeTimeDelta))
+		{
+			AddStat(TEXT("充能时间"), FText::FromString(FString::Printf(
+				TEXT("%+.2f 秒"), Definition.RechargeTimeDelta)));
+		}
+
+		TSharedRef<SVerticalBox> Details = SNew(SVerticalBox);
+		Details->AddSlot().AutoHeight()
+		[
+			SNew(STextBlock)
+			.Text(FText::FromString(Definition.DisplayName))
+			.Font(WorkbenchFont(21, true))
+			.ColorAndOpacity(Ink)
+		];
+		Details->AddSlot().AutoHeight().Padding(0.0f, 12.0f, 0.0f, 14.0f)
+		[
+			SNew(STextBlock)
+			.Text(FText::FromString(Definition.Description))
+			.Font(WorkbenchFont(12))
+			.ColorAndOpacity(Muted)
+			.AutoWrapText(true)
+			.WrapTextAt(280.0f)
+		];
+		Details->AddSlot().AutoHeight()[Stats];
+
+		return SNew(SBorder)
+			.BorderImage(FCoreStyle::Get().GetBrush(TEXT("GenericWhiteBox")))
+			.BorderBackgroundColor(Ink)
+			.Padding(1.0f)
+			[
+				SNew(SBorder)
+					.BorderImage(FCoreStyle::Get().GetBrush(TEXT("GenericWhiteBox")))
+					.BorderBackgroundColor(FLinearColor::White)
+					.Padding(FMargin(17.0f, 14.0f, 18.0f, 16.0f))
+				[
+					SNew(SBox)
+						.WidthOverride(310.0f)
+					[
+						Details
+					]
+				]
+			];
+	}
+
 	enum class EDragSource : uint8
 	{
 		None,
@@ -122,6 +348,7 @@ namespace MatterFluxMagicUI
 		FText Label;
 		FText Badge;
 		FText Subtitle;
+		const FSlateBrush* IconBrush = nullptr;
 		FLinearColor Tint = FLinearColor::White;
 
 		bool IsValid() const
@@ -130,59 +357,32 @@ namespace MatterFluxMagicUI
 		}
 	};
 
-	class FMagicDragDropOperation : public FDragDropOperation
+	class FMagicDragDropOperation : public FGameDragDropOperation
 	{
 	public:
 		DRAG_DROP_OPERATOR_TYPE(
 			FMagicDragDropOperation,
-			FDragDropOperation)
+			FGameDragDropOperation)
 
 		FDragPayload Payload;
 
 		static TSharedRef<FMagicDragDropOperation> New(
-			const FDragPayload& InPayload)
+			const FDragPayload& InPayload,
+			const FVector2D& CursorScreenPosition)
 		{
 			TSharedRef<FMagicDragDropOperation> Operation =
 				MakeShared<FMagicDragDropOperation>();
 			Operation->Payload = InPayload;
-			Operation->DecoratorWidget = SNew(SBox)
-				.WidthOverride(SpellSlotSize)
-				.HeightOverride(SpellSlotSize)
-				[
-					SNew(SBorder)
-					.BorderImage(FCoreStyle::Get().GetBrush(TEXT("GenericWhiteBox")))
-					.BorderBackgroundColor(Ink)
-					.Padding(KeylineThickness)
-					[
-						SNew(SBorder)
-						.BorderImage(FCoreStyle::Get().GetBrush(TEXT("GenericWhiteBox")))
-						.BorderBackgroundColor(InPayload.Tint)
-						.Padding(2.0f)
-						[
-							SNew(SOverlay)
-							+ SOverlay::Slot()
-							.HAlign(HAlign_Center)
-							.VAlign(VAlign_Center)
-							[
-								SNew(STextBlock)
-								.Text(InPayload.Badge.IsEmpty()
-									? InPayload.Label : InPayload.Badge)
-								.Font(Font(18, true))
-								.Justification(ETextJustify::Center)
-								.ColorAndOpacity(Ink)
-							]
-							+ SOverlay::Slot()
-							.HAlign(HAlign_Right)
-							.VAlign(VAlign_Bottom)
-							[
-								SNew(STextBlock)
-								.Text(InPayload.Subtitle)
-								.Font(Font(9, true))
-								.ColorAndOpacity(Ink)
-							]
-						]
-					]
-				];
+			Operation->DecoratorPosition =
+				FMatterFluxMagicWorkbenchInteraction::
+					CalculateSpellDragDecoratorPosition(
+						CursorScreenPosition);
+			Operation->DecoratorWidget = BuildSpellItemFrame(
+				InPayload.IconBrush,
+				InPayload.Badge.IsEmpty()
+					? InPayload.Label : InPayload.Badge,
+				InPayload.Subtitle,
+				InPayload.Tint);
 			Operation->Construct();
 			return Operation;
 		}
@@ -190,6 +390,15 @@ namespace MatterFluxMagicUI
 		virtual TSharedPtr<SWidget> GetDefaultDecorator() const override
 		{
 			return DecoratorWidget;
+		}
+
+		virtual void OnDragged(
+			const FDragDropEvent& DragDropEvent) override
+		{
+			DecoratorPosition =
+				FMatterFluxMagicWorkbenchInteraction::
+					CalculateSpellDragDecoratorPosition(
+						DragDropEvent.GetScreenSpacePosition());
 		}
 
 	private:
@@ -201,13 +410,17 @@ namespace MatterFluxMagicUI
 	public:
 		SLATE_BEGIN_ARGS(SMagicItemSlot)
 			: _Badge(FText::GetEmpty())
+			, _IconBrush(nullptr)
+			, _ToolTipContent()
 			, _Tint(Slot)
 			, _bSelected(false)
 		{}
 			SLATE_ARGUMENT(FText, Badge)
 			SLATE_ARGUMENT(FText, Label)
 			SLATE_ARGUMENT(FText, Subtitle)
+			SLATE_ARGUMENT(const FSlateBrush*, IconBrush)
 			SLATE_ARGUMENT(FText, ToolTip)
+			SLATE_ARGUMENT(TSharedPtr<SWidget>, ToolTipContent)
 			SLATE_ARGUMENT(FLinearColor, Tint)
 			SLATE_ARGUMENT(bool, bSelected)
 			SLATE_ARGUMENT(FDragPayload, DragPayload)
@@ -227,49 +440,28 @@ namespace MatterFluxMagicUI
 			CanAcceptPayload = Args._CanAcceptPayload;
 			OnDropPayload = Args._OnDropPayload;
 			BaseBorderColor = Line;
-			SetToolTipText(Args._ToolTip);
+			if (Args._ToolTipContent.IsValid())
+			{
+				const TSharedRef<SToolTip> RichToolTip = SNew(SToolTip)
+					.TextMargin(FMargin(0.0f))
+					.BorderImage(FCoreStyle::Get().GetBrush(TEXT("NoBorder")))
+					[Args._ToolTipContent.ToSharedRef()];
+				SetToolTip(TAttribute<TSharedPtr<IToolTip>>(RichToolTip));
+			}
+			else
+			{
+				SetToolTipText(Args._ToolTip);
+			}
 			ChildSlot
 			[
-				SNew(SBox)
-				.WidthOverride(SpellSlotSize)
-				.HeightOverride(SpellSlotSize)
-				[
-					SAssignNew(FocusBorder, SBorder)
-					.BorderImage(FCoreStyle::Get().GetBrush(TEXT("GenericWhiteBox")))
-					.BorderBackgroundColor(BaseBorderColor)
-					.Padding(KeylineThickness)
-					[
-						SNew(SBorder)
-						.BorderImage(FCoreStyle::Get().GetBrush(TEXT("GenericWhiteBox")))
-						.BorderBackgroundColor(
-							Args._bSelected ? Selected : FLinearColor::White)
-						.Padding(2.0f)
-						[
-							SNew(SOverlay)
-							+ SOverlay::Slot()
-							.HAlign(HAlign_Center)
-							.VAlign(VAlign_Center)
-							[
-								SNew(STextBlock)
-								.Text(Args._Badge)
-								.Font(Font(18, true))
-								.Justification(ETextJustify::Center)
-								.ColorAndOpacity(
-									Args._bSelected ? FLinearColor::White : Ink)
-							]
-							+ SOverlay::Slot()
-							.HAlign(HAlign_Right)
-							.VAlign(VAlign_Bottom)
-							[
-								SNew(STextBlock)
-								.Text(Args._Subtitle)
-								.Font(Font(9, true))
-								.ColorAndOpacity(
-									Args._bSelected ? FLinearColor::White : Ink)
-							]
-						]
-					]
-				]
+				BuildSpellItemFrame(
+					Args._IconBrush,
+					Args._Badge,
+					Args._Subtitle,
+					Args._bSelected
+						? SRGB(234, 234, 234)
+						: FLinearColor::White,
+					&FocusBorder)
 			];
 		}
 
@@ -389,7 +581,9 @@ namespace MatterFluxMagicUI
 		{
 			return DragPayload.IsValid()
 				? FReply::Handled().BeginDragDrop(
-					FMagicDragDropOperation::New(DragPayload))
+					FMagicDragDropOperation::New(
+						DragPayload,
+						Event.GetScreenSpacePosition()))
 				: FReply::Unhandled();
 		}
 
@@ -540,18 +734,6 @@ namespace MatterFluxMagicUI
 			Definition.Spread));
 	}
 
-	FText SpellToolTip(const FMatterFluxSpellDefinition& Definition)
-	{
-		return FText::FromString(FString::Printf(
-			TEXT("%s\n%s\n\n法力 %.0f  伤害/强度 %.0f  抽取 %d\n施法 %+0.2f秒  充能 %+0.2f秒"),
-			*Definition.DisplayName,
-			*Definition.Description,
-			Definition.ManaCost,
-			Definition.Damage,
-			Definition.DrawCount,
-			Definition.CastDelayDelta,
-			Definition.RechargeTimeDelta));
-	}
 }
 
 namespace MatterFluxMagicUI
@@ -581,7 +763,7 @@ private:
 	{
 		return SNew(STextBlock)
 			.Text(FText::FromString(Text))
-			.Font(Font(14, true))
+			.Font(WorkbenchFont(14, true))
 			.ColorAndOpacity(Ink);
 	}
 
@@ -591,6 +773,34 @@ private:
 		const FLinearColor& Fill = FLinearColor::White) const
 	{
 		return MatterFlux::UI::Paper::Outline(Content, Padding, Fill);
+	}
+
+	const FSlateBrush* GetIconBrush(const FString& IconKey)
+	{
+		if (IconKey.IsEmpty())
+		{
+			return nullptr;
+		}
+		if (const TSharedPtr<FSlateDynamicImageBrush>* Existing =
+			IconBrushes.Find(IconKey))
+		{
+			return Existing->Get();
+		}
+
+		FString IconPath;
+		if (!FMatterFluxMagicIconResolver::TryResolveIconPath(
+			IconKey,
+			IconPath))
+		{
+			return nullptr;
+		}
+
+		TSharedPtr<FSlateDynamicImageBrush> Brush =
+			MakeShared<FSlateDynamicImageBrush>(
+				FName(*IconPath),
+				FVector2D(SpellIconSize, SpellIconSize));
+		IconBrushes.Add(IconKey, Brush);
+		return Brush.Get();
 	}
 
 	TSharedRef<SWidget> BuildWorkbench()
@@ -610,7 +820,7 @@ private:
 				[
 					SNew(STextBlock)
 					.Text(FText::FromString(TEXT("正在等待同步魔法背包……")))
-					.Font(Font(14, true))
+					.Font(WorkbenchFont(14, true))
 					.ColorAndOpacity(Ink)
 				];
 		}
@@ -654,19 +864,18 @@ private:
 		+ SOverlay::Slot()
 		.HAlign(HAlign_Fill)
 		.VAlign(VAlign_Fill)
-		.Padding(32.0f)
+		.Padding(24.0f)
 		[
 			SNew(SMatterFluxPaperWindow)
 			.Header()
 			[
-				BuildTabBar(*Inventory)
+				BuildTabBar()
 			]
 			[Page]
 		];
 	}
 
-	TSharedRef<SWidget> BuildTabBar(
-		const UMatterFluxMagicInventoryComponent& Inventory)
+	TSharedRef<SWidget> BuildTabBar()
 	{
 		const EMatterFluxWorkbenchPage Page = OwnerWidget->GetPage();
 		const bool bSpell = Page == EMatterFluxWorkbenchPage::SpellEditor;
@@ -674,40 +883,6 @@ private:
 		const bool bItem = Page == EMatterFluxWorkbenchPage::ItemBackpack;
 		const bool bQuest = Page == EMatterFluxWorkbenchPage::QuestJournal;
 		const bool bSettings = Page == EMatterFluxWorkbenchPage::Settings;
-		FString Help = TEXT("悬停条目可查看详细说明。");
-		if (bSpell)
-		{
-			Help = TEXT("拖拽法术到槽位编排；右键或 Delete 移除。\n连线表示施法程序的实际执行关系。");
-		}
-		else if (bWand)
-		{
-			Help = TEXT("拖拽法杖到目标键位槽装备；同一法杖只能占用一个键位。");
-		}
-		else if (bItem)
-		{
-			Help = TEXT("左键选择道具；右键或 Enter 使用可消耗道具。");
-		}
-		else if (bQuest)
-		{
-			Help = TEXT("左侧切换当前追踪任务；右侧显示必需与可选目标。");
-		}
-		else if (bSettings)
-		{
-			Help = TEXT("使用下拉框、复选框或滑动条调整；改动会立即应用并保存。");
-		}
-		int32 SyncRevision = Inventory.GetInventoryRevision();
-		if ((bItem || bQuest) && OwnerWidget.IsValid())
-		{
-			if (const UMatterFluxProgressionComponent* Progression =
-				OwnerWidget->ResolveProgression())
-			{
-				SyncRevision = Progression->GetRevision();
-			}
-		}
-		const FText HelpText = FText::FromString(bSettings
-			? Help
-			: FString::Printf(TEXT("%s\n\n同步版本：%d"), *Help,
-				SyncRevision));
 		auto Tab = [this](
 			const FString& Label,
 			const bool bSelected,
@@ -715,6 +890,7 @@ private:
 		{
 			return SNew(SMatterFluxPaperTab)
 				.Label(FText::FromString(Label))
+				.FontSize(18)
 				.bSelected(bSelected)
 				.OnClicked([SelectPage = MoveTemp(SelectPage)]() mutable
 				{
@@ -727,7 +903,7 @@ private:
 		.AutoWidth()
 		.Padding(8.0f, 6.0f, 4.0f, 6.0f)
 		[
-			Tab(TEXT("法术编程"), bSpell, [Owner = OwnerWidget]()
+			Tab(TEXT("法术"), bSpell, [Owner = OwnerWidget]()
 			{
 				if (Owner.IsValid()) Owner->ShowSpellEditor();
 			})
@@ -736,7 +912,7 @@ private:
 		.AutoWidth()
 		.Padding(0.0f, 6.0f, 4.0f, 6.0f)
 		[
-			Tab(TEXT("法杖背包"), bWand, [Owner = OwnerWidget]()
+			Tab(TEXT("法杖"), bWand, [Owner = OwnerWidget]()
 			{
 				if (Owner.IsValid()) Owner->ShowWandBackpack();
 			})
@@ -745,7 +921,7 @@ private:
 		.AutoWidth()
 		.Padding(0.0f, 6.0f, 4.0f, 6.0f)
 		[
-			Tab(TEXT("道具背包"), bItem, [Owner = OwnerWidget]()
+			Tab(TEXT("道具"), bItem, [Owner = OwnerWidget]()
 			{
 				if (Owner.IsValid()) Owner->ShowItemBackpack();
 			})
@@ -774,14 +950,6 @@ private:
 			.BorderImage(FCoreStyle::Get().GetBrush(TEXT("GenericWhiteBox")))
 			.BorderBackgroundColor(Panel)
 		]
-		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(5.0f)
-		[
-			SNew(SMatterFluxPaperTab)
-			.Label(FText::FromString(TEXT("?")))
-			.ToolTip(HelpText)
-			.Padding(FMargin(10.0f, 5.0f))
-			.OnClicked([]() { return FReply::Handled(); })
-		]
 		+ SHorizontalBox::Slot()
 		.AutoWidth()
 		.VAlign(VAlign_Center)
@@ -789,6 +957,7 @@ private:
 		[
 			SNew(SMatterFluxPaperTab)
 			.Label(FText::FromString(TEXT("×")))
+			.FontSize(18)
 			.ToolTip(FText::FromString(TEXT("关闭（I / Tab / Esc）")))
 			.Padding(FMargin(10.0f, 5.0f))
 			.OnClicked([Owner = OwnerWidget]()
@@ -817,7 +986,7 @@ private:
 			return OutlinedPanel(
 				SNew(STextBlock)
 				.Text(FText::FromString(TEXT("正在等待同步道具背包……")))
-				.Font(Font(14, true))
+				.Font(WorkbenchFont(14, true))
 				.ColorAndOpacity(Ink), FMargin(20.0f));
 		}
 
@@ -851,8 +1020,9 @@ private:
 			Grid->AddSlot().Padding(4.0f)
 			[
 				SNew(SMagicItemSlot)
-				.Badge(FText::FromString(Badge))
-				.Label(FText::FromString(Definition->DisplayName))
+					.Badge(FText::FromString(Badge))
+					.IconBrush(GetIconBrush(Definition->Icon))
+					.Label(FText::FromString(Definition->DisplayName))
 				.Subtitle(FText::AsNumber(Stack.Quantity))
 				.ToolTip(ToolTip)
 				.bSelected(SelectedItem == ItemId)
@@ -891,7 +1061,7 @@ private:
 					SelectedQuantity, SelectedDefinition->MaxStack,
 					*SelectedDefinition->Description)
 				: TEXT("从左侧选择一个道具。")))
-			.Font(Font(12))
+			.Font(WorkbenchFont(12))
 			.ColorAndOpacity(Ink)
 			.AutoWrapText(true)
 		];
@@ -915,7 +1085,7 @@ private:
 					OutlinedPanel(
 						SNew(STextBlock)
 						.Text(FText::FromString(TEXT("使用")))
-						.Font(Font(12, true))
+						.Font(WorkbenchFont(12, true))
 						.Justification(ETextJustify::Center)
 						.ColorAndOpacity(Ink), FMargin(18.0f, 7.0f))
 				]
@@ -952,7 +1122,7 @@ private:
 			return OutlinedPanel(
 				SNew(STextBlock)
 				.Text(FText::FromString(TEXT("正在等待同步任务……")))
-				.Font(Font(14, true))
+				.Font(WorkbenchFont(14, true))
 				.ColorAndOpacity(Ink), FMargin(20.0f));
 		}
 		TArray<const FMatterFluxQuestDefinition*> VisibleDefinitions;
@@ -1010,7 +1180,7 @@ private:
 						.Text(FText::FromString(FString::Printf(
 							TEXT("%s  %s"), bCompleted ? TEXT("■") : TEXT("□"),
 							*Definition->DisplayName)))
-						.Font(Font(12, bSelected))
+						.Font(WorkbenchFont(12, bSelected))
 						.Justification(ETextJustify::Center)
 						.ColorAndOpacity(bSelected ? FLinearColor::White : Ink),
 						FMargin(10.0f, 8.0f),
@@ -1040,7 +1210,7 @@ private:
 					&& !SelectedDefinition->CompletedDescription.IsEmpty()
 						? SelectedDefinition->CompletedDescription
 						: SelectedDefinition->Description))
-				.Font(Font(12))
+				.Font(WorkbenchFont(12))
 				.ColorAndOpacity(Ink)
 				.AutoWrapText(true)
 			];
@@ -1070,7 +1240,7 @@ private:
 						*Child->Description,
 						*ProgressText,
 						Child->bOptional ? TEXT("（可选）") : TEXT(""))))
-					.Font(Font(11))
+					.Font(WorkbenchFont(11))
 					.ColorAndOpacity(bChildCompleted ? Muted : Ink)
 					.AutoWrapText(true)
 				];
@@ -1103,10 +1273,6 @@ private:
 		const FMatterFluxContentRegistry& Registry)
 	{
 		TSharedRef<SVerticalBox> Content = SNew(SVerticalBox);
-		Content->AddSlot().AutoHeight().Padding(10.0f, 8.0f)
-		[
-			Heading(TEXT("法杖"))
-		];
 		TSharedRef<SWrapBox> WandGrid = SNew(SWrapBox).UseAllottedSize(true);
 		for (const FMatterFluxOwnedWand& Wand : Inventory.GetOwnedWands())
 		{
@@ -1121,12 +1287,14 @@ private:
 			Payload.WandId = Wand.InstanceId;
 			Payload.Label = FText::FromString(Definition->DisplayName);
 			Payload.Badge = FText::FromString(TEXT("杖"));
+			Payload.IconBrush = GetIconBrush(Definition->Icon);
 			Payload.Tint = FLinearColor::White;
 			const FGuid WandId = Wand.InstanceId;
 			WandGrid->AddSlot().Padding(3.0f)
 			[
 				SNew(SMagicItemSlot)
 				.Badge(FText::FromString(TEXT("杖")))
+				.IconBrush(Payload.IconBrush)
 				.Label(FText::FromString(Definition->DisplayName))
 				.Subtitle(FText::GetEmpty())
 				.ToolTip(WandToolTip(*Definition, Wand))
@@ -1139,7 +1307,7 @@ private:
 				})
 			];
 		}
-		Content->AddSlot().FillHeight(1.0f).Padding(7.0f, 0.0f, 7.0f, 7.0f)
+		Content->AddSlot().FillHeight(1.0f).Padding(7.0f)
 		[
 			SNew(SScrollBox)
 			+ SScrollBox::Slot()[WandGrid]
@@ -1160,10 +1328,6 @@ private:
 		const FMatterFluxContentRegistry& Registry)
 	{
 		TSharedRef<SVerticalBox> Equipment = SNew(SVerticalBox);
-		Equipment->AddSlot().AutoHeight().HAlign(HAlign_Center).Padding(0.0f, 5.0f)
-		[
-			Heading(TEXT("装备"))
-		];
 		for (int32 SlotIndex = 0; SlotIndex < 4; ++SlotIndex)
 		{
 			const FGuid EquippedId = Inventory.GetEquippedWands().IsValidIndex(SlotIndex)
@@ -1180,7 +1344,13 @@ private:
 				Payload.WandId = EquippedId;
 				Payload.Label = FText::FromString(
 					EquippedDefinition ? EquippedDefinition->DisplayName : TEXT("法杖"));
+				Payload.IconBrush = EquippedDefinition
+					? GetIconBrush(EquippedDefinition->Icon)
+					: nullptr;
 			}
+			const FSlateBrush* EquipmentIcon = EquippedId.IsValid()
+				? Payload.IconBrush
+				: GetIconBrush(TEXT("paper/add_sign"));
 			const int32 TargetSlot = SlotIndex;
 			const bool bIsActiveSlot = Inventory.GetActiveEquipmentSlot() == SlotIndex;
 			const bool bIsEditedSlot = EquippedId.IsValid()
@@ -1189,9 +1359,10 @@ private:
 			[
 				SNew(SMagicItemSlot)
 				.Badge(FText::FromString(EquippedId.IsValid() ? TEXT("杖") : TEXT("+")))
+				.IconBrush(EquipmentIcon)
 				.Label(FText::FromString(
 					EquippedDefinition ? EquippedDefinition->DisplayName : TEXT("拖入法杖")))
-				.Subtitle(FText::FromString(EquipmentKeyLabel(SlotIndex)))
+				.Subtitle(FText::FromString(EquipmentKeyBadge(SlotIndex)))
 				.ToolTip(EquippedWand && EquippedDefinition
 					? WandToolTip(*EquippedDefinition, *EquippedWand)
 					: FText::FromString(FString::Printf(
@@ -1239,7 +1410,7 @@ private:
 			];
 		}
 		return SNew(SBox)
-			.WidthOverride(74.0f)
+			.WidthOverride(93.0f)
 			[
 				OutlinedPanel(Equipment, FMargin(3.0f))
 			];
@@ -1260,17 +1431,20 @@ private:
 			Payload.SpellId = OwnedSpell.SpellId;
 			Payload.Label = FText::FromString(Definition->DisplayName);
 			Payload.Badge = SpellBadge(Definition->Kind);
-			Payload.Subtitle = FText::FromString(
-				FString::Printf(TEXT("×%d"), OwnedSpell.Quantity));
+			Payload.Subtitle = OwnedSpell.Quantity > 1
+				? FText::AsNumber(OwnedSpell.Quantity)
+				: FText::GetEmpty();
+			Payload.IconBrush = GetIconBrush(Definition->Icon);
 			Payload.Tint = SpellColor(Definition->Kind);
 			const FName SpellId = OwnedSpell.SpellId;
 			SpellGrid->AddSlot().Padding(3.0f)
 			[
 				SNew(SMagicItemSlot)
 				.Badge(SpellBadge(Definition->Kind))
+				.IconBrush(Payload.IconBrush)
 				.Label(FText::FromString(Definition->DisplayName))
-				.Subtitle(FText::FromString(FString::Printf(TEXT("×%d"), OwnedSpell.Quantity)))
-				.ToolTip(SpellToolTip(*Definition))
+				.Subtitle(Payload.Subtitle)
+				.ToolTipContent(BuildSpellToolTipContent(*Definition))
 				.Tint(SpellColor(Definition->Kind))
 				.bSelected(OwnerWidget->GetPendingSpell() == SpellId)
 				.DragPayload(Payload)
@@ -1281,14 +1455,10 @@ private:
 			];
 		}
 		return SNew(SBox)
-			.WidthOverride(210.0f)
+			.WidthOverride(280.0f)
 			[
 				OutlinedPanel(
 					SNew(SVerticalBox)
-					+ SVerticalBox::Slot().AutoHeight().Padding(2.0f, 0.0f, 0.0f, 7.0f)
-					[
-						Heading(TEXT("法术"))
-					]
 					+ SVerticalBox::Slot().FillHeight(1.0f)
 					[
 						SNew(SScrollBox)
@@ -1331,11 +1501,14 @@ private:
 		{
 			Content->AddSlot().FillHeight(1.0f).VAlign(VAlign_Center)
 			[
-				SNew(STextBlock)
-				.Text(FText::FromString(TEXT("请从法杖背包或装备栏中选择一根法杖。")))
-				.Font(Font(14, true))
-				.Justification(ETextJustify::Center)
-				.ColorAndOpacity(Muted)
+				SNew(SBox)
+				.WidthOverride(SpellIconSize)
+				.HeightOverride(SpellIconSize)
+				.ToolTipText(FText::FromString(TEXT("选择一根法杖")))
+				[
+					SNew(SImage)
+					.Image(GetIconBrush(TEXT("paper/add_sign")))
+				]
 			];
 			return Content;
 		}
@@ -1354,53 +1527,17 @@ private:
 					TEXT("%.0f / %.0f"),
 					Wand->Mana,
 					Definition->ManaMax)))
-				.Font(Font(11, true))
+				.Font(WorkbenchFont(11, true))
 				.ColorAndOpacity(Ink)
 			]
 		];
 		Content->AddSlot().AutoHeight().Padding(0.0f, 2.0f, 0.0f, 8.0f)
 		[
 			SNew(SMatterFluxProgressBar)
-			.Height(12.0f)
+			.Height(15.0f)
 			.Percent(Definition->ManaMax > 0.0f
 				? Wand->Mana / Definition->ManaMax
 				: 0.0f)
-		];
-
-		const auto StatCard = [this](const FString& Label, const FString& Value)
-		{
-			return OutlinedPanel(
-					SNew(SVerticalBox)
-					+ SVerticalBox::Slot().AutoHeight()
-					[
-						SNew(STextBlock)
-						.Text(FText::FromString(Label))
-						.Font(Font(9))
-						.Justification(ETextJustify::Center)
-						.ColorAndOpacity(Muted)
-					]
-					+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 2.0f, 0.0f, 0.0f)
-					[
-						SNew(STextBlock)
-						.Text(FText::FromString(Value))
-						.Font(Font(13, true))
-						.Justification(ETextJustify::Center)
-						.ColorAndOpacity(Ink)
-					],
-					FMargin(9.0f, 6.0f));
-		};
-		Content->AddSlot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 12.0f)
-		[
-			SNew(SUniformGridPanel)
-			.SlotPadding(FMargin(3.0f, 0.0f))
-			+ SUniformGridPanel::Slot(0, 0)
-			[StatCard(TEXT("法力上限"), FString::Printf(TEXT("%.0f"), Definition->ManaMax))]
-			+ SUniformGridPanel::Slot(1, 0)
-			[StatCard(TEXT("恢复速度"), FString::Printf(TEXT("%.0f / 秒"), Definition->ManaRechargePerSecond))]
-			+ SUniformGridPanel::Slot(2, 0)
-			[StatCard(TEXT("释放间隔"), FString::Printf(TEXT("%.2f 秒"), Definition->CastDelay))]
-			+ SUniformGridPanel::Slot(3, 0)
-			[StatCard(TEXT("法术容量"), FString::Printf(TEXT("%d"), Definition->Capacity))]
 		];
 
 		const auto BuildSpellSlot = [this, &Registry, Wand](const int32 SlotIndex)
@@ -1418,9 +1555,13 @@ private:
 				Payload.SpellSlot = SlotIndex;
 				Payload.Label = FText::FromString(Spell->DisplayName);
 				Payload.Badge = SpellBadge(Spell->Kind);
-				Payload.Subtitle = FText::FromString(
-					FString::Printf(TEXT("%02d"), SlotIndex + 1));
+				Payload.IconBrush = GetIconBrush(Spell->Icon);
 				Payload.Tint = SpellColor(Spell->Kind);
+			}
+			TSharedPtr<SWidget> RichToolTip;
+			if (Spell)
+			{
+				RichToolTip = BuildSpellToolTipContent(*Spell);
 			}
 			const FGuid WandId = Wand->InstanceId;
 			const int32 TargetIndex = SlotIndex;
@@ -1428,10 +1569,14 @@ private:
 					.Badge(Spell
 						? SpellBadge(Spell->Kind)
 						: FText::FromString(TEXT("＋")))
+					.IconBrush(Spell
+						? Payload.IconBrush
+						: GetIconBrush(TEXT("paper/add_sign")))
 					.Label(FText::FromString(Spell ? Spell->DisplayName : TEXT("+ 法术")))
-					.Subtitle(FText::FromString(FString::Printf(TEXT("%02d"), SlotIndex + 1)))
+					.Subtitle(FText::GetEmpty())
+					.ToolTipContent(RichToolTip)
 					.ToolTip(Spell
-						? SpellToolTip(*Spell)
+						? FText::GetEmpty()
 						: FText::FromString(TEXT("把法术拖到这里，或先选择法术再点击该槽。")))
 					.Tint(Spell ? SpellColor(Spell->Kind) : SRGB(126, 123, 115))
 					.DragPayload(Payload)
@@ -1505,56 +1650,21 @@ private:
 			[
 				SNew(STextBlock)
 				.Text(FText::FromString(LayoutError))
-				.Font(Font(11))
+				.Font(WorkbenchFont(11))
 				.ColorAndOpacity(SpellTrigger)
 			];
 			return Content;
 		}
 
-		const auto BuildProgramNode = [&BuildSpellSlot, Wand](
+		const auto BuildProgramNode = [&BuildSpellSlot](
 			const FMatterFluxSpellProgramNode& Node)
 			-> TSharedRef<SWidget>
 		{
-			const bool bMissingRequiredSpell = !Node.IsRoot()
-				&& Wand->SpellSlots[Node.SlotIndex].IsNone();
-			const FString Relation = Node.IsRoot()
-				? FString::Printf(TEXT("槽%02d · 起点"), Node.SlotIndex + 1)
-				: FString::Printf(
-					TEXT("来自%02d · %d/%d%s"),
-					Node.ParentSlotIndex + 1,
-					Node.ChildIndex + 1,
-					Node.SiblingCount,
-					bMissingRequiredSpell ? TEXT("·待填") : TEXT(""));
 			return SNew(SBox)
 				.WidthOverride(ProgramNodeWidth)
 				.HeightOverride(ProgramNodeHeight)
 				[
-					SNew(SVerticalBox)
-					+ SVerticalBox::Slot().AutoHeight()
-					[
-					SNew(SBox)
-						.HeightOverride(ProgramNodeLabelHeight)
-						.WidthOverride(ProgramNodeWidth)
-						.HAlign(HAlign_Center)
-						.VAlign(VAlign_Center)
-						[
-							SNew(STextBlock)
-								.Text(FText::FromString(Relation))
-								.Font(Font(9, Node.IsRoot()))
-								.Justification(ETextJustify::Center)
-								.ColorAndOpacity(
-									bMissingRequiredSpell ? Ink : Muted)
-						]
-					]
-					+ SVerticalBox::Slot().AutoHeight()
-					.Padding(0.0f, 4.0f, 0.0f, 0.0f)
-					.HAlign(HAlign_Center)
-					[
-						SNew(SBox)
-						.WidthOverride(SpellSlotSize)
-						.HeightOverride(SpellSlotSize)
-						[BuildSpellSlot(Node.SlotIndex)]
-					]
+					BuildSpellSlot(Node.SlotIndex)
 				];
 		};
 
@@ -1688,8 +1798,7 @@ private:
 
 			const FVector2D SlotCenterOffset(
 				ProgramNodeWidth * 0.5f,
-				ProgramNodeLabelHeight + 4.0f
-					+ SpellSlotSize * 0.5f);
+				ProgramNodeHeight * 0.5f);
 			TArray<FMagicTreeLine> Lines;
 			for (const FProgramNodePlacement& Placement : Placements)
 			{
@@ -1722,46 +1831,13 @@ private:
 		TSharedRef<SVerticalBox> ProgramTrees = SNew(SVerticalBox);
 		for (const FMatterFluxSpellProgramNode* Root : RootNodes)
 		{
-			TSharedRef<SVerticalBox> RootContent = SNew(SVerticalBox);
-			RootContent->AddSlot().AutoHeight().Padding(
-				0.0f, 0.0f, 0.0f, 5.0f)
-			[
-				SNew(STextBlock)
-					.Text(FText::FromString(FString::Printf(
-						TEXT("施法段 %d"),
-						Root->RootIndex + 1)))
-					.Font(Font(10, true))
-					.ColorAndOpacity(Ink)
-			];
-			RootContent->AddSlot().AutoHeight()[BuildProgramTree(*Root)];
 			ProgramTrees->AddSlot().AutoHeight().Padding(
-				0.0f, 0.0f, 0.0f, 7.0f)
-			[OutlinedPanel(RootContent, FMargin(8.0f))];
+				0.0f, 0.0f, 0.0f, 12.0f)
+			[BuildProgramTree(*Root)];
 		}
 
 		TSharedRef<SVerticalBox> Program = SNew(SVerticalBox);
-		const int32 RootCount = RootNodes.Num();
-		Program->AddSlot().AutoHeight()
-		[
-			SNew(SVerticalBox)
-			+ SVerticalBox::Slot().AutoHeight()
-			[
-				SNew(STextBlock)
-				.Text(FText::FromString(TEXT("法术树")))
-				.Font(Font(11, true))
-				.ColorAndOpacity(Ink)
-			]
-			+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 2.0f, 0.0f, 0.0f)
-			[
-				SNew(STextBlock)
-				.Text(FText::FromString(FString::Printf(
-					TEXT("%d 个施法段 · 从左向右读取；子节点标注来源槽和分支序号"),
-					RootCount)))
-				.Font(Font(9))
-				.ColorAndOpacity(Muted)
-			]
-		];
-		Program->AddSlot().AutoHeight().Padding(0.0f, 6.0f, 0.0f, 10.0f)
+		Program->AddSlot().AutoHeight().Padding(0.0f, 6.0f, 0.0f, 12.0f)
 		[
 			SNew(SScrollBox)
 			.Orientation(Orient_Horizontal)
@@ -1776,13 +1852,6 @@ private:
 			{
 				Reserve->AddSlot().Padding(3.0f)[BuildSpellSlot(SlotIndex)];
 			}
-			Program->AddSlot().AutoHeight().Padding(0.0f, 2.0f, 0.0f, 4.0f)
-			[
-				SNew(STextBlock)
-				.Text(FText::FromString(TEXT("空闲容量槽（不参与当前法术树）")))
-				.Font(Font(9, true))
-				.ColorAndOpacity(Muted)
-			];
 			Program->AddSlot().AutoHeight()[Reserve];
 		}
 		Content->AddSlot().FillHeight(1.0f)
@@ -1868,7 +1937,7 @@ private:
 				[
 					SNew(STextBlock)
 						.Text(FText::FromString(Title))
-						.Font(Font(16, true))
+						.Font(WorkbenchFont(16, true))
 						.ColorAndOpacity(Ink)
 				]
 				+ SVerticalBox::Slot().FillHeight(1.0f)
@@ -1876,7 +1945,7 @@ private:
 				[
 					SNew(STextBlock)
 						.Text(FText::FromString(Text))
-						.Font(Font(14))
+						.Font(WorkbenchFont(14))
 						.AutoWrapText(true)
 						.ColorAndOpacity(Ink)
 				],
@@ -1903,6 +1972,7 @@ private:
 	}
 
 	TWeakObjectPtr<UMatterFluxMagicWorkbenchWidget> OwnerWidget;
+	TMap<FString, TSharedPtr<FSlateDynamicImageBrush>> IconBrushes;
 };
 }
 

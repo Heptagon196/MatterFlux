@@ -1,7 +1,9 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Fragment/FragmentTypes.h"
 #include "GameFramework/Actor.h"
+#include "Rendering/MatterFluxMaterialCutaway.h"
 #include "MatterFluxTwoStoreyHouseActor.generated.h"
 
 class ACharacter;
@@ -19,9 +21,9 @@ class UStaticMesh;
 /**
  * 可复用的双层体素房屋。
  *
- * 房屋自己负责三件彼此强相关的事：组合静态结构、提供室内巡逻路线，
- * 以及只在本地客户端根据观察者所在楼层虚化上方结构。世界生成器只需
- * 决定房屋放在哪里，角色和生物不需要知道具体有哪些墙或家具。
+ * Lua 选择有界生成能力并配置切面策略；Actor 负责生成和投影适配。
+ * Floor/Wall/Furniture 身份以及切割后的 RuntimeMask 保存在 canonical
+ * Source 中，房屋类和 Actor 包围盒不参与虚化事实判定。
  */
 UCLASS()
 class MATTERFLUX_API AMatterFluxTwoStoreyHouseActor : public AActor
@@ -60,6 +62,11 @@ public:
 	/** 当前本地切面楼层；INDEX_NONE 表示房屋完全实显。 */
 	int32 GetCurrentCutawayFloor() const { return CurrentCutawayFloor; }
 	float GetCurrentStructureOpacity() const { return CurrentStructureOpacity; }
+	bool HasActiveStructureFade() const
+	{
+		return !CurrentGhostSourceIds.IsEmpty()
+			|| CurrentStructureOpacity < 0.999f;
+	}
 	/** 返回地板表面当前本地显示透明度，便于 UI/测试核对切面语义。 */
 	float GetFloorSurfaceOpacity(int32 FloorIndex) const;
 	/** 返回指定楼层家具投影的最低透明度；没有家具时返回 1。 */
@@ -69,6 +76,14 @@ public:
 	/** 自动测试与截图可显式指定观察者；传 nullptr 恢复本地玩家自动选择。 */
 	void SetCutawayViewerOverride(ACharacter* Viewer);
 	void RefreshCutawayImmediately();
+	/** Selects the immutable Lua structure profile before FinishSpawning. */
+	void InitializeStructureDefinition(FName DefinitionId);
+	/** Hide and reset a streamed house while retaining its expensive component graph. */
+	void DeactivateForStreamingPool();
+	/** Reuse a pooled component graph at a new deterministic streamed location. */
+	void ReactivateFromStreamingPool(
+		const FTransform& WorldTransform,
+		FName DefinitionId);
 
 	/** 查找包含该位置的房屋，供通用生物控制器选择室内路线。 */
 	static AMatterFluxTwoStoreyHouseActor* FindContainingHouse(
@@ -88,6 +103,9 @@ private:
 		TWeakObjectPtr<UMeshComponent> Component;
 		FLinearColor Color = FLinearColor::White;
 		FName MaterialId = NAME_None;
+		FGuid SourceId;
+		EMatterFluxMaterialStructuralRole StructuralRole =
+			EMatterFluxMaterialStructuralRole::None;
 		int32 FloorTier = 0;
 		bool bNeverFade = false;
 		bool bFloorSurface = false;
@@ -103,15 +121,6 @@ private:
 		TArray<int32> MaterialSlots;
 		TArray<TWeakObjectPtr<UMaterialInterface>> SolidMaterials;
 		TWeakObjectPtr<UMaterialInstanceDynamic> GhostMaterial;
-	};
-
-	struct FTrackedMeshFade
-	{
-		TWeakObjectPtr<UMeshComponent> Mesh;
-		TArray<TWeakObjectPtr<UMaterialInterface>> OriginalMaterials;
-		TArray<TWeakObjectPtr<UMaterialInstanceDynamic>> GhostMaterials;
-		float Opacity = 1.0f;
-		bool bWantsGhost = false;
 	};
 
 	UInstancedStaticMeshComponent* CreateVoxelGroup(
@@ -142,20 +151,13 @@ private:
 	uint32 ComputeCuttableWholeObjectSignature() const;
 	void RefreshReplicatedCuttableStructureSources(float DeltaSeconds);
 	void DestroyCuttableStructureSources();
-	void RegisterCuttableSourceFade(
-		AFragment2DSourceActor& Source,
-		const FStructureFadeGroup& TemplateGroup);
-
+	void MoveHouseAndCuttableSources(const FTransform& WorldTransform);
 	ACharacter* ResolveLocalViewer() const;
-	int32 ResolveViewerFloor(const ACharacter& Viewer) const;
-	bool IsInsideCutawayRetentionVolume(const FVector& WorldLocation) const;
+	bool ResolveViewerCameraLocation(
+		ACharacter& Viewer,
+		FVector& OutCameraLocation) const;
 	void UpdateCutawayFloor(ACharacter* Viewer, float DeltaSeconds);
-	void UpdateStructureFade(float DeltaSeconds, bool bImmediate);
-	void UpdateInteriorActorFade(float DeltaSeconds, bool bImmediate);
-	void TrackInteriorMesh(UMeshComponent& Mesh);
-	void RestoreTrackedMesh(FTrackedMeshFade& Entry);
-	void ApplyTrackedMeshOpacity(FTrackedMeshFade& Entry, float Opacity);
-	FLinearColor ResolveMeshColor(const UMeshComponent& Mesh) const;
+	void UpdateStructureFade(float DeltaSeconds);
 
 	UPROPERTY(Transient)
 	TObjectPtr<UStaticMesh> CubeMesh;
@@ -192,13 +194,23 @@ private:
 	TObjectPtr<UPointLightComponent> UpperFloorLight;
 
 	TArray<FStructureFadeGroup> StructureFadeGroups;
-	TMap<TWeakObjectPtr<UMeshComponent>, FTrackedMeshFade> TrackedInteriorMeshes;
 	TWeakObjectPtr<ACharacter> CutawayViewerOverride;
+	FName StructureDefinitionId = TEXT("structure.house.two_storey");
+	FDelegateHandle StructureReloadHandle;
+	FGuid CurrentFloorSourceId;
+	TSet<FGuid> CurrentGhostSourceIds;
+	/** Reused adapter from GC-aware ownership to the resolver's read-only view. */
+	TArray<AFragment2DSourceActor*> CutawaySourceView;
+	MatterFlux::MaterialCutaway::FPolicy CutawayPolicy;
+	float CutawayExitGraceSeconds = 0.18f;
+	float StructureFadeSpeed = 4.5f;
+	float WallGhostOpacity = 0.055f;
+	float RoofGhostOpacity = 0.025f;
 	int32 CurrentCutawayFloor = INDEX_NONE;
 	float CutawayExitAccumulator = 0.0f;
 	float CurrentStructureOpacity = 1.0f;
-	float InteriorScanAccumulator = 0.0f;
 	float CuttableSourceDiscoveryAccumulator = 0.0f;
 	bool bMaterialsConfigured = false;
+	bool bExteriorOcclusionActive = false;
 	uint32 CuttableWholeObjectSignature = MAX_uint32;
 };

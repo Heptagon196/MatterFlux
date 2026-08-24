@@ -816,7 +816,7 @@ bool FMatterFluxSurfaceLiquidRefillsAcrossUnevenSupportTest::RunTest(
 		World.SumMaterialAmount(TEXT("water")), AmountBefore);
 	TestTrue(TEXT("At least one surrounding liquid column participates"),
 		Stats.MovedCells > 0);
-	uint8 MaximumRefilledAmount = Refilled.Amount;
+	uint16 MaximumRefilledAmount = Refilled.Amount;
 	for (int32 StepIndex = 0; StepIndex < 32; ++StepIndex)
 	{
 		World.Step();
@@ -833,7 +833,7 @@ bool FMatterFluxSurfaceLiquidRefillsAcrossUnevenSupportTest::RunTest(
 	TestEqual(TEXT("Body vacancy restores its pre-displacement amount"),
 		Restored.Amount, static_cast<uint8>(120));
 	TestEqual(TEXT("Restitution never pumps above the reference amount"),
-		MaximumRefilledAmount, static_cast<uint8>(120));
+		MaximumRefilledAmount, static_cast<uint16>(120));
 	TestEqual(TEXT("Long restitution conserves exact liquid amount"),
 		World.SumMaterialAmount(TEXT("water")), AmountBefore);
 	return true;
@@ -1151,6 +1151,9 @@ bool FMatterFluxMaterialRuntimeFocusDebtTest::RunTest(
 	TestTrue(
 		TEXT("Water can be placed in the next focus chunk"),
 		Runtime.SetCell(FIntPoint(8, 1), TEXT("water")));
+	TestTrue(
+		TEXT("A full fixed-step interval reserves the next frame"),
+		Runtime.WillAdvanceStep(0.05f));
 
 	const TArray<FIntPoint> NextFocuses = { FIntPoint(8, 0) };
 	const MatterFlux::Material::FRuntimeAdvanceResult FocusFrame =
@@ -1161,6 +1164,9 @@ bool FMatterFluxMaterialRuntimeFocusDebtTest::RunTest(
 		TEXT("Focus frame preserves the unmoved cell"),
 		Runtime.GetMaterialAt(FIntPoint(8, 1)),
 		FName(TEXT("water")));
+	TestTrue(
+		TEXT("Deferred fixed-step debt still reserves the next frame"),
+		Runtime.WillAdvanceStep(0.0f));
 
 	const MatterFlux::Material::FRuntimeAdvanceResult DebtFrame =
 		Runtime.AdvanceAuthority(0.0f, NextFocuses);
@@ -1172,6 +1178,9 @@ bool FMatterFluxMaterialRuntimeFocusDebtTest::RunTest(
 		TEXT("Water moves after deferred debt is consumed"),
 		Runtime.GetMaterialAt(FIntPoint(8, 0)),
 		FName(TEXT("water")));
+	TestFalse(
+		TEXT("Consumed fixed-step debt releases the following frame"),
+		Runtime.WillAdvanceStep(0.0f));
 	return true;
 }
 
@@ -1606,6 +1615,88 @@ bool FMatterFluxGasCeilingTest::RunTest(const FString& Parameters)
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxTransientMaterialLifetimeTest,
+	"MatterFlux.Material.TransientParticlesHaveFiniteLifetimeAndBoundedTravel",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxTransientMaterialLifetimeTest::RunTest(
+	const FString& Parameters)
+{
+	FMatterFluxContentRegistry Registry = MakeLiquidRegistry();
+	FMatterFluxMaterialDefinition TransientGas;
+	TransientGas.Id = TEXT("transient_gas");
+	TransientGas.Density = 0.01f;
+	TransientGas.Phase = EMatterFluxMaterialPhase::Gas;
+	TransientGas.Mobility = 255;
+	TransientGas.Dispersion = 255;
+	TransientGas.LifetimeSteps = 4;
+	Registry.Materials.Add(TransientGas.Id, TransientGas);
+
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 8;
+	Settings.ActiveChunkRadius = 2;
+	Settings.MaxActiveChunks = 25;
+	Settings.bUseSurfaceTopology = true;
+	Settings.MinSurfaceCell = FIntPoint(-16, -16);
+	Settings.MaxSurfaceCellExclusive = FIntPoint(17, 17);
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(
+		TEXT("Transient-particle world initializes"),
+		World.Initialize(Settings, Registry, 20260823, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	World.SetSimulationFocus(FIntPoint::ZeroValue);
+	TestTrue(
+		TEXT("Transient material enters the canonical world"),
+		World.SetCell(FIntPoint::ZeroValue, TransientGas.Id));
+
+	int32 MaximumChebyshevDistance = 0;
+	for (int32 Step = 0; Step < TransientGas.LifetimeSteps; ++Step)
+	{
+		World.Step();
+		TArray<MatterFlux::Material::FCellSnapshot> Cells;
+		World.GetAllCells(Cells);
+		for (const MatterFlux::Material::FCellSnapshot& Cell : Cells)
+		{
+			if (Cell.MaterialId == TransientGas.Id)
+			{
+				MaximumChebyshevDistance = FMath::Max(
+					MaximumChebyshevDistance,
+					FMath::Max(
+						FMath::Abs(Cell.WorldCell.X),
+						FMath::Abs(Cell.WorldCell.Y)));
+			}
+		}
+	}
+
+	TestEqual(
+		TEXT("Transient particles disappear when their configured lifetime expires"),
+		World.CountMaterial(TransientGas.Id),
+		0);
+	TestTrue(
+		TEXT("Finite lifetime places a deterministic upper bound on travel distance"),
+		MaximumChebyshevDistance < TransientGas.LifetimeSteps);
+
+	TestTrue(
+		TEXT("A second transient particle enters the active window"),
+		World.SetCell(FIntPoint::ZeroValue, TransientGas.Id));
+	World.SetSimulationFocus(FIntPoint(Settings.ChunkSize * 10, 0));
+	TestEqual(
+		TEXT("Transient particles are discarded instead of freezing in archived chunks"),
+		World.CountMaterial(TransientGas.Id),
+		0);
+	World.SetSimulationFocus(FIntPoint::ZeroValue);
+	TestEqual(
+		TEXT("Discarded transient particles do not return with the simulation window"),
+		World.CountMaterial(TransientGas.Id),
+		0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxPowderStacksTest,
 	"MatterFlux.Material.PowderFallsDiagonallyAndStacks",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
@@ -1640,6 +1731,122 @@ bool FMatterFluxPowderStacksTest::RunTest(const FString& Parameters)
 		World.CountMaterial(TEXT("sand")),
 		1);
 	TestEqual(TEXT("One powder cell moved"), Stats.MovedCells, 1);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxSurfacePowderBuildsPileTest,
+	"MatterFlux.Material.SurfacePowderBuildsAConicalPile",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxSurfacePowderBuildsPileTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 16;
+	Settings.ActiveChunkRadius = 1;
+	Settings.MaxActiveChunks = 9;
+	Settings.bUseSurfaceTopology = true;
+	Settings.MinSurfaceCell = FIntPoint(-8, -8);
+	Settings.MaxSurfaceCellExclusive = FIntPoint(9, 9);
+
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(TEXT("Powder-pile world initializes"),
+		World.Initialize(Settings, MakeLiquidRegistry(), 20260824, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	TArray<MatterFlux::Material::FSeedCell> Surface;
+	for (int32 Y = -8; Y <= 8; ++Y)
+	{
+		for (int32 X = -8; X <= 8; ++X)
+		{
+			Surface.Add({ FIntPoint(X, Y), NAME_None, 0, 0 });
+		}
+	}
+	TestTrue(TEXT("Flat support surface is seeded"),
+		World.SeedSurface(Surface));
+	World.SetSimulationFocus(FIntPoint::ZeroValue);
+	constexpr uint16 FiveFullSandCells = 5 * 255;
+	TestTrue(TEXT("Repeated spray volume enters one impact column"),
+		World.SetCellAmount(
+			FIntPoint::ZeroValue,
+			TEXT("sand"),
+			FiveFullSandCells));
+
+	for (int32 Step = 0; Step < 96; ++Step)
+	{
+		if (World.Step().MovedCells == 0)
+		{
+			break;
+		}
+	}
+
+	TArray<MatterFlux::Material::FCellSnapshot> Cells;
+	World.GetActiveCells(Cells);
+	uint16 PeakAmount = 0;
+	uint16 EdgeAmount = MAX_uint16;
+	int32 PeakDistance = MAX_int32;
+	int32 OuterDistance = 0;
+	int32 SandColumns = 0;
+	for (const MatterFlux::Material::FCellSnapshot& Cell : Cells)
+	{
+		if (Cell.MaterialId != TEXT("sand"))
+		{
+			continue;
+		}
+		++SandColumns;
+		const int32 Distance = FMath::Max(
+			FMath::Abs(Cell.WorldCell.X),
+			FMath::Abs(Cell.WorldCell.Y));
+		if (Cell.Amount > PeakAmount)
+		{
+			PeakAmount = Cell.Amount;
+			PeakDistance = Distance;
+		}
+		if (Distance > OuterDistance)
+		{
+			OuterDistance = Distance;
+			EdgeAmount = Cell.Amount;
+		}
+		else if (Distance == OuterDistance)
+		{
+			EdgeAmount = FMath::Min(EdgeAmount, Cell.Amount);
+		}
+	}
+
+	TestEqual(TEXT("Powder relaxation conserves deposited volume"),
+		World.SumMaterialAmount(TEXT("sand")),
+		static_cast<int64>(FiveFullSandCells));
+	TestTrue(TEXT("Powder spreads into more than one surface column"),
+		SandColumns > 1);
+	TestTrue(TEXT("Pile peak stays at the impact center"),
+		PeakDistance <= 1);
+	TestTrue(TEXT("Pile center is higher than its outer skirt"),
+		PeakAmount > EdgeAmount);
+
+	TArray<uint8> ReplicatedState;
+	TestTrue(TEXT("Tall powder columns export to replicated state"),
+		World.ExportActiveState(96, ReplicatedState, Error));
+	MatterFlux::Material::FChunkedMaterialWorld ClientWorld;
+	TestTrue(TEXT("Powder-pile client world initializes"),
+		ClientWorld.Initialize(Settings, MakeLiquidRegistry(), 20260824, Error));
+	TestTrue(TEXT("Client receives the same support surface"),
+		ClientWorld.SeedSurface(Surface));
+	int32 ImportedLogicalStep = INDEX_NONE;
+	FIntPoint ImportedFocus = FIntPoint::ZeroValue;
+	TestTrue(TEXT("Tall powder columns import from replicated state"),
+		ClientWorld.ImportActiveState(
+			ReplicatedState,
+			ImportedLogicalStep,
+			ImportedFocus,
+			Error));
+	TestEqual(TEXT("Powder volume survives replication exactly"),
+		ClientWorld.SumMaterialAmount(TEXT("sand")),
+		static_cast<int64>(FiveFullSandCells));
 	return true;
 }
 
@@ -1920,6 +2127,60 @@ bool FMatterFluxSurfaceLiquidDownhillTest::RunTest(
 		Water && Water->SupportHeight == 0);
 	TestTrue(TEXT("Downhill flow transfers a bounded particle amount"),
 		Water && Water->Amount > 0 && Water->Amount < 255);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxSurfaceLiquidFallsAcrossChunkBoundaryTest,
+	"MatterFlux.Material.SurfaceLiquidFallsAcrossSimulationChunkBoundary",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxSurfaceLiquidFallsAcrossChunkBoundaryTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 8;
+	Settings.ActiveChunkRadius = 0;
+	Settings.MaxActiveChunks = 1;
+	Settings.bUseSurfaceTopology = true;
+	Settings.MinSurfaceCell = FIntPoint(0, 0);
+	Settings.MaxSurfaceCellExclusive = FIntPoint(16, 3);
+	Settings.LiquidFullColumnHeight = 16;
+
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(TEXT("Surface material world initializes"),
+		World.Initialize(Settings, MakeLiquidRegistry(), 20260823, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	World.SetSimulationFocus(FIntPoint(7, 1));
+	for (int32 Y = 0; Y < 3; ++Y)
+	{
+		for (int32 X = 6; X <= 10; ++X)
+		{
+			World.SetSupportHeight(FIntPoint(X, Y), 160);
+		}
+	}
+	World.SetSupportHeight(FIntPoint(7, 1), 96);
+	World.SetSupportHeight(FIntPoint(8, 1), 48);
+	World.SetSupportHeight(FIntPoint(9, 1), 0);
+	World.SetCell(FIntPoint(7, 1), TEXT("water"));
+
+	World.Step();
+	TestEqual(TEXT("Falling water crosses the inactive seam"),
+		World.GetMaterialAt(FIntPoint(8, 1)), FName(TEXT("water")));
+	for (int32 StepIndex = 1; StepIndex < 12; ++StepIndex)
+	{
+		World.Step();
+	}
+
+	TestEqual(TEXT("Terrain slope, not the simulation seam, stops falling water"),
+		World.GetMaterialAt(FIntPoint(9, 1)), FName(TEXT("water")));
+	TestEqual(TEXT("Cross-seam falling conserves every liquid particle"),
+		World.SumMaterialAmount(TEXT("water")), static_cast<int64>(255));
 	return true;
 }
 
@@ -2320,10 +2581,10 @@ bool FMatterFluxGroundStateChunkRoundTripTest::RunTest(
 	constexpr int32 Width = MatterFlux::PlayableLevel::TerrainCellsX;
 	constexpr int32 Height = MatterFlux::PlayableLevel::TerrainCellsY;
 	const FIntPoint ChunkCoordinate(3, 2);
-	TArray<uint8> Residue;
-	TArray<uint8> Burning;
-	Residue.Init(0, Width * Height);
-	Burning.Init(0, Width * Height);
+	TArray<uint8> Output;
+	TArray<uint8> Active;
+	Output.Init(0, Width * Height);
+	Active.Init(0, Width * Height);
 	for (int32 LocalY = 0; LocalY < 64; ++LocalY)
 	{
 		for (int32 LocalX = 0; LocalX < 64; ++LocalX)
@@ -2331,8 +2592,8 @@ bool FMatterFluxGroundStateChunkRoundTripTest::RunTest(
 			const int32 X = ChunkCoordinate.X * 64 + LocalX;
 			const int32 Y = ChunkCoordinate.Y * 64 + LocalY;
 			const int32 Index = Y * Width + X;
-			Residue[Index] = (LocalX + LocalY * 3) % 11 == 0 ? 1 : 0;
-			Burning[Index] = (LocalX * 5 + LocalY) % 17 < 3
+			Output[Index] = (LocalX + LocalY * 3) % 11 == 0 ? 1 : 0;
+			Active[Index] = (LocalX * 5 + LocalY) % 17 < 3
 				? static_cast<uint8>(12 - (LocalY % 5))
 				: 0;
 		}
@@ -2345,8 +2606,8 @@ bool FMatterFluxGroundStateChunkRoundTripTest::RunTest(
 		State.Encode(
 			ChunkCoordinate,
 			37,
-			Residue,
-			Burning,
+			Output,
+			Active,
 			Width,
 			Height,
 			Error)))
@@ -2358,42 +2619,42 @@ bool FMatterFluxGroundStateChunkRoundTripTest::RunTest(
 		TEXT("Chunk payload always fits one actor bunch"),
 		State.StateBytes.Num() > 0 && State.StateBytes.Num() <= 4608);
 
-	TArray<uint8> DecodedResidue;
-	TArray<uint8> DecodedBurning;
-	DecodedResidue.Init(0, Width * Height);
-	DecodedBurning.Init(0, Width * Height);
+	TArray<uint8> DecodedOutput;
+	TArray<uint8> DecodedActive;
+	DecodedOutput.Init(0, Width * Height);
+	DecodedActive.Init(0, Width * Height);
 	TestTrue(
 		TEXT("Chunk applies to a full client mask"),
 		State.DecodeInto(
-			DecodedResidue,
-			DecodedBurning,
+			DecodedOutput,
+			DecodedActive,
 			Width,
 			Height,
 			Error));
-	TestEqual(TEXT("Chunk residue is exact"), DecodedResidue, Residue);
-	TestEqual(TEXT("Chunk burn timers are exact"), DecodedBurning, Burning);
+	TestEqual(TEXT("Chunk output is exact"), DecodedOutput, Output);
+	TestEqual(TEXT("Chunk burn timers are exact"), DecodedActive, Active);
 
 	FMatterFluxGroundStateChunk Corrupt = State;
 	Corrupt.StateHash ^= 0xdeadbeefu;
-	TArray<uint8> UntouchedResidue;
-	TArray<uint8> UntouchedBurning;
-	UntouchedResidue.Init(0, Width * Height);
-	UntouchedBurning.Init(0, Width * Height);
+	TArray<uint8> UntouchedOutput;
+	TArray<uint8> UntouchedActive;
+	UntouchedOutput.Init(0, Width * Height);
+	UntouchedActive.Init(0, Width * Height);
 	TestFalse(
 		TEXT("CRC-corrupt chunk is rejected before mask mutation"),
 		Corrupt.DecodeInto(
-			UntouchedResidue,
-			UntouchedBurning,
+			UntouchedOutput,
+			UntouchedActive,
 			Width,
 			Height,
 			Error));
 	TestFalse(
-		TEXT("Rejected chunk leaves residue untouched"),
-		UntouchedResidue.ContainsByPredicate(
+		TEXT("Rejected chunk leaves output untouched"),
+		UntouchedOutput.ContainsByPredicate(
 			[](const uint8 Value) { return Value != 0; }));
 	TestFalse(
-		TEXT("Rejected chunk leaves burning state untouched"),
-		UntouchedBurning.ContainsByPredicate(
+		TEXT("Rejected chunk leaves active state untouched"),
+		UntouchedActive.ContainsByPredicate(
 			[](const uint8 Value) { return Value != 0; }));
 	return true;
 }

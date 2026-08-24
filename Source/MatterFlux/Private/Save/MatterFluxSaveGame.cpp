@@ -16,22 +16,38 @@ namespace MatterFluxSaveValidation
 				[](const uint8 Value) { return Value > 1; });
 	}
 
-	bool IsValidCombustionState(
-		const FMatterFluxSavedCombustionState& State)
+	bool IsValidReactionState(
+		const FMatterFluxSavedReactionState& State)
 	{
 		const int64 CellCount = static_cast<int64>(State.Width)
 			* static_cast<int64>(State.Height);
-		return !State.RuleId.IsNone()
-			&& State.Width > 0
-			&& State.Height > 0
-			&& CellCount > 0
-			&& CellCount <= MaximumMaskCells
-			&& State.FuelMask.Num() == CellCount
-			&& State.ResidueMask.Num() == CellCount
-			&& State.BurningMask.Num() == CellCount
-			&& IsBinaryMask(State.FuelMask)
-			&& IsBinaryMask(State.ResidueMask)
-			&& IsBinaryMask(State.BurningMask);
+		if (State.RuleId.IsNone()
+			|| State.Width <= 0
+			|| State.Height <= 0
+			|| CellCount <= 0
+			|| CellCount > MaximumMaskCells
+			|| State.InputMask.Num() != CellCount
+			|| State.OutputMask.Num() != CellCount
+			|| State.ActiveMask.Num() != CellCount
+			|| !IsBinaryMask(State.InputMask)
+			|| !IsBinaryMask(State.OutputMask))
+		{
+			return false;
+		}
+		for (int32 Index = 0; Index < State.InputMask.Num(); ++Index)
+		{
+			const uint8 Input = State.InputMask[Index];
+			const uint8 Output = State.OutputMask[Index];
+			// This is a countdown, not a binary occupancy mask. Its rule-specific
+			// upper bound is checked when the reaction runtime restores the state.
+			const uint8 ActiveStepsRemaining = State.ActiveMask[Index];
+			if ((Input != 0 && Output != 0)
+				|| (ActiveStepsRemaining != 0 && Input == 0))
+			{
+				return false;
+			}
+		}
+		return true;
 	}
 }
 
@@ -183,9 +199,9 @@ bool UMatterFluxSaveGame::ValidateAndMigrate(FString& OutError)
 	if (WorldState.MaterialActiveState.Num() > MaximumMaterialStateBytes
 		|| WorldState.FragmentSources.Num() > MaximumFragmentStates
 		|| WorldState.RemovedFragmentSourceIds.Num() > MaximumFragmentStates
-		|| !FMath::IsFinite(WorldState.GroundCombustionAccumulator)
-		|| WorldState.GroundCombustionAccumulator < 0.0f
-		|| WorldState.GroundCombustionRevision < 0)
+		|| !FMath::IsFinite(WorldState.GroundReactionAccumulator)
+		|| WorldState.GroundReactionAccumulator < 0.0f
+		|| WorldState.GroundReactionRevision < 0)
 	{
 		OutError = TEXT("save exceeds the supported world-state budget");
 		return false;
@@ -198,12 +214,12 @@ bool UMatterFluxSaveGame::ValidateAndMigrate(FString& OutError)
 			|| SeenSourceIds.Contains(State.SourceId)
 			|| State.Revision < 0
 			|| !IsBinaryMask(State.RuntimeMask)
-			|| !FMath::IsFinite(State.CombustionAccumulator)
-			|| State.CombustionAccumulator < 0.0f
-			|| State.TotalSmokeEmissionCount < 0
+			|| !FMath::IsFinite(State.ReactionAccumulator)
+			|| State.ReactionAccumulator < 0.0f
+			|| State.TotalMaterialEmissionCount < 0
 			|| !State.ActorTransform.IsValid()
-			|| (State.bHasCombustionState
-				&& !IsValidCombustionState(State.CombustionState)))
+			|| (State.bHasReactionState
+				&& !IsValidReactionState(State.ReactionState)))
 		{
 			OutError = TEXT("save contains an invalid fragment-source state");
 			return false;
@@ -223,14 +239,14 @@ bool UMatterFluxSaveGame::ValidateAndMigrate(FString& OutError)
 		}
 		SeenRemovedSourceIds.Add(RemovedSourceId);
 	}
-	if (WorldState.bHasGroundCombustionState
-		&& !IsValidCombustionState(WorldState.GroundCombustionState))
+	if (WorldState.bHasGroundReactionState
+		&& !IsValidReactionState(WorldState.GroundReactionState))
 	{
-		OutError = TEXT("save contains an invalid ground-combustion state");
+		OutError = TEXT("save contains an invalid ground-reaction state");
 		return false;
 	}
 	TSet<FGuid> SeenIgnitionSourceIds;
-	for (const FGuid SourceId : WorldState.SourcesThatIgnitedGround)
+	for (const FGuid SourceId : WorldState.SourcesThatActivatedGround)
 	{
 		if (!SourceId.IsValid()
 			|| SeenIgnitionSourceIds.Contains(SourceId))

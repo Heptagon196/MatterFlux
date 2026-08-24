@@ -4,7 +4,7 @@
 #include "GameFramework/Actor.h"
 #include "Fragment/Fragment2DSourceStreamingState.h"
 #include "Fragment/FragmentTypes.h"
-#include "Material/MatterFluxCombustion.h"
+#include "Material/MatterFluxReaction.h"
 #include "Rendering/MatterFluxSmokeVisualPool.h"
 #include "Fragment2DSourceActor.generated.h"
 
@@ -40,16 +40,20 @@ public:
 		const FFragmentSourceMask& InMask,
 		const FGuid& InSourceId,
 		const FLinearColor& InColor = FLinearColor::White,
-		FName InMaterialId = NAME_None);
+		FName InMaterialId = NAME_None,
+		EMatterFluxMaterialStructuralRole InStructuralRole =
+			EMatterFluxMaterialStructuralRole::None);
+	/** Restore an existing procedural source to its pristine mask under a new ID. */
+	bool ResetForStreamingReuse(const FGuid& InSourceId);
 	bool CaptureStreamingState(
 		FFragment2DSourceStreamingState& OutState,
 		FString& OutError) const;
 	bool RestoreStreamingState(
 		const FFragment2DSourceStreamingState& State,
 		FString& OutError);
-	bool IgniteAtWorldLocation(
+	bool ApplyMaterialStimulusAtWorldLocation(
 		const FVector& WorldLocation,
-		FName IgnitionMaterial = TEXT("fire"),
+		FName StimulusMaterial = NAME_None,
 		int32 EventSeed = 0);
 	void SetSourceCollisionEnabled(bool bEnabled);
 	/** Keep the logical source while another component owns its rendering. */
@@ -88,28 +92,28 @@ public:
 	int32 GetMinFragmentAreaPixels() const;
 	int32 GetMaxFragmentsPerBreak() const;
 	const TArray<uint8>& GetRuntimeMask() const { return RuntimeMask; }
-	int32 GetRemainingFuelCellCount() const;
-	int32 GetResidueCellCount() const;
-	int32 GetBurningCellCount() const;
-	int32 GetTotalSmokeEmissionCount() const
+	int32 GetRemainingInputCellCount() const;
+	int32 GetOutputCellCount() const;
+	int32 GetActiveCellCount() const;
+	int32 GetTotalMaterialEmissionCount() const
 	{
-		return TotalSmokeEmissionCount;
+		return TotalMaterialEmissionCount;
 	}
-	int32 GetReplicatedCombustionByteCount() const
+	int32 GetReplicatedReactionByteCount() const
 	{
-		return ReplicatedCombustionFuelMask.Num()
-			+ ReplicatedCombustionResidueMask.Num()
-			+ ReplicatedCombustionBurningMask.Num();
+		return ReplicatedReactionInputMask.Num()
+			+ ReplicatedReactionOutputMask.Num()
+			+ ReplicatedReactionActiveMask.Num();
 	}
-	bool IsCombusting() const;
-	FBox GetBurningWorldBounds() const;
-	FName GetCombustionFlameMaterial() const;
-	void GatherCombustionSmokeAnchors(
-		TArray<MatterFlux::Rendering::FSmokeEmissionAnchor>& OutAnchors,
+	bool IsReacting() const;
+	FBox GetActiveWorldBounds() const;
+	FName GetReactionStimulusMaterial() const;
+	void GatherReactionSmokeAnchors(
+		TArray<MatterFlux::Rendering::FMaterialEmissionAnchor>& OutAnchors,
 		int32 MaxAnchors) const;
-	bool HasCombustionRule() const
+	bool HasReactionRule() const
 	{
-		return FindCombustionRule() != nullptr;
+		return FindReactionRule() != nullptr;
 	}
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment")
@@ -143,8 +147,13 @@ public:
 	UPROPERTY(ReplicatedUsing = OnRep_SourceId, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment")
 	FGuid SourceId;
 
-	UPROPERTY(Replicated, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Combustion")
+	UPROPERTY(Replicated, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Reaction")
 	FName SourceMaterialId = NAME_None;
+
+	/** Structural material semantics used by generic visibility projection. */
+	UPROPERTY(Replicated, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Material")
+	EMatterFluxMaterialStructuralRole StructuralRole =
+		EMatterFluxMaterialStructuralRole::None;
 
 	UPROPERTY(Replicated, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment")
 	int32 Revision = 0;
@@ -184,22 +193,24 @@ protected:
 	void OnRep_AggregateSeparationCollisionSuppressed();
 
 	UFUNCTION()
-	void OnRep_CombustionState();
+	void OnRep_ReactionState();
 
 	void ApplyBrokenState();
 	void ApplySourceCollisionState();
 	void UpdateAggregateSeparationGracePeriod();
 	void EndAggregateSeparationGracePeriod();
 	void ApplySourceMaterial();
-	void AdvanceCombustion(float DeltaSeconds);
-	void RebuildCombustionVisualization();
-	void RebuildResidueMesh();
-	void EnsureCombustionVisualComponents();
-	void AddSmokeEmissions(const TArray<FIntPoint>& Cells);
+	void AdvanceReaction(float DeltaSeconds);
+	void RebuildReactionVisualization();
+	void RebuildOutputMesh();
+	void EnsureReactionVisualComponents();
+	void AddMaterialEmissions(const TArray<FIntPoint>& Cells);
 	void MarkSharedSmokeVisualizationDirty() const;
 	FIntPoint WorldToMaskCell(const FVector& WorldLocation) const;
-	void PublishCombustionState();
-	const FMatterFluxReactionDefinition* FindCombustionRule() const;
+	void PublishReactionState();
+	const FMatterFluxReactionDefinition* FindReactionRule() const;
+	const FMatterFluxReactionDefinition* FindReactionRule(
+		FName StimulusMaterial) const;
 	void EnsureInitialized();
 	bool RebuildSourceMesh();
 	void BuildDefaultMask(TArray<uint8>& OutMask) const;
@@ -218,7 +229,7 @@ protected:
 	TObjectPtr<UMaterialInstanceDynamic> DynamicFragmentSideMaterial;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UProceduralMeshComponent> ResidueMeshComponent;
+	TObjectPtr<UProceduralMeshComponent> OutputMeshComponent;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UInstancedStaticMeshComponent> FlameInstances;
@@ -227,23 +238,23 @@ protected:
 	TObjectPtr<UPointLightComponent> FireLight;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInstanceDynamic> ResidueMaterialInstance;
+	TObjectPtr<UMaterialInstanceDynamic> OutputMaterialInstance;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInstanceDynamic> FlameMaterialInstance;
+	TObjectPtr<UMaterialInstanceDynamic> StimulusMaterialInstance;
 
 
 	UPROPERTY(Replicated)
-	TArray<uint8> ReplicatedCombustionFuelMask;
+	TArray<uint8> ReplicatedReactionInputMask;
 
 	UPROPERTY(Replicated)
-	TArray<uint8> ReplicatedCombustionResidueMask;
+	TArray<uint8> ReplicatedReactionOutputMask;
 
 	UPROPERTY(Replicated)
-	TArray<uint8> ReplicatedCombustionBurningMask;
+	TArray<uint8> ReplicatedReactionActiveMask;
 
-	UPROPERTY(ReplicatedUsing = OnRep_CombustionState)
-	int32 CombustionRevision = 0;
+	UPROPERTY(ReplicatedUsing = OnRep_ReactionState)
+	int32 ReactionRevision = 0;
 
 private:
 	friend class UFragmentSimulationSubsystem;
@@ -260,19 +271,19 @@ private:
 	bool PrepareDamageEvent(const FFragmentDamageEvent& DamageEvent, FPreparedFragmentDamage& OutTransaction) const;
 	bool CommitPreparedDamage(FPreparedFragmentDamage& Transaction);
 
-	TUniquePtr<MatterFlux::Combustion::FMaskCombustion>
-		CombustionSimulation;
-	TArray<uint8> ResidueMask;
-	TArray<uint8> VisibleBurningMask;
-	float CombustionAccumulator = 0.0f;
-	float CombustionVisualAccumulator = 0.0f;
-	int32 TotalSmokeEmissionCount = 0;
+	TUniquePtr<MatterFlux::Reaction::FMaskReaction>
+		ReactionSimulation;
+	TArray<uint8> OutputMask;
+	TArray<uint8> VisibleActiveMask;
+	float ReactionAccumulator = 0.0f;
+	float ReactionVisualAccumulator = 0.0f;
+	int32 TotalMaterialEmissionCount = 0;
 	FGuid RegisteredPresenceSourceId;
 	TWeakObjectPtr<AActor> AggregateSeparationCarrier;
 	FTimerHandle AggregateSeparationTimerHandle;
 	double AggregateSeparationEarliestEndSeconds = 0.0;
 	double AggregateSeparationDeadlineSeconds = 0.0;
-	bool bCombustionVisualDirty = false;
-	bool bCombustionGeometryDirty = false;
+	bool bReactionVisualDirty = false;
+	bool bReactionGeometryDirty = false;
 	bool bSourceMeshProjectionEnabled = true;
 };

@@ -428,9 +428,14 @@ int32 UFragmentSimulationSubsystem::ExecuteWorldCut(
 
 	const FVector ShapeCenter =
 		Shape.WorldTransform.GetLocation();
+	int32 AcceptedTerrainCuts = 0;
 	for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
 	{
 		It->MaterializeFragmentSourcesForDamage(Shape);
+		AcceptedTerrainCuts +=
+			It->ApplyTerrainDamage(Shape, Request.DamagePower) > 0
+				? 1
+				: 0;
 	}
 	const FBox QueryBounds = FBox::BuildAABB(
 		ShapeCenter,
@@ -647,7 +652,7 @@ int32 UFragmentSimulationSubsystem::ExecuteWorldCut(
 		}
 		AcceptedCuts += bTargetAccepted ? 1 : 0;
 	}
-	return AcceptedCuts;
+	return AcceptedCuts + AcceptedTerrainCuts;
 }
 
 bool UFragmentSimulationSubsystem::ExecuteFragmentDamage(AFragment2DSourceActor* SourceActor, const FFragmentDamageEvent& DamageEvent)

@@ -59,6 +59,7 @@ namespace
 	bool GTreeBatchCutCapturePending = false;
 	bool GShellCapturePending = false;
 	bool GStabilityCapturePending = false;
+	bool GTerrainCutCapturePending = false;
 	bool GLiquidPoolCapturePending = false;
 	bool GDeepLiquidWalkCapturePending = false;
 	bool GLiquidDropCapturePending = false;
@@ -98,7 +99,7 @@ namespace
 				TEXT("spell.add_damage"),
 				TEXT("spell.spark_trigger"),
 				TEXT("spell.spark_bolt"),
-				TEXT("spell.ember_bolt")
+				TEXT("spell.flame_jet")
 			};
 		}
 		else if (Preset.Equals(TEXT("forest"), ESearchCase::IgnoreCase))
@@ -752,19 +753,19 @@ namespace
 			{
 				const FVector ViewDirection =
 					(State->CameraFront + State->CameraRight).GetSafeNormal();
-				const FVector IgnitionPoint = State->CameraFocus
+				const FVector StimulusPoint = State->CameraFocus
 					+ FVector::UpVector * State->CaptureOrthoWidth * 0.22f
 					+ ViewDirection * State->CaptureOrthoWidth * 0.16f;
-				if (!PlayableWorld->IgniteLogicalFragmentAggregate(
+				if (!PlayableWorld->ApplyMaterialStimulusToLogicalFragmentAggregate(
 					State->AggregateId,
-					IgnitionPoint,
-					TEXT("fire"),
+					StimulusPoint,
+					NAME_None,
 					State->EventSeed))
 				{
 					UE_LOG(
 						LogMatterFlux,
 						Error,
-						TEXT("Tree burn inspection could not ignite the logical aggregate."));
+						TEXT("Tree reaction inspection could not apply the configured material stimulus."));
 					GTreeCutCapturePending = false;
 					RestoreTreeCutCamera(*State);
 					if (State->bQuitAfterCapture)
@@ -806,9 +807,6 @@ namespace
 			PositionTreeCaptureCamera(
 				*State,
 				(State->CameraFront + State->CameraRight).GetSafeNormal());
-			FFragmentWorldCutRequest CutRequest;
-			CutRequest.CutShape.Type = EFragmentDamageShapeType::Line;
-			CutRequest.CutShape.WorldTransform = Tree->GetActorTransform();
 			// Cut just above the rooted first voxel. A center cut leaves a tall
 			// stump and mostly tests a falling canopy instead of a felled tree.
 			const FVector RootLocalCut(
@@ -816,14 +814,20 @@ namespace
 				0.0f,
 				(-static_cast<float>(Tree->GetMaskHeight()) * 0.5f + 1.5f)
 					* Tree->GetCellSize());
-			CutRequest.CutShape.WorldTransform.SetLocation(
-				Tree->GetActorTransform().TransformPosition(RootLocalCut));
+			const FVector WorldCutLocation = Tree->GetActorTransform()
+				.TransformPosition(RootLocalCut);
+			FMatterFluxMagicProjectilePlan SpellPlan;
+			SpellPlan.Radius = 60.0f;
+			SpellPlan.bUsePlaneVisual = true;
+			FFragmentWorldCutRequest CutRequest;
+			CutRequest.CutShape =
+				AMatterFluxMagicProjectile::BuildImpactCutShape(
+					SpellPlan,
+					Tree->GetActorTransform().GetUnitAxis(EAxis::Y),
+					WorldCutLocation);
 			// 可视验收只覆盖 2 格实体树干，不把 mask padding 或旁边
 			// 花草纳入唯一目标预算；仍然走与玩家法术相同的世界切割
 			// 服务，并在执行后校验选定聚合根确实提交了 revision。
-			CutRequest.CutShape.Extents.X = Tree->GetCellSize() * 2.2f;
-			CutRequest.CutShape.Thickness =
-				Tree->GetCellSize() * 1.1f;
 			CutRequest.DamagePower = 500.0f;
 			CutRequest.EventSeed = State->EventSeed;
 			CutRequest.TargetPadding = 0.0f;
@@ -857,7 +861,7 @@ namespace
 			{
 				RequestTreeCutScreenshot(
 					*State,
-					TEXT("09_Burning_0p2s_FrontRight45.png"));
+					TEXT("09_Active_0p2s_FrontRight45.png"));
 				State->NextActionAt = Now + 0.5;
 				break;
 			}
@@ -870,7 +874,7 @@ namespace
 			{
 				RequestTreeCutScreenshot(
 					*State,
-					TEXT("10_Burning_0p7s_FrontRight45.png"));
+					TEXT("10_Active_0p7s_FrontRight45.png"));
 				State->NextActionAt = Now + 1.1;
 				break;
 			}
@@ -883,7 +887,7 @@ namespace
 			{
 				RequestTreeCutScreenshot(
 					*State,
-					TEXT("11_Burning_1p8s_FrontRight45.png"));
+					TEXT("11_Active_1p8s_FrontRight45.png"));
 				State->NextActionAt = Now + 2.2;
 				break;
 			}
@@ -896,7 +900,7 @@ namespace
 			{
 				RequestTreeCutScreenshot(
 					*State,
-					TEXT("12_Burning_4p0s_FrontRight45.png"));
+					TEXT("12_Active_4p0s_FrontRight45.png"));
 				State->NextActionAt = Now + 0.5;
 				State->Phase = 17;
 				break;
@@ -2518,6 +2522,251 @@ namespace
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
 			&QueueVisualStabilityCapture));
 
+	struct FTerrainCutCaptureState
+	{
+		double QueuedAt = 0.0;
+		double PhaseStartedAt = 0.0;
+		int32 Phase = 0;
+		int32 MapSeed = 1337;
+		bool bQuitAfterCapture = true;
+		bool bAccepted = false;
+		bool bProbeSelected = false;
+		float HeightBefore = 0.0f;
+		float HeightAfter = 0.0f;
+		FVector2D ProbeXY = FVector2D(1800.0, 1200.0);
+		FString OutputDirectory;
+		TWeakObjectPtr<ACameraActor> Camera;
+	};
+
+	void RequestTerrainCutScreenshot(
+		const FTerrainCutCaptureState& State,
+		const TCHAR* Filename)
+	{
+		IFileManager::Get().MakeDirectory(*State.OutputDirectory, true);
+		const FString Path = FPaths::Combine(State.OutputDirectory, Filename);
+		FScreenshotRequest::RequestScreenshot(
+			Path, false, false, false, FIntRect(), true);
+		UE_LOG(LogMatterFlux, Display,
+			TEXT("Terrain cut capture requested screenshot: %s"), *Path);
+	}
+
+	bool TickTerrainCutCapture(
+		const TSharedRef<FTerrainCutCaptureState>& State)
+	{
+		const double Now = FPlatformTime::Seconds();
+		UWorld* World = GEngine && GEngine->GameViewport
+			? GEngine->GameViewport->GetWorld()
+			: nullptr;
+		if (!World || !World->IsGameWorld())
+		{
+			if (Now - State->QueuedAt < 45.0)
+			{
+				return true;
+			}
+			GTerrainCutCapturePending = false;
+			if (State->bQuitAfterCapture)
+			{
+				FPlatformMisc::RequestExitWithStatus(false, 4);
+			}
+			return false;
+		}
+
+		AMatterFluxPlayableWorldActor* PlayableWorld = nullptr;
+		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
+		{
+			PlayableWorld = *It;
+			break;
+		}
+		if (!PlayableWorld)
+		{
+			return true;
+		}
+		if (PlayableWorld->GetMapSeed() != State->MapSeed)
+		{
+			PlayableWorld->Regenerate(State->MapSeed);
+			State->Phase = 0;
+			State->PhaseStartedAt = Now;
+			return true;
+		}
+		if (PlayableWorld->IsGenerationInProgress()
+			|| PlayableWorld->GetPendingFragmentSourceSpawnCount() > 0
+			|| FScreenshotRequest::IsScreenshotRequested())
+		{
+			return true;
+		}
+
+		const FVector ProbeXY(State->ProbeXY, 0.0f);
+		if (State->Phase == 0)
+		{
+			if (!State->bProbeSelected)
+			{
+				const FVector2D Candidates[] = {
+					FVector2D(1800.0, 1200.0),
+					FVector2D(2400.0, 1200.0),
+					FVector2D(1800.0, 2000.0),
+					FVector2D(2800.0, 2000.0),
+					FVector2D(-2400.0, 1800.0),
+					FVector2D(3200.0, -1800.0)
+				};
+				for (const FVector2D Candidate : Candidates)
+				{
+					TArray<AFragment2DSourceActor*> NearbySources;
+					PlayableWorld->GatherFragmentSourcesInBounds(
+						FBox(
+							FVector(Candidate.X - 240.0, Candidate.Y - 240.0, -10000.0),
+							FVector(Candidate.X + 240.0, Candidate.Y + 240.0, 10000.0)),
+						NearbySources);
+					if (NearbySources.IsEmpty())
+					{
+						State->ProbeXY = Candidate;
+						State->bProbeSelected = true;
+						break;
+					}
+				}
+				if (!State->bProbeSelected)
+				{
+					UE_LOG(LogMatterFlux, Error,
+						TEXT("Terrain cut capture could not find an unobstructed generated-terrain probe."));
+					State->bAccepted = false;
+					State->Phase = 3;
+					State->PhaseStartedAt = Now;
+					return true;
+				}
+			}
+			const FVector SelectedProbe(State->ProbeXY, 0.0f);
+			if (!PlayableWorld->TrySampleTerrainHeightAtWorldLocation(
+				SelectedProbe, State->HeightBefore))
+			{
+				return true;
+			}
+			const FVector Target(
+				State->ProbeXY.X,
+				State->ProbeXY.Y,
+				State->HeightBefore - 25.0f);
+			const FVector CameraLocation =
+				Target + FVector(-380.0f, -380.0f, 320.0f);
+			ACameraActor* Camera = World->SpawnActor<ACameraActor>(
+				CameraLocation,
+				(Target - CameraLocation).Rotation());
+			if (!Camera)
+			{
+				return true;
+			}
+			State->Camera = Camera;
+			if (APlayerController* Controller = World->GetFirstPlayerController())
+			{
+				if (APawn* Pawn = Controller->GetPawn())
+				{
+					Pawn->SetActorLocation(Target + FVector(0.0f, 0.0f, 220.0f));
+				}
+				Controller->SetViewTarget(Camera);
+			}
+			PlayableWorld->SetWorldStreamingFocus(Target);
+			State->Phase = 10;
+			State->PhaseStartedAt = Now;
+			return true;
+		}
+		if (State->Phase == 10 && Now - State->PhaseStartedAt >= 2.0)
+		{
+			RequestTerrainCutScreenshot(*State, TEXT("01_TerrainBeforeCut.png"));
+			State->Phase = 1;
+			State->PhaseStartedAt = Now;
+			return true;
+		}
+
+		if (State->Phase == 1 && Now - State->PhaseStartedAt >= 0.75)
+		{
+			FFragmentWorldCutRequest Request;
+			Request.CutShape.Type = EFragmentDamageShapeType::Circle;
+			Request.CutShape.WorldTransform = FTransform(FVector(
+				State->ProbeXY.X,
+				State->ProbeXY.Y,
+				State->HeightBefore));
+			Request.CutShape.Radius = 160.0f;
+			Request.DamagePower = 1200.0f;
+			Request.EventSeed = 1337002;
+			Request.TargetPadding = 160.0f;
+			const int32 Accepted =
+				UFragmentSimulationSubsystem::ExecuteWorldCut(World, Request);
+			State->bAccepted = Accepted > 0
+				&& PlayableWorld->TrySampleTerrainHeightAtWorldLocation(
+					ProbeXY, State->HeightAfter)
+				&& State->HeightAfter < State->HeightBefore;
+			if (State->bAccepted)
+			{
+				UE_LOG(LogMatterFlux, Display,
+					TEXT("Terrain cut runtime audit: accepted=%d before=%.2f after=%.2f"),
+					Accepted,
+					State->HeightBefore,
+					State->HeightAfter);
+			}
+			else
+			{
+				UE_LOG(LogMatterFlux, Error,
+					TEXT("Terrain cut runtime audit: accepted=%d before=%.2f after=%.2f"),
+					Accepted,
+					State->HeightBefore,
+					State->HeightAfter);
+			}
+			State->Phase = 2;
+			State->PhaseStartedAt = Now;
+			return true;
+		}
+
+		if (State->Phase == 2 && Now - State->PhaseStartedAt >= 1.0)
+		{
+			RequestTerrainCutScreenshot(*State, TEXT("02_TerrainAfterCut.png"));
+			State->Phase = 3;
+			State->PhaseStartedAt = Now;
+			return true;
+		}
+		if (State->Phase == 3 && Now - State->PhaseStartedAt >= 1.0)
+		{
+			GTerrainCutCapturePending = false;
+			if (State->bQuitAfterCapture)
+			{
+				FPlatformMisc::RequestExitWithStatus(
+					false, State->bAccepted ? 0 : 5);
+			}
+			return false;
+		}
+		return true;
+	}
+
+	void QueueTerrainCutCapture(const TArray<FString>& Args, UWorld*)
+	{
+		if (GTerrainCutCapturePending)
+		{
+			return;
+		}
+		const TSharedRef<FTerrainCutCaptureState> State =
+			MakeShared<FTerrainCutCaptureState>();
+		State->QueuedAt = FPlatformTime::Seconds();
+		State->PhaseStartedAt = State->QueuedAt;
+		State->MapSeed = Args.IsValidIndex(0)
+			? FMath::Max(1, FCString::Atoi(*Args[0]))
+			: 1337;
+		State->bQuitAfterCapture = !Args.IsValidIndex(1)
+			|| FCString::Atoi(*Args[1]) != 0;
+		State->OutputDirectory = FPaths::Combine(
+			FPaths::ScreenShotDir(),
+			TEXT("MatterFluxTerrainCut"),
+			FDateTime::Now().ToString(TEXT("%Y%m%d-%H%M%S")));
+		GTerrainCutCapturePending = true;
+		FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateLambda([State](float)
+			{
+				return TickTerrainCutCapture(State);
+			}),
+			0.05f);
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs GTerrainCutCaptureCommand(
+		TEXT("mf.Visual.TerrainCut"),
+		TEXT("Capture a real generated terrain crater before and after a world cut: mf.Visual.TerrainCut [map-seed=1337] [quit=1]"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+			&QueueTerrainCutCapture));
+
 	struct FHouseCaptureState
 	{
 		double QueuedAt = 0.0;
@@ -3113,7 +3362,11 @@ namespace
 			State->MaximumPlayerFeetZ = FMath::Max(
 				State->MaximumPlayerFeetZ, FeetZ);
 			const float UpperZ = House->GetFloorSurfaceWorldZ(1);
-			if (FeetZ >= UpperZ - 55.0f)
+			// Height alone can be reached while the capsule is still above the
+			// stair opening.  Wait until the canonical floor material resolver has
+			// actually selected the upper floor before accepting the visual gate.
+			if (FeetZ >= UpperZ - 55.0f
+				&& House->GetCurrentCutawayFloor() == 1)
 			{
 				if (UCharacterMovementComponent* Movement =
 					Character->GetCharacterMovement())
@@ -3146,7 +3399,17 @@ namespace
 			}
 			State->MinimumPlayerFeetZAfterUpper =
 				House->GetFloorSurfaceWorldZ(1);
-			House->RefreshCutawayImmediately();
+			if (House->GetCurrentCutawayFloor() != 1)
+			{
+				UE_LOG(LogMatterFlux, Error,
+					TEXT("Upper-floor screenshot lost its material cutaway state."));
+				RestoreHouseCapture(*State);
+				if (State->bQuitAfterCapture)
+				{
+					FPlatformMisc::RequestExitWithStatus(false, 4);
+				}
+				return false;
+			}
 			RequestHouseScreenshot(*State, TEXT("03_UpperFloorReached.png"));
 			State->Phase = 7;
 			State->PhaseStartedAt = Now;
@@ -3178,7 +3441,9 @@ namespace
 				State->PhaseStartedAt = Now;
 				return true;
 			}
-			if (State->Phase == 8 && FeetZ <= GroundZ + 55.0f)
+			if (State->Phase == 8
+				&& FeetZ <= GroundZ + 55.0f
+				&& House->GetCurrentCutawayFloor() == 0)
 			{
 				if (UCharacterMovementComponent* Movement =
 					Character->GetCharacterMovement())
@@ -3210,7 +3475,17 @@ namespace
 			{
 				return true;
 			}
-			House->RefreshCutawayImmediately();
+			if (House->GetCurrentCutawayFloor() != 0)
+			{
+				UE_LOG(LogMatterFlux, Error,
+					TEXT("Ground-floor screenshot lost its material cutaway state."));
+				RestoreHouseCapture(*State);
+				if (State->bQuitAfterCapture)
+				{
+					FPlatformMisc::RequestExitWithStatus(false, 4);
+				}
+				return false;
+			}
 			RequestHouseScreenshot(
 				*State, TEXT("05_PlayerReturnedGroundFloor.png"));
 			State->Phase = 10;
@@ -3319,7 +3594,9 @@ namespace
 				State->PhaseStartedAt = Now;
 				return true;
 			}
-			if (State->Phase == 12 && FeetZ >= UpperZ - 55.0f)
+			// Do not label the resident as being on the upper floor while it is
+			// merely standing on the last few stair cells.
+			if (State->Phase == 12 && FeetZ >= UpperZ - 20.0f)
 			{
 				if (UCharacterMovementComponent* Movement =
 					Resident->GetCharacterMovement())
@@ -3466,9 +3743,9 @@ namespace
 			}
 			const float GroundZ = House->GetFloorSurfaceWorldZ(0);
 			const float UpperZ = House->GetFloorSurfaceWorldZ(1);
-			if (State->MaximumPlayerFeetZ < UpperZ - 55.0f
+			if (State->MaximumPlayerFeetZ < UpperZ - 20.0f
 				|| State->MinimumPlayerFeetZAfterUpper > GroundZ + 55.0f
-				|| State->MaximumResidentFeetZ < UpperZ - 55.0f
+				|| State->MaximumResidentFeetZ < UpperZ - 20.0f
 				|| State->MinimumResidentFeetZAfterUpper > GroundZ + 55.0f)
 			{
 				UE_LOG(LogMatterFlux, Error,

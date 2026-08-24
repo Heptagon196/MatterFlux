@@ -2,15 +2,375 @@
 #include "Game/MatterFluxCharacter.h"
 #include "Game/MatterFluxPlayableLevel.h"
 #include "Game/MatterFluxPlayableWorldActor.h"
-#include "Material/MatterFluxGroundCombustionRuntime.h"
-#include "Material/MatterFluxLogicalSourceCombustionIndex.h"
+#include "Material/MatterFluxGroundReactionRuntime.h"
+#include "Material/MatterFluxLogicalSourceReactionIndex.h"
 
 #include "Algo/Sort.h"
+#include "Engine/World.h"
 #include "EngineUtils.h"
 #include "GameFramework/PlayerController.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/AutomationTest.h"
+#include "ProfilingDebugging/MiscTrace.h"
 #include "Tests/AutomationEditorCommon.h"
+
+namespace
+{
+	enum class EMatterFluxLongTraversalPhase : uint8
+	{
+		Warmup,
+		Traverse,
+		Drain
+	};
+
+	struct FMatterFluxLongTraversalState
+	{
+		FAutomationTestBase* Test = nullptr;
+		TWeakObjectPtr<UWorld> World;
+		TWeakObjectPtr<AMatterFluxPlayableWorldActor> WorldActor;
+		TWeakObjectPtr<AMatterFluxCharacter> Character;
+		EMatterFluxLongTraversalPhase Phase =
+			EMatterFluxLongTraversalPhase::Warmup;
+		FVector PathStart = FVector::ZeroVector;
+		FVector PathEnd = FVector::ZeroVector;
+		FIntPoint PreviousChunk = FIntPoint::ZeroValue;
+		float ChunkWorldSize = 0.0f;
+		int32 MovementFrames = 0;
+		int32 WarmupFrames = 0;
+		int32 MovementFrame = 0;
+		int32 DrainFrames = 0;
+		int32 BoundaryCrossingCount = 0;
+		int32 SlowPlayableWorldTickCount = 0;
+		int32 VisibleHitchFrameCount = 0;
+		int32 MissingTerrainFrameCount = 0;
+		int32 MissingPopulationFrameCount = 0;
+		int32 MaximumPopulationBacklog = 0;
+		int32 MaximumTerrainBacklog = 0;
+		int32 MaximumStreamedHouseCount = 0;
+		double PreviousFrameStartSeconds = 0.0;
+		double MaximumPlayableWorldTickMilliseconds = 0.0;
+		double MaximumFrameIntervalMilliseconds = 0.0;
+		TArray<double> PlayableWorldTickSamples;
+		TArray<double> FrameIntervalSamples;
+		bool bTraceRegionOpen = false;
+	};
+
+	class FMatterFluxLongTraversalLatentCommand final
+		: public IAutomationLatentCommand
+	{
+	public:
+		explicit FMatterFluxLongTraversalLatentCommand(
+			TSharedPtr<FMatterFluxLongTraversalState> InState)
+			: State(MoveTemp(InState))
+		{
+		}
+
+		virtual bool Update() override
+		{
+			if (!State.IsValid() || !State->Test)
+			{
+				return true;
+			}
+			UWorld* World = State->World.Get();
+			AMatterFluxPlayableWorldActor* WorldActor =
+				State->WorldActor.Get();
+			AMatterFluxCharacter* Character = State->Character.Get();
+			if (!World || !WorldActor || !Character)
+			{
+				CloseTraceRegion();
+				State->Test->AddError(
+					TEXT("Long traversal lost its world or player"));
+				return true;
+			}
+
+			switch (State->Phase)
+			{
+			case EMatterFluxLongTraversalPhase::Warmup:
+				WorldActor->Tick(FixedDeltaSeconds);
+				++State->WarmupFrames;
+				if (StreamingIsIdle(*WorldActor))
+				{
+					State->Phase = EMatterFluxLongTraversalPhase::Traverse;
+					State->PreviousFrameStartSeconds =
+						FPlatformTime::Seconds();
+					TRACE_BEGIN_REGION(
+						TEXT("MatterFluxLongContinuousExternalTraversal"));
+					State->bTraceRegionOpen = true;
+				}
+				else if (State->WarmupFrames >= MaximumWarmupFrames)
+				{
+					State->Test->AddError(FString::Printf(
+						TEXT("Long traversal warmup did not drain: population=%d terrain=%d fragment=%d"),
+						WorldActor->GetPendingProceduralPopulationUpdateCount(),
+						WorldActor->GetPendingTerrainChunkPrefetchCount(),
+						WorldActor->GetPendingFragmentSourceSpawnCount()));
+					return true;
+				}
+				return false;
+
+			case EMatterFluxLongTraversalPhase::Traverse:
+				return UpdateTraversal(*WorldActor, *Character);
+
+			case EMatterFluxLongTraversalPhase::Drain:
+				WorldActor->Tick(FixedDeltaSeconds);
+				++State->DrainFrames;
+				if (StreamingIsIdle(*WorldActor)
+					|| State->DrainFrames >= MaximumDrainFrames)
+				{
+					return Finish(*WorldActor);
+				}
+				return false;
+			}
+			return true;
+		}
+
+	private:
+		static constexpr float FixedDeltaSeconds = 1.0f / 60.0f;
+		static constexpr int32 MaximumWarmupFrames = 1200;
+		static constexpr int32 MaximumDrainFrames = 1800;
+		static constexpr double SixtyFpsBudgetMilliseconds = 16.67;
+		static constexpr double TwoFrameBudgetMilliseconds = 33.34;
+		static constexpr double VisibleHitchMilliseconds = 250.0;
+
+		static bool StreamingIsIdle(
+			const AMatterFluxPlayableWorldActor& WorldActor)
+		{
+			return WorldActor.GetPendingFragmentSourceSpawnCount() == 0
+				&& WorldActor.GetPendingProceduralPopulationUpdateCount() == 0
+				&& WorldActor.GetPendingTerrainChunkPrefetchCount() == 0;
+		}
+
+		FIntPoint ToChunk(const FVector& Location) const
+		{
+			return FIntPoint(
+				FMath::FloorToInt(Location.X / State->ChunkWorldSize),
+				FMath::FloorToInt(Location.Y / State->ChunkWorldSize));
+		}
+
+		bool UpdateTraversal(
+			AMatterFluxPlayableWorldActor& WorldActor,
+			AMatterFluxCharacter& Character)
+		{
+			const double FrameStartSeconds = FPlatformTime::Seconds();
+			if (State->MovementFrame > 0)
+			{
+				const double FrameIntervalMilliseconds =
+					(FrameStartSeconds - State->PreviousFrameStartSeconds)
+						* 1000.0;
+				State->FrameIntervalSamples.Add(FrameIntervalMilliseconds);
+				State->MaximumFrameIntervalMilliseconds = FMath::Max(
+					State->MaximumFrameIntervalMilliseconds,
+					FrameIntervalMilliseconds);
+				State->VisibleHitchFrameCount +=
+					FrameIntervalMilliseconds >= VisibleHitchMilliseconds ? 1 : 0;
+			}
+
+			if (State->MovementFrame >= State->MovementFrames)
+			{
+				CloseTraceRegion();
+				State->Phase = EMatterFluxLongTraversalPhase::Drain;
+				return false;
+			}
+
+			State->PreviousFrameStartSeconds = FrameStartSeconds;
+			++State->MovementFrame;
+			const FVector Location = FMath::Lerp(
+				State->PathStart,
+				State->PathEnd,
+				static_cast<float>(State->MovementFrame)
+					/ static_cast<float>(State->MovementFrames));
+			const FIntPoint CurrentChunk = ToChunk(Location);
+			const bool bBoundaryFrame = CurrentChunk != State->PreviousChunk;
+			Character.SetActorLocation(Location);
+			const double PlayableWorldTickStartSeconds = FPlatformTime::Seconds();
+			WorldActor.Tick(FixedDeltaSeconds);
+			const double PlayableWorldTickMilliseconds =
+				(FPlatformTime::Seconds() - PlayableWorldTickStartSeconds) * 1000.0;
+			State->PlayableWorldTickSamples.Add(PlayableWorldTickMilliseconds);
+			State->MaximumPlayableWorldTickMilliseconds = FMath::Max(
+				State->MaximumPlayableWorldTickMilliseconds,
+				PlayableWorldTickMilliseconds);
+			State->SlowPlayableWorldTickCount +=
+				PlayableWorldTickMilliseconds >= SixtyFpsBudgetMilliseconds ? 1 : 0;
+			State->BoundaryCrossingCount += bBoundaryFrame ? 1 : 0;
+			State->MissingTerrainFrameCount +=
+				WorldActor.HasVisibleTerrainChunk(CurrentChunk) ? 0 : 1;
+			State->MissingPopulationFrameCount +=
+				WorldActor.HasProceduralPopulationChunk(CurrentChunk) ? 0 : 1;
+			State->MaximumPopulationBacklog = FMath::Max(
+				State->MaximumPopulationBacklog,
+				WorldActor.GetPendingProceduralPopulationUpdateCount());
+			State->MaximumTerrainBacklog = FMath::Max(
+				State->MaximumTerrainBacklog,
+				WorldActor.GetPendingTerrainChunkPrefetchCount());
+			State->MaximumStreamedHouseCount = FMath::Max(
+				State->MaximumStreamedHouseCount,
+				WorldActor.GetGeneratedStreamedHouseCount());
+			State->PreviousChunk = CurrentChunk;
+			return false;
+		}
+
+		static double Percentile(
+			TArray<double> Samples,
+			const double Fraction)
+		{
+			if (Samples.IsEmpty())
+			{
+				return 0.0;
+			}
+			Algo::Sort(Samples);
+			const int32 Index = FMath::Clamp(
+				FMath::CeilToInt(Samples.Num() * Fraction) - 1,
+				0,
+				Samples.Num() - 1);
+			return Samples[Index];
+		}
+
+		bool Finish(AMatterFluxPlayableWorldActor& WorldActor)
+		{
+			CloseTraceRegion();
+			const int32 Radius = WorldActor.GetTerrainStreamingChunkRadius();
+			const int32 Diameter = Radius * 2 + 1;
+			const int32 CameraOverlapSide = FMath::Max(Diameter - 2, 0);
+			const int32 ExpectedVisibleChunks =
+				Diameter * Diameter * 2
+					- CameraOverlapSide * CameraOverlapSide;
+			const int32 PopulationRadius = Radius + 1;
+			const int32 PopulationDiameter = PopulationRadius * 2 + 1;
+			const int32 PopulationCameraOverlapSide =
+				FMath::Max(PopulationDiameter - 2, 0);
+			const int32 ExpectedPopulationChunks =
+				PopulationDiameter * PopulationDiameter * 2
+					- PopulationCameraOverlapSide
+						* PopulationCameraOverlapSide;
+			const int32 ProceduralChunkCount =
+				WorldActor.GetProceduralPopulationChunkCount();
+			const int32 TreeCount =
+				WorldActor.GetProceduralTreeAggregateCount();
+			const double TreesPerChunk = ProceduralChunkCount > 0
+				? static_cast<double>(TreeCount) / ProceduralChunkCount
+				: 0.0;
+
+			TArray<AFragment2DSourceActor*> FinalSources;
+			const FVector SearchExtent(
+				Radius * State->ChunkWorldSize,
+				Radius * State->ChunkWorldSize,
+				2000.0f);
+			WorldActor.GatherFragmentSourcesInBounds(
+				FBox(State->PathEnd - SearchExtent, State->PathEnd + SearchExtent),
+				FinalSources);
+			TSet<FName> FinalMaterials;
+			for (const AFragment2DSourceActor* Source : FinalSources)
+			{
+				if (Source
+					&& Source->ActorHasTag(TEXT("MatterFluxGeneratedDecoration")))
+				{
+					FinalMaterials.Add(Source->SourceMaterialId);
+				}
+			}
+
+			const double PlayableWorldTickP99 =
+				Percentile(State->PlayableWorldTickSamples, 0.99);
+			const double FrameIntervalP99 =
+				Percentile(State->FrameIntervalSamples, 0.99);
+			State->Test->AddInfo(FString::Printf(
+				TEXT("Long real-frame external walk: %d frames, %d boundaries; playable-world tick p99 %.2f ms max %.2f ms slow=%d; frame interval p99 %.2f ms max %.2f ms visible hitches=%d; missing terrain=%d population=%d; max backlogs population=%d terrain=%d; resident=%d/%d trees=%d (%.3f/chunk), houses=%d, final materials=%d"),
+				State->MovementFrames,
+				State->BoundaryCrossingCount,
+				PlayableWorldTickP99,
+				State->MaximumPlayableWorldTickMilliseconds,
+				State->SlowPlayableWorldTickCount,
+				FrameIntervalP99,
+				State->MaximumFrameIntervalMilliseconds,
+				State->VisibleHitchFrameCount,
+				State->MissingTerrainFrameCount,
+				State->MissingPopulationFrameCount,
+				State->MaximumPopulationBacklog,
+				State->MaximumTerrainBacklog,
+				ProceduralChunkCount,
+				ExpectedPopulationChunks,
+				TreeCount,
+				TreesPerChunk,
+				State->MaximumStreamedHouseCount,
+				FinalMaterials.Num()));
+
+			State->Test->TestEqual(
+				TEXT("Long traversal crosses every requested chunk boundary"),
+				State->BoundaryCrossingCount,
+				64);
+			State->Test->TestEqual(
+				TEXT("Playable-world streaming ticks stay inside the 60 FPS budget"),
+				State->SlowPlayableWorldTickCount,
+				0);
+			State->Test->TestTrue(
+				TEXT("99 percent of rendered frame intervals stay inside two 60 FPS frames"),
+				FrameIntervalP99 < TwoFrameBudgetMilliseconds);
+			State->Test->TestEqual(
+				TEXT("Long traversal has no visibly frozen frame"),
+				State->VisibleHitchFrameCount,
+				0);
+			State->Test->TestEqual(
+				TEXT("Terrain is resident before the player reaches each chunk"),
+				State->MissingTerrainFrameCount,
+				0);
+			State->Test->TestEqual(
+				TEXT("Decorations are resident before the player reaches each external chunk"),
+				State->MissingPopulationFrameCount,
+				0);
+			State->Test->TestTrue(
+				TEXT("The final terrain window is completely visible"),
+				WorldActor.GetVisibleTerrainChunkCount()
+					== ExpectedVisibleChunks);
+			State->Test->TestEqual(
+				TEXT("The final off-screen decoration prefetch ring is resident"),
+				ProceduralChunkCount,
+				ExpectedPopulationChunks);
+			State->Test->TestTrue(
+				TEXT("The final external forest keeps local authored density"),
+				TreesPerChunk >= 1.5);
+			State->Test->TestTrue(
+				TEXT("Long traversal encounters streamed houses"),
+				State->MaximumStreamedHouseCount > 0);
+			const FName RequiredMaterials[] = {
+				TEXT("wood"),
+				TEXT("leaf"),
+				TEXT("stone"),
+				TEXT("grass"),
+				TEXT("flower_pink"),
+				TEXT("flower_gold"),
+				TEXT("flower_blue")
+			};
+			for (const FName Material : RequiredMaterials)
+			{
+				State->Test->TestTrue(
+					*FString::Printf(
+						TEXT("The final streamed window visibly contains %s"),
+						*Material.ToString()),
+					FinalMaterials.Contains(Material));
+			}
+			State->Test->TestEqual(
+				TEXT("Long traversal drains the decoration queue"),
+				WorldActor.GetPendingProceduralPopulationUpdateCount(),
+				0);
+			State->Test->TestEqual(
+				TEXT("Long traversal drains the terrain queue"),
+				WorldActor.GetPendingTerrainChunkPrefetchCount(),
+				0);
+			return true;
+		}
+
+		void CloseTraceRegion()
+		{
+			if (State.IsValid() && State->bTraceRegionOpen)
+			{
+				TRACE_END_REGION(TEXT("MatterFluxLongContinuousExternalTraversal"));
+				State->bTraceRegionOpen = false;
+			}
+		}
+
+		TSharedPtr<FMatterFluxLongTraversalState> State;
+	};
+}
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxLogicalSourceHistoryPerformanceTest,
@@ -25,8 +385,8 @@ bool FMatterFluxLogicalSourceHistoryPerformanceTest::RunTest(
 	constexpr int32 ActiveSourceCount = 32;
 	constexpr int32 VisualRefreshCount = 10000;
 	const TArray<uint8> ExtinguishedMask = {0, 0, 0, 0};
-	const TArray<uint8> BurningMask = {0, 1, 0, 0};
-	MatterFlux::Combustion::FLogicalSourceCombustionIndex Index;
+	const TArray<uint8> ActiveMask = {0, 1, 0, 0};
+	MatterFlux::Reaction::FLogicalSourceReactionIndex Index;
 
 	for (int32 SourceIndex = 0;
 		SourceIndex < HistoricalSourceCount;
@@ -52,7 +412,7 @@ bool FMatterFluxLogicalSourceHistoryPerformanceTest::RunTest(
 			0x27d4eb2du,
 			0x165667b1u,
 			0xd3a2646cu);
-		Index.ApplySnapshot(SourceId, true, BurningMask);
+		Index.ApplySnapshot(SourceId, true, ActiveMask);
 	}
 	TestEqual(
 		TEXT("Only current fires survive a long exploration history"),
@@ -113,10 +473,10 @@ bool FMatterFluxGroundRuntimeSparseUpdatePerformanceTest::RunTest(
 	Rule.PropagationChancePermille = 0;
 	Rule.DurationSteps = 255;
 
-	MatterFlux::Combustion::FGroundRuntimeSettings Settings;
+	MatterFlux::Reaction::FGroundRuntimeSettings Settings;
 	Settings.Width = Width;
 	Settings.Height = Height;
-	MatterFlux::Combustion::FGroundCombustionRuntime Runtime;
+	MatterFlux::Reaction::FGroundReactionRuntime Runtime;
 	FString Error;
 	if (!TestTrue(
 		TEXT("Large sparse-update runtime initializes"),
@@ -126,11 +486,11 @@ bool FMatterFluxGroundRuntimeSparseUpdatePerformanceTest::RunTest(
 		return false;
 	}
 
-	int32 Ignited = 0;
+	int32 Activated = 0;
 	const double StartSeconds = FPlatformTime::Seconds();
 	for (int32 Index = 0; Index < IgnitionCount; ++Index)
 	{
-		Ignited += Runtime.Ignite(
+		Activated += Runtime.Activate(
 			FIntPoint(Index % Width, Index / Width),
 			Rule.InputB)
 			? 1
@@ -145,8 +505,8 @@ bool FMatterFluxGroundRuntimeSparseUpdatePerformanceTest::RunTest(
 		Height,
 		ElapsedMilliseconds));
 	TestEqual(
-		TEXT("Every distinct fuel cell ignites"),
-		Ignited,
+		TEXT("Every distinct input cell ignites"),
+		Activated,
 		IgnitionCount);
 	TestTrue(
 		TEXT("Sparse ignition cost stays independent of the full mask size"),
@@ -280,18 +640,18 @@ bool FMatterFluxFragmentSourceStateBatchScalePerformanceTest::RunTest(
 	{
 		FFragment2DSourceStreamingState State;
 		State.Revision = Revision;
-		State.bHasCombustionState = true;
+		State.bHasReactionState = true;
 		TArray<uint8> RuntimeMask;
 		RuntimeMask.SetNumUninitialized(256);
-		State.CombustionState.ResidueMask.SetNumUninitialized(256);
-		State.CombustionState.BurningMask.SetNumUninitialized(256);
+		State.ReactionState.OutputMask.SetNumUninitialized(256);
+		State.ReactionState.ActiveMask.SetNumUninitialized(256);
 		for (int32 CellIndex = 0; CellIndex < 256; ++CellIndex)
 		{
 			RuntimeMask[CellIndex] =
 				((CellIndex + Pattern) & 1) != 0 ? 1 : 0;
-			State.CombustionState.ResidueMask[CellIndex] =
+			State.ReactionState.OutputMask[CellIndex] =
 				((CellIndex + Pattern) % 5) == 0 ? 1 : 0;
-			State.CombustionState.BurningMask[CellIndex] =
+			State.ReactionState.ActiveMask[CellIndex] =
 				((CellIndex + Pattern) % 7) == 0 ? 4 : 0;
 		}
 		State.SetRuntimeMask(MoveTemp(RuntimeMask));
@@ -379,11 +739,11 @@ bool FMatterFluxFragmentSourceStateBudgetTransactionTest::RunTest(
 	const FGuid FirstSourceId(1, 2, 3, 4);
 	FFragment2DSourceStreamingState Initial;
 	Initial.Revision = 7;
-	Initial.bHasCombustionState = true;
-	Initial.CombustionState.ResidueMask.Init(0, 16);
-	Initial.CombustionState.ResidueMask[1] = 1;
-	Initial.CombustionState.BurningMask.Init(0, 16);
-	Initial.CombustionState.BurningMask[2] = 5;
+	Initial.bHasReactionState = true;
+	Initial.ReactionState.OutputMask.Init(0, 16);
+	Initial.ReactionState.OutputMask[1] = 1;
+	Initial.ReactionState.ActiveMask.Init(0, 16);
+	Initial.ReactionState.ActiveMask[2] = 5;
 	TArray<uint8> InitialRuntimeMask;
 	InitialRuntimeMask.Init(0, 16);
 	InitialRuntimeMask[0] = 1;
@@ -498,10 +858,10 @@ bool FMatterFluxGroundRuntimeAdvanceBreakdownPerformanceTest::RunTest(
 	Rule.PropagationChancePermille = 420;
 	Rule.DurationSteps = 8;
 
-	MatterFlux::Combustion::FGroundRuntimeSettings Settings;
+	MatterFlux::Reaction::FGroundRuntimeSettings Settings;
 	Settings.Width = Width;
 	Settings.Height = Height;
-	MatterFlux::Combustion::FGroundCombustionRuntime Runtime;
+	MatterFlux::Reaction::FGroundReactionRuntime Runtime;
 	FString Error;
 	if (!TestTrue(
 		TEXT("Ground breakdown runtime initializes"),
@@ -512,7 +872,7 @@ bool FMatterFluxGroundRuntimeAdvanceBreakdownPerformanceTest::RunTest(
 	}
 	TestTrue(
 		TEXT("Ground breakdown runtime ignites its center cell"),
-		Runtime.Ignite(FIntPoint(Width / 2, Height / 2), Rule.InputB));
+		Runtime.Activate(FIntPoint(Width / 2, Height / 2), Rule.InputB));
 
 	double AdvanceSeconds = 0.0;
 	double ReplicationSeconds = 0.0;
@@ -539,11 +899,11 @@ bool FMatterFluxGroundRuntimeAdvanceBreakdownPerformanceTest::RunTest(
 	const double AdvanceMilliseconds = AdvanceSeconds * 1000.0;
 	const double ReplicationMilliseconds = ReplicationSeconds * 1000.0;
 	AddInfo(FString::Printf(
-		TEXT("GroundRuntime 120 gameplay fire steps: advance %.2f ms, replication %.2f ms, published chunks=%d, residue=%d"),
+		TEXT("GroundRuntime 120 gameplay fire steps: advance %.2f ms, replication %.2f ms, published chunks=%d, output=%d"),
 		AdvanceMilliseconds,
 		ReplicationMilliseconds,
 		PublishedChunks,
-		Runtime.CountResidueCells()));
+		Runtime.CountOutputCells()));
 	TestTrue(
 		TEXT("Sparse ground simulation remains below the aggregate frame budget"),
 		AdvanceMilliseconds < 100.0);
@@ -554,8 +914,163 @@ bool FMatterFluxGroundRuntimeAdvanceBreakdownPerformanceTest::RunTest(
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxInfiniteBoundaryStreamingPerformanceTest,
+	"MatterFlux.Performance.InfinitePopulationBoundaryFrame",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::PerfFilter)
+
+bool FMatterFluxInfiniteBoundaryStreamingPerformanceTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* WorldActor =
+		World ? World->SpawnActor<AMatterFluxPlayableWorldActor>() : nullptr;
+	if (!TestNotNull(TEXT("Playable world actor spawned"), WorldActor))
+	{
+		return false;
+	}
+	WorldActor->Regenerate(1337);
+	constexpr int32 ChunkSize = 64;
+	const FVector FirstExternalChunkCenter(
+		(static_cast<double>(4 * ChunkSize) + ChunkSize * 0.5)
+			* MatterFlux::PlayableLevel::TerrainCellSize,
+		0.0,
+		0.0);
+	const double StartSeconds = FPlatformTime::Seconds();
+	WorldActor->SetWorldStreamingFocus(FirstExternalChunkCenter);
+	const double BoundaryMilliseconds =
+		(FPlatformTime::Seconds() - StartSeconds) * 1000.0;
+	double MaximumStreamingTickMilliseconds = 0.0;
+	int32 MaximumStreamingTickFrame = INDEX_NONE;
+	int32 MaximumTickChunksBefore = 0;
+	int32 MaximumTickChunksAfter = 0;
+	int32 MaximumTickPendingBefore = 0;
+	int32 MaximumTickPendingAfter = 0;
+	int32 StreamingFrames = 0;
+	for (;
+		StreamingFrames < 256
+			&& WorldActor->GetPendingProceduralPopulationUpdateCount() > 0;
+		++StreamingFrames)
+	{
+		const int32 ChunksBefore =
+			WorldActor->GetProceduralPopulationChunkCount();
+		const int32 PendingBefore =
+			WorldActor->GetPendingProceduralPopulationUpdateCount();
+		const double TickStartSeconds = FPlatformTime::Seconds();
+		WorldActor->Tick(1.0f / 60.0f);
+		const double TickMilliseconds =
+			(FPlatformTime::Seconds() - TickStartSeconds) * 1000.0;
+		if (TickMilliseconds > MaximumStreamingTickMilliseconds)
+		{
+			MaximumStreamingTickMilliseconds = TickMilliseconds;
+			MaximumStreamingTickFrame = StreamingFrames;
+			MaximumTickChunksBefore = ChunksBefore;
+			MaximumTickChunksAfter =
+				WorldActor->GetProceduralPopulationChunkCount();
+			MaximumTickPendingBefore = PendingBefore;
+			MaximumTickPendingAfter =
+				WorldActor->GetPendingProceduralPopulationUpdateCount();
+		}
+	}
+	AddInfo(FString::Printf(
+		TEXT("Infinite-population boundary plan: %.2f ms; max queued tick: %.2f ms at frame %d (chunks %d->%d, pending %d->%d); frames=%d, chunks=%d"),
+		BoundaryMilliseconds,
+		MaximumStreamingTickMilliseconds,
+		MaximumStreamingTickFrame,
+		MaximumTickChunksBefore,
+		MaximumTickChunksAfter,
+		MaximumTickPendingBefore,
+		MaximumTickPendingAfter,
+		StreamingFrames,
+		WorldActor->GetProceduralPopulationChunkCount()));
+	TestTrue(
+		TEXT("Entering external terrain only plans work inside one 60 FPS frame"),
+		BoundaryMilliseconds < 16.67);
+	TestTrue(
+		TEXT("Each queued population update stays inside one 60 FPS frame"),
+		MaximumStreamingTickMilliseconds < 16.67);
+	TestEqual(
+		TEXT("The deterministic population queue drains"),
+		WorldActor->GetPendingProceduralPopulationUpdateCount(),
+		0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxContinuousInfiniteTerrainTraversalTest,
+	"MatterFlux.Performance.ContinuousInfiniteTerrainTraversal",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::PerfFilter)
+
+bool FMatterFluxContinuousInfiniteTerrainTraversalTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* WorldActor =
+		World ? World->SpawnActor<AMatterFluxPlayableWorldActor>() : nullptr;
+	if (!TestNotNull(TEXT("Continuous-traversal world actor spawns"), WorldActor))
+	{
+		return false;
+	}
+	WorldActor->Regenerate(24681357);
+
+	FActorSpawnParameters SpawnParameters;
+	SpawnParameters.SpawnCollisionHandlingOverride =
+		ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	APlayerController* PlayerController = World->SpawnActor<APlayerController>(
+		APlayerController::StaticClass(),
+		FTransform::Identity,
+		SpawnParameters);
+	AMatterFluxCharacter* PlayerCharacter = World->SpawnActor<AMatterFluxCharacter>(
+		AMatterFluxCharacter::StaticClass(),
+		FTransform::Identity,
+		SpawnParameters);
+	if (!TestNotNull(TEXT("Traversal controller spawns"), PlayerController)
+		|| !TestNotNull(TEXT("Traversal character spawns"), PlayerCharacter))
+	{
+		return false;
+	}
+	PlayerController->Possess(PlayerCharacter);
+
+	constexpr int32 ChunkSize = 64;
+	constexpr float FixedDeltaSeconds = 1.0f / 60.0f;
+	constexpr float WalkingSpeed = 1200.0f;
+	constexpr int32 ExternalChunkCrossings = 64;
+	const float ChunkWorldSize =
+		ChunkSize * MatterFlux::PlayableLevel::TerrainCellSize;
+	// Start beyond the eagerly authored seed region. Keep the capsule above the
+	// terrain so this test measures streaming rather than collision depenetration.
+	const FVector PathStart(4.5f * ChunkWorldSize, 0.0f, 1000.0f);
+	const FVector PathEnd = PathStart
+		+ FVector(ExternalChunkCrossings * ChunkWorldSize, 0.0f, 0.0f);
+	const int32 MovementFrames = FMath::CeilToInt(
+		FVector::Distance(PathStart, PathEnd)
+			/ (WalkingSpeed * FixedDeltaSeconds));
+	PlayerCharacter->SetActorLocation(PathStart);
+
+	TSharedPtr<FMatterFluxLongTraversalState> State =
+		MakeShared<FMatterFluxLongTraversalState>();
+	State->Test = this;
+	State->World = World;
+	State->WorldActor = WorldActor;
+	State->Character = PlayerCharacter;
+	State->PathStart = PathStart;
+	State->PathEnd = PathEnd;
+	State->ChunkWorldSize = ChunkWorldSize;
+	State->MovementFrames = MovementFrames;
+	State->PreviousChunk = FIntPoint(
+		FMath::FloorToInt(PathStart.X / ChunkWorldSize),
+		FMath::FloorToInt(PathStart.Y / ChunkWorldSize));
+	State->PlayableWorldTickSamples.Reserve(MovementFrames);
+	State->FrameIntervalSamples.Reserve(MovementFrames);
+	ADD_LATENT_AUTOMATION_COMMAND(
+		FMatterFluxLongTraversalLatentCommand(State));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxLargeWorldStreamingPerformanceTest,
-	"MatterFlux.Performance.LargeWorldStreamingMovementAndCombustion",
+	"MatterFlux.Performance.LargeWorldStreamingMovementAndReaction",
 	EAutomationTestFlags::EditorContext
 		| EAutomationTestFlags::PerfFilter)
 
@@ -616,9 +1131,9 @@ bool FMatterFluxLargeWorldStreamingPerformanceTest::RunTest(
 
 	// A local spell query must not scale with the total number of cached
 	// decorations. Keep the bounds far outside the generated map so this probes
-	// broad-phase cost without changing combustion state or materializing Actors.
+	// broad-phase cost without changing reaction state or materializing Actors.
 	constexpr int32 FarIgnitionQueryCount = 65536;
-	const FBox FarIgnitionBounds(
+	const FBox FarStimulusBounds(
 		FVector(10000000.0, 10000000.0, -50.0),
 		FVector(10000100.0, 10000100.0, 50.0));
 	int32 UnexpectedFarIgnitions = 0;
@@ -628,9 +1143,9 @@ bool FMatterFluxLargeWorldStreamingPerformanceTest::RunTest(
 		++QueryIndex)
 	{
 		UnexpectedFarIgnitions +=
-			WorldActor->IgniteLogicalFragmentSourcesInBounds(
-				FarIgnitionBounds,
-				FarIgnitionBounds.GetCenter(),
+			WorldActor->ApplyMaterialStimulusToLogicalFragmentSourcesInBounds(
+				FarStimulusBounds,
+				FarStimulusBounds.GetCenter(),
 				TEXT("fire"),
 				900000 + QueryIndex);
 	}
@@ -822,9 +1337,16 @@ bool FMatterFluxLargeWorldStreamingPerformanceTest::RunTest(
 				TEXT("%s chunk-boundary frames stay below two 60 FPS frames"),
 				Profile.Name),
 			MaximumBoundaryFrameMilliseconds < 33.34);
+		const int32 ResidentMaterialChunkCount =
+			WorldActor->GetResidentMaterialChunkCount();
+		AddInfo(FString::Printf(
+			TEXT("%s resident material chunks after traversal: %d (active budget %d)"),
+			Profile.Name,
+			ResidentMaterialChunkCount,
+			ExpectedActiveDiameter * ExpectedActiveDiameter));
 		TestTrue(
 			TEXT("Movement does not grow the resident simulation window"),
-			WorldActor->GetResidentMaterialChunkCount()
+			ResidentMaterialChunkCount
 				<= ExpectedActiveDiameter * ExpectedActiveDiameter);
 		TestTrue(
 			TEXT("Movement does not load the full terrain render grid"),
@@ -876,11 +1398,11 @@ bool FMatterFluxLargeWorldStreamingPerformanceTest::RunTest(
 		TEXT("LargeWorld 120 pre-ignition world ticks: %.2f ms"),
 		ControlTickMilliseconds));
 	TestTrue(
-		TEXT("A nearby generated tree can be ignited under load"),
-		WorldActor->IgniteFirstGeneratedTree(9091));
+		TEXT("A nearby generated tree can be activated under load"),
+		WorldActor->ApplyMaterialStimulusToFirstGeneratedTree(9091));
 	double SourceActorTickSeconds = 0.0;
 	double WorldActorTickSeconds = 0.0;
-	const double CombustionStart = FPlatformTime::Seconds();
+	const double ReactionStart = FPlatformTime::Seconds();
 	for (int32 Step = 0; Step < 120; ++Step)
 	{
 		const double SourceActorTickStart = FPlatformTime::Seconds();
@@ -895,22 +1417,22 @@ bool FMatterFluxLargeWorldStreamingPerformanceTest::RunTest(
 		WorldActorTickSeconds +=
 			FPlatformTime::Seconds() - WorldActorTickStart;
 	}
-	const double CombustionMilliseconds =
-		(FPlatformTime::Seconds() - CombustionStart) * 1000.0;
+	const double ReactionMilliseconds =
+		(FPlatformTime::Seconds() - ReactionStart) * 1000.0;
 	AddInfo(FString::Printf(
-		TEXT("LargeWorld 120 movement/material/combustion ticks: %.2f ms, ground replication=%d bytes"),
-		CombustionMilliseconds,
-		WorldActor->GetReplicatedGroundCombustionByteCount()));
+		TEXT("LargeWorld 120 movement/material/reaction ticks: %.2f ms, ground replication=%d bytes"),
+		ReactionMilliseconds,
+		WorldActor->GetReplicatedGroundReactionByteCount()));
 	AddInfo(FString::Printf(
-		TEXT("LargeWorld combustion breakdown: Source Actor ticks %.2f ms, World Actor ticks %.2f ms"),
+		TEXT("LargeWorld reaction breakdown: Source Actor ticks %.2f ms, World Actor ticks %.2f ms"),
 		SourceActorTickSeconds * 1000.0,
 		WorldActorTickSeconds * 1000.0));
 	TestTrue(
-		TEXT("Burning simulation remains inside the 60 FPS CPU budget"),
-		CombustionMilliseconds < 2000.0);
+		TEXT("Active simulation remains inside the 60 FPS CPU budget"),
+		ReactionMilliseconds < 2000.0);
 	TestTrue(
-		TEXT("Combustion adds less than 275 ms over the no-fire control ticks"),
-		CombustionMilliseconds - ControlTickMilliseconds < 275.0);
+		TEXT("Reaction adds less than 275 ms over the no-fire control ticks"),
+		ReactionMilliseconds - ControlTickMilliseconds < 275.0);
 	constexpr int32 GroundCellCount =
 		MatterFlux::PlayableLevel::TerrainCellsX
 		* MatterFlux::PlayableLevel::TerrainCellsY;
@@ -918,10 +1440,10 @@ bool FMatterFluxLargeWorldStreamingPerformanceTest::RunTest(
 		2 * (1 + FMath::DivideAndRoundUp(GroundCellCount, 8));
 	TestTrue(
 		TEXT("Localized ground fire compresses below two full bit masks"),
-		WorldActor->GetReplicatedGroundCombustionByteCount()
+		WorldActor->GetReplicatedGroundReactionByteCount()
 			< RawGroundStateBytes);
 	TestTrue(
-		TEXT("Combustion still creates solid residue in the stress map"),
-		WorldActor->GetCombustionResidueCellCount() > 0);
+		TEXT("Reaction still creates solid output in the stress map"),
+		WorldActor->GetReactionOutputCellCount() > 0);
 	return true;
 }

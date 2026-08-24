@@ -1,23 +1,23 @@
-#include "Material/MatterFluxLogicalSourceCombustionIndex.h"
+#include "Material/MatterFluxLogicalSourceReactionIndex.h"
 
-namespace MatterFlux::Combustion
+namespace MatterFlux::Reaction
 {
-	bool FLogicalSourceCombustionIndex::ApplySnapshot(
+	bool FLogicalSourceReactionIndex::ApplySnapshot(
 		const FGuid& SourceId,
-		const bool bHasCombustionState,
-		const TConstArrayView<uint8> BurningMask)
+		const bool bHasReactionState,
+		const TConstArrayView<uint8> ActiveMask)
 	{
 		if (!SourceId.IsValid())
 		{
 			return false;
 		}
 
-		const bool bIsBurning = bHasCombustionState
-			&& BurningMask.ContainsByPredicate([](const uint8 Value)
+		const bool bIsActive = bHasReactionState
+			&& ActiveMask.ContainsByPredicate([](const uint8 Value)
 			{
 				return Value != 0;
 			});
-		if (bIsBurning)
+		if (bIsActive)
 		{
 			ActiveSourceIds.Add(SourceId);
 		}
@@ -28,27 +28,27 @@ namespace MatterFlux::Combustion
 		return true;
 	}
 
-	void FLogicalSourceCombustionIndex::Remove(const FGuid& SourceId)
+	void FLogicalSourceReactionIndex::Remove(const FGuid& SourceId)
 	{
 		ActiveSourceIds.Remove(SourceId);
 	}
 
-	void FLogicalSourceCombustionIndex::Reset()
+	void FLogicalSourceReactionIndex::Reset()
 	{
 		ActiveSourceIds.Reset();
 	}
 
-	bool FLogicalSourceCombustionIndex::Contains(const FGuid& SourceId) const
+	bool FLogicalSourceReactionIndex::Contains(const FGuid& SourceId) const
 	{
 		return ActiveSourceIds.Contains(SourceId);
 	}
 
-	int32 FLogicalSourceCombustionIndex::Num() const
+	int32 FLogicalSourceReactionIndex::Num() const
 	{
 		return ActiveSourceIds.Num();
 	}
 
-	void FLogicalSourceCombustionIndex::GatherStableIds(
+	void FLogicalSourceReactionIndex::GatherStableIds(
 		TArray<FGuid>& OutSourceIds) const
 	{
 		OutSourceIds.Reset(ActiveSourceIds.Num());

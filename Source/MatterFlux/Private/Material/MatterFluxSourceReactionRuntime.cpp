@@ -1,6 +1,6 @@
-#include "Material/MatterFluxSourceCombustionRuntime.h"
+#include "Material/MatterFluxSourceReactionRuntime.h"
 
-namespace MatterFlux::Combustion
+namespace MatterFlux::Reaction
 {
 	namespace
 	{
@@ -17,14 +17,14 @@ namespace MatterFlux::Combustion
 			&& StepSeconds > 0.0f
 			&& MaxStepsPerAdvance > 0
 			&& MaxStepsPerAdvance <= 64
-			&& MaxSpreadIgnitionsPerStep > 0
-			&& MaxSpreadIgnitionsPerStep <= 64;
+			&& MaxActivationsPerStep > 0
+			&& MaxActivationsPerStep <= 64;
 	}
 
-	FSourceCombustionRuntime::FSourceCombustionRuntime() = default;
-	FSourceCombustionRuntime::~FSourceCombustionRuntime() = default;
+	FSourceReactionRuntime::FSourceReactionRuntime() = default;
+	FSourceReactionRuntime::~FSourceReactionRuntime() = default;
 
-	bool FSourceCombustionRuntime::Initialize(
+	bool FSourceReactionRuntime::Initialize(
 		const FSourceRuntimeSettings& Settings,
 		const FFragmentSourceMask& SourceMask,
 		const FMatterFluxReactionDefinition& Rule,
@@ -34,13 +34,13 @@ namespace MatterFlux::Combustion
 		OutError.Reset();
 		if (!Settings.IsValid())
 		{
-			OutError = TEXT("source combustion runtime settings are invalid");
+			OutError = TEXT("source reaction runtime settings are invalid");
 			return false;
 		}
-		TUniquePtr<FMaskCombustion> Candidate = MakeUnique<FMaskCombustion>();
+		TUniquePtr<FMaskReaction> Candidate = MakeUnique<FMaskReaction>();
 		if (!Candidate->Initialize(SourceMask, Rule, Seed))
 		{
-			OutError = TEXT("source combustion mask could not be initialized");
+			OutError = TEXT("source reaction mask could not be initialized");
 			return false;
 		}
 		Reset();
@@ -51,7 +51,7 @@ namespace MatterFlux::Combustion
 		return true;
 	}
 
-	bool FSourceCombustionRuntime::RestoreState(
+	bool FSourceReactionRuntime::RestoreState(
 		const FSourceRuntimeSettings& Settings,
 		const FSourceRuntimeSnapshot& State,
 		const FMatterFluxReactionDefinition& Rule,
@@ -59,61 +59,61 @@ namespace MatterFlux::Combustion
 	{
 		OutError.Reset();
 		if (!Settings.IsValid()
-			|| !FMath::IsFinite(State.CombustionAccumulator)
-			|| State.CombustionAccumulator < 0.0f
-			|| State.CombustionAccumulator >= Settings.StepSeconds
-			|| State.TotalSmokeEmissionCount < 0)
+			|| !FMath::IsFinite(State.ReactionAccumulator)
+			|| State.ReactionAccumulator < 0.0f
+			|| State.ReactionAccumulator >= Settings.StepSeconds
+			|| State.TotalMaterialEmissionCount < 0)
 		{
-			OutError = TEXT("source combustion snapshot metadata is invalid");
+			OutError = TEXT("source reaction snapshot metadata is invalid");
 			return false;
 		}
-		TUniquePtr<FMaskCombustion> Candidate = MakeUnique<FMaskCombustion>();
-		if (!Candidate->RestoreState(State.CombustionState, Rule, OutError))
+		TUniquePtr<FMaskReaction> Candidate = MakeUnique<FMaskReaction>();
+		if (!Candidate->RestoreState(State.ReactionState, Rule, OutError))
 		{
 			return false;
 		}
 		Reset();
 		RuntimeSettings = Settings;
-		Width = State.CombustionState.Width;
-		Height = State.CombustionState.Height;
-		StepAccumulator = State.CombustionAccumulator;
-		TotalSmokeEmissionCount = State.TotalSmokeEmissionCount;
+		Width = State.ReactionState.Width;
+		Height = State.ReactionState.Height;
+		StepAccumulator = State.ReactionAccumulator;
+		TotalMaterialEmissionCount = State.TotalMaterialEmissionCount;
 		Simulation = MoveTemp(Candidate);
 		return true;
 	}
 
-	bool FSourceCombustionRuntime::CaptureState(
+	bool FSourceReactionRuntime::CaptureState(
 		FSourceRuntimeSnapshot& OutState) const
 	{
 		if (!Simulation
-			|| !Simulation->CaptureState(OutState.CombustionState))
+			|| !Simulation->CaptureState(OutState.ReactionState))
 		{
 			return false;
 		}
-		OutState.CombustionAccumulator = StepAccumulator;
-		OutState.TotalSmokeEmissionCount = TotalSmokeEmissionCount;
+		OutState.ReactionAccumulator = StepAccumulator;
+		OutState.TotalMaterialEmissionCount = TotalMaterialEmissionCount;
 		return true;
 	}
 
-	void FSourceCombustionRuntime::Reset()
+	void FSourceReactionRuntime::Reset()
 	{
 		Simulation.Reset();
 		RuntimeSettings = FSourceRuntimeSettings();
 		Width = 0;
 		Height = 0;
 		StepAccumulator = 0.0f;
-		TotalSmokeEmissionCount = 0;
+		TotalMaterialEmissionCount = 0;
 	}
 
-	bool FSourceCombustionRuntime::IgniteNearest(
+	bool FSourceReactionRuntime::ActivateNearest(
 		const FIntPoint RequestedCell,
-		const FName IgnitionMaterial)
+		const FName StimulusMaterial)
 	{
 		if (!Simulation)
 		{
 			return false;
 		}
-		if (Simulation->Ignite(RequestedCell, IgnitionMaterial))
+		if (Simulation->Activate(RequestedCell, StimulusMaterial))
 		{
 			return true;
 		}
@@ -126,7 +126,7 @@ namespace MatterFlux::Combustion
 			FMath::Clamp(RequestedCell.X, 0, Width - 1),
 			FMath::Clamp(RequestedCell.Y, 0, Height - 1));
 		if (SearchCenter != RequestedCell
-			&& Simulation->Ignite(SearchCenter, IgnitionMaterial))
+			&& Simulation->Activate(SearchCenter, StimulusMaterial))
 		{
 			return true;
 		}
@@ -154,18 +154,18 @@ namespace MatterFlux::Combustion
 				{
 					for (int32 X = MinimumX; X <= MaximumX; ++X)
 					{
-						if (Simulation->Ignite(FIntPoint(X, Y), IgnitionMaterial))
+						if (Simulation->Activate(FIntPoint(X, Y), StimulusMaterial))
 						{
 							return true;
 						}
 					}
 					continue;
 				}
-				if (Simulation->Ignite(FIntPoint(MinimumX, Y), IgnitionMaterial)
+				if (Simulation->Activate(FIntPoint(MinimumX, Y), StimulusMaterial)
 					|| (MaximumX != MinimumX
-						&& Simulation->Ignite(
+						&& Simulation->Activate(
 							FIntPoint(MaximumX, Y),
-							IgnitionMaterial)))
+							StimulusMaterial)))
 				{
 					return true;
 				}
@@ -174,19 +174,19 @@ namespace MatterFlux::Combustion
 		return false;
 	}
 
-	bool FSourceCombustionRuntime::ConstrainFuelMask(
-		const TArray<uint8>& AllowedFuelMask)
+	bool FSourceReactionRuntime::ConstrainInputMask(
+		const TArray<uint8>& AllowedInputMask)
 	{
 		return Simulation
-			&& Simulation->ConstrainFuelMask(AllowedFuelMask);
+			&& Simulation->ConstrainInputMask(AllowedInputMask);
 	}
 
-	FSourceAdvanceResult FSourceCombustionRuntime::AdvanceAuthority(
+	FSourceAdvanceResult FSourceReactionRuntime::AdvanceAuthority(
 		const float DeltaSeconds)
 	{
 		FSourceAdvanceResult Result;
 		if (!Simulation
-			|| !Simulation->IsBurning()
+			|| !Simulation->IsActive()
 			|| !FMath::IsFinite(DeltaSeconds))
 		{
 			return Result;
@@ -200,12 +200,12 @@ namespace MatterFlux::Combustion
 				0.0f,
 				StepAccumulator - RuntimeSettings.StepSeconds);
 			const FStepStats Stats = Simulation->Step(
-				RuntimeSettings.MaxSpreadIgnitionsPerStep);
+				RuntimeSettings.MaxActivationsPerStep);
 			Result.bStateChanged |= !Stats.ChangedCellIndices.IsEmpty();
-			Result.bGeometryChanged |= Stats.ConsumedFuelCells > 0;
-			Result.SmokeEmissionCells.Append(Stats.SmokeEmissionCells);
+			Result.bGeometryChanged |= Stats.ConsumedInputCells > 0;
+			Result.MaterialEmissionCells.Append(Stats.MaterialEmissionCells);
 			Result.ChangedCellIndices.Append(Stats.ChangedCellIndices);
-			TotalSmokeEmissionCount += Stats.SmokeEmissionCells.Num();
+			TotalMaterialEmissionCount += Stats.MaterialEmissionCells.Num();
 			++Result.Steps;
 		}
 		if (Result.Steps == RuntimeSettings.MaxStepsPerAdvance
@@ -218,18 +218,18 @@ namespace MatterFlux::Combustion
 		return Result;
 	}
 
-	const TArray<uint8>& FSourceCombustionRuntime::GetFuelMask() const
+	const TArray<uint8>& FSourceReactionRuntime::GetInputMask() const
 	{
-		return Simulation ? Simulation->GetFuelMask() : EmptyMask();
+		return Simulation ? Simulation->GetInputMask() : EmptyMask();
 	}
 
-	const TArray<uint8>& FSourceCombustionRuntime::GetResidueMask() const
+	const TArray<uint8>& FSourceReactionRuntime::GetOutputMask() const
 	{
-		return Simulation ? Simulation->GetResidueMask() : EmptyMask();
+		return Simulation ? Simulation->GetOutputMask() : EmptyMask();
 	}
 
-	const TArray<uint8>& FSourceCombustionRuntime::GetBurningMask() const
+	const TArray<uint8>& FSourceReactionRuntime::GetActiveMask() const
 	{
-		return Simulation ? Simulation->GetBurningMask() : EmptyMask();
+		return Simulation ? Simulation->GetActiveMask() : EmptyMask();
 	}
 }

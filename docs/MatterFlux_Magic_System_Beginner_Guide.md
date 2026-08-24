@@ -133,10 +133,10 @@ content.register_wand({
     starter_slot = 2,
     starter_deck = {
         "spell.double_cast",
-        "spell.add_damage",
-        "spell.spark_trigger",
-        "spell.spark_bolt",
-        "spell.ember_bolt"
+		"spell.add_damage",
+		"spell.spark_trigger",
+		"spell.spark_bolt",
+		"spell.flame_jet"
     }
 })
 ```
@@ -232,20 +232,20 @@ UI 发出的每个编辑命令都带 `ExpectedRevision`。服务器只接受与�
 
 ## 9. 投射物如何进入 MatterFlux 世界
 
-`AMatterFluxMagicProjectile` 由服务器生成，开启 movement replication。法术 ID、速度、寿命、半径、本体材质和冲击材质使用 `COND_InitialOnly`，因为它们生成后不再变化。投射物移动组件的重力缩放为 0；法术通过速度和寿命限定射程。
+`AMatterFluxMagicProjectile` 由服务器生成，开启 movement replication。法术 ID、速度、寿命、半径、本体材质和携带量使用 `COND_InitialOnly`，因为它们生成后不再变化。投射物的重力比例由法术定义；速度和寿命共同限定射程。
 
 普通投射物仍使用紧凑体素外观；声明 `body_material` 的投射物则根据材质颜色建立确定性的
 多体素球。火焰喷流因此是一团向玩家前方移动、无重力的火焰材质球，而不是施法瞬间
 向锥形区域直接写世界。颜色回退使用法术字符串 ID 的稳定 CRC，而不是进程局部的 FName 索引。
 
-命中只在服务器处理：
+碰撞只在服务器处理：
 
-- 普通伤害构造 `FFragmentWorldCutRequest`，调用通用 `RequestWorldCut`；它不是法杖专用切割路径。
-- `impact_material` 在命中点进入材质世界；值为 `fire` 时还会点燃可燃 fragment source 和地面材质。
+- 普通伤害投射物只伤害角色，不直接改写可切割世界；只有明确的平面切割工具会提交 `FFragmentWorldCutRequest`。
+- `body_material` 是投射物实际携带的物质。碰撞或寿命结束时，它按 `material_amount` 进入统一物质模拟；火、水、沙、酸的后续变化都由反应与移动规则推进。
 - trigger 投射物按声明在命中点生成 `OnImpactProjectiles`，或在寿命结束位置生成 `OnExpireProjectiles`。
 - 圆形轨迹只在服务器推进，客户端接收 movement replication；红色覆盖随 InitialOnly presentation 一次复制。
 
-这意味着以后敌人技能、机关和可动物体也能复用 CastPlan、Projectile 或 WorldCut，而不必复制树木切割代码。
+法术定义因此只负责制造、组合和修改世界中的投射物，不携带“命中后点燃/腐蚀/改地形”一类结果命令。敌人技能、机关和可动物体也能复用同一套 CastPlan 与物质反应，而不必复制专用命中逻辑。
 
 ## 10. 工作台 UI 的实现方式
 
@@ -253,15 +253,15 @@ UI 发出的每个编辑命令都带 `ExpectedRevision`。服务器只接受与�
 
 布局直接遵循 PaperMagic 的工作区层级：顶部页签互斥切换，法术页由“左侧竖向装备槽—中央程序—右侧法术包”组成，法杖页只显示键位槽和法杖库存。选中哪个键位，中央就编辑该键位的法杖，不会偷偷编辑未装备法杖。
 
-中央不再把所有法术横向塞成一条线。`FMatterFluxSpellProgramLayoutBuilder` 根据修饰器、多重释放和触发器的子节点数，从左到右消费平铺槽位，为每个节点记录父槽位、分支序号和所属施法段。一根法杖可以包含多个互不相连的根；Slate 把它们分成独立的“施法段”边框，每个节点使用相同大小的布局单元和法术槽。连线层先从父法术槽中心画到子法术槽中心，节点再在更高图层绘制，所以线会自然被槽体遮挡，不会压住图标或边框。
+中央不再把所有法术横向塞成一条线。`FMatterFluxSpellProgramLayoutBuilder` 根据修饰器、多重释放和触发器的子节点数，从左到右消费平铺槽位，为每个节点记录父槽位、分支序号和所属施法段。一根法杖可以包含多个互不相连的根；Slate 只显示同尺寸法术槽与它们之间的连线，不再常驻显示槽号、来源和施法段说明。连线层先从父法术槽中心画到子法术槽中心，节点再在更高图层绘制，所以线会自然被槽体遮挡，不会压住图标或边框。
 
 必需子节点即使为空，也会留在树内并标记“待填”；只有没被任何树消费的空槽才进入“空闲容量槽”。这个区分很重要：前者会导致当前组合不完整，后者只是法杖还有可用容量。同一份布局模块同时供测试和 Slate 使用，避免“画面看起来是一棵树，实际执行另一套规则”。
 
-物品槽约 50 px，只显示类型图形和数量角标；法术说明在悬停 tooltip 中。法力上限、恢复速度、释放间隔、法术容量则是中央编辑器顶部的常驻属性卡，不需要悬停。操作方法和 revision 收进右上角 `?`。界面使用中文和统一的白底、黑色描边；当前编辑项反白为黑底白字。键位槽显示左键、右键、`Q`、`E`。不方便拖放时仍可“先点法术，再点目标槽”。
+物品槽约 50 px，只显示图标和必要的数量角标；名称、说明和数值统一放进悬停 tooltip。中央只保留当前法杖名称、法力条、程序连线和槽位，顶部页签也使用短名称。界面使用统一的白底、黑色描边；当前编辑项用浅灰底标出，保证黑色图标始终可见。键位槽只显示 `L`、`R`、`Q`、`E` 角标。不方便拖放时仍可“先点法术，再点目标槽”。
 
 UI 始终只构造 `FMatterFluxMagicEdit` 并调用 `RequestEdit`。客户端画面会在 Fast Array、装备 RepNotify 或 Lua 内容热重载后重建。打开时 PlayerController 使用 `FInputModeUIOnly` 并显示鼠标，避免编辑时误移动或施法；关闭时恢复 `FInputModeGameOnly`。
 
-当前图标字段是内容层的稳定资源键，但工作台先使用文字和类型颜色，尚未接入可 Cook 的图标 Data Asset 映射。增加正式图标时，应让 Data Asset/Asset Manager 持有软引用，不要让 Lua 任意加载 `/Game` 路径。
+Lua 的 `icon` 字段是相对 `Content/Lua/Icons` 的稳定资源键，可以省略 `.png`。例如 `icon = "paper/default"` 会读取 `Content/Lua/Icons/paper/default.png`；找不到图片时槽位才回退到类型符号。法术、法杖和道具共用这套解析器，空法杖/法术槽则统一读取 `paper/add_sign`。`paper/` 保存从 PaperMagic 移植的原图，MatterFlux 自有法术图标放在图标根目录。解析器拒绝绝对路径、目录穿越和非 PNG 扩展，整个 `Lua` 目录会作为 NonUFS 内容随包分发，因此同一份 Lua 配置在编辑器与打包版本中行为一致。
 
 ## 11. 热重载行为
 
@@ -310,7 +310,7 @@ Automation RunTests MatterFlux.Magic
 - 切割/火焰编译为投射物，直接注册 `cut`/`flame` 世界法术会被拒绝；
 - 火焰本体材质复制、确定性体素球表现与无重力前向运动；
 - modifier、multicast、trigger 的组合与失败回滚；
-- PaperMagic 9 个法术的清单、关键原始数值与逐项编译结果；
+- PaperMagic 9 个法术的清单、关键原始数值、逐项编译结果，以及法术/法杖/道具/空槽图标的安全路径解析；
 - 全空法杖、并列投射物、修饰链、嵌套多重施法/触发器、缺失子节点和多个独立施法段；
 - 父槽位、分支序号、根序号、完整容量记账，以及未知法术失败时不暴露半棵树；
 - 红色/圆轨迹 presentation、碰撞/消逝载荷和 GAS 跳跃的运行时执行；
@@ -359,4 +359,4 @@ Automation RunTests MatterFlux.Magic
 
 当前版本已经有可玩的中文法术、法杖、道具与任务页面、四键装备、列式法杖编辑、能力式 Lua 法术 API、PaperMagic 9 法术兼容库、GAS 施法、命中/消逝载荷、MatterFlux 切割/点燃、模块热重载、存档和多人复制。
 
-还没有实现地面拾取、掉落、商店交互、正式图标资产映射、GameplayEffect 属性化伤害、施法音效/Niagara，以及客户端施法预测。这些功能可以继续建立在当前接口上，不需要让 UI 或 Lua 绕过服务器权威。普通道具和任务系统见 [MatterFlux 任务与道具系统：UE 初学者指南](MatterFlux_Quest_Item_System_Beginner_Guide.md)。
+还没有实现地面拾取、掉落、商店交互、GameplayEffect 属性化伤害、施法音效/Niagara，以及客户端施法预测。这些功能可以继续建立在当前接口上，不需要让 UI 或 Lua 绕过服务器权威。普通道具和任务系统见 [MatterFlux 任务与道具系统：UE 初学者指南](MatterFlux_Quest_Item_System_Beginner_Guide.md)。

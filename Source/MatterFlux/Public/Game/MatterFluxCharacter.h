@@ -34,7 +34,9 @@ class MATTERFLUX_API AMatterFluxCharacter : public ACharacter, public IAbilitySy
 	GENERATED_BODY()
 
 public:
-	AMatterFluxCharacter();
+	explicit AMatterFluxCharacter(
+		const FObjectInitializer& ObjectInitializer =
+			FObjectInitializer::Get());
 
 	virtual void BeginPlay() override;
 	virtual void Tick(float DeltaSeconds) override;
@@ -125,8 +127,9 @@ private:
 		int32 IntegerValue = 0);
 	void ClearCutEffect();
 	void ClearFlameEffect();
-	void UpdateItemOcclusionGhosting();
+	void UpdateItemOcclusionGhosting(float DeltaSeconds);
 	void RestoreItemOcclusionGhosts();
+	void SetGhostRevealOutlineEnabled(bool bEnabled);
 	void ApplyItemOcclusionGhost(
 		AActor& Actor,
 		UMeshComponent& ItemMesh,
@@ -137,6 +140,8 @@ private:
 		TWeakObjectPtr<UMeshComponent> Mesh;
 		TArray<TWeakObjectPtr<UMaterialInterface>> SolidMaterials;
 		TArray<TWeakObjectPtr<UMaterialInterface>> GhostMaterials;
+		float CurrentOpacity = 1.0f;
+		bool bGhostDesired = false;
 	};
 
 	UFUNCTION(NetMulticast, Unreliable)
@@ -185,10 +190,14 @@ private:
 	TObjectPtr<UMaterialInterface> PlayerOutlineMaterial;
 
 	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInterface> PlayerGhostOutlineMaterial;
+
+	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInterface> ItemOcclusionGhostMaterial;
 
 	TMap<TWeakObjectPtr<AActor>, FItemOcclusionGhostState>
 		ItemOcclusionGhostStates;
+	bool bGhostRevealOutlineEnabled = false;
 
 	FTimerHandle CutEffectTimer;
 	FTimerHandle FlameEffectTimer;

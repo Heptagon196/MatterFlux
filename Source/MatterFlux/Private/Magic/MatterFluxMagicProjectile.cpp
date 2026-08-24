@@ -4,6 +4,7 @@
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Creatures/MatterFluxCreatureActor.h"
+#include "Engine/StaticMesh.h"
 #include "EngineUtils.h"
 #include "Fragment/Fragment2DSourceActor.h"
 #include "Fragment/FragmentSimulationSubsystem.h"
@@ -78,8 +79,15 @@ AMatterFluxMagicProjectile::AMatterFluxMagicProjectile()
 	ProjectileMovement->InitialSpeed = 1000.0f;
 	ProjectileMovement->MaxSpeed = 1000.0f;
 	ProjectileMovement->ProjectileGravityScale = 0.0f;
+	ProjectileMovement->bSweepCollision = true;
+	ProjectileMovement->bForceSubStepping = true;
+	ProjectileMovement->MaxSimulationTimeStep = 0.025f;
+	ProjectileMovement->MaxSimulationIterations = 8;
 	ProjectileMovement->bRotationFollowsVelocity = true;
 	ProjectileMovement->bShouldBounce = false;
+	ProjectileMovement->OnProjectileStop.AddDynamic(
+		this,
+		&AMatterFluxMagicProjectile::OnProjectileStopped);
 }
 
 void AMatterFluxMagicProjectile::BeginPlay()
@@ -134,6 +142,7 @@ void AMatterFluxMagicProjectile::LifeSpanExpired()
 	if (HasAuthority() && !bImpactHandled)
 	{
 		bImpactHandled = true;
+		ReleaseMaterialBodyAtWorldLocation(GetActorLocation());
 		SpawnTriggerPayload(
 			ServerPlan.OnExpireProjectiles,
 			GetActorLocation(),
@@ -166,11 +175,17 @@ void AMatterFluxMagicProjectile::InitializeProjectile(
 	Presentation.Speed = Plan.Speed;
 	Presentation.Lifetime = Plan.Lifetime;
 	Presentation.Radius = Plan.Radius;
+	Presentation.GravityScale = Plan.GravityScale;
 	Presentation.bOverrideColor = Plan.bOverrideColor;
 	Presentation.Color = Plan.Color;
 	Presentation.OrbitRadius = Plan.OrbitRadius;
 	Presentation.BodyMaterial = Plan.BodyMaterial;
-	Presentation.ImpactMaterial = Plan.ImpactMaterial;
+	Presentation.bUsePlaneVisual = Plan.bUsePlaneVisual;
+	Presentation.bUseVerticalPlaneVisual = Plan.bUseVerticalPlaneVisual;
+	ProjectileMovement->ProjectileGravityScale = FMath::Clamp(
+		Plan.GravityScale,
+		0.0f,
+		4.0f);
 	// Deferred-spawned actors may not have entered BeginPlay yet (notably in
 	// editor worlds), but their immutable material body is already complete.
 	BuildMaterialBodyPresentation(
@@ -184,12 +199,26 @@ void AMatterFluxMagicProjectile::ApplyPresentation()
 	const bool bUsesMaterialBody = !Presentation.BodyMaterial.IsNone();
 	Visual->SetVisibility(!bUsesMaterialBody);
 	MaterialBody->SetVisibility(bUsesMaterialBody);
-	Visual->SetRelativeScale3D(FVector(
-		Radius / 50.0f,
-		FMath::Max(0.08f, Radius / 80.0f),
-		Radius / 50.0f));
+	Visual->SetRelativeScale3D(Presentation.bUsePlaneVisual
+		? Presentation.bUseVerticalPlaneVisual
+			? FVector(
+				Radius / 50.0f,
+				0.02f,
+				Radius / 50.0f)
+			: FVector(
+				Radius / 50.0f,
+				Radius / 50.0f,
+				0.02f)
+		: FVector(
+			Radius / 50.0f,
+			FMath::Max(0.08f, Radius / 80.0f),
+			Radius / 50.0f));
 	ProjectileMovement->InitialSpeed = Presentation.Speed;
 	ProjectileMovement->MaxSpeed = Presentation.Speed;
+	ProjectileMovement->ProjectileGravityScale = FMath::Clamp(
+		Presentation.GravityScale,
+		0.0f,
+		4.0f);
 	ProjectileMovement->Velocity =
 		GetActorForwardVector() * Presentation.Speed;
 	SetLifeSpan(FMath::Clamp(Presentation.Lifetime, 0.05f, 30.0f));
@@ -211,7 +240,8 @@ void AMatterFluxMagicProjectile::ApplyPresentation()
 			*Presentation.SpellId.ToString());
 		FLinearColor MaterialColor = FLinearColor::White;
 		bool bHasMaterialColor = false;
-		if (bUsesMaterialBody
+		const FName PresentationMaterial = Presentation.BodyMaterial;
+		if (!PresentationMaterial.IsNone()
 			&& IMatterFluxScriptRuntime::IsAvailable())
 		{
 			const FMatterFluxContentRegistryPtr Registry =
@@ -219,7 +249,7 @@ void AMatterFluxMagicProjectile::ApplyPresentation()
 			if (Registry.IsValid())
 			{
 				if (const FMatterFluxMaterialDefinition* Material =
-					Registry->Materials.Find(Presentation.BodyMaterial))
+					Registry->Materials.Find(PresentationMaterial))
 				{
 					MaterialColor = Material->Color;
 					bHasMaterialColor = true;
@@ -230,9 +260,7 @@ void AMatterFluxMagicProjectile::ApplyPresentation()
 			? Presentation.Color
 			: bHasMaterialColor
 				? MaterialColor
-				: Presentation.ImpactMaterial == TEXT("fire")
-					? FLinearColor(1.0f, 0.12f, 0.015f)
-					: FLinearColor(
+				: FLinearColor(
 						0.25f
 							+ static_cast<float>(Hash & 0xff) / 510.0f,
 						0.45f
@@ -266,7 +294,8 @@ void AMatterFluxMagicProjectile::BuildMaterialBodyPresentation(
 
 	// Keep one compact deterministic material body per projectile. The body is
 	// an in-flight projection; collision is still owned by the single sphere,
-	// and only impact hands material back to the falling-sand world.
+	// and collision or lifetime expiry hands its conserved payload back to the
+	// falling-sand world.
 	const float Spacing = FMath::Max(5.0f, Radius * 0.45f);
 	const float BodyRadius = Radius * 0.92f;
 	const int32 StepCount = FMath::Max(
@@ -299,6 +328,25 @@ int32 AMatterFluxMagicProjectile::GetMaterialBodyVoxelCount() const
 	return MaterialBody ? MaterialBody->GetInstanceCount() : 0;
 }
 
+void AMatterFluxMagicProjectile::ReleaseMaterialBodyAtWorldLocation(
+	const FVector& WorldLocation)
+{
+	if (ServerPlan.BodyMaterial.IsNone())
+	{
+		return;
+	}
+	if (UWorld* World = GetWorld())
+	{
+		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
+		{
+			It->DepositSimulatedMaterialAtWorldLocation(
+				WorldLocation,
+				ServerPlan.BodyMaterial,
+				ServerPlan.MaterialAmount);
+		}
+	}
+}
+
 void AMatterFluxMagicProjectile::ApplyWorldImpact(const FHitResult& Hit)
 {
 	UWorld* World = GetWorld();
@@ -308,75 +356,75 @@ void AMatterFluxMagicProjectile::ApplyWorldImpact(const FHitResult& Hit)
 	}
 	UFragmentSimulationSubsystem* Subsystem =
 		World->GetSubsystem<UFragmentSimulationSubsystem>();
-	if (Subsystem && ServerPlan.Damage > 0.0f)
+	if (Subsystem
+		&& ServerPlan.bUsePlaneVisual
+		&& ServerPlan.Damage > 0.0f)
 	{
 		FFragmentWorldCutRequest Request;
-		Request.CutShape.Type = EFragmentDamageShapeType::Circle;
-		Request.CutShape.WorldTransform = FTransform(Hit.ImpactPoint);
-		Request.CutShape.Radius = FMath::Max(2.0f, ServerPlan.Radius);
+		Request.CutShape = BuildImpactCutShape(
+			ServerPlan,
+			GetActorForwardVector(),
+			Hit.ImpactPoint);
 		Request.DamagePower = ServerPlan.Damage * 100.0f;
 		Request.EventSeed = ServerEventSeed;
 		Request.TargetPadding = ServerPlan.Radius;
 		Subsystem->RequestWorldCut(Request);
 	}
 
-	if (!ServerPlan.ImpactMaterial.IsNone())
+	ReleaseMaterialBodyAtWorldLocation(Hit.ImpactPoint);
+}
+
+FFragmentDamageShape AMatterFluxMagicProjectile::BuildImpactCutShape(
+	const FMatterFluxMagicProjectilePlan& Plan,
+	const FVector& ProjectileForward,
+	const FVector& ImpactPoint)
+{
+	constexpr float SingleMaterialCellThickness = 10.0f;
+	if (!Plan.bUsePlaneVisual)
 	{
-		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World);
-			It;
-			++It)
-		{
-			It->SetSimulatedMaterialAtWorldLocation(
-				Hit.ImpactPoint,
-				ServerPlan.ImpactMaterial);
-		}
+		FFragmentDamageShape Shape;
+		Shape.Type = EFragmentDamageShapeType::Circle;
+		Shape.WorldTransform = FTransform(ImpactPoint);
+		Shape.Radius = FMath::Max(2.0f, Plan.Radius);
+		return Shape;
 	}
 
-	if (ServerPlan.ImpactMaterial == TEXT("fire"))
+	FVector PlanarForward = ProjectileForward;
+	PlanarForward.Z = 0.0f;
+	if (!PlanarForward.Normalize())
 	{
-		const FBox IgnitionBounds(
-			Hit.ImpactPoint - FVector(ServerPlan.Radius),
-			Hit.ImpactPoint + FVector(ServerPlan.Radius));
-		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World);
-			It;
-			++It)
-		{
-			It->IgniteLogicalFragmentSourcesInBounds(
-				IgnitionBounds,
-				Hit.ImpactPoint,
-				TEXT("fire"),
-				ServerEventSeed);
-		}
-		TArray<AFragment2DSourceActor*> CandidateSources;
-		if (Subsystem)
-		{
-			Subsystem->GatherSourcesInBounds(
-				IgnitionBounds,
-				CandidateSources);
-		}
-		for (AFragment2DSourceActor* Source : CandidateSources)
-		{
-			if (IsValid(Source)
-				&& Source->HasCombustionRule()
-				&& Source->GetComponentsBoundingBox(true)
-					.ExpandBy(ServerPlan.Radius)
-					.IsInsideOrOn(Hit.ImpactPoint))
-			{
-				Source->IgniteAtWorldLocation(
-					Hit.ImpactPoint,
-					TEXT("fire"),
-					ServerEventSeed);
-			}
-		}
-		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World);
-			It;
-			++It)
-		{
-			It->IgniteGroundAtWorldLocation(
-				Hit.ImpactPoint,
-				ServerEventSeed);
-		}
+		PlanarForward = FVector::ForwardVector;
 	}
+	FVector CutRight = FVector::CrossProduct(
+		FVector::UpVector,
+		PlanarForward).GetSafeNormal();
+	if (CutRight.IsNearlyZero())
+	{
+		CutRight = FVector::RightVector;
+	}
+
+	// A plane is only the projectile presentation. The canonical material
+	// operation is its one-cell intersection line: horizontal cuts run across
+	// world right, vertical cuts run along world up. Circle used to erase a
+	// full radius-sized disk and also ignored distance along its plane normal.
+	const FVector LineDirection = Plan.bUseVerticalPlaneVisual
+		? FVector::UpVector
+		: CutRight;
+	const FVector ThicknessDirection = Plan.bUseVerticalPlaneVisual
+		? CutRight
+		: FVector::UpVector;
+	FFragmentDamageShape Shape;
+	Shape.Type = EFragmentDamageShapeType::Line;
+	Shape.WorldTransform = FTransform(
+		FRotationMatrix::MakeFromXZ(
+			LineDirection,
+			ThicknessDirection).ToQuat(),
+		ImpactPoint);
+	Shape.Extents.X = FMath::Max(
+		SingleMaterialCellThickness,
+		Plan.Radius * 2.0f);
+	Shape.Thickness = SingleMaterialCellThickness;
+	return Shape;
 }
 
 void AMatterFluxMagicProjectile::SpawnTriggerPayload(
@@ -431,6 +479,12 @@ void AMatterFluxMagicProjectile::OnProjectileHit(
 	AActor* OtherActor,
 	UPrimitiveComponent* OtherComponent,
 	FVector NormalImpulse,
+	const FHitResult& Hit)
+{
+	ResolveImpactAuthority(Hit);
+}
+
+void AMatterFluxMagicProjectile::OnProjectileStopped(
 	const FHitResult& Hit)
 {
 	ResolveImpactAuthority(Hit);

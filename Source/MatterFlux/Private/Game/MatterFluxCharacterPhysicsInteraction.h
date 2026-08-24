@@ -29,5 +29,13 @@ namespace MatterFlux::CharacterPhysics
 		Movement.MinTouchForce = -1.0f;
 		Movement.MaxTouchForce = -1.0f;
 		Movement.RepulsionForce = 0.0f;
+
+		// CharacterMovement's default standing load applies the character's
+		// full weight every frame to its simulated movement base. Cut products
+		// can legitimately weigh only 0.5 kg, so that load accelerates the body
+		// while the same body moves the character back through based movement,
+		// producing a violent feedback loop. Side contact still uses the bounded
+		// push/touch forces above; standing must not inject another force path.
+		Movement.StandingDownwardForceScale = 0.0f;
 	}
 }

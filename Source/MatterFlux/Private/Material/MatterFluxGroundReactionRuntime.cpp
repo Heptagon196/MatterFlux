@@ -1,6 +1,6 @@
-#include "Material/MatterFluxGroundCombustionRuntime.h"
+#include "Material/MatterFluxGroundReactionRuntime.h"
 
-namespace MatterFlux::Combustion
+namespace MatterFlux::Reaction
 {
 	namespace
 	{
@@ -37,10 +37,10 @@ namespace MatterFlux::Combustion
 			&& MaxStepsPerAdvance <= 64;
 	}
 
-	FGroundCombustionRuntime::FGroundCombustionRuntime() = default;
-	FGroundCombustionRuntime::~FGroundCombustionRuntime() = default;
+	FGroundReactionRuntime::FGroundReactionRuntime() = default;
+	FGroundReactionRuntime::~FGroundReactionRuntime() = default;
 
-	bool FGroundCombustionRuntime::Initialize(
+	bool FGroundReactionRuntime::Initialize(
 		const FGroundRuntimeSettings& Settings,
 		const FFragmentSourceMask& GroundMask,
 		const FMatterFluxReactionDefinition& Rule,
@@ -53,40 +53,40 @@ namespace MatterFlux::Combustion
 			|| GroundMask.Width != Settings.Width
 			|| GroundMask.Height != Settings.Height)
 		{
-			OutError = TEXT("ground combustion runtime settings are invalid");
+			OutError = TEXT("ground reaction runtime settings are invalid");
 			return false;
 		}
-		TUniquePtr<FMaskCombustion> Candidate = MakeUnique<FMaskCombustion>();
+		TUniquePtr<FMaskReaction> Candidate = MakeUnique<FMaskReaction>();
 		if (!Candidate->Initialize(GroundMask, Rule, Seed))
 		{
-			OutError = TEXT("ground combustion mask could not be initialized");
+			OutError = TEXT("ground reaction mask could not be initialized");
 			return false;
 		}
 		RuntimeSettings = Settings;
-		VisibleResidueMask = Candidate->GetResidueMask();
-		VisibleBurningMask = Candidate->GetBurningMask();
+		VisibleOutputMask = Candidate->GetOutputMask();
+		VisibleActiveMask = Candidate->GetActiveMask();
 		RebuildVisibleCellIndices();
 		Simulation = MoveTemp(Candidate);
 		return true;
 	}
 
-	void FGroundCombustionRuntime::Reset()
+	void FGroundReactionRuntime::Reset()
 	{
 		Simulation.Reset();
 		RuntimeSettings = FGroundRuntimeSettings();
-		VisibleResidueMask.Reset();
-		VisibleBurningMask.Reset();
-		BurningCellIndicesByChunk.Reset();
-		ResidueCellIndicesByChunk.Reset();
+		VisibleOutputMask.Reset();
+		VisibleActiveMask.Reset();
+		ActiveCellIndicesByChunk.Reset();
+		OutputCellIndicesByChunk.Reset();
 		DirtyChunks.Reset();
 		AppliedChunkRevisions.Reset();
 		StepAccumulator = 0.0f;
 		Revision = 0;
 	}
 
-	void FGroundCombustionRuntime::SetResidueCellIndexState(
+	void FGroundReactionRuntime::SetOutputCellIndexState(
 		const int32 CellIndex,
-		const bool bResidue)
+		const bool bOutput)
 	{
 		if (!RuntimeSettings.IsValid()
 			|| CellIndex < 0
@@ -100,29 +100,29 @@ namespace MatterFlux::Combustion
 			CellX / RuntimeSettings.ChunkSize,
 			CellY / RuntimeSettings.ChunkSize);
 		TSet<int32>* ChunkCells =
-			ResidueCellIndicesByChunk.Find(ChunkCoordinate);
-		const bool bWasResidue = ChunkCells && ChunkCells->Contains(CellIndex);
-		if (bWasResidue == bResidue)
+			OutputCellIndicesByChunk.Find(ChunkCoordinate);
+		const bool bWasOutput = ChunkCells && ChunkCells->Contains(CellIndex);
+		if (bWasOutput == bOutput)
 		{
 			return;
 		}
-		if (bResidue)
+		if (bOutput)
 		{
-			ResidueCellIndicesByChunk.FindOrAdd(ChunkCoordinate).Add(CellIndex);
+			OutputCellIndicesByChunk.FindOrAdd(ChunkCoordinate).Add(CellIndex);
 		}
 		else if (ChunkCells)
 		{
 			ChunkCells->Remove(CellIndex);
 			if (ChunkCells->IsEmpty())
 			{
-				ResidueCellIndicesByChunk.Remove(ChunkCoordinate);
+				OutputCellIndicesByChunk.Remove(ChunkCoordinate);
 			}
 		}
 	}
 
-	void FGroundCombustionRuntime::SetBurningCellIndexState(
+	void FGroundReactionRuntime::SetActiveCellIndexState(
 		const int32 CellIndex,
-		const bool bBurning)
+		const bool bActive)
 	{
 		if (!RuntimeSettings.IsValid()
 			|| CellIndex < 0
@@ -136,15 +136,15 @@ namespace MatterFlux::Combustion
 			CellX / RuntimeSettings.ChunkSize,
 			CellY / RuntimeSettings.ChunkSize);
 		TSet<int32>* ChunkCells =
-			BurningCellIndicesByChunk.Find(ChunkCoordinate);
-		const bool bWasBurning = ChunkCells && ChunkCells->Contains(CellIndex);
-		if (bWasBurning == bBurning)
+			ActiveCellIndicesByChunk.Find(ChunkCoordinate);
+		const bool bWasActive = ChunkCells && ChunkCells->Contains(CellIndex);
+		if (bWasActive == bActive)
 		{
 			return;
 		}
-		if (bBurning)
+		if (bActive)
 		{
-			BurningCellIndicesByChunk.FindOrAdd(ChunkCoordinate).Add(CellIndex);
+			ActiveCellIndicesByChunk.FindOrAdd(ChunkCoordinate).Add(CellIndex);
 			return;
 		}
 		if (ChunkCells)
@@ -152,12 +152,12 @@ namespace MatterFlux::Combustion
 			ChunkCells->Remove(CellIndex);
 			if (ChunkCells->IsEmpty())
 			{
-				BurningCellIndicesByChunk.Remove(ChunkCoordinate);
+				ActiveCellIndicesByChunk.Remove(ChunkCoordinate);
 			}
 		}
 	}
 
-	void FGroundCombustionRuntime::MarkCellDirty(const int32 CellIndex)
+	void FGroundReactionRuntime::MarkCellDirty(const int32 CellIndex)
 	{
 		if (!Simulation || CellIndex < 0
 			|| CellIndex >= RuntimeSettings.Width * RuntimeSettings.Height)
@@ -171,7 +171,7 @@ namespace MatterFlux::Combustion
 			CellY / RuntimeSettings.ChunkSize));
 	}
 
-	void FGroundCombustionRuntime::RefreshVisibleCellIndicesForChunk(
+	void FGroundReactionRuntime::RefreshVisibleCellIndicesForChunk(
 		const FIntPoint ChunkCoordinate)
 	{
 		if (!RuntimeSettings.IsValid())
@@ -196,43 +196,43 @@ namespace MatterFlux::Combustion
 			for (int32 X = StartX; X < EndX; ++X)
 			{
 				const int32 CellIndex = Y * RuntimeSettings.Width + X;
-				SetBurningCellIndexState(
+				SetActiveCellIndexState(
 					CellIndex,
-					VisibleBurningMask.IsValidIndex(CellIndex)
-						&& VisibleBurningMask[CellIndex] != 0);
-				SetResidueCellIndexState(
+					VisibleActiveMask.IsValidIndex(CellIndex)
+						&& VisibleActiveMask[CellIndex] != 0);
+				SetOutputCellIndexState(
 					CellIndex,
-					VisibleResidueMask.IsValidIndex(CellIndex)
-						&& VisibleResidueMask[CellIndex] != 0);
+					VisibleOutputMask.IsValidIndex(CellIndex)
+						&& VisibleOutputMask[CellIndex] != 0);
 			}
 		}
 	}
 
-	void FGroundCombustionRuntime::RebuildVisibleCellIndices()
+	void FGroundReactionRuntime::RebuildVisibleCellIndices()
 	{
-		BurningCellIndicesByChunk.Reset();
-		ResidueCellIndicesByChunk.Reset();
+		ActiveCellIndicesByChunk.Reset();
+		OutputCellIndicesByChunk.Reset();
 		const int32 CellCount = FMath::Max(
-			VisibleBurningMask.Num(),
-			VisibleResidueMask.Num());
+			VisibleActiveMask.Num(),
+			VisibleOutputMask.Num());
 		for (int32 CellIndex = 0;
 			CellIndex < CellCount;
 			++CellIndex)
 		{
-			SetBurningCellIndexState(
+			SetActiveCellIndexState(
 				CellIndex,
-				VisibleBurningMask.IsValidIndex(CellIndex)
-					&& VisibleBurningMask[CellIndex] != 0);
-			SetResidueCellIndexState(
+				VisibleActiveMask.IsValidIndex(CellIndex)
+					&& VisibleActiveMask[CellIndex] != 0);
+			SetOutputCellIndexState(
 				CellIndex,
-				VisibleResidueMask.IsValidIndex(CellIndex)
-					&& VisibleResidueMask[CellIndex] != 0);
+				VisibleOutputMask.IsValidIndex(CellIndex)
+					&& VisibleOutputMask[CellIndex] != 0);
 		}
 	}
 
-	bool FGroundCombustionRuntime::Ignite(
+	bool FGroundReactionRuntime::Activate(
 		const FIntPoint Cell,
-		const FName IgnitionMaterial)
+		const FName StimulusMaterial)
 	{
 		if (!Simulation
 			|| Cell.X < 0
@@ -243,27 +243,27 @@ namespace MatterFlux::Combustion
 			return false;
 		}
 		const int32 CellIndex = Cell.Y * RuntimeSettings.Width + Cell.X;
-		const TArray<uint8>& SimulationBurningMask =
-			Simulation->GetBurningMask();
-		if (!VisibleBurningMask.IsValidIndex(CellIndex)
-			|| !SimulationBurningMask.IsValidIndex(CellIndex)
-			|| !Simulation->Ignite(Cell, IgnitionMaterial))
+		const TArray<uint8>& SimulationActiveMask =
+			Simulation->GetActiveMask();
+		if (!VisibleActiveMask.IsValidIndex(CellIndex)
+			|| !SimulationActiveMask.IsValidIndex(CellIndex)
+			|| !Simulation->Activate(Cell, StimulusMaterial))
 		{
 			return false;
 		}
-		VisibleBurningMask[CellIndex] =
-			SimulationBurningMask[CellIndex];
-		SetBurningCellIndexState(CellIndex, true);
+		VisibleActiveMask[CellIndex] =
+			SimulationActiveMask[CellIndex];
+		SetActiveCellIndexState(CellIndex, true);
 		MarkCellDirty(CellIndex);
 		return true;
 	}
 
-	FGroundAdvanceResult FGroundCombustionRuntime::AdvanceAuthority(
+	FGroundAdvanceResult FGroundReactionRuntime::AdvanceAuthority(
 		const float DeltaSeconds)
 	{
 		FGroundAdvanceResult Result;
 		if (!Simulation
-			|| !Simulation->IsBurning()
+			|| !Simulation->IsActive()
 			|| !FMath::IsFinite(DeltaSeconds))
 		{
 			return Result;
@@ -303,40 +303,40 @@ namespace MatterFlux::Combustion
 			}
 			ChangedCellIndices.SetNum(UniqueCount, EAllowShrinking::No);
 			Result.ChangedCellIndices = MoveTemp(ChangedCellIndices);
-			const TArray<uint8>& SimulationResidueMask =
-				Simulation->GetResidueMask();
-			const TArray<uint8>& SimulationBurningMask =
-				Simulation->GetBurningMask();
+			const TArray<uint8>& SimulationOutputMask =
+				Simulation->GetOutputMask();
+			const TArray<uint8>& SimulationActiveMask =
+				Simulation->GetActiveMask();
 			for (const int32 CellIndex : Result.ChangedCellIndices)
 			{
-				if (!VisibleResidueMask.IsValidIndex(CellIndex)
-					|| !VisibleBurningMask.IsValidIndex(CellIndex)
-					|| !SimulationResidueMask.IsValidIndex(CellIndex)
-					|| !SimulationBurningMask.IsValidIndex(CellIndex))
+				if (!VisibleOutputMask.IsValidIndex(CellIndex)
+					|| !VisibleActiveMask.IsValidIndex(CellIndex)
+					|| !SimulationOutputMask.IsValidIndex(CellIndex)
+					|| !SimulationActiveMask.IsValidIndex(CellIndex))
 				{
 					continue;
 				}
-				const bool bWasBurning =
-					VisibleBurningMask[CellIndex] != 0;
-				const bool bWasResidue =
-					VisibleResidueMask[CellIndex] != 0;
-				const uint8 NewResidue =
-					SimulationResidueMask[CellIndex];
-				const uint8 NewBurning =
-					SimulationBurningMask[CellIndex];
-				VisibleResidueMask[CellIndex] = NewResidue;
-				VisibleBurningMask[CellIndex] = NewBurning;
-				if (bWasBurning != (NewBurning != 0))
+				const bool bWasActive =
+					VisibleActiveMask[CellIndex] != 0;
+				const bool bWasOutput =
+					VisibleOutputMask[CellIndex] != 0;
+				const uint8 NewOutput =
+					SimulationOutputMask[CellIndex];
+				const uint8 NewActive =
+					SimulationActiveMask[CellIndex];
+				VisibleOutputMask[CellIndex] = NewOutput;
+				VisibleActiveMask[CellIndex] = NewActive;
+				if (bWasActive != (NewActive != 0))
 				{
-					SetBurningCellIndexState(
+					SetActiveCellIndexState(
 						CellIndex,
-						NewBurning != 0);
+						NewActive != 0);
 				}
-				if (bWasResidue != (NewResidue != 0))
+				if (bWasOutput != (NewOutput != 0))
 				{
-					SetResidueCellIndexState(
+					SetOutputCellIndexState(
 						CellIndex,
-						NewResidue != 0);
+						NewOutput != 0);
 				}
 				MarkCellDirty(CellIndex);
 			}
@@ -344,7 +344,7 @@ namespace MatterFlux::Combustion
 		return Result;
 	}
 
-	bool FGroundCombustionRuntime::BuildReplicationForCoordinates(
+	bool FGroundReactionRuntime::BuildReplicationForCoordinates(
 		const TConstArrayView<FIntPoint> Coordinates,
 		const int32 TargetRevision,
 		TArray<FMatterFluxGroundStateChunk>& OutChunks,
@@ -354,7 +354,7 @@ namespace MatterFlux::Combustion
 		OutError.Reset();
 		if (!Simulation || Coordinates.IsEmpty())
 		{
-			OutError = TEXT("ground combustion has no chunks to publish");
+			OutError = TEXT("ground reaction has no chunks to publish");
 			return false;
 		}
 		OutChunks.Reserve(Coordinates.Num());
@@ -364,8 +364,8 @@ namespace MatterFlux::Combustion
 			if (!Chunk.Encode(
 				Coordinate,
 				TargetRevision,
-				VisibleResidueMask,
-				VisibleBurningMask,
+				VisibleOutputMask,
+				VisibleActiveMask,
 				RuntimeSettings.Width,
 				RuntimeSettings.Height,
 				OutError))
@@ -378,7 +378,7 @@ namespace MatterFlux::Combustion
 		return true;
 	}
 
-	bool FGroundCombustionRuntime::BuildInitialReplication(
+	bool FGroundReactionRuntime::BuildInitialReplication(
 		TArray<FMatterFluxGroundStateChunk>& OutChunks,
 		FString& OutError) const
 	{
@@ -405,7 +405,7 @@ namespace MatterFlux::Combustion
 			OutError);
 	}
 
-	bool FGroundCombustionRuntime::BuildPendingReplication(
+	bool FGroundReactionRuntime::BuildPendingReplication(
 		TArray<FMatterFluxGroundStateChunk>& OutChunks,
 		FString& OutError)
 	{
@@ -430,14 +430,14 @@ namespace MatterFlux::Combustion
 		return true;
 	}
 
-	EGroundChunkApplyResult FGroundCombustionRuntime::ApplyReplicatedChunk(
+	EGroundChunkApplyResult FGroundReactionRuntime::ApplyReplicatedChunk(
 		const FMatterFluxGroundStateChunk& State,
 		FString& OutError)
 	{
 		OutError.Reset();
 		if (!Simulation)
 		{
-			OutError = TEXT("ground combustion runtime is not initialized");
+			OutError = TEXT("ground reaction runtime is not initialized");
 			return EGroundChunkApplyResult::Rejected;
 		}
 		if (const int32* Applied =
@@ -449,8 +449,8 @@ namespace MatterFlux::Combustion
 			}
 		}
 		if (!State.DecodeInto(
-			VisibleResidueMask,
-			VisibleBurningMask,
+			VisibleOutputMask,
+			VisibleActiveMask,
 			RuntimeSettings.Width,
 			RuntimeSettings.Height,
 			OutError))
@@ -462,10 +462,10 @@ namespace MatterFlux::Combustion
 		return EGroundChunkApplyResult::Applied;
 	}
 
-	bool FGroundCombustionRuntime::CaptureState(
+	bool FGroundReactionRuntime::CaptureState(
 		FGroundRuntimeSnapshot& OutState) const
 	{
-		if (!Simulation || !Simulation->CaptureState(OutState.CombustionState))
+		if (!Simulation || !Simulation->CaptureState(OutState.ReactionState))
 		{
 			return false;
 		}
@@ -474,7 +474,7 @@ namespace MatterFlux::Combustion
 		return true;
 	}
 
-	bool FGroundCombustionRuntime::RestoreState(
+	bool FGroundReactionRuntime::RestoreState(
 		const FGroundRuntimeSettings& Settings,
 		const FGroundRuntimeSnapshot& State,
 		const FMatterFluxReactionDefinition& Rule,
@@ -482,18 +482,18 @@ namespace MatterFlux::Combustion
 	{
 		OutError.Reset();
 		if (!Settings.IsValid()
-			|| State.CombustionState.Width != Settings.Width
-			|| State.CombustionState.Height != Settings.Height
+			|| State.ReactionState.Width != Settings.Width
+			|| State.ReactionState.Height != Settings.Height
 			|| !FMath::IsFinite(State.StepAccumulator)
 			|| State.StepAccumulator < 0.0f
 			|| State.StepAccumulator >= Settings.StepSeconds
 			|| State.Revision < 0)
 		{
-			OutError = TEXT("saved ground combustion runtime state is invalid");
+			OutError = TEXT("saved ground reaction runtime state is invalid");
 			return false;
 		}
-		TUniquePtr<FMaskCombustion> Candidate = MakeUnique<FMaskCombustion>();
-		if (!Candidate->RestoreState(State.CombustionState, Rule, OutError))
+		TUniquePtr<FMaskReaction> Candidate = MakeUnique<FMaskReaction>();
+		if (!Candidate->RestoreState(State.ReactionState, Rule, OutError))
 		{
 			return false;
 		}
@@ -501,52 +501,52 @@ namespace MatterFlux::Combustion
 		RuntimeSettings = Settings;
 		StepAccumulator = State.StepAccumulator;
 		Revision = State.Revision;
-		VisibleResidueMask = Candidate->GetResidueMask();
-		VisibleBurningMask = Candidate->GetBurningMask();
+		VisibleOutputMask = Candidate->GetOutputMask();
+		VisibleActiveMask = Candidate->GetActiveMask();
 		RebuildVisibleCellIndices();
 		Simulation = MoveTemp(Candidate);
 		return true;
 	}
 
-	int32 FGroundCombustionRuntime::CountResidueCells() const
+	int32 FGroundReactionRuntime::CountOutputCells() const
 	{
 		int32 Count = 0;
 		for (const TPair<FIntPoint, TSet<int32>>& Pair
-			: ResidueCellIndicesByChunk)
+			: OutputCellIndicesByChunk)
 		{
 			Count += Pair.Value.Num();
 		}
 		return Count;
 	}
 
-	void FGroundCombustionRuntime::GatherBurningCellIndices(
+	void FGroundReactionRuntime::GatherActiveCellIndices(
 		TArray<int32>& OutCellIndices) const
 	{
 		OutCellIndices.Reset();
 		for (const TPair<FIntPoint, TSet<int32>>& Pair
-			: BurningCellIndicesByChunk)
+			: ActiveCellIndicesByChunk)
 		{
 			OutCellIndices.Append(Pair.Value.Array());
 		}
 		OutCellIndices.Sort();
 	}
 
-	void FGroundCombustionRuntime::GatherResidueCellIndices(
+	void FGroundReactionRuntime::GatherOutputCellIndices(
 		TArray<int32>& OutCellIndices) const
 	{
 		OutCellIndices.Reset();
 		for (const TPair<FIntPoint, TSet<int32>>& Pair
-			: ResidueCellIndicesByChunk)
+			: OutputCellIndicesByChunk)
 		{
 			OutCellIndices.Append(Pair.Value.Array());
 		}
 		OutCellIndices.Sort();
 	}
 
-	void FGroundCombustionRuntime::GatherBurningChunkCoordinates(
+	void FGroundReactionRuntime::GatherActiveChunkCoordinates(
 		TArray<FIntPoint>& OutChunkCoordinates) const
 	{
-		BurningCellIndicesByChunk.GetKeys(OutChunkCoordinates);
+		ActiveCellIndicesByChunk.GetKeys(OutChunkCoordinates);
 		OutChunkCoordinates.Sort(
 			[](const FIntPoint A, const FIntPoint B)
 			{
@@ -554,29 +554,29 @@ namespace MatterFlux::Combustion
 			});
 	}
 
-	void FGroundCombustionRuntime::GatherVisibleCellIndicesForChunks(
+	void FGroundReactionRuntime::GatherVisibleCellIndicesForChunks(
 		const TConstArrayView<FIntPoint> ChunkCoordinates,
-		TArray<int32>& OutResidueCellIndices,
-		TArray<int32>& OutBurningCellIndices) const
+		TArray<int32>& OutOutputCellIndices,
+		TArray<int32>& OutActiveCellIndices) const
 	{
-		TSet<int32> ResidueCells;
-		TSet<int32> BurningCells;
+		TSet<int32> OutputCells;
+		TSet<int32> ActiveCells;
 		for (const FIntPoint ChunkCoordinate : ChunkCoordinates)
 		{
-			if (const TSet<int32>* ChunkResidue =
-				ResidueCellIndicesByChunk.Find(ChunkCoordinate))
+			if (const TSet<int32>* ChunkOutput =
+				OutputCellIndicesByChunk.Find(ChunkCoordinate))
 			{
-				ResidueCells.Append(*ChunkResidue);
+				OutputCells.Append(*ChunkOutput);
 			}
-			if (const TSet<int32>* ChunkBurning =
-				BurningCellIndicesByChunk.Find(ChunkCoordinate))
+			if (const TSet<int32>* ChunkActive =
+				ActiveCellIndicesByChunk.Find(ChunkCoordinate))
 			{
-				BurningCells.Append(*ChunkBurning);
+				ActiveCells.Append(*ChunkActive);
 			}
 		}
-		OutResidueCellIndices = ResidueCells.Array();
-		OutBurningCellIndices = BurningCells.Array();
-		OutResidueCellIndices.Sort();
-		OutBurningCellIndices.Sort();
+		OutOutputCellIndices = OutputCells.Array();
+		OutActiveCellIndices = ActiveCells.Array();
+		OutOutputCellIndices.Sort();
+		OutActiveCellIndices.Sort();
 	}
 }

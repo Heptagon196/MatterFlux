@@ -2,21 +2,21 @@
 
 #include "CoreMinimal.h"
 
-namespace MatterFlux::Combustion
+namespace MatterFlux::Reaction
 {
 	/**
-	 * Tracks only logical fragment sources that currently contain burning
-	 * cells. Historical residue snapshots stay in the world state store but
+	 * Tracks only logical fragment sources that currently contain active
+	 * cells. Historical output snapshots stay in the world state store but
 	 * do not make visualization work grow over the lifetime of the world.
 	 */
-	class MATTERFLUX_API FLogicalSourceCombustionIndex
+	class MATTERFLUX_API FLogicalSourceReactionIndex
 	{
 	public:
 		/** Applies the latest snapshot. Invalid source ids are rejected. */
 		bool ApplySnapshot(
 			const FGuid& SourceId,
-			bool bHasCombustionState,
-			TConstArrayView<uint8> BurningMask);
+			bool bHasReactionState,
+			TConstArrayView<uint8> ActiveMask);
 
 		void Remove(const FGuid& SourceId);
 		void Reset();

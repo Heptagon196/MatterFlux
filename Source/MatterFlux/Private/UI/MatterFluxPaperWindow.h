@@ -31,11 +31,13 @@ public:
 		: _Label(FText::GetEmpty())
 		, _ToolTip(FText::GetEmpty())
 		, _bSelected(false)
+		, _FontSize(14)
 		, _Padding(18.0f, 8.0f)
 	{}
 		SLATE_ARGUMENT(FText, Label)
 		SLATE_ARGUMENT(FText, ToolTip)
 		SLATE_ARGUMENT(bool, bSelected)
+		SLATE_ARGUMENT(int32, FontSize)
 		SLATE_ARGUMENT(FMargin, Padding)
 		SLATE_ARGUMENT(TFunction<FReply()>, OnClicked)
 	SLATE_END_ARGS()

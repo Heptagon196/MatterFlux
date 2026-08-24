@@ -78,7 +78,7 @@ bool FMatterFluxDeveloperCaptureModuleTest::RunTest(
 		TEXT("mf.Visual.PhysicsPush"),
 		TEXT("mf.Visual.StabilitySequence"),
 		TEXT("mf.Player.Ability"),
-		TEXT("mf.Combustion.IgniteTree") })
+		TEXT("mf.Reaction.ActivateTree") })
 	{
 		TestNotNull(
 			*FString::Printf(

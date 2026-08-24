@@ -8,34 +8,34 @@ namespace
 	constexpr int32 ReplicationBenchmarkCellCount = 1024;
 	constexpr int32 ReplicationBenchmarkIterations = 256;
 
-	FFragment2DSourceStreamingState MakeCombustionState(
+	FFragment2DSourceStreamingState MakeReactionState(
 		const int32 SourceIndex)
 	{
 		FFragment2DSourceStreamingState State;
 		State.Revision = 1;
-		State.bHasCombustionState = true;
-		State.CombustionState.RuleId = TEXT("replication_benchmark");
-		State.CombustionState.Seed = 1000 + SourceIndex;
-		TArray<uint8> FuelMask;
-		FuelMask.SetNumUninitialized(ReplicationBenchmarkCellCount);
-		State.CombustionState.ResidueMask.Init(
+		State.bHasReactionState = true;
+		State.ReactionState.RuleId = TEXT("replication_benchmark");
+		State.ReactionState.Seed = 1000 + SourceIndex;
+		TArray<uint8> InputMask;
+		InputMask.SetNumUninitialized(ReplicationBenchmarkCellCount);
+		State.ReactionState.OutputMask.Init(
 			0,
 			ReplicationBenchmarkCellCount);
-		State.CombustionState.BurningMask.Init(
+		State.ReactionState.ActiveMask.Init(
 			0,
 			ReplicationBenchmarkCellCount);
 		for (int32 CellIndex = 0;
 			CellIndex < ReplicationBenchmarkCellCount;
 			++CellIndex)
 		{
-			FuelMask[CellIndex] =
+			InputMask[CellIndex] =
 				((CellIndex + SourceIndex) % 5) != 0 ? 1 : 0;
-			State.CombustionState.ResidueMask[CellIndex] =
+			State.ReactionState.OutputMask[CellIndex] =
 				((CellIndex + SourceIndex) % 23) == 0 ? 1 : 0;
-			State.CombustionState.BurningMask[CellIndex] =
+			State.ReactionState.ActiveMask[CellIndex] =
 				((CellIndex + SourceIndex) % 31) == 0 ? 7 : 0;
 		}
-		State.SetRuntimeMask(MoveTemp(FuelMask));
+		State.SetRuntimeMask(MoveTemp(InputMask));
 		return State;
 	}
 
@@ -50,7 +50,7 @@ namespace
 		Updates.Reserve(SourceCount);
 		for (int32 SourceIndex = 0; SourceIndex < SourceCount; ++SourceIndex)
 		{
-			SourceStates.Add(MakeCombustionState(SourceIndex));
+			SourceStates.Add(MakeReactionState(SourceIndex));
 		}
 		for (int32 SourceIndex = SourceCount - 1;
 			SourceIndex >= 0;
@@ -94,7 +94,7 @@ namespace
 			for (FFragment2DSourceStreamingState& State : SourceStates)
 			{
 				++State.Revision;
-				++State.CombustionState.Tick;
+				++State.ReactionState.Tick;
 			}
 			if (ReplicatedStates.UpsertAuthorityBatch(
 				Updates,

@@ -46,12 +46,32 @@ bool FMatterFluxLuaModularSpellApiTest::RunTest(const FString& Parameters)
 	{
 		return false;
 	}
-	TestEqual(TEXT("All spell modules loaded"), First->Spells.Num(), 18);
+	TestEqual(TEXT("All spell modules loaded"), First->Spells.Num(), 21);
 	TestEqual(TEXT("All wand modules loaded"), First->Wands.Num(), 9);
 	TestEqual(TEXT("All item modules loaded"), First->Items.Num(), 2);
 	TestEqual(TEXT("All quest modules loaded"), First->Quests.Num(), 10);
+	TestEqual(TEXT("All structure modules loaded"), First->Structures.Num(), 1);
 	TestEqual(TEXT("All custom map modules loaded"), First->CustomMaps.Num(), 2);
-	TestEqual(TEXT("Modular content revision"), First->Manifest.Revision, 13);
+	TestEqual(TEXT("Modular content revision"), First->Manifest.Revision, 21);
+	const FMatterFluxMaterialDefinition* Fire = First->Materials.Find(TEXT("fire"));
+	if (TestNotNull(TEXT("Default fire material compiled"), Fire))
+	{
+		TestTrue(TEXT("Fire remains a generic gas material"),
+			Fire->Phase == EMatterFluxMaterialPhase::Gas);
+		TestEqual(TEXT("Named lifetime_steps field is compiled"),
+			static_cast<int32>(Fire->LifetimeSteps), 6);
+	}
+	const FMatterFluxStructureDefinition* House = First->Structures.Find(
+		TEXT("structure.house.two_storey"));
+	if (TestNotNull(TEXT("Two-storey house profile compiled"), House))
+	{
+		TestEqual(TEXT("Lua selects the bounded house generator"),
+			House->GeneratorId, FName(TEXT("two_storey_house")));
+		TestEqual(TEXT("Lua configures connected-wall tolerance"),
+			House->ContactToleranceCentimeters, 12.0f);
+		TestEqual(TEXT("Lua keeps furniture out of wall opacity policy"),
+			House->WallGhostOpacity, 0.055f);
+	}
 	const FString FirstHash = First->Manifest.VersionHash;
 
 	const FString LuaRoot = FPaths::Combine(
@@ -112,8 +132,8 @@ bool FMatterFluxLuaModularSpellApiTest::RunTest(const FString& Parameters)
 		TEXT("Chemistry uses the unified reaction DSL"),
 		ChemistrySource.Contains(TEXT("reaction.define")));
 	TestFalse(
-		TEXT("Chemistry has no separate combustion registration path"),
-		ChemistrySource.Contains(TEXT("register_combustion")));
+		TEXT("Chemistry has no separate reaction registration path"),
+		ChemistrySource.Contains(TEXT("register_reaction")));
 	TestFalse(
 		TEXT("Chemistry cannot depend on the raw reaction compiler table"),
 		ChemistrySource.Contains(TEXT("content.register_reaction")));
@@ -277,6 +297,33 @@ end)
 		Error.Contains(TEXT("unknown spell metadata field 'damage'")));
 	TestTrue(
 		TEXT("Rejected capability program preserves the active registry"),
+		Runtime.GetActiveRegistry() == Baseline);
+
+	const FString ImpactOnlyAttempt = EngineSource + TEXT(R"LUA(
+content.set_manifest("invalid.impact.only", 1, 2)
+material.define({
+    id = "fire", density = 0.01, hardness = 0,
+    color_r = 1, color_g = 0.2, color_b = 0.02
+})
+spell.define({
+    id = "invalid.impact_only", name = "Impact Only", mana_cost = 1
+}, function(api)
+    api.projectile({
+        speed = 100, lifetime = 1, radius = 4,
+        impact_material = "fire"
+    })
+end)
+)LUA");
+	Error.Reset();
+	TestFalse(
+		TEXT("Direct impact-state mutation is not a spell capability"),
+		Runtime.LoadContentPackFromSource(
+			ImpactOnlyAttempt,
+			TEXT("ImpactOnlyMaterialSpell"),
+			Error));
+	TestFalse(TEXT("Impact-only rejection returns a diagnostic"),
+		Error.IsEmpty());
+	TestTrue(TEXT("Rejected impact-only spell preserves the active registry"),
 		Runtime.GetActiveRegistry() == Baseline);
 	return true;
 }
@@ -947,8 +994,7 @@ bool FMatterFluxLuaAcidChemistryTest::RunTest(const FString& Parameters)
 		Acid->ShallowOpacity >= 0.0f
 			&& Acid->DeepOpacity >= Acid->ShallowOpacity
 			&& Acid->DeepOpacity <= 1.0f
-			&& Acid->OpacityDepth > 0.0f
-			&& Acid->RefractionIndex >= 1.0f);
+			&& Acid->OpacityDepth > 0.0f);
 	TestTrue(
 		TEXT("Acid remains visibly magenta over bright terrain"),
 		Acid->Color.R >= 0.70f
@@ -958,7 +1004,8 @@ bool FMatterFluxLuaAcidChemistryTest::RunTest(const FString& Parameters)
 
 	static const FName CorrodibleMaterials[] = {
 		TEXT("wood"), TEXT("leaf"), TEXT("grass"), TEXT("grassland"),
-		TEXT("flower_pink"), TEXT("flower_gold"), TEXT("flower_blue")
+		TEXT("flower_pink"), TEXT("flower_gold"), TEXT("flower_blue"),
+		TEXT("soil"), TEXT("stone"), TEXT("sand")
 	};
 	for (const FName Target : CorrodibleMaterials)
 	{
@@ -1022,10 +1069,9 @@ content.register_material({
     phase = "liquid",
     mobility = 255,
     dispersion = 220,
-    shallow_opacity = 0.16,
-    deep_opacity = 0.88,
-    opacity_depth = 160.0,
-    refraction_index = 1.33,
+	shallow_opacity = 0.16,
+	deep_opacity = 0.88,
+	opacity_depth = 160.0,
 })
 )LUA");
 
@@ -1054,8 +1100,6 @@ content.register_material({
 			Water.DeepOpacity, 0.88f);
 		TestEqual(TEXT("Opacity depth is retained in centimeters"),
 			Water.OpacityDepth, 160.0f);
-		TestEqual(TEXT("Physical refraction index is retained"),
-			Water.RefractionIndex, 1.33f);
 	}
 
 	MatterFluxLuaTests::RestoreDefault(Runtime);

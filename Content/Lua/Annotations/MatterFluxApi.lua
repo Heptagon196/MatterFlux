@@ -23,10 +23,10 @@
 ---@field phase? MatterFluxMaterialPhase 物态，默认 static。
 ---@field mobility? integer 每步移动意愿，范围 0～255。
 ---@field dispersion? integer 横向扩散意愿，范围 0～255。
+---@field lifetime_steps? integer 存在的固定模拟步数，范围 0～255；0 表示不会自行消散。
 ---@field shallow_opacity? number 浅水不透明度，范围 0～1。
 ---@field deep_opacity? number 深水不透明度，范围 0～1，且不小于 shallow_opacity。
 ---@field opacity_depth? number 达到深水不透明度所需的视线内液体深度，单位厘米。
----@field refraction_index? number 折射率，范围 1～2.5；水通常使用 1.33。
 
 ---@class MatterFluxMaterialNamespace
 ---@field define fun(definition: MatterFluxMaterialDefinition) 注册物质；命名字段在加载时编译和校验。
@@ -34,6 +34,11 @@
 ---@alias MatterFluxSpellTriggerEvent
 ---| 'impact' # 载体碰撞时触发子法术。
 ---| 'expired' # 载体寿命结束时触发子法术。
+
+---@alias MatterFluxProjectileVisualShape
+---| 'orb' # 默认紧凑投射物。
+---| 'plane' # 与地面平行的横向切割面。
+---| 'vertical_plane' # 垂直于地面、沿飞行方向延展并以薄边前进的纵向切割面。
 
 ---@alias MatterFluxItemCategory
 ---| 'material' # 普通材料或货币。
@@ -94,8 +99,10 @@
 ---@field speed? number 投射物初速度，单位为 UE 单位/秒。
 ---@field lifetime? number 投射物最大存在时间，单位为秒。
 ---@field radius? number 投射物碰撞半径，单位为 UE 单位。
+---@field gravity_scale? number 飞行阶段承受的世界重力比例；命中并转入材质世界后不再生效。
 ---@field body_material? MatterFluxContentId 飞行中组成投射物体素球的材质 ID；留空使用普通投射物外观。
----@field impact_material? MatterFluxContentId 命中后写入世界的材质 ID；留空表示不写入。
+---@field material_amount? integer 投射物携带、并在碰撞或寿命结束时交给物质模拟的材质格数量，范围 1～64，默认 1。
+---@field visual_shape? MatterFluxProjectileVisualShape 投射物外形；默认 orb。
 ---@field cast_delay? number 对当前轮施法间隔的增量，单位为秒。
 ---@field recharge_time? number 对法杖充能时间的增量，单位为秒。
 
@@ -353,6 +360,23 @@
 ---@class MatterFluxCustomMapNamespace
 ---@field define fun(metadata: MatterFluxCustomMapMetadata, build_map: fun(api: MatterFluxCustomMapBuilder)) 注册有界确定性材料地图；回调只在内容加载时编译。
 
+---@class MatterFluxStructureMetadata
+---@field id MatterFluxContentId 结构模板稳定 ID。
+---@field generator 'two_storey_house' 有界 C++ 几何生成能力；Lua 只选择能力，不在 Tick 中创建 Actor。
+
+---@class MatterFluxStructureCutaway
+---@field contact_tolerance_cm? number 当前 RuntimeMask 之间允许视为接触的小缝容差。
+---@field floor_snap_height_cm? number 脚底吸附到真实 Floor Source 表面的最大高度差。
+---@field preferred_floor_padding_cm? number 楼梯井和边缘滞回时扩张上一个 Floor Source 的水平范围。
+---@field preferred_floor_vertical_range_cm? number 楼梯移动时保留上一个 Floor Source 的垂直范围。
+---@field exit_grace_seconds? number 离开所有材料地板后恢复外立面的短暂防抖时间。
+---@field fade_speed? number 墙体投影每秒透明度变化速度。
+---@field wall_opacity? number 连通墙体的目标透明度。
+---@field roof_opacity? number 连通屋顶墙体的目标透明度。
+
+---@class MatterFluxStructureNamespace
+---@field define fun(metadata: MatterFluxStructureMetadata, cutaway?: MatterFluxStructureCutaway) 注册结构生成能力和通用材质切面策略。
+
 ---@class MatterFluxContentApi
 ---@field set_manifest fun(pack_id: MatterFluxContentId, revision: integer, schema_version: integer) 设置内容包 ID、修订号和 C++ 接口版本；每个内容包只能调用一次。
 ---@field configure_fragmentation fun(min_detached_area_pixels: integer) 设置脱离 mask 后生成物理碎片所需的最小像素面积。
@@ -367,6 +391,7 @@
 ---@field register_creature fun(definition: table) 引擎内部的扁平编译格式；内容脚本应使用 creature.define。
 ---@field register_dialogue fun(definition: table) 引擎内部的扁平编译格式；内容脚本应使用 dialogue.define。
 ---@field register_shop fun(definition: table) 引擎内部的扁平编译格式；内容脚本应使用 shop.define。
+---@field register_structure fun(definition: table) 引擎内部的结构编译格式；内容脚本应使用 structure.define。
 ---@field register_custom_map fun(definition: table) 引擎内部的地图编译格式；内容脚本应使用 map.define。
 
 ---@type MatterFluxContentApi
@@ -423,6 +448,10 @@ dialogue = {}
 ---@type MatterFluxShopNamespace
 ---@diagnostic disable-next-line: missing-fields
 shop = {}
+
+---@type MatterFluxStructureNamespace
+---@diagnostic disable-next-line: missing-fields
+structure = {}
 
 ---@type MatterFluxCustomMapNamespace
 ---@diagnostic disable-next-line: missing-fields

@@ -203,7 +203,7 @@ bool FMatterFluxPlayerForwardCutTest::RunTest(
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxPlayerForwardFlameTest,
-	"MatterFlux.PlayerAbilities.RightClickFlameIgnitesOnlyTargetsAhead",
+	"MatterFlux.PlayerAbilities.RightClickFlameActivatesOnlyTargetsAhead",
 	EAutomationTestFlags::EditorContext
 		| EAutomationTestFlags::ProductFilter)
 
@@ -235,7 +235,7 @@ bool FMatterFluxPlayerForwardFlameTest::RunTest(
 		return false;
 	}
 
-	const int32 IgnitedCount =
+	const int32 ActivatedCount =
 		UGA_PlayerFlameJet::ExecuteFlameJet(
 			*Avatar,
 			800.0f,
@@ -244,14 +244,14 @@ bool FMatterFluxPlayerForwardFlameTest::RunTest(
 			TEXT("fire"),
 			1776);
 	TestEqual(
-		TEXT("Exactly the forward combustible target ignites"),
-		IgnitedCount,
+		TEXT("Exactly the forward reactive target ignites"),
+		ActivatedCount,
 		1);
 	TestTrue(
-		TEXT("Forward wood target is combusting"),
-		Ahead->IsCombusting());
+		TEXT("Forward wood target is reacting"),
+		Ahead->IsReacting());
 	TestFalse(
 		TEXT("Target behind the player stays unlit"),
-		Behind->IsCombusting());
+		Behind->IsReacting());
 	return true;
 }

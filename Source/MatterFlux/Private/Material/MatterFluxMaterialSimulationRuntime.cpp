@@ -1,6 +1,7 @@
 #include "Material/MatterFluxMaterialSimulationRuntime.h"
 
 #include "Algo/Unique.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 
 namespace MatterFlux::Material
 {
@@ -72,10 +73,19 @@ namespace MatterFlux::Material
 		bReplicationDirty = false;
 	}
 
+	bool FSimulationRuntime::WillAdvanceStep(const float DeltaSeconds) const
+	{
+		return MaterialWorld.IsValid()
+			&& StepAccumulator
+				+ FMath::Clamp(DeltaSeconds, 0.0f, 0.25f)
+				>= RuntimeSettings.StepSeconds;
+	}
+
 	FRuntimeAdvanceResult FSimulationRuntime::AdvanceAuthority(
 		const float DeltaSeconds,
 		const TConstArrayView<FIntPoint> Focuses)
 	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(MatterFlux_MaterialRuntime_AdvanceAuthority);
 		FRuntimeAdvanceResult Result;
 		Result.LogicalStep = LogicalStep;
 		if (!MaterialWorld)
@@ -91,7 +101,11 @@ namespace MatterFlux::Material
 		if (NormalizedFocuses != CurrentFocuses)
 		{
 			CurrentFocuses = MoveTemp(NormalizedFocuses);
-			MaterialWorld->SetSimulationFocuses(CurrentFocuses);
+			{
+				TRACE_CPUPROFILER_EVENT_SCOPE(
+					MatterFlux_MaterialRuntime_ReconcileFocus);
+				MaterialWorld->SetSimulationFocuses(CurrentFocuses);
+			}
 			Result.bFocusChanged = true;
 			bReplicationDirty = true;
 		}
@@ -106,7 +120,11 @@ namespace MatterFlux::Material
 			&& Result.Steps < RuntimeSettings.MaxStepsPerAdvance)
 		{
 			StepAccumulator -= RuntimeSettings.StepSeconds;
-			const FStepStats Stats = MaterialWorld->Step();
+			FStepStats Stats;
+			{
+				TRACE_CPUPROFILER_EVENT_SCOPE(MatterFlux_MaterialRuntime_Step);
+				Stats = MaterialWorld->Step();
+			}
 			LogicalStep = LogicalStep == MAX_int32 ? 0 : LogicalStep + 1;
 			Result.bStateChanged |= Stats.MovedCells > 0
 				|| Stats.ReactedPairs > 0
@@ -291,6 +309,20 @@ namespace MatterFlux::Material
 	{
 		const bool bChanged = MaterialWorld
 			&& MaterialWorld->SetCell(WorldCell, MaterialId);
+		bReplicationDirty |= bChanged;
+		return bChanged;
+	}
+
+	bool FSimulationRuntime::SetCellAmount(
+		const FIntPoint& WorldCell,
+		const FName MaterialId,
+		const uint16 Amount)
+	{
+		const bool bChanged = MaterialWorld
+			&& MaterialWorld->SetCellAmount(
+				WorldCell,
+				MaterialId,
+				Amount);
 		bReplicationDirty |= bChanged;
 		return bChanged;
 	}

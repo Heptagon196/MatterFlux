@@ -31,7 +31,8 @@ class MATTERFLUX_API AMatterFluxCreatureActor : public ACharacter
 	GENERATED_BODY()
 
 public:
-	AMatterFluxCreatureActor();
+	explicit AMatterFluxCreatureActor(
+		const FObjectInitializer& ObjectInitializer);
 
 	virtual void BeginPlay() override;
 	virtual void GetLifetimeReplicatedProps(

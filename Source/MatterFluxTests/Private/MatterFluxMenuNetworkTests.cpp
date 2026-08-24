@@ -99,34 +99,33 @@ bool FMatterFluxFrontEndNavigationCannotEnterGameplayTest::RunTest(
 		EMatterFluxShellView::SinglePlayerMenu);
 
 	Shell->ShowMultiplayerMenu();
-	Shell->ShowSettings();
-	TestTrue(
-		TEXT("Settings opened from multiplayer remains in front-end context"),
-		Shell->IsStartMenuOpen());
-	Shell->ReturnFromSubmenu();
 	TestEqual(
-		TEXT("Settings returns to multiplayer"),
+		TEXT("Disabled multiplayer navigation returns to the start menu"),
 		Shell->GetView(),
-		EMatterFluxShellView::MultiplayerMenu);
+		EMatterFluxShellView::StartMenu);
+	TestEqual(
+		TEXT("Disabled multiplayer navigation explains why it is unavailable"),
+		Shell->GetTransientNotice(),
+		FString(TEXT("联机模式暂未开放")));
 
 	Shell->ShowCreateRoomMenu();
-	TestTrue(
-		TEXT("Create-room selection remains in front-end context"),
-		Shell->IsStartMenuOpen());
-	Shell->ShowMultiplayerMenu();
 	TestEqual(
-		TEXT("Create-room back button returns to multiplayer"),
+		TEXT("Create-room cannot bypass the multiplayer entry gate"),
 		Shell->GetView(),
-		EMatterFluxShellView::MultiplayerMenu);
-
+		EMatterFluxShellView::StartMenu);
 	Shell->ShowJoinRoomMenu();
-	TestTrue(
-		TEXT("Join-room selection remains in front-end context"),
-		Shell->IsStartMenuOpen());
-	Shell->ShowMultiplayerMenu();
-	Shell->ShowStartMenu();
 	TestEqual(
-		TEXT("Multiplayer back button returns to the start menu"),
+		TEXT("Join-room cannot bypass the multiplayer entry gate"),
+		Shell->GetView(),
+		EMatterFluxShellView::StartMenu);
+	Shell->RequestHostRoom();
+	TestEqual(
+		TEXT("Host requests cannot bypass the multiplayer entry gate"),
+		Shell->GetView(),
+		EMatterFluxShellView::StartMenu);
+	Shell->RequestJoinRoom();
+	TestEqual(
+		TEXT("Join requests cannot bypass the multiplayer entry gate"),
 		Shell->GetView(),
 		EMatterFluxShellView::StartMenu);
 	TestTrue(

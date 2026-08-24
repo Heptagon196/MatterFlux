@@ -53,7 +53,7 @@ void SMatterFluxPaperTab::Construct(const FArguments& InArgs)
 			Outline(
 				SNew(STextBlock)
 				.Text(InArgs._Label)
-				.Font(Font(14, true))
+				.Font(Font(InArgs._FontSize, true))
 				.Justification(ETextJustify::Center)
 				.ColorAndOpacity(TextColor),
 				InArgs._Padding,

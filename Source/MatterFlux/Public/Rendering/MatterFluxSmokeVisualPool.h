@@ -4,10 +4,10 @@
 
 namespace MatterFlux::Rendering
 {
-	/** One currently burning surface that may emit cosmetic smoke. */
-	struct MATTERFLUX_API FSmokeEmissionAnchor
+	/** One currently active surface that may emit cosmetic smoke. */
+	struct MATTERFLUX_API FMaterialEmissionAnchor
 	{
-		FSmokeEmissionAnchor();
+		FMaterialEmissionAnchor();
 
 		FVector WorldPosition = FVector::ZeroVector;
 		float CellSize = 0.0f;
@@ -32,8 +32,8 @@ namespace MatterFlux::Rendering
 	};
 
 	/**
-	 * Client-only world smoke simulation. Gameplay combustion remains fully
-	 * deterministic; this pool converts burning surface anchors into a bounded,
+	 * Client-only world smoke simulation. Gameplay reaction remains fully
+	 * deterministic; this pool converts active surface anchors into a bounded,
 	 * shared set of rising voxel smoke clusters.
 	 */
 	class MATTERFLUX_API FSmokeVisualPool
@@ -44,7 +44,7 @@ namespace MatterFlux::Rendering
 
 		bool Configure(const FSmokeVisualSettings& InSettings);
 		void Reset();
-		void SetEmissionAnchors(TConstArrayView<FSmokeEmissionAnchor> InAnchors);
+		void SetEmissionAnchors(TConstArrayView<FMaterialEmissionAnchor> InAnchors);
 		void Advance(float DeltaSeconds);
 		void BuildInstanceTransforms(TArray<FTransform>& OutTransforms) const;
 
@@ -66,7 +66,7 @@ namespace MatterFlux::Rendering
 		void SpawnStep();
 
 		FSmokeVisualSettings Settings;
-		TArray<FSmokeEmissionAnchor> Anchors;
+		TArray<FMaterialEmissionAnchor> Anchors;
 		TArray<FParticle> Particles;
 		float SpawnAccumulator = 0.0f;
 		uint32 SpawnSequence = 0;

@@ -149,9 +149,9 @@ creature.define({
 material.define({
     id = "oil", density = 0.82, hardness = 0.03,
     color_r = 0.12, color_g = 0.08, color_b = 0.03, color_a = 0.90,
-    phase = "liquid", mobility = 245, dispersion = 210,
-    shallow_opacity = 0.22, deep_opacity = 0.94,
-    opacity_depth = 110.0, refraction_index = 1.47,
+	phase = "liquid", mobility = 245, dispersion = 210,
+	shallow_opacity = 0.22, deep_opacity = 0.94,
+	opacity_depth = 110.0,
 })
 ```
 
@@ -212,7 +212,7 @@ MatterFlux.Performance.LargeWorld
 ```
 
 截图保存在 `Saved/Screenshots/WindowsEditor/MatterFluxLiquidPool`。命令会自动拍摄两个
-斜向和一个高角度视图，用于检查连续液面、浅岸透视、深水不透明度与折射。
+斜向和一个高角度视图，用于检查连续液面、浅岸透视与深水不透明度。
 
 ## 12. 后续扩展建议
 

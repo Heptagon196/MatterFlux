@@ -131,7 +131,7 @@ struct MATTERFLUX_API FMatterFluxProgressionSaveState
 };
 
 USTRUCT(BlueprintType)
-struct MATTERFLUX_API FMatterFluxSavedCombustionState
+struct MATTERFLUX_API FMatterFluxSavedReactionState
 {
 	GENERATED_BODY()
 
@@ -151,13 +151,13 @@ struct MATTERFLUX_API FMatterFluxSavedCombustionState
 	uint32 Tick = 0;
 
 	UPROPERTY(SaveGame)
-	TArray<uint8> FuelMask;
+	TArray<uint8> InputMask;
 
 	UPROPERTY(SaveGame)
-	TArray<uint8> ResidueMask;
+	TArray<uint8> OutputMask;
 
 	UPROPERTY(SaveGame)
-	TArray<uint8> BurningMask;
+	TArray<uint8> ActiveMask;
 };
 
 USTRUCT(BlueprintType)
@@ -175,22 +175,35 @@ struct MATTERFLUX_API FMatterFluxSavedFragmentSourceState
 	TArray<uint8> RuntimeMask;
 
 	UPROPERTY(SaveGame)
-	bool bHasCombustionState = false;
+	bool bHasReactionState = false;
 
 	UPROPERTY(SaveGame)
-	FMatterFluxSavedCombustionState CombustionState;
+	FMatterFluxSavedReactionState ReactionState;
 
 	UPROPERTY(SaveGame)
-	float CombustionAccumulator = 0.0f;
+	float ReactionAccumulator = 0.0f;
 
 	UPROPERTY(SaveGame)
-	int32 TotalSmokeEmissionCount = 0;
+	int32 TotalMaterialEmissionCount = 0;
 
 	UPROPERTY(SaveGame)
 	FTransform ActorTransform = FTransform::Identity;
 
 	UPROPERTY(SaveGame)
 	bool bDetachedFromTerrain = false;
+};
+
+/** One sparse canonical terrain edit; also used directly for replication. */
+USTRUCT(BlueprintType)
+struct MATTERFLUX_API FMatterFluxTerrainHeightOverride
+{
+	GENERATED_BODY()
+
+	UPROPERTY(SaveGame)
+	FIntPoint WorldCell = FIntPoint::ZeroValue;
+
+	UPROPERTY(SaveGame)
+	float Height = 0.0f;
 };
 
 USTRUCT(BlueprintType)
@@ -202,25 +215,28 @@ struct MATTERFLUX_API FMatterFluxWorldSaveState
 	TArray<uint8> MaterialActiveState;
 
 	UPROPERTY(SaveGame)
+	TArray<FMatterFluxTerrainHeightOverride> TerrainHeightOverrides;
+
+	UPROPERTY(SaveGame)
 	TArray<FMatterFluxSavedFragmentSourceState> FragmentSources;
 
 	UPROPERTY(SaveGame)
 	TArray<FGuid> RemovedFragmentSourceIds;
 
 	UPROPERTY(SaveGame)
-	bool bHasGroundCombustionState = false;
+	bool bHasGroundReactionState = false;
 
 	UPROPERTY(SaveGame)
-	FMatterFluxSavedCombustionState GroundCombustionState;
+	FMatterFluxSavedReactionState GroundReactionState;
 
 	UPROPERTY(SaveGame)
-	float GroundCombustionAccumulator = 0.0f;
+	float GroundReactionAccumulator = 0.0f;
 
 	UPROPERTY(SaveGame)
-	int32 GroundCombustionRevision = 0;
+	int32 GroundReactionRevision = 0;
 
 	UPROPERTY(SaveGame)
-	TArray<FGuid> SourcesThatIgnitedGround;
+	TArray<FGuid> SourcesThatActivatedGround;
 };
 
 USTRUCT(BlueprintType)

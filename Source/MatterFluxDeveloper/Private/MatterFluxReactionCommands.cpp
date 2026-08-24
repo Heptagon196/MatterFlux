@@ -7,7 +7,7 @@
 
 namespace
 {
-	void IgniteTreeCommand(
+	void ActivateTreeCommand(
 		const TArray<FString>& Args,
 		UWorld* World)
 	{
@@ -23,15 +23,15 @@ namespace
 		TActorIterator<AMatterFluxPlayableWorldActor> It(World);
 		if (It)
 		{
-			const bool bIgnited =
-				It->IgniteFirstGeneratedTree(EventSeed);
+			const bool bActivated =
+				It->ApplyMaterialStimulusToFirstGeneratedTree(EventSeed);
 			UE_LOG(
 				LogMatterFlux,
 				Display,
-				TEXT("mf.Combustion.IgniteTree: %s (seed=%d)"),
-				bIgnited ? TEXT("ignited") : TEXT("no eligible tree"),
+				TEXT("mf.Reaction.ActivateTree: %s (seed=%d)"),
+				bActivated ? TEXT("activated") : TEXT("no eligible tree"),
 				EventSeed);
-			if (bIgnited && Args.Num() > 1)
+			if (bActivated && Args.Num() > 1)
 			{
 				if (IConsoleObject* CaptureObject =
 					IConsoleManager::Get().FindConsoleObject(
@@ -59,12 +59,12 @@ namespace
 		UE_LOG(
 			LogMatterFlux,
 			Warning,
-			TEXT("mf.Combustion.IgniteTree: playable world actor not found."));
+			TEXT("mf.Reaction.ActivateTree: playable world actor not found."));
 	}
 
-	FAutoConsoleCommandWithWorldAndArgs GIgniteTreeCommand(
-		TEXT("mf.Combustion.IgniteTree"),
-		TEXT("Ignite the tree nearest the player: mf.Combustion.IgniteTree [event-seed=404] [capture-delay] [capture-multiplier] [quit-after-capture]"),
+	FAutoConsoleCommandWithWorldAndArgs GActivateTreeCommand(
+		TEXT("mf.Reaction.ActivateTree"),
+		TEXT("Activate the tree nearest the player: mf.Reaction.ActivateTree [event-seed=404] [capture-delay] [capture-multiplier] [quit-after-capture]"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
-			&IgniteTreeCommand));
+			&ActivateTreeCommand));
 }

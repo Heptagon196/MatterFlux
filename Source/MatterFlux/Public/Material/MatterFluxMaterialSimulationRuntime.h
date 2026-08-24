@@ -58,6 +58,12 @@ namespace MatterFlux::Material
 		FRuntimeAdvanceResult AdvanceAuthority(
 			float DeltaSeconds,
 			TConstArrayView<FIntPoint> Focuses);
+		/**
+		 * Predicts whether the next authority advance has fixed-step debt to
+		 * consume. Callers use this to keep unrelated streaming commits off the
+		 * same game-thread frame; a focus reconciliation may still defer the step.
+		 */
+		bool WillAdvanceStep(float DeltaSeconds) const;
 		bool BuildReplicatedState(
 			int32 MapSeed,
 			int32 PreviousRevision,
@@ -84,6 +90,10 @@ namespace MatterFlux::Material
 		void RequireFocusReconciliation() { CurrentFocuses.Reset(); }
 
 		bool SetCell(const FIntPoint& WorldCell, FName MaterialId);
+		bool SetCellAmount(
+			const FIntPoint& WorldCell,
+			FName MaterialId,
+			uint16 Amount);
 		FName GetMaterialAt(const FIntPoint& WorldCell) const;
 		bool TryGetCellSnapshot(
 			const FIntPoint& WorldCell,

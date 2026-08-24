@@ -29,6 +29,10 @@ class MATTERFLUX_API UMatterFluxShellWidget : public UUserWidget
 	GENERATED_BODY()
 
 public:
+	// Multiplayer is intentionally kept behind one compile-time presentation
+	// gate while its unfinished implementation remains available for later work.
+	static constexpr bool IsMultiplayerEntryEnabled() { return false; }
+
 	void InitializeForPlayer(AMatterFluxPlayerController* Controller);
 	void ShowStartMenu();
 	void ShowSinglePlayerMenu();
@@ -94,6 +98,7 @@ private:
 	// ordinary UI callers must still complete a real save/session operation.
 	friend class AMatterFluxPlayerController;
 	void CancelPendingJoinForSinglePlayer();
+	void RejectMultiplayerEntry();
 	void SetView(EMatterFluxShellView NewView);
 	void EnterGameplayAfterSuccessfulOperation();
 	void NotifyControllerState(bool bOperationActive = false) const;

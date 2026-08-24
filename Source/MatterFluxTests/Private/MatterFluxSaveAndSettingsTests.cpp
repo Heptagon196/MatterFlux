@@ -112,6 +112,30 @@ bool FMatterFluxSaveCorruptionTest::RunTest(const FString& Parameters)
 	NonBinaryMaskSave->WorldState.FragmentSources = { Source };
 	TestFalse(TEXT("Non-binary source masks are rejected"),
 		NonBinaryMaskSave->ValidateAndMigrate(Error));
+
+	UMatterFluxSaveGame* ActiveCountdownSave = MakeValidSave();
+	Source = FMatterFluxSavedFragmentSourceState();
+	Source.SourceId = FGuid::NewGuid();
+	Source.RuntimeMask = { 1 };
+	Source.bHasReactionState = true;
+	Source.ReactionState.RuleId = TEXT("reaction.test");
+	Source.ReactionState.Width = 1;
+	Source.ReactionState.Height = 1;
+	Source.ReactionState.InputMask = { 1 };
+	Source.ReactionState.OutputMask = { 0 };
+	Source.ReactionState.ActiveMask = { 3 };
+	ActiveCountdownSave->WorldState.FragmentSources = { Source };
+	TestTrue(TEXT("A multi-step active reaction is saveable"),
+		ActiveCountdownSave->ValidateAndMigrate(Error));
+
+	UMatterFluxSaveGame* OrphanedActiveCellSave = MakeValidSave();
+	Source.SourceId = FGuid::NewGuid();
+	Source.RuntimeMask = { 0 };
+	Source.ReactionState.InputMask = { 0 };
+	Source.ReactionState.ActiveMask = { 1 };
+	OrphanedActiveCellSave->WorldState.FragmentSources = { Source };
+	TestFalse(TEXT("An active cell without reaction input is rejected"),
+		OrphanedActiveCellSave->ValidateAndMigrate(Error));
 	return true;
 }
 

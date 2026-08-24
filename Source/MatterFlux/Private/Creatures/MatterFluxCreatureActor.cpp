@@ -5,6 +5,7 @@
 #include "Components/StaticMeshComponent.h"
 #include "Game/MatterFluxCharacter.h"
 #include "Game/MatterFluxCharacterPhysicsInteraction.h"
+#include "Game/MatterFluxCharacterMovementComponent.h"
 #include "Game/MatterFluxPlayerState.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "IMatterFluxScriptRuntime.h"
@@ -17,7 +18,11 @@
 #include "TimerManager.h"
 #include "UObject/ConstructorHelpers.h"
 
-AMatterFluxCreatureActor::AMatterFluxCreatureActor()
+AMatterFluxCreatureActor::AMatterFluxCreatureActor(
+	const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer.SetDefaultSubobjectClass<
+		UMatterFluxCharacterMovementComponent>(
+			ACharacter::CharacterMovementComponentName))
 {
 	bReplicates = true;
 	SetReplicateMovement(true);
@@ -297,7 +302,11 @@ bool AMatterFluxCreatureActor::SpawnCastShotAuthority(
 	Plan.Speed = Spell->Speed;
 	Plan.Lifetime = Spell->Lifetime;
 	Plan.Radius = Spell->Radius;
-	Plan.ImpactMaterial = Spell->ImpactMaterial;
+	Plan.GravityScale = Spell->GravityScale;
+	Plan.BodyMaterial = Spell->BodyMaterial;
+	Plan.MaterialAmount = Spell->MaterialAmount;
+	Plan.bUsePlaneVisual = Spell->bUsePlaneVisual;
+	Plan.bUseVerticalPlaneVisual = Spell->bUseVerticalPlaneVisual;
 	Plan.bOverrideColor = Program.bOverrideColor || Spell->bOverrideColor;
 	Plan.Color = Program.bOverrideColor ? Program.Color : Spell->Color;
 	const FTransform Transform(

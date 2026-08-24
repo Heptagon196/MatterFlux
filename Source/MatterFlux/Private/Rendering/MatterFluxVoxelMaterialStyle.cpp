@@ -17,6 +17,7 @@ namespace MatterFlux::Rendering
 
 	FVoxelMaterialStyle ResolveVoxelMaterialStyle(const FName MaterialId)
 	{
+		// Material-specific styles are canonical across every voxel projection.
 		FVoxelMaterialStyle Style;
 		if (MaterialId == TEXT("wood"))
 		{
@@ -58,8 +59,9 @@ namespace MatterFlux::Rendering
 		else if (MaterialId == TEXT("stone"))
 		{
 			Style.FaceContrast = 0.72f;
+			Style.ColorVariation = 0.055f;
 			Style.Roughness = 0.96f;
-			Style.ShadowLift = 0.12f;
+			Style.ShadowLift = 0.30f;
 		}
 		else if (MaterialId == TEXT("roof"))
 		{

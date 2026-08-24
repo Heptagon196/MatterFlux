@@ -88,6 +88,9 @@ namespace MatterFluxLua
 		bool AddQuest(
 			const FMatterFluxQuestDefinition& Definition,
 			FString& OutError);
+		bool AddStructure(
+			const FMatterFluxStructureDefinition& Definition,
+			FString& OutError);
 		bool AddCustomMap(
 			const FMatterFluxCustomMapDefinition& Definition,
 			FString& OutError);
@@ -447,6 +450,7 @@ namespace MatterFluxLua
 			TEXT("Creatures"),
 			TEXT("Dialogues"),
 			TEXT("Shops"),
+			TEXT("Structures"),
 			TEXT("Maps")
 		};
 		for (const TCHAR* DirectoryName : ModuleDirectories)
@@ -619,9 +623,6 @@ namespace MatterFluxLua
 			|| Definition.DeepOpacity > 1.0f
 			|| !FMath::IsFinite(Definition.OpacityDepth)
 			|| Definition.OpacityDepth <= 0.0f
-			|| !FMath::IsFinite(Definition.RefractionIndex)
-			|| Definition.RefractionIndex < 1.0f
-			|| Definition.RefractionIndex > 2.5f
 			|| !bValidPhase)
 		{
 			OutError = FString::Printf(
@@ -981,6 +982,7 @@ namespace MatterFluxLua
 			&& IsFiniteNonNegative(Definition.Lifetime)
 			&& IsFiniteNonNegative(Definition.LifetimeMultiplier)
 			&& IsFiniteNonNegative(Definition.Radius)
+			&& IsFiniteNonNegative(Definition.GravityScale)
 			&& FMath::IsFinite(Definition.SpreadDelta)
 			&& FMath::IsFinite(Definition.CastDelayDelta)
 			&& FMath::IsFinite(Definition.RechargeTimeDelta)
@@ -1008,12 +1010,15 @@ namespace MatterFluxLua
 			|| Definition.DisplayName.Len() > 96
 			|| Definition.Description.Len() > 512
 			|| Definition.Icon.Len() > 256
+			|| Definition.GravityScale > 4.0f
 			|| !bFinite
 			|| !bValidKind
 			|| !bValidColor
 			|| Definition.OrbitRadius > 10000.0f
 			|| Definition.CarrierLifetimeOverride > 30.0f
 			|| Definition.VerticalImpulse > 5000.0f
+			|| Definition.MaterialAmount < 1
+			|| Definition.MaterialAmount > 64
 			|| Definition.DrawCount < 0
 			|| Definition.DrawCount > 16
 			|| Definition.TriggerDrawCount < 0
@@ -1034,6 +1039,15 @@ namespace MatterFluxLua
 		{
 			OutError = FString::Printf(
 				TEXT("projectile spell '%s' requires positive speed, lifetime, and radius"),
+				*Id);
+			return false;
+		}
+		if (Definition.bUsePlaneVisual
+			&& Definition.Kind != EMatterFluxSpellKind::Projectile
+			&& Definition.Kind != EMatterFluxSpellKind::Trigger)
+		{
+			OutError = FString::Printf(
+				TEXT("plane visual spell '%s' must produce a projectile"),
 				*Id);
 			return false;
 		}
@@ -1407,6 +1421,55 @@ namespace MatterFluxLua
 		return true;
 	}
 
+	bool FRegistryBuilder::AddStructure(
+		const FMatterFluxStructureDefinition& Definition,
+		FString& OutError)
+	{
+		const FString Id = Definition.Id.ToString();
+		const FString GeneratorId = Definition.GeneratorId.ToString();
+		if (!IsValidContentId(Id)
+			|| !IsValidContentId(GeneratorId)
+			|| GeneratorId != TEXT("two_storey_house")
+			|| !FMath::IsFinite(Definition.ContactToleranceCentimeters)
+			|| Definition.ContactToleranceCentimeters < 0.0f
+			|| Definition.ContactToleranceCentimeters > 100.0f
+			|| !FMath::IsFinite(Definition.FloorSnapHeightCentimeters)
+			|| Definition.FloorSnapHeightCentimeters < 0.0f
+			|| Definition.FloorSnapHeightCentimeters > 200.0f
+			|| !FMath::IsFinite(Definition.PreferredFloorPaddingCentimeters)
+			|| Definition.PreferredFloorPaddingCentimeters < 0.0f
+			|| Definition.PreferredFloorPaddingCentimeters > 500.0f
+			|| !FMath::IsFinite(Definition.PreferredFloorVerticalRangeCentimeters)
+			|| Definition.PreferredFloorVerticalRangeCentimeters < 0.0f
+			|| Definition.PreferredFloorVerticalRangeCentimeters > 1000.0f
+			|| !FMath::IsFinite(Definition.ExitGraceSeconds)
+			|| Definition.ExitGraceSeconds < 0.0f
+			|| Definition.ExitGraceSeconds > 2.0f
+			|| !FMath::IsFinite(Definition.FadeSpeed)
+			|| Definition.FadeSpeed <= 0.0f
+			|| Definition.FadeSpeed > 100.0f
+			|| !FMath::IsFinite(Definition.WallGhostOpacity)
+			|| Definition.WallGhostOpacity < 0.0f
+			|| Definition.WallGhostOpacity > 1.0f
+			|| !FMath::IsFinite(Definition.RoofGhostOpacity)
+			|| Definition.RoofGhostOpacity < 0.0f
+			|| Definition.RoofGhostOpacity > 1.0f)
+		{
+			OutError = FString::Printf(
+				TEXT("structure '%s' contains invalid generator or cutaway data"),
+				*Id);
+			return false;
+		}
+		if (Registry.Structures.Contains(Definition.Id))
+		{
+			OutError = FString::Printf(
+				TEXT("duplicate structure id '%s'"), *Id);
+			return false;
+		}
+		Registry.Structures.Add(Definition.Id, Definition);
+		return true;
+	}
+
 	bool FRegistryBuilder::SetFragmentationSettings(
 		const int32 MinDetachedAreaPixels,
 		FString& OutError)
@@ -1522,11 +1585,6 @@ namespace MatterFluxLua
 				&& !Registry.Materials.Contains(Pair.Value.BodyMaterial))
 			{
 				MissingMaterial = Pair.Value.BodyMaterial;
-			}
-			else if (!Pair.Value.ImpactMaterial.IsNone()
-				&& !Registry.Materials.Contains(Pair.Value.ImpactMaterial))
-			{
-				MissingMaterial = Pair.Value.ImpactMaterial;
 			}
 			if (!MissingMaterial.IsNone())
 			{
@@ -2455,6 +2513,7 @@ namespace MatterFluxLua
 		FMatterFluxMaterialDefinition Definition;
 		int32 Mobility = 255;
 		int32 Dispersion = 128;
+		int32 LifetimeSteps = 0;
 		if (ArgumentCount == 1 && lua_istable(State, 1))
 		{
 			// Lua 作者只面对命名字段。C++ 在这一条深模块接口后完成
@@ -2488,6 +2547,8 @@ namespace MatterFluxLua
 					State, TableIndex, "mobility", Mobility, Error)
 				|| !ReadTableIntegerField(
 					State, TableIndex, "dispersion", Dispersion, Error)
+				|| !ReadTableIntegerField(
+					State, TableIndex, "lifetime_steps", LifetimeSteps, Error)
 				|| !ReadTableNumberField(
 					State, TableIndex, "shallow_opacity",
 					Definition.ShallowOpacity, Error)
@@ -2496,10 +2557,7 @@ namespace MatterFluxLua
 					Definition.DeepOpacity, Error)
 				|| !ReadTableNumberField(
 					State, TableIndex, "opacity_depth",
-					Definition.OpacityDepth, Error)
-				|| !ReadTableNumberField(
-					State, TableIndex, "refraction_index",
-					Definition.RefractionIndex, Error))
+					Definition.OpacityDepth, Error))
 			{
 				return FailLuaCall(State, Error);
 			}
@@ -2567,14 +2625,17 @@ namespace MatterFluxLua
 		if (Mobility < 0
 			|| Mobility > 255
 			|| Dispersion < 0
-			|| Dispersion > 255)
+			|| Dispersion > 255
+			|| LifetimeSteps < 0
+			|| LifetimeSteps > 255)
 		{
 			return FailLuaCall(
 				State,
-				TEXT("material mobility and dispersion must be between 0 and 255"));
+				TEXT("material mobility, dispersion, and lifetime_steps must be between 0 and 255"));
 		}
 		Definition.Mobility = static_cast<uint8>(Mobility);
 		Definition.Dispersion = static_cast<uint8>(Dispersion);
+		Definition.LifetimeSteps = static_cast<uint8>(LifetimeSteps);
 		if (!GetExecutionContext(State).Builder->AddMaterial(Definition, Error))
 		{
 			return FailLuaCall(State, Error);
@@ -3521,7 +3582,7 @@ namespace MatterFluxLua
 		FString Id;
 		FString Kind;
 		FString BodyMaterial;
-		FString ImpactMaterial;
+		FString VisualShape;
 		FString TriggerEvent;
 		if (!ReadTableStringField(State, 1, "id", Id, true, Error)
 			|| !ReadTableStringField(
@@ -3554,6 +3615,8 @@ namespace MatterFluxLua
 			|| !ReadTableNumberField(
 				State, 1, "radius", Definition.Radius, Error)
 			|| !ReadTableNumberField(
+				State, 1, "gravity_scale", Definition.GravityScale, Error)
+			|| !ReadTableNumberField(
 				State, 1, "spread", Definition.SpreadDelta, Error)
 			|| !ReadTableNumberField(
 				State, 1, "cast_delay", Definition.CastDelayDelta, Error)
@@ -3581,8 +3644,10 @@ namespace MatterFluxLua
 				State, 1, "vertical_impulse", Definition.VerticalImpulse, Error)
 			|| !ReadTableStringField(
 				State, 1, "body_material", BodyMaterial, false, Error)
+			|| !ReadTableIntegerField(
+				State, 1, "material_amount", Definition.MaterialAmount, Error)
 			|| !ReadTableStringField(
-				State, 1, "impact_material", ImpactMaterial, false, Error)
+				State, 1, "visual_shape", VisualShape, false, Error)
 			|| !ReadTableIntegerField(
 				State, 1, "starter_count", Definition.StarterCount, Error)
 			|| !ParseSpellKind(Kind, Definition.Kind, Error))
@@ -3591,9 +3656,7 @@ namespace MatterFluxLua
 		}
 		if (!IsValidContentId(Id)
 			|| (!BodyMaterial.IsEmpty()
-				&& !IsValidContentId(BodyMaterial))
-			|| (!ImpactMaterial.IsEmpty()
-				&& !IsValidContentId(ImpactMaterial)))
+				&& !IsValidContentId(BodyMaterial)))
 		{
 			return FailLuaCall(
 				State,
@@ -3603,9 +3666,27 @@ namespace MatterFluxLua
 		Definition.BodyMaterial = BodyMaterial.IsEmpty()
 			? NAME_None
 			: FName(*BodyMaterial);
-		Definition.ImpactMaterial = ImpactMaterial.IsEmpty()
-			? NAME_None
-			: FName(*ImpactMaterial);
+		if (VisualShape.IsEmpty() || VisualShape == TEXT("orb"))
+		{
+			Definition.bUsePlaneVisual = false;
+			Definition.bUseVerticalPlaneVisual = false;
+		}
+		else if (VisualShape == TEXT("plane"))
+		{
+			Definition.bUsePlaneVisual = true;
+			Definition.bUseVerticalPlaneVisual = false;
+		}
+		else if (VisualShape == TEXT("vertical_plane"))
+		{
+			Definition.bUsePlaneVisual = true;
+			Definition.bUseVerticalPlaneVisual = true;
+		}
+		else
+		{
+			return FailLuaCall(
+				State,
+				TEXT("field 'visual_shape' must be orb, plane, or vertical_plane"));
+		}
 		if (TriggerEvent.IsEmpty() || TriggerEvent == TEXT("impact"))
 		{
 			Definition.TriggerEvent =
@@ -3864,6 +3945,65 @@ namespace MatterFluxLua
 		Definition.Id = FName(*Id);
 		Definition.TargetId = TargetId.IsEmpty() ? NAME_None : FName(*TargetId);
 		if (!Context.Builder->AddQuest(Definition, Error))
+		{
+			return FailLuaCall(State, Error);
+		}
+		return 0;
+	}
+
+	static int RegisterStructure(lua_State* State)
+	{
+		FExecutionContext& Context = GetExecutionContext(State);
+		if (lua_gettop(State) != 1 || lua_type(State, 1) != LUA_TTABLE)
+		{
+			return FailLuaCall(
+				State, TEXT("register_structure expects one definition table"));
+		}
+		if (Context.Builder->Registry.Structures.Num()
+			>= MaximumDefinitionsPerCategory)
+		{
+			return FailLuaCall(State, TEXT("structure definition limit exceeded"));
+		}
+
+		FMatterFluxStructureDefinition Definition;
+		FString Id;
+		FString GeneratorId;
+		FString Error;
+		if (!ReadTableStringField(State, 1, "id", Id, true, Error)
+			|| !ReadTableStringField(
+				State, 1, "generator", GeneratorId, true, Error)
+			|| !ReadTableNumberField(
+				State, 1, "contact_tolerance_cm",
+				Definition.ContactToleranceCentimeters, Error)
+			|| !ReadTableNumberField(
+				State, 1, "floor_snap_height_cm",
+				Definition.FloorSnapHeightCentimeters, Error)
+			|| !ReadTableNumberField(
+				State, 1, "preferred_floor_padding_cm",
+				Definition.PreferredFloorPaddingCentimeters, Error)
+			|| !ReadTableNumberField(
+				State, 1, "preferred_floor_vertical_range_cm",
+				Definition.PreferredFloorVerticalRangeCentimeters, Error)
+			|| !ReadTableNumberField(
+				State, 1, "exit_grace_seconds",
+				Definition.ExitGraceSeconds, Error)
+			|| !ReadTableNumberField(
+				State, 1, "fade_speed", Definition.FadeSpeed, Error)
+			|| !ReadTableNumberField(
+				State, 1, "wall_opacity", Definition.WallGhostOpacity, Error)
+			|| !ReadTableNumberField(
+				State, 1, "roof_opacity", Definition.RoofGhostOpacity, Error)
+			|| !IsValidContentId(Id)
+			|| !IsValidContentId(GeneratorId))
+		{
+			return FailLuaCall(
+				State,
+				Error.IsEmpty()
+					? TEXT("structure id or generator is invalid") : Error);
+		}
+		Definition.Id = FName(*Id);
+		Definition.GeneratorId = FName(*GeneratorId);
+		if (!Context.Builder->AddStructure(Definition, Error))
 		{
 			return FailLuaCall(State, Error);
 		}
@@ -4283,6 +4423,8 @@ namespace MatterFluxLua
 		lua_setfield(State, -2, "register_item");
 		lua_pushcfunction(State, RegisterQuest);
 		lua_setfield(State, -2, "register_quest");
+		lua_pushcfunction(State, RegisterStructure);
+		lua_setfield(State, -2, "register_structure");
 		lua_pushcfunction(State, RegisterCustomMap);
 		lua_setfield(State, -2, "register_custom_map");
 		lua_setglobal(State, "content");

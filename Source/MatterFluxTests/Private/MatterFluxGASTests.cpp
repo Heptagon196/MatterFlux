@@ -12,6 +12,53 @@
 #include "Magic/MatterFluxMagicInventoryComponent.h"
 #include "Progression/MatterFluxProgressionComponent.h"
 #include "GAS/MatterFluxPlayerAttributeSet.h"
+#include "UI/MatterFluxPlayerStatusWidget.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxPlayerStatusHudProjectionTest,
+	"MatterFlux.UI.PlayerStatusHudProjectsHealthAndFourWandSlots",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxPlayerStatusHudProjectionTest::RunTest(
+	const FString& Parameters)
+{
+	const AMatterFluxPlayerState* PlayerStateCDO =
+		GetDefault<AMatterFluxPlayerState>();
+	if (!TestNotNull(TEXT("PlayerState CDO exists"), PlayerStateCDO))
+	{
+		return false;
+	}
+
+	const FMatterFluxPlayerStatusSnapshot Snapshot =
+		UMatterFluxPlayerStatusWidget::BuildStatusSnapshot(PlayerStateCDO);
+	TestEqual(TEXT("HUD always exposes four wand slots"),
+		Snapshot.Wands.Num(),
+		UMatterFluxPlayerStatusWidget::WandSlotCount);
+	TestTrue(TEXT("Health is finite"), FMath::IsFinite(Snapshot.Health));
+	TestTrue(TEXT("Maximum health is finite"),
+		FMath::IsFinite(Snapshot.MaxHealth));
+	TestTrue(TEXT("Health remains inside its display range"),
+		Snapshot.Health >= 0.0f
+			&& Snapshot.Health <= Snapshot.MaxHealth);
+	for (int32 SlotIndex = 0; SlotIndex < Snapshot.Wands.Num(); ++SlotIndex)
+	{
+		const FMatterFluxPlayerStatusWandView& Wand =
+			Snapshot.Wands[SlotIndex];
+		TestFalse(
+			*FString::Printf(TEXT("Wand row %d has a label"), SlotIndex),
+			Wand.Label.IsEmpty());
+		TestTrue(
+			*FString::Printf(TEXT("Wand row %d mana is finite"), SlotIndex),
+			FMath::IsFinite(Wand.Mana)
+				&& FMath::IsFinite(Wand.MaxMana));
+		TestTrue(
+			*FString::Printf(TEXT("Wand row %d mana is in range"), SlotIndex),
+			Wand.Mana >= 0.0f
+				&& Wand.Mana <= Wand.MaxMana);
+	}
+	return true;
+}
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMatterFluxPlayerStateASCTest, "MatterFlux.GAS.PlayerStateASCDefaults", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 

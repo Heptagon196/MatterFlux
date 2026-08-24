@@ -7,6 +7,6 @@ content.register_wand({
 	starter_slot = 2,
 	starter_deck = {
 		"spell.double_cast", "spell.add_damage", "spell.spark_trigger",
-		"spell.spark_bolt", "spell.ember_bolt"
+		"spell.spark_bolt", "spell.flame_jet"
 	}
 })

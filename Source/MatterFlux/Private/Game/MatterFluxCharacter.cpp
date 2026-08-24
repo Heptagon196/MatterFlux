@@ -14,8 +14,10 @@
 #include "Fragment/Fragment2DActor.h"
 #include "Fragment/Fragment2DSourceActor.h"
 #include "Game/MatterFluxPlayableWorldActor.h"
+#include "Game/MatterFluxTwoStoreyHouseActor.h"
 #include "Game/MatterFluxPlayerState.h"
 #include "Game/MatterFluxCharacterPhysicsInteraction.h"
+#include "Game/MatterFluxCharacterMovementComponent.h"
 #include "GAS/GA_CastWand.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/PlayerController.h"
@@ -30,13 +32,20 @@
 #include "Material/MatterFluxBuoyancyComponent.h"
 #include "ProceduralMeshComponent.h"
 #include "Rendering/MatterFluxItemOcclusion.h"
+#include "Rendering/MatterFluxGhostFade.h"
 #include "TimerManager.h"
 #include "UObject/ConstructorHelpers.h"
 
-AMatterFluxCharacter::AMatterFluxCharacter()
+AMatterFluxCharacter::AMatterFluxCharacter(
+	const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer.SetDefaultSubobjectClass<
+		UMatterFluxCharacterMovementComponent>(
+			ACharacter::CharacterMovementComponentName))
 {
 	PrimaryActorTick.bCanEverTick = true;
-	PrimaryActorTick.TickInterval = 0.08f;
+	// Occlusion selection remains cheap at 25 Hz while opacity transitions are
+	// frequent enough to read as a continuous cutaway rather than a material pop.
+	PrimaryActorTick.TickInterval = 0.04f;
 	bReplicates = true;
 	bUseControllerRotationPitch = false;
 	bUseControllerRotationYaw = false;
@@ -121,6 +130,13 @@ AMatterFluxCharacter::AMatterFluxCharacter()
 	if (OutlineMaterial.Succeeded())
 	{
 		PlayerOutlineMaterial = OutlineMaterial.Object;
+	}
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface>
+		GhostOutlineMaterial(
+			TEXT("/Game/MatterFlux/Materials/M_PlayerGhostOutline.M_PlayerGhostOutline"));
+	if (GhostOutlineMaterial.Succeeded())
+	{
+		PlayerGhostOutlineMaterial = GhostOutlineMaterial.Object;
 	}
 	static ConstructorHelpers::FObjectFinder<UMaterialInterface> GhostMaterial(
 		TEXT("/Game/MatterFlux/Materials/M_VoxelGas.M_VoxelGas"));
@@ -208,7 +224,7 @@ AMatterFluxCharacter::AMatterFluxCharacter()
 void AMatterFluxCharacter::Tick(const float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
-	UpdateItemOcclusionGhosting();
+	UpdateItemOcclusionGhosting(DeltaSeconds);
 }
 
 void AMatterFluxCharacter::BeginPlay()
@@ -315,14 +331,21 @@ void AMatterFluxCharacter::EndPlay(
 	Super::EndPlay(EndPlayReason);
 }
 
-void AMatterFluxCharacter::UpdateItemOcclusionGhosting()
+void AMatterFluxCharacter::UpdateItemOcclusionGhosting(
+	const float DeltaSeconds)
 {
 	UWorld* World = GetWorld();
 	if (!World || !IsLocallyControlled() || !FollowCamera
 		|| !GetCapsuleComponent())
 	{
 		RestoreItemOcclusionGhosts();
+		SetGhostRevealOutlineEnabled(false);
 		return;
+	}
+	for (TPair<TWeakObjectPtr<AActor>, FItemOcclusionGhostState>& Pair
+		: ItemOcclusionGhostStates)
+	{
+		Pair.Value.bGhostDesired = false;
 	}
 
 	const FVector CameraLocation = FollowCamera->GetComponentLocation();
@@ -332,9 +355,11 @@ void AMatterFluxCharacter::UpdateItemOcclusionGhosting()
 		GetCapsuleComponent()->GetScaledCapsuleRadius(),
 		GetCapsuleComponent()->GetScaledCapsuleHalfHeight());
 	const FBox ViewerBounds(ViewerCenter - ViewerExtent, ViewerCenter + ViewerExtent);
+	bool bMergedItemGhostActive = false;
 	for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
 	{
-		It->UpdateLocalFragmentItemOcclusion(CameraLocation, ViewerBounds);
+		bMergedItemGhostActive |= It->UpdateLocalFragmentItemOcclusion(
+			CameraLocation, ViewerBounds);
 	}
 
 	TArray<MatterFlux::ItemOcclusion::FItem, TInlineAllocator<32>> Items;
@@ -395,7 +420,6 @@ void AMatterFluxCharacter::UpdateItemOcclusionGhosting()
 	MatterFlux::ItemOcclusion::FResult Result;
 	MatterFlux::ItemOcclusion::Resolve(
 		CameraLocation, ViewerBounds, Items, Result);
-	TSet<TWeakObjectPtr<AActor>> DesiredActors;
 	for (const FGuid& ItemId : Result.GhostItemIds)
 	{
 		const TPair<TWeakObjectPtr<AActor>, FLinearColor>* Item =
@@ -412,31 +436,67 @@ void AMatterFluxCharacter::UpdateItemOcclusionGhosting()
 		}
 		if (Actor && ItemMesh)
 		{
-			DesiredActors.Add(TWeakObjectPtr<AActor>(Actor));
 			ApplyItemOcclusionGhost(*Actor, *ItemMesh, Item->Value);
 		}
 	}
 
+	bool bActorGhostActive = false;
 	for (auto It = ItemOcclusionGhostStates.CreateIterator(); It; ++It)
 	{
-		AActor* Actor = It.Key().Get();
-		if (Actor && DesiredActors.Contains(TWeakObjectPtr<AActor>(Actor)))
+		FItemOcclusionGhostState& State = It.Value();
+		UMeshComponent* ItemMesh = State.Mesh.Get();
+		if (!ItemMesh)
 		{
+			It.RemoveCurrent();
 			continue;
 		}
-		FItemOcclusionGhostState& State = It.Value();
-		if (UMeshComponent* ItemMesh = State.Mesh.Get())
+		const int32 SlotCount = FMath::Min(
+			State.SolidMaterials.Num(), State.GhostMaterials.Num());
+		for (int32 Slot = 0; Slot < SlotCount; ++Slot)
 		{
-			for (int32 Slot = 0; Slot < State.SolidMaterials.Num(); ++Slot)
+			UMaterialInterface* Ghost = State.GhostMaterials[Slot].Get();
+			if (Ghost && ItemMesh->GetMaterial(Slot) != Ghost)
 			{
-				if (ItemMesh->GetMaterial(Slot) == State.GhostMaterials[Slot].Get())
-				{
-					ItemMesh->SetMaterial(Slot, State.SolidMaterials[Slot].Get());
-				}
+				State.SolidMaterials[Slot] = ItemMesh->GetMaterial(Slot);
+				ItemMesh->SetMaterial(Slot, Ghost);
 			}
 		}
-		It.RemoveCurrent();
+		State.CurrentOpacity = MatterFlux::GhostFade::AdvanceItemOpacity(
+			State.CurrentOpacity, State.bGhostDesired, DeltaSeconds);
+		for (const TWeakObjectPtr<UMaterialInterface>& Material
+			: State.GhostMaterials)
+		{
+			if (UMaterialInstanceDynamic* Ghost =
+				Cast<UMaterialInstanceDynamic>(Material.Get()))
+			{
+				Ghost->SetScalarParameterValue(
+					TEXT("Opacity"), State.CurrentOpacity);
+			}
+		}
+		if (!State.bGhostDesired && State.CurrentOpacity >= 0.999f)
+		{
+			for (int32 Slot = 0; Slot < SlotCount; ++Slot)
+			{
+				if (ItemMesh->GetMaterial(Slot)
+					== State.GhostMaterials[Slot].Get())
+				{
+					ItemMesh->SetMaterial(
+						Slot, State.SolidMaterials[Slot].Get());
+				}
+			}
+			It.RemoveCurrent();
+			continue;
+		}
+		bActorGhostActive = true;
 	}
+
+	bool bHouseGhostActive = false;
+	for (TActorIterator<AMatterFluxTwoStoreyHouseActor> It(World); It; ++It)
+	{
+		bHouseGhostActive |= It->HasActiveStructureFade();
+	}
+	SetGhostRevealOutlineEnabled(
+		bActorGhostActive || bMergedItemGhostActive || bHouseGhostActive);
 }
 
 void AMatterFluxCharacter::ApplyItemOcclusionGhost(
@@ -452,6 +512,7 @@ void AMatterFluxCharacter::ApplyItemOcclusionGhost(
 	if (FItemOcclusionGhostState* Existing =
 		ItemOcclusionGhostStates.Find(ActorKey))
 	{
+		Existing->bGhostDesired = true;
 		if (Existing->Mesh.Get() == &ItemMesh)
 		{
 			const int32 ExistingSlotCount = FMath::Min(
@@ -474,6 +535,8 @@ void AMatterFluxCharacter::ApplyItemOcclusionGhost(
 
 	FItemOcclusionGhostState& State = ItemOcclusionGhostStates.Add(ActorKey);
 	State.Mesh = &ItemMesh;
+	State.bGhostDesired = true;
+	State.CurrentOpacity = 1.0f;
 	const int32 MaterialCount = ItemMesh.GetNumMaterials();
 	State.SolidMaterials.Reserve(MaterialCount);
 	State.GhostMaterials.Reserve(MaterialCount);
@@ -484,7 +547,7 @@ void AMatterFluxCharacter::ApplyItemOcclusionGhost(
 			ItemOcclusionGhostMaterial, this);
 		Ghost->SetVectorParameterValue(
 			TEXT("Color"), FLinearColor(Color.R, Color.G, Color.B, 1.0f));
-		Ghost->SetScalarParameterValue(TEXT("Opacity"), 0.075f);
+		Ghost->SetScalarParameterValue(TEXT("Opacity"), State.CurrentOpacity);
 		Ghost->SetScalarParameterValue(TEXT("FaceContrast"), 0.68f);
 		Ghost->SetScalarParameterValue(TEXT("PixelSize"), 10.0f);
 		Ghost->SetScalarParameterValue(TEXT("Roughness"), 0.82f);
@@ -512,6 +575,26 @@ void AMatterFluxCharacter::RestoreItemOcclusionGhosts()
 		}
 	}
 	ItemOcclusionGhostStates.Reset();
+}
+
+void AMatterFluxCharacter::SetGhostRevealOutlineEnabled(const bool bEnabled)
+{
+	if (bGhostRevealOutlineEnabled == bEnabled || !FollowCamera
+		|| !PlayerGhostOutlineMaterial)
+	{
+		return;
+	}
+	bGhostRevealOutlineEnabled = bEnabled;
+	if (bEnabled)
+	{
+		FollowCamera->PostProcessSettings.AddBlendable(
+			PlayerGhostOutlineMaterial, 1.0f);
+	}
+	else
+	{
+		FollowCamera->PostProcessSettings.RemoveBlendable(
+			PlayerGhostOutlineMaterial);
+	}
 }
 
 UAbilitySystemComponent* AMatterFluxCharacter::GetAbilitySystemComponent() const

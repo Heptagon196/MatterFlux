@@ -6,9 +6,9 @@
 #include "Game/MatterFluxFragmentSourceReplication.h"
 #include "GameFramework/Actor.h"
 #include "Game/MatterFluxPlayableLevel.h"
-#include "Material/MatterFluxGroundCombustionRuntime.h"
-#include "Material/MatterFluxLogicalSourceCombustionIndex.h"
-#include "Material/MatterFluxSourceCombustionRuntime.h"
+#include "Material/MatterFluxGroundReactionRuntime.h"
+#include "Material/MatterFluxLogicalSourceReactionIndex.h"
+#include "Material/MatterFluxSourceReactionRuntime.h"
 #include "Material/MatterFluxMaterialSimulationRuntime.h"
 #include "Material/MatterFluxReplicatedMaterialState.h"
 #include "Rendering/MatterFluxSmokeVisualPool.h"
@@ -31,6 +31,8 @@ class AFragment2DActor;
 class AMatterFluxGroundStateChunkActor;
 class AMatterFluxPlayableWorldActor;
 class AMatterFluxTwoStoreyHouseActor;
+struct FMatterFluxAsyncPopulationBuildState;
+struct FMatterFluxAsyncTerrainBuildState;
 
 namespace MatterFlux::PlayableLevel
 {
@@ -47,6 +49,11 @@ namespace MatterFlux::Liquid
 namespace MatterFlux::Rendering
 {
 	struct FLiquidSurfaceProjection;
+}
+
+namespace MatterFlux::TerrainMesh
+{
+	struct FChunk;
 }
 
 UENUM(BlueprintType)
@@ -188,11 +195,61 @@ public:
 
 	UFUNCTION(BlueprintPure, Category = "Playable World|Streaming")
 	int32 GetCachedFragmentSourceCount() const;
+	int32 GetProceduralPopulationChunkCount() const
+	{
+		return ProceduralPopulationChunks.Num();
+	}
+	int32 GetPendingProceduralPopulationUpdateCount() const
+	{
+		int32 PendingCount = PendingProceduralPopulationChunks.Num()
+			+ PendingProceduralPopulationRemovals.Num()
+			+ ProceduralPopulationChunksBuilding.Num();
+		// Surface topology and river particles are streamed on the same bounded
+		// queue as decorations. Treat the unseeded near-focus window as pending
+		// work as well, so loading/drain callers do not observe a visually complete
+		// forest before its ground and water simulation exists.
+		TSet<FIntPoint> PendingSurfaceChunks;
+		for (const FIntPoint Focus : ProceduralPopulationFocusChunks)
+		{
+			for (int32 OffsetY = -1; OffsetY <= 1; ++OffsetY)
+			{
+				for (int32 OffsetX = -1; OffsetX <= 1; ++OffsetX)
+				{
+					const FIntPoint Candidate =
+						Focus + FIntPoint(OffsetX, OffsetY);
+					if (DesiredProceduralPopulationChunks.Contains(Candidate)
+						&& !SeededProceduralSurfaceChunks.Contains(Candidate))
+					{
+						PendingSurfaceChunks.Add(Candidate);
+					}
+				}
+			}
+		}
+		return PendingCount + PendingSurfaceChunks.Num();
+	}
+	int32 GetPendingTerrainChunkPrefetchCount() const
+	{
+		return PendingTerrainChunkPrefetches.Num()
+			+ TerrainChunksBuilding.Num();
+	}
+	bool HasVisibleTerrainChunk(const FIntPoint Chunk) const
+	{
+		return ActiveTerrainChunks.Contains(Chunk);
+	}
+	int32 GetProceduralTreeAggregateCount() const;
+	bool HasProceduralPopulationChunk(FIntPoint Chunk) const
+	{
+		return ProceduralPopulationChunks.Contains(Chunk);
+	}
+	int32 GetGeneratedStreamedHouseCount() const
+	{
+		return GeneratedStreamedHouses.Num();
+	}
 
 	UFUNCTION(BlueprintPure, Category = "Playable World|Streaming")
 	int32 GetVisibleFragmentSourceProxyCount() const;
 	/** Updates the local camera-only ghost projection for merged material items. */
-	void UpdateLocalFragmentItemOcclusion(
+	bool UpdateLocalFragmentItemOcclusion(
 		const FVector& CameraLocation,
 		const FBox& ViewerBounds);
 	/** Restricts merged source presentation for deterministic visual QA. Invalid restores all. */
@@ -203,10 +260,10 @@ public:
 		FGuid& OutRootSourceId,
 		FBox& OutWorldBounds,
 		FTransform& OutRootWorldTransform) const;
-	bool IgniteLogicalFragmentAggregate(
+	bool ApplyMaterialStimulusToLogicalFragmentAggregate(
 		const FGuid& AggregateId,
 		const FVector& WorldLocation,
-		FName FlameMaterial,
+		FName StimulusMaterial,
 		int32 EventSeed);
 
 	/** Materializes pristine mask proxies intersecting Bounds, then returns all active sources there. */
@@ -215,36 +272,33 @@ public:
 		TArray<AFragment2DSourceActor*>& OutSources);
 	int32 MaterializeFragmentSourcesForDamage(
 		const FFragmentDamageShape& DamageShape);
-	int32 MaterializeFragmentSourcesForFlame(
+	/** Commits a cut to the canonical sparse terrain facts and refreshes resident projections. */
+	int32 ApplyTerrainDamage(
+		const FFragmentDamageShape& DamageShape,
+		float DamagePower);
+	int32 ApplyMaterialStimulusToLogicalFragmentSourcesInCone(
 		const FVector& Start,
 		const FVector& Direction,
 		float Range,
 		float StartRadius,
 		float EndRadius,
-		FName FlameMaterial);
-	int32 IgniteLogicalFragmentSourcesInCone(
-		const FVector& Start,
-		const FVector& Direction,
-		float Range,
-		float StartRadius,
-		float EndRadius,
-		FName FlameMaterial,
+		FName StimulusMaterial,
 		int32 EventSeed);
-	int32 IgniteLogicalFragmentSourcesInBounds(
+	int32 ApplyMaterialStimulusToLogicalFragmentSourcesInBounds(
 		const FBox& Bounds,
-		const FVector& IgnitionPoint,
-		FName FlameMaterial,
+		const FVector& StimulusPoint,
+		FName StimulusMaterial,
 		int32 EventSeed,
-		int32 MaxIgnitions = MAX_int32);
-	bool IgniteDynamicAggregateSource(
+		int32 MaxActivations = MAX_int32);
+	bool ApplyMaterialStimulusToDynamicAggregateSource(
 		AFragment2DActor& CarrierActor,
 		const FGuid& SourceId,
 		const FVector& WorldLocation,
-		FName FlameMaterial,
+		FName StimulusMaterial,
 		int32 EventSeed);
-	void MarkSourceCombustionVisualizationDirty()
+	void MarkSourceReactionVisualizationDirty()
 	{
-		bSourceCombustionVisualDirty = true;
+		bSourceReactionVisualDirty = true;
 	}
 	void MaterializeFragmentAggregate(const FGuid& AggregateId);
 	/** Keeps an interaction source resident across asynchronous presentation steps. */
@@ -312,6 +366,23 @@ public:
 		const FVector& WorldLocation,
 		FName MaterialId);
 
+	/** Deposits a compact deterministic patch without overwriting its neighbors. */
+	int32 DepositSimulatedMaterialAtWorldLocation(
+		const FVector& WorldLocation,
+		FName MaterialId,
+		int32 CellCount);
+
+	/**
+	 * Resolves one world-space material particle against every reactive storage
+	 * adapter. The caller supplies only material identity and geometry; target
+	 * selection is derived from Lua reaction rules.
+	 */
+	int32 ApplyMaterialStimulusAtWorldLocation(
+		const FVector& WorldLocation,
+		FName StimulusMaterial,
+		int32 EventSeed,
+		float ContactRadius = 0.0f);
+
 	UFUNCTION(BlueprintCallable, Category = "Playable World|Streaming")
 	void SetWorldStreamingFocus(const FVector& WorldLocation);
 
@@ -362,28 +433,31 @@ public:
 		return MaterialSimulationActiveChunkRadius * 2 + 1;
 	}
 
-	UFUNCTION(BlueprintCallable, Category = "Playable World|Combustion")
-	bool IgniteFirstGeneratedTree(int32 EventSeed = 404);
+	UFUNCTION(BlueprintCallable, Category = "Playable World|Reaction")
+	bool ApplyMaterialStimulusToFirstGeneratedTree(int32 EventSeed = 404);
 
-	UFUNCTION(BlueprintCallable, Category = "Playable World|Combustion")
-	bool IgniteGroundAtWorldLocation(
-		const FVector& WorldLocation,
-		int32 EventSeed);
+	UFUNCTION(BlueprintPure, Category = "Playable World|Reaction")
+	int32 GetReactingSourceCount() const;
 
-	UFUNCTION(BlueprintPure, Category = "Playable World|Combustion")
-	int32 GetCombustingSourceCount() const;
+	UFUNCTION(BlueprintPure, Category = "Playable World|Reaction")
+	int32 GetReactionOutputCellCount() const;
+	int32 GetLogicalReactionOutputCellCount(FName MaterialId) const;
+	int32 GetLogicalReactionInputCellCount(FName MaterialId) const;
+	int32 GetLogicalReactionActiveCellCount(FName MaterialId) const;
+	int32 GetLogicalReactionMaterialEmissionCount() const;
+	/** Read-only audit for duplicate normal/burned proxy cells. */
+	int32 GetLogicalReactionProjectionOverlapCellCount() const;
+	/** Number of burned tree layers still rendered as a separate 2D overlay. */
+	int32 GetStandaloneTreeReactionOutputProjectionCount() const;
+	/** Read-only count of currently rendered logical-source flame cells. */
+	int32 GetLogicalReactionFlameInstanceCount() const;
 
-	UFUNCTION(BlueprintPure, Category = "Playable World|Combustion")
-	int32 GetCombustionResidueCellCount() const;
-	int32 GetLogicalCombustionResidueCellCount(FName MaterialId) const;
-	int32 GetLogicalCombustionFuelCellCount(FName MaterialId) const;
-	int32 GetLogicalCombustionSmokeEmissionCount() const;
+	UFUNCTION(BlueprintPure, Category = "Playable World|Reaction")
+	int32 GetReactedGroundCellCount() const;
+	int32 GetActiveGroundReactionCellCount() const;
 
-	UFUNCTION(BlueprintPure, Category = "Playable World|Combustion")
-	int32 GetScorchedGroundCellCount() const;
-
-	UFUNCTION(BlueprintPure, Category = "Playable World|Combustion")
-	int32 GetReplicatedGroundCombustionByteCount() const;
+	UFUNCTION(BlueprintPure, Category = "Playable World|Reaction")
+	int32 GetReplicatedGroundReactionByteCount() const;
 
 	bool ApplyReplicatedGroundStateChunk(
 		const FMatterFluxGroundStateChunk& State);
@@ -447,7 +521,7 @@ protected:
 	int32 TerrainChunkCacheLimit = 192;
 
 	UPROPERTY(EditAnywhere, Category = "Playable World|Streaming", meta = (ClampMin = "1", ClampMax = "8"))
-	int32 MaxTerrainChunkPrefetchesPerFrame = 2;
+	int32 MaxTerrainChunkPrefetchesPerFrame = 1;
 
 	UPROPERTY(EditAnywhere, Category = "Playable World|Streaming", meta = (ClampMin = "0.5", ClampMax = "16.0"))
 	float TerrainChunkPrefetchBudgetMilliseconds = 8.0f;
@@ -493,6 +567,9 @@ private:
 	UFUNCTION()
 	void OnRep_FragmentSourceStates();
 
+	UFUNCTION()
+	void OnRep_TerrainHeightOverrides();
+
 	void RebuildLevel();
 	void SanitizeGenerationSettings();
 	void AdvanceAsyncGeneration();
@@ -501,6 +578,18 @@ private:
 	void RebuildGeneratedHouse(
 		const MatterFlux::PlayableLevel::FLevelLayout& Layout);
 	void DestroyGeneratedHouse();
+	void PrewarmStreamedHousePool(const FTransform& TemplateTransform);
+	AMatterFluxTwoStoreyHouseActor* AcquireStreamedHouse(
+		const FTransform& HouseTransform,
+		FName StructureDefinitionId);
+	void ReleaseStreamedHouse(AMatterFluxTwoStoreyHouseActor* House);
+	void RefreshProceduralPopulation(
+		TConstArrayView<FIntPoint> OrderedDesiredChunks,
+		TConstArrayView<FIntPoint> FocusChunks);
+	void ProcessPendingProceduralPopulationUpdates(
+		bool bAllowSurfaceSeed = true,
+		bool bAllowChunkCommit = true);
+	void DestroyGeneratedStreamedHouses();
 	void HandleFragmentSourcePresenceChanged(
 		const FGuid& SourceId,
 		bool bMaterialized);
@@ -525,13 +614,18 @@ private:
 	void ApplyReplicatedFragmentSourceStates();
 	bool ApplyReplicatedFragmentSourceState(
 		const FMatterFluxReplicatedFragmentSourceState& Replicated);
+	bool ApplyPersistentFragmentSourceStateToProxy(
+		const FGuid& SourceId,
+		const FFragment2DSourceStreamingState& State);
 	void RemoveReplicatedFragmentSourceState(const FGuid& SourceId);
 	void MarkReplicatedFragmentSourceStatesDirty();
-	void UpdateMaterialVisualization(float DeltaSeconds);
+	void UpdateMaterialVisualization(
+		float DeltaSeconds,
+		bool bAllowRebuild = true);
 	void RebuildMaterialVisualization(
 		const FMatterFluxContentRegistry& Registry);
 	/** 执行动态材料格与可切割 Source 之间由 Lua contact 规则定义的接触反应。 */
-	void ApplyMaterialSourceContactReactions(
+	void ResolveMaterialInteractions(
 		const FMatterFluxContentRegistry& Registry);
 	void DestroyMaterialVisualization();
 	UInstancedStaticMeshComponent*
@@ -547,12 +641,16 @@ private:
 	void SpawnFragmentSource(
 		const MatterFlux::PlayableLevel::FLevelFragmentSource& Source);
 	void DestroyGeneratedFragmentSources();
-	void PropagateCombustion(float DeltaSeconds);
-	void AdvanceLogicalSourceCombustion(float DeltaSeconds);
-	bool IgniteLogicalFragmentSource(
+	void EmitActiveReactionParticles(float DeltaSeconds);
+	void AdvanceLogicalSourceReaction(float DeltaSeconds);
+	bool ApplyMaterialStimulusToLogicalFragmentSource(
 		const MatterFlux::PlayableLevel::FLevelFragmentSource& Source,
 		const FVector& WorldLocation,
-		FName FlameMaterial,
+		FName StimulusMaterial,
+		int32 EventSeed);
+	bool ApplyMaterialStimulusToGroundAtWorldLocation(
+		const FVector& WorldLocation,
+		FName StimulusMaterial,
 		int32 EventSeed);
 	const MatterFlux::PlayableLevel::FLevelFragmentSource*
 		FindFragmentSourceDefinition(const FGuid& SourceId) const;
@@ -560,28 +658,28 @@ private:
 		const FBox& WorldBounds,
 		TArray<const MatterFlux::PlayableLevel::FLevelFragmentSource*>&
 			OutCandidates) const;
-	bool SynchronizeLogicalSourceCombustionState(
+	bool SynchronizeLogicalSourceReactionState(
 		const FGuid& SourceId,
 		const MatterFlux::PlayableLevel::FLevelFragmentSource& Source,
-		const MatterFlux::Combustion::FSourceCombustionRuntime& Runtime,
+		const MatterFlux::Reaction::FSourceReactionRuntime& Runtime,
 		bool bPublish);
-	void RebuildLogicalSourceCombustionVisualization();
+	void RebuildLogicalSourceReactionVisualization();
 	void AdvanceUnifiedSmokeVisualization(float DeltaSeconds);
 	void RefreshUnifiedSmokeAnchors();
 	void RebuildGroundSmokeAnchors();
-	void InitializeGroundCombustion(
+	void InitializeGroundReaction(
 		const FMatterFluxContentRegistry& Registry,
 		const MatterFlux::PlayableLevel::FLevelLayout& Layout);
-	void AdvanceGroundCombustion(float DeltaSeconds);
-	void EnsureGroundCombustionVisuals(
+	void AdvanceGroundReaction(float DeltaSeconds);
+	void EnsureGroundReactionVisuals(
 		const FMatterFluxContentRegistry& Registry);
-	void RebuildGroundCombustionVisualization();
-	void ApplyGroundCombustionVisualChanges(
+	void RebuildGroundReactionVisualization();
+	void ApplyGroundReactionVisualChanges(
 		TConstArrayView<int32> ChangedCellIndices);
-	bool IsGroundCombustionCellVisible(int32 CellIndex) const;
+	bool IsGroundReactionCellVisible(int32 CellIndex) const;
 	void InitializeGroundStateChunks();
 	void DestroyGroundStateChunks();
-	void PublishGroundCombustionState();
+	void PublishGroundReactionState();
 	void BuildLayerStreamingCache(
 		const MatterFlux::PlayableLevel::FLevelLayout& Layout);
 	void BuildTerrainStreamingCache(
@@ -594,9 +692,20 @@ private:
 	bool RefreshVisibleTerrainChunks(
 		bool bForce,
 		const TArray<FIntPoint>& FocusChunks);
-	void ProcessPendingTerrainChunkPrefetches();
+	bool ProcessPendingTerrainChunkPrefetches(bool bAllowChunkCommit = true);
 	UProceduralMeshComponent* CreateTerrainChunkComponent(
 		FIntPoint ChunkCoordinate);
+	UProceduralMeshComponent* CreateTerrainChunkComponentFromData(
+		FIntPoint ChunkCoordinate,
+		const MatterFlux::TerrainMesh::FChunk& Chunk);
+	void ApplyTerrainHeightOverrides(
+		TConstArrayView<FMatterFluxTerrainHeightOverride> Overrides,
+		bool bRebuildResidentChunks);
+	void RebuildResidentTerrainChunksForCells(
+		TConstArrayView<FIntPoint> WorldCells);
+	void RefreshTerrainBackdropForCells(
+		TConstArrayView<FIntPoint> WorldCells);
+	void PublishTerrainHeightOverrides();
 	void DestroyTerrainChunkMeshes();
 	UHierarchicalInstancedStaticMeshComponent* FindOrCreateLayerComponent(
 		const MatterFlux::PlayableLevel::FLevelLayer& Layer);
@@ -632,6 +741,11 @@ private:
 	TSet<FIntPoint> DesiredTerrainChunks;
 	TSet<FIntPoint> ActiveTerrainChunks;
 	TArray<FIntPoint> PendingTerrainChunkPrefetches;
+	TSet<FIntPoint> TerrainChunksBuilding;
+	TSharedPtr<FMatterFluxAsyncTerrainBuildState, ESPMode::ThreadSafe>
+		AsyncTerrainBuildState;
+	TSharedPtr<const MatterFlux::PlayableLevel::FLevelTerrain,
+		ESPMode::ThreadSafe> AsyncTerrainHeightField;
 	TMap<FIntPoint, uint64> TerrainChunkLastUsed;
 	uint64 TerrainChunkUseCounter = 0;
 	bool bTerrainCacheCoversWholeMap = false;
@@ -641,9 +755,26 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<AMatterFluxTwoStoreyHouseActor> GeneratedHouse;
+	UPROPERTY(Transient)
+	TMap<FIntPoint, TObjectPtr<AMatterFluxTwoStoreyHouseActor>>
+		GeneratedStreamedHouses;
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<AMatterFluxTwoStoreyHouseActor>>
+		StreamedHousePool;
+	static constexpr int32 PrewarmedStreamedHouseCount = 2;
 
 	TMap<FIntPoint, TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>>
 		FragmentSourceChunks;
+	TSet<FIntPoint> ProceduralPopulationChunks;
+	TSet<FIntPoint> DesiredProceduralPopulationChunks;
+	TArray<FIntPoint> PendingProceduralPopulationChunks;
+	TSet<FIntPoint> ProceduralPopulationChunksBuilding;
+	TSharedPtr<FMatterFluxAsyncPopulationBuildState, ESPMode::ThreadSafe>
+		AsyncPopulationBuildState;
+	TArray<FIntPoint> PendingProceduralPopulationRemovals;
+	TArray<FIntPoint> ProceduralPopulationFocusChunks;
+	bool bPreferProceduralSurfaceSeed = false;
+	TSet<FIntPoint> SeededProceduralSurfaceChunks;
 	MatterFlux::Fragment::FSourceSpatialIndex
 		FragmentSourceDefinitionIndex;
 	TMap<FGuid, FIntPoint> FragmentSourceChunkById;
@@ -664,6 +795,15 @@ private:
 	UPROPERTY(EditAnywhere, Category = "Playable World|Streaming", meta = (ClampMin = "0.25", ClampMax = "16.0"))
 	float DecorationSpawnBudgetMilliseconds = 4.0f;
 
+	UPROPERTY(EditAnywhere, Category = "Playable World|Streaming", meta = (ClampMin = "1", ClampMax = "8"))
+	int32 MaxProceduralPopulationUpdatesPerFrame = 2;
+
+	UPROPERTY(EditAnywhere, Category = "Playable World|Streaming", meta = (ClampMin = "0.25", ClampMax = "16.0"))
+	float ProceduralPopulationBudgetMilliseconds = 4.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Playable World|Streaming", meta = (ClampMin = "1", ClampMax = "16"))
+	int32 MaxAsyncStreamingBuildTasks = 4;
+
 	UPROPERTY(Transient)
 	TMap<FName, TObjectPtr<UInstancedStaticMeshComponent>>
 		GeneratedMaterialInstances;
@@ -671,7 +811,7 @@ private:
 	TMap<FName, FName> MaterialVisualizationMaterials;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UInstancedStaticMeshComponent> GroundResidueInstances;
+	TObjectPtr<UInstancedStaticMeshComponent> GroundOutputInstances;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UInstancedStaticMeshComponent> GroundFlameInstances;
@@ -686,16 +826,16 @@ private:
 	TObjectPtr<UInstancedStaticMeshComponent> SourceSmokeInstances;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInstanceDynamic> GroundResidueMaterial;
+	TObjectPtr<UMaterialInstanceDynamic> GroundOutputMaterial;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInstanceDynamic> GroundFlameMaterial;
+	TObjectPtr<UMaterialInstanceDynamic> GroundStimulusMaterial;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> GroundSmokeMaterial;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInstanceDynamic> SourceFlameMaterial;
+	TObjectPtr<UMaterialInstanceDynamic> SourceStimulusMaterial;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> SourceSmokeMaterial;
@@ -712,6 +852,10 @@ private:
 	UPROPERTY(ReplicatedUsing = OnRep_FragmentSourceStates)
 	FMatterFluxReplicatedFragmentSourceStateList
 		ReplicatedFragmentSourceStates;
+
+	UPROPERTY(ReplicatedUsing = OnRep_TerrainHeightOverrides)
+	TArray<FMatterFluxTerrainHeightOverride>
+		ReplicatedTerrainHeightOverrides;
 
 	TSet<FGuid> AppliedReplicatedFragmentSourceIds;
 	bool bReplicatedFragmentSourceStatesDirty = false;
@@ -753,12 +897,19 @@ private:
 	UPROPERTY()
 	TObjectPtr<UMaterialInterface> VoxelGasMaterialTemplate;
 
-	/** 深度感知透明度和折射参数均由 Lua 液体定义驱动。 */
+	/** 深度感知透明度由 Lua 液体定义驱动。 */
 	UPROPERTY()
 	TObjectPtr<UMaterialInterface> VoxelLiquidMaterialTemplate;
 
 	TUniquePtr<MatterFlux::Material::FSimulationRuntime>
 		MaterialSimulation;
+	struct FPendingMaterialStimulus
+	{
+		FVector WorldLocation = FVector::ZeroVector;
+		FName MaterialId = NAME_None;
+		int32 EventSeed = 0;
+	};
+	TArray<FPendingMaterialStimulus> PendingMaterialStimuli;
 	/** 热路径液柱查询只读缓存，避免每个浮力采样重复访问脚本注册表。 */
 	TMap<FName, float> MaterialLiquidDensities;
 	/** Idempotent per-column volume constraints submitted by bodies this frame. */
@@ -775,20 +926,20 @@ private:
 	int32 LastLiquidProjectionDirtyChunkCount = 0;
 	int32 LastLiquidProjectionRebuiltChunkCount = 0;
 	int32 LastLiquidProjectionCheckerboardPassCount = 0;
-	TUniquePtr<MatterFlux::Combustion::FGroundCombustionRuntime>
-		GroundCombustion;
+	TUniquePtr<MatterFlux::Reaction::FGroundReactionRuntime>
+		GroundReaction;
 	TMap<FGuid, TUniquePtr<
-		MatterFlux::Combustion::FSourceCombustionRuntime>>
-		ActiveSourceCombustions;
-	MatterFlux::Combustion::FLogicalSourceCombustionIndex
-		LogicalSourceCombustionIndex;
-	TArray<FGuid> SourceCombustionActiveIdsScratch;
-	TArray<FGuid> SourceCombustionFinishedIdsScratch;
-	TArray<FGuid> SourceCombustionPublishIdsScratch;
+		MatterFlux::Reaction::FSourceReactionRuntime>>
+		ActiveSourceReactions;
+	MatterFlux::Reaction::FLogicalSourceReactionIndex
+		LogicalSourceReactionIndex;
+	TArray<FGuid> SourceReactionActiveIdsScratch;
+	TArray<FGuid> SourceReactionFinishedIdsScratch;
+	TArray<FGuid> SourceReactionPublishIdsScratch;
 	TArray<FMatterFluxFragmentSourceStateBatchUpdate>
 		FragmentSourceReplicationUpdatesScratch;
 	TArray<FVector> GroundSurfacePositions;
-	TSet<FGuid> SourcesThatIgnitedGround;
+	TSet<FGuid> SourcesThatActivatedGround;
 	float MaterialVisualizationAccumulator = 0.0f;
 	/** 每帧最多提交的材料-Source 接触反应，防止大面积泄漏触发切割尖峰。 */
 	UPROPERTY(EditAnywhere, Category = "Playable World|Material Simulation",
@@ -796,26 +947,26 @@ private:
 	int32 MaxMaterialSourceReactionsPerFrame = 8;
 	bool bMaterialVisualizationDirty = false;
 	bool bMaterialVisualizationDeferredForStreaming = false;
-	float CombustionPropagationAccumulator = 0.0f;
-	float CombustionProxyFlushAccumulator = 0.0f;
-	float GroundCombustionVisualAccumulator = 0.0f;
-	bool bGroundCombustionVisualDirty = false;
-	bool bGroundCombustionVisualNeedsFullRebuild = true;
-	TSet<int32> PendingGroundCombustionVisualCellIndices;
-	TMap<int32, int32> GroundResidueInstanceByCell;
-	TArray<int32> GroundResidueCellByInstance;
+	float ReactionPropagationAccumulator = 0.0f;
+	float ReactionProxyFlushAccumulator = 0.0f;
+	float GroundReactionVisualAccumulator = 0.0f;
+	bool bGroundReactionVisualDirty = false;
+	bool bGroundReactionVisualNeedsFullRebuild = true;
+	TSet<int32> PendingGroundReactionVisualCellIndices;
+	TMap<int32, int32> GroundOutputInstanceByCell;
+	TArray<int32> GroundOutputCellByInstance;
 	TMap<int32, int32> GroundFlameInstanceByCell;
 	TArray<int32> GroundFlameCellByInstance;
 	TMap<int32, int32> GroundSmokeInstanceByCell;
 	TArray<int32> GroundSmokeCellByInstance;
-	TArray<MatterFlux::Rendering::FSmokeEmissionAnchor>
+	TArray<MatterFlux::Rendering::FMaterialEmissionAnchor>
 		GroundSmokeAnchors;
-	TArray<MatterFlux::Rendering::FSmokeEmissionAnchor>
+	TArray<MatterFlux::Rendering::FMaterialEmissionAnchor>
 		SourceSmokeAnchors;
 	MatterFlux::Rendering::FSmokeVisualPool SmokeVisualPool;
-	float SourceCombustionVisualAccumulator = 0.0f;
-	bool bSourceCombustionVisualDirty = false;
-	bool bBatchingGroundIgnitions = false;
+	float SourceReactionVisualAccumulator = 0.0f;
+	bool bSourceReactionVisualDirty = false;
+	bool bBatchingGroundReactions = false;
 	FDelegateHandle ContentReloadHandle;
 	FDelegateHandle FragmentSourcePresenceHandle;
 	TUniquePtr<MatterFlux::PlayableLevel::FLevelLayout>

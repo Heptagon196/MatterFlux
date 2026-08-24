@@ -31,6 +31,19 @@ enum class EFragmentSourceGeometryStyle : uint8
 	VoxelBlocks
 };
 
+/**
+ * Structural meaning carried by the canonical material Source.  This is not
+ * inferred from an owning Actor class: wood can be a floor, wall or table.
+ */
+UENUM(BlueprintType)
+enum class EMatterFluxMaterialStructuralRole : uint8
+{
+	None,
+	Floor,
+	Wall,
+	Furniture
+};
+
 USTRUCT(BlueprintType)
 struct MATTERFLUX_API FFragmentDamageShape
 {

@@ -12,9 +12,9 @@
 material.define({
     id = "water", density = 1.00, hardness = 0.05,
     color_r = 0.12, color_g = 0.46, color_b = 0.78, color_a = 0.82,
-    phase = "liquid", mobility = 255, dispersion = 220,
-    shallow_opacity = 0.82, deep_opacity = 0.96,
-    opacity_depth = 120.0, refraction_index = 1.33,
+	phase = "liquid", mobility = 255, dispersion = 220,
+	shallow_opacity = 0.82, deep_opacity = 0.96,
+	opacity_depth = 120.0,
 })
 ```
 
@@ -22,10 +22,8 @@ material.define({
 - `shallow_opacity`：岸边或后方几何很近时的不透明度。
 - `deep_opacity`：达到吸收距离后的不透明度，不能小于浅水值。
 - `opacity_depth`：浅水到深水过渡所需的厘米距离。
-- `refraction_index`：保留的液体光学元数据；水默认为 `1.33`，当前体素液面不把它连接到屏幕空间折射。
-
-Lua 加载器先校验所有字段，再原子替换只读 Registry。非法透明度、负吸收距离或异常
-折射率元数据会让本次内容加载失败，不会留下半更新状态。类型注解位于
+Lua 加载器先校验所有字段，再原子替换只读 Registry。非法透明度或负吸收距离
+会让本次内容加载失败，不会留下半更新状态。类型注解位于
 `Content/Lua/Annotations/MatterFluxApi.lua`。
 
 ## 2. 水越深越不透明是怎样实现的
@@ -40,8 +38,7 @@ Lua 加载器先校验所有字段，再原子替换只读 Registry。非法透�
 
 湖岸的湖床离水面近，仍能透过水看见体素阶梯；湖心的湖床更深，颜色逐渐被液体吸收。
 生成脚本 `Scripts/Editor/BuildVoxelLiquidMaterial.py` 创建半透明、受光材质并连接
-`Base Color`、`Opacity` 和 `Roughness`。体素液面不再连接屏幕空间 `Refraction`：它会在
-分格顶面和运动物体上产生明显重影。运行时把兼容参数固定为中性 IOR=1.0，只创建 MID 并写参数，
+`Base Color`、`Opacity` 和 `Roughness`。运行时只创建 MID 并写透明度参数，
 不会每帧重建材质图。
 
 ## 3. 为什么不再画上千个透明小立方体

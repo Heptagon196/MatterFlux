@@ -13,9 +13,9 @@ class UPhysicalMaterial;
 class UMatterFluxBuoyancyComponent;
 class AFragment2DSourceActor;
 struct FFragment2DSourceStreamingState;
-namespace MatterFlux::Combustion
+namespace MatterFlux::Reaction
 {
-	class FSourceCombustionRuntime;
+	class FSourceReactionRuntime;
 }
 
 /**
@@ -61,35 +61,35 @@ struct MATTERFLUX_API FFragmentAggregateSourceState
 	bool bEnableCollision = false;
 
 	/** Bit-packed by FFragmentSourceMask::NetSerialize. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Combustion")
-	FFragmentSourceMask ResidueMask;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Reaction")
+	FFragmentSourceMask OutputMask;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Combustion")
-	FFragmentSourceMask BurningMask;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Reaction")
+	FFragmentSourceMask ActiveMask;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Combustion")
-	bool bHasCombustionState = false;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Reaction")
+	bool bHasReactionState = false;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Combustion")
-	FName CombustionRuleId = NAME_None;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Reaction")
+	FName ReactionRuleId = NAME_None;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Combustion")
-	FName ResidueMaterialId = NAME_None;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Reaction")
+	FName OutputMaterialId = NAME_None;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Combustion")
-	FLinearColor ResidueColor = FLinearColor(0.08f, 0.07f, 0.06f);
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Reaction")
+	FLinearColor OutputColor = FLinearColor(0.08f, 0.07f, 0.06f);
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Combustion")
-	int32 CombustionSeed = 0;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Reaction")
+	int32 ReactionSeed = 0;
 
 	UPROPERTY()
-	uint32 CombustionTick = 0;
+	uint32 ReactionTick = 0;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Combustion")
-	float CombustionAccumulator = 0.0f;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Reaction")
+	float ReactionAccumulator = 0.0f;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Combustion")
-	int32 TotalSmokeEmissionCount = 0;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Reaction")
+	int32 TotalMaterialEmissionCount = 0;
 
 	bool IsValid() const;
 };
@@ -117,39 +117,39 @@ public:
 	bool ApplyAggregateSourceStreamingState(
 		const FGuid& SourceId,
 		const FFragment2DSourceStreamingState& State,
-		FName ResidueMaterialId,
-		const FLinearColor& ResidueColor);
+		FName OutputMaterialId,
+		const FLinearColor& OutputColor);
 	bool GetAggregateSourceWorldTransform(
 		const FGuid& SourceId,
 		FTransform& OutWorldTransform) const;
 	bool GetAggregateSourceState(
 		const FGuid& SourceId,
 		FFragmentAggregateSourceState& OutState) const;
-	bool IgniteAtWorldLocation(
+	bool ApplyMaterialStimulusAtWorldLocation(
 		const FVector& WorldLocation,
-		FName FlameMaterial,
+		FName StimulusMaterial,
 		int32 EventSeed);
-	bool IgniteAggregateSourceAtWorldLocation(
+	bool ApplyMaterialStimulusToAggregateAtWorldLocation(
 		const FGuid& SourceId,
 		const FVector& WorldLocation,
-		FName FlameMaterial,
+		FName StimulusMaterial,
 		int32 EventSeed);
-	bool IgniteInCone(
+	bool ApplyMaterialStimulusInCone(
 		const FVector& Start,
 		const FVector& Direction,
 		float Range,
 		float StartRadius,
 		float EndRadius,
-		FName FlameMaterial,
+		FName StimulusMaterial,
 		int32 EventSeed);
-	bool IsRootCombusting() const;
-	bool IsAggregateSourceCombusting(const FGuid& SourceId) const;
-	bool IsAnyAggregateMaterialCombusting(FName MaterialId) const;
-	int32 GetRootCombustionResidueCellCount() const;
-	FBox GetCombustibleWorldBounds() const;
-	void GatherRootCombustionVisualTransforms(
+	bool IsRootReacting() const;
+	bool IsAggregateSourceReacting(const FGuid& SourceId) const;
+	bool IsAnyAggregateMaterialReacting(FName MaterialId) const;
+	int32 GetRootReactionOutputCellCount() const;
+	FBox GetReactiveWorldBounds() const;
+	void GatherRootReactionVisualTransforms(
 		TArray<FTransform>& OutFlameTransforms,
-		TArray<MatterFlux::Rendering::FSmokeEmissionAnchor>& OutSmokeAnchors,
+		TArray<MatterFlux::Rendering::FMaterialEmissionAnchor>& OutSmokeAnchors,
 		int32 MaxVisualInstances) const;
 	float GetTransientFadeAlpha() const { return TransientFadeAlpha; }
 	float GetVisualDepthOffset() const { return VisualDepthOffset; }
@@ -189,9 +189,9 @@ public:
 	UPROPERTY(ReplicatedUsing = OnRep_AggregateSources, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate")
 	TArray<FFragmentAggregateSourceState> AggregateSources;
 
-	/** Combustion state for the detached payload itself (for example the cut trunk). */
-	UPROPERTY(ReplicatedUsing = OnRep_RootCombustionState, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Combustion")
-	FFragmentAggregateSourceState RootCombustionState;
+	/** Reaction state for the detached payload itself (for example the cut trunk). */
+	UPROPERTY(ReplicatedUsing = OnRep_RootReactionState, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Reaction")
+	FFragmentAggregateSourceState RootReactionState;
 
 	/** Number of exact world cuts this detached logical item has accepted. */
 	UPROPERTY(ReplicatedUsing = OnRep_CutState, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Cut")
@@ -199,7 +199,7 @@ public:
 
 	/** Detached items remain physical until this many exact cuts are accepted. */
 	UPROPERTY(EditDefaultsOnly, Replicated, BlueprintReadOnly, Category = "Fragment|Cut", meta = (ClampMin = "1", UIMin = "1"))
-	int32 CutsBeforeFade = 3;
+	int32 CutsBeforeFade = 10;
 
 	/** Fade time used when the detached item exhausts its cut durability. */
 	UPROPERTY(EditDefaultsOnly, Replicated, BlueprintReadOnly, Category = "Fragment|Cut", meta = (ClampMin = "0.05", UIMin = "0.05"))
@@ -220,7 +220,7 @@ protected:
 	void OnRep_AggregateSources();
 
 	UFUNCTION()
-	void OnRep_RootCombustionState();
+	void OnRep_RootReactionState();
 
 	UFUNCTION()
 	void OnRep_CutState();
@@ -238,26 +238,26 @@ protected:
 	void SynchronizeCutFadeState();
 	bool DoesCutShapeIntersect(const FFragmentDamageShape& CutShape) const;
 	void ApplyTransientFadeAlpha();
-	void InitializeRootCombustionState();
-	bool IgniteRootAtWorldLocation(
+	void InitializeRootReactionState();
+	bool ApplyMaterialStimulusToRootAtWorldLocation(
 		const FVector& WorldLocation,
-		FName FlameMaterial,
+		FName StimulusMaterial,
 		int32 EventSeed);
-	bool SynchronizeRootCombustionState();
-	void AdvanceRootCombustion(float DeltaSeconds);
-	bool IgniteDetachedAggregateAtWorldLocation(
+	bool SynchronizeRootReactionState();
+	void AdvanceRootReaction(float DeltaSeconds);
+	bool ApplyMaterialStimulusToDetachedAggregateAtWorldLocation(
 		const FGuid& SourceId,
 		const FVector& WorldLocation,
-		FName FlameMaterial,
+		FName StimulusMaterial,
 		int32 EventSeed);
-	bool SynchronizeDetachedAggregateCombustionState(const FGuid& SourceId);
-	void AdvanceDetachedAggregateCombustion(float DeltaSeconds);
-	bool PropagateCombustionToAdjacentLayer(
-		const FFragmentAggregateSourceState& BurningSource,
-		const FTransform& BurningWorldTransform,
-		FName FlameMaterial,
+	bool SynchronizeDetachedAggregateReactionState(const FGuid& SourceId);
+	void AdvanceDetachedAggregateReaction(float DeltaSeconds);
+	bool EmitReactionParticleToAdjacentLayer(
+		const FFragmentAggregateSourceState& ActiveSource,
+		const FTransform& ActiveWorldTransform,
+		FName StimulusMaterial,
 		int32 EventSeed);
-	void MarkCombustionVisualizationDirty() const;
+	void MarkReactionVisualizationDirty() const;
 	void RefreshBuoyancyDensity();
 
 	UPROPERTY(Transient)
@@ -275,10 +275,10 @@ protected:
 	float TransientFadeElapsed = 0.0f;
 	float TransientFadeAlpha = 1.0f;
 	float VisualDepthOffset = 0.0f;
-	float RootCombustionPropagationAccumulator = 0.0f;
-	float DetachedAggregateCombustionPropagationAccumulator = 0.0f;
-	TUniquePtr<MatterFlux::Combustion::FSourceCombustionRuntime>
-		RootCombustionRuntime;
-	TMap<FGuid, TUniquePtr<MatterFlux::Combustion::FSourceCombustionRuntime>>
-		DetachedAggregateCombustionRuntimes;
+	float RootReactionPropagationAccumulator = 0.0f;
+	float DetachedAggregateReactionPropagationAccumulator = 0.0f;
+	TUniquePtr<MatterFlux::Reaction::FSourceReactionRuntime>
+		RootReactionRuntime;
+	TMap<FGuid, TUniquePtr<MatterFlux::Reaction::FSourceReactionRuntime>>
+		DetachedAggregateReactionRuntimes;
 };

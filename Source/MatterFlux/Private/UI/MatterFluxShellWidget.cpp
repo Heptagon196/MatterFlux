@@ -13,7 +13,8 @@ void UMatterFluxShellWidget::InitializeForPlayer(
 	AMatterFluxPlayerController* Controller)
 {
 	OwnerController = Controller;
-	bHostRestorePending = GetWorld()
+	bHostRestorePending = IsMultiplayerEntryEnabled()
+		&& GetWorld()
 		&& GetWorld()->URL.HasOption(TEXT("MatterFluxHostSlot="));
 	SetIsFocusable(true);
 	RefreshShell();
@@ -58,18 +59,43 @@ void UMatterFluxShellWidget::CancelPendingJoinForSinglePlayer()
 
 void UMatterFluxShellWidget::ShowMultiplayerMenu()
 {
+	if (!IsMultiplayerEntryEnabled())
+	{
+		RejectMultiplayerEntry();
+		return;
+	}
 	SetView(EMatterFluxShellView::MultiplayerMenu);
 }
 
 void UMatterFluxShellWidget::ShowCreateRoomMenu()
 {
+	if (!IsMultiplayerEntryEnabled())
+	{
+		RejectMultiplayerEntry();
+		return;
+	}
 	SelectedHostSlotIndex = INDEX_NONE;
 	SetView(EMatterFluxShellView::CreateRoomMenu);
 }
 
 void UMatterFluxShellWidget::ShowJoinRoomMenu()
 {
+	if (!IsMultiplayerEntryEnabled())
+	{
+		RejectMultiplayerEntry();
+		return;
+	}
 	SetView(EMatterFluxShellView::JoinRoomMenu);
+}
+
+void UMatterFluxShellWidget::RejectMultiplayerEntry()
+{
+	const EMatterFluxShellView FallbackView = bFrontEndContext
+		? EMatterFluxShellView::StartMenu
+		: EMatterFluxShellView::PauseMenu;
+	SetView(FallbackView);
+	TransientNotice = TEXT("联机模式暂未开放");
+	RefreshShell();
 }
 
 bool UMatterFluxShellWidget::IsFrontEndView() const
@@ -221,6 +247,11 @@ void UMatterFluxShellWidget::RequestContinue()
 
 void UMatterFluxShellWidget::RequestHostRoom(const int32 SaveSlotIndex)
 {
+	if (!IsMultiplayerEntryEnabled())
+	{
+		RejectMultiplayerEntry();
+		return;
+	}
 	TransientNotice.Reset();
 	if (!OwnerController)
 	{
@@ -251,6 +282,11 @@ void UMatterFluxShellWidget::SelectHostSlot(const int32 SlotIndex)
 
 void UMatterFluxShellWidget::RequestJoinRoom()
 {
+	if (!IsMultiplayerEntryEnabled())
+	{
+		RejectMultiplayerEntry();
+		return;
+	}
 	TransientNotice.Reset();
 	if (!OwnerController)
 	{

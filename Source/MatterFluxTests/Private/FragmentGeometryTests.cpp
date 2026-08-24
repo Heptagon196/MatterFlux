@@ -894,26 +894,26 @@ bool FMatterFluxVoxelMaterialBoundaryTest::RunTest(const FString& Parameters)
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FMatterFluxCombustionTopSurfaceTest,
-	"MatterFlux.Fragment.Geometry.CombustionUsesOnlyTopExposedVoxelCells",
+	FMatterFluxReactionTopSurfaceTest,
+	"MatterFlux.Fragment.Geometry.ReactionUsesOnlyTopExposedVoxelCells",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 
-bool FMatterFluxCombustionTopSurfaceTest::RunTest(const FString& Parameters)
+bool FMatterFluxReactionTopSurfaceTest::RunTest(const FString& Parameters)
 {
 	const TArray<uint8> Occupied = {
 		1, 1,
 		1, 1,
 		1, 0
 	};
-	const TArray<uint8> Burning = {
+	const TArray<uint8> Active = {
 		1, 1,
 		1, 1,
 		1, 0
 	};
 	TArray<int32> VisibleCells;
-	if (!TestTrue(TEXT("Valid combustion masks are accepted"),
-		MatterFlux::FragmentGeometry::GatherTopExposedBurningMaskCells(
-			Occupied, Burning, 2, 3, VisibleCells)))
+	if (!TestTrue(TEXT("Valid reaction masks are accepted"),
+		MatterFlux::FragmentGeometry::GatherTopExposedActiveMaskCells(
+			Occupied, Active, 2, 3, VisibleCells)))
 	{
 		return false;
 	}
@@ -923,11 +923,11 @@ bool FMatterFluxCombustionTopSurfaceTest::RunTest(const FString& Parameters)
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FMatterFluxCombustionVisibleSurfaceTest,
-	"MatterFlux.Fragment.Geometry.InternalCombustionDoesNotTeleportToSurface",
+	FMatterFluxReactionVisibleSurfaceTest,
+	"MatterFlux.Fragment.Geometry.InternalReactionDoesNotTeleportToSurface",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 
-bool FMatterFluxCombustionVisibleSurfaceTest::RunTest(
+bool FMatterFluxReactionVisibleSurfaceTest::RunTest(
 	const FString& Parameters)
 {
 	const TArray<uint8> Occupied = {
@@ -935,17 +935,17 @@ bool FMatterFluxCombustionVisibleSurfaceTest::RunTest(
 		1, 1,
 		1, 0
 	};
-	const TArray<uint8> Burning = {
+	const TArray<uint8> Active = {
 		1, 0,
 		0, 1,
 		0, 0
 	};
 	TArray<int32> VisibleCells;
 	if (!TestTrue(
-		TEXT("Visible combustion masks are accepted"),
-		MatterFlux::FragmentGeometry::GatherTopExposedBurningMaskCells(
+		TEXT("Visible reaction masks are accepted"),
+		MatterFlux::FragmentGeometry::GatherTopExposedActiveMaskCells(
 			Occupied,
-			Burning,
+			Active,
 			2,
 			3,
 			VisibleCells)))

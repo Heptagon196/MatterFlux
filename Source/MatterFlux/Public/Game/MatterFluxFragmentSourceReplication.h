@@ -23,28 +23,28 @@ struct MATTERFLUX_API FMatterFluxReplicatedFragmentSourceState
 	TArray<uint8> PackedRuntimeMask;
 
 	UPROPERTY()
-	bool bHasCombustionState = false;
+	bool bHasReactionState = false;
 
 	UPROPERTY()
-	FName CombustionRuleId = NAME_None;
+	FName ReactionRuleId = NAME_None;
 
 	UPROPERTY()
-	int32 CombustionSeed = 0;
+	int32 ReactionSeed = 0;
 
 	UPROPERTY()
-	uint32 CombustionTick = 0;
+	uint32 ReactionTick = 0;
 
 	UPROPERTY()
-	TArray<uint8> PackedResidueMask;
+	TArray<uint8> PackedOutputMask;
 
 	UPROPERTY()
-	TArray<uint8> PackedBurningMask;
+	TArray<uint8> PackedActiveMask;
 
 	UPROPERTY()
-	float CombustionAccumulator = 0.0f;
+	float ReactionAccumulator = 0.0f;
 
 	UPROPERTY()
-	int32 TotalSmokeEmissionCount = 0;
+	int32 TotalMaterialEmissionCount = 0;
 
 };
 

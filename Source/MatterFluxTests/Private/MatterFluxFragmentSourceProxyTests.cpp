@@ -148,6 +148,244 @@ namespace
 		}
 		return Snapshot;
 	}
+
+	TArray<UProceduralMeshComponent*> FindProxyChunkMeshes(const AActor& Owner)
+	{
+		TArray<UProceduralMeshComponent*> Meshes;
+		Owner.GetComponents(Meshes);
+		Meshes.RemoveAllSwap([](const UProceduralMeshComponent* Mesh)
+		{
+			return !Mesh
+				|| !Mesh->ComponentHasTag(
+					TEXT("MatterFluxFragmentSourceProxy"));
+		});
+		return Meshes;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxFragmentSourceProxyIncrementalChunkTest,
+	"MatterFlux.Game.FragmentSourceProxyPreservesUnchangedChunksAcrossStreaming",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxFragmentSourceProxyIncrementalChunkTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AActor* Owner = World ? World->SpawnActor<AActor>() : nullptr;
+	if (!TestNotNull(TEXT("Proxy owner is spawned"), Owner))
+	{
+		return false;
+	}
+	USceneComponent* Root = NewObject<USceneComponent>(Owner, TEXT("Root"));
+	Owner->SetRootComponent(Root);
+	Owner->AddInstanceComponent(Root);
+	Root->RegisterComponent();
+	UMatterFluxFragmentSourceProxyComponent* Proxy =
+		NewObject<UMatterFluxFragmentSourceProxyComponent>(Owner, TEXT("Proxy"));
+	Owner->AddInstanceComponent(Proxy);
+	Proxy->RegisterComponent();
+	Proxy->Configure(Root, nullptr);
+
+	const auto MakeSource = [](const int32 Index, const FVector& Location)
+	{
+		MatterFlux::PlayableLevel::FLevelFragmentSource Source;
+		Source.SourceId = MakeProxyBenchmarkSourceId(Index);
+		Source.MaterialId = TEXT("wood");
+		Source.Transform.SetLocation(Location);
+		Source.Mask.Width = 1;
+		Source.Mask.Height = 1;
+		Source.Mask.CellSize = 4.0f;
+		Source.Mask.SolidMask = {1};
+		return Source;
+	};
+	const FIntPoint StableChunk = FIntPoint::ZeroValue;
+	const FIntPoint NeighborChunk(1, 0);
+	TMap<
+		FIntPoint,
+		TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>> InitialChunks;
+	InitialChunks.FindOrAdd(StableChunk).Add(
+		MakeSource(0, FVector::ZeroVector));
+	Proxy->SetSourceChunks(InitialChunks);
+	Proxy->SetVisibleChunks({StableChunk});
+	const TArray<UProceduralMeshComponent*> InitialMeshes =
+		FindProxyChunkMeshes(*Owner);
+	UProceduralMeshComponent* StableMesh =
+		InitialMeshes.Num() == 1 ? InitialMeshes[0] : nullptr;
+	if (!TestNotNull(TEXT("The stable chunk builds once"), StableMesh))
+	{
+		return false;
+	}
+
+	TMap<
+		FIntPoint,
+		TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>> AddedChunks;
+	AddedChunks.FindOrAdd(NeighborChunk).Add(
+		MakeSource(1, FVector(8.0f, 0.0f, 0.0f)));
+	Proxy->ApplySourceChunkDelta({}, AddedChunks);
+	Proxy->SetVisibleChunks({StableChunk, NeighborChunk});
+	const TArray<UProceduralMeshComponent*> ExpandedMeshes =
+		FindProxyChunkMeshes(*Owner);
+	TestTrue(
+		TEXT("Adding a neighbor preserves the unchanged chunk mesh"),
+		ExpandedMeshes.Contains(StableMesh));
+	TestEqual(
+		TEXT("The added neighbor receives its own mesh"),
+		ExpandedMeshes.Num(),
+		2);
+
+	Proxy->ApplySourceChunkDelta({NeighborChunk}, {});
+	Proxy->SetVisibleChunks({StableChunk});
+	const TArray<UProceduralMeshComponent*> FinalMeshes =
+		FindProxyChunkMeshes(*Owner);
+	TestTrue(
+		TEXT("Removing a neighbor preserves the unchanged chunk mesh"),
+		FinalMeshes.Num() == 1 && FinalMeshes[0] == StableMesh);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxFragmentSourceProxyVoxelAggregateTest,
+	"MatterFlux.Game.FragmentSourceProxyMergesVoxelAggregatesWithoutNameChecks",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxFragmentSourceProxyVoxelAggregateTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AActor* Owner = World ? World->SpawnActor<AActor>() : nullptr;
+	if (!TestNotNull(TEXT("Proxy owner is spawned"), Owner))
+	{
+		return false;
+	}
+	USceneComponent* Root = NewObject<USceneComponent>(Owner, TEXT("Root"));
+	Owner->SetRootComponent(Root);
+	Owner->AddInstanceComponent(Root);
+	Root->RegisterComponent();
+	UMatterFluxFragmentSourceProxyComponent* Proxy =
+		NewObject<UMatterFluxFragmentSourceProxyComponent>(Owner, TEXT("Proxy"));
+	Owner->AddInstanceComponent(Proxy);
+	Proxy->RegisterComponent();
+	Proxy->Configure(Root, nullptr);
+
+	const FGuid AggregateId = FGuid::NewDeterministicGuid(
+		TEXT("StreamingVoxelAggregate"), 1);
+	const auto MakePart = [AggregateId](
+		const int32 Index,
+		const FName Name,
+		const FName MaterialId,
+		const bool bRoot)
+	{
+		MatterFlux::PlayableLevel::FLevelFragmentSource Source;
+		Source.SourceId = MakeProxyBenchmarkSourceId(Index);
+		Source.AggregateId = AggregateId;
+		Source.bAggregateRoot = bRoot;
+		Source.Name = Name;
+		Source.MaterialId = MaterialId;
+		Source.Mask.Width = 1;
+		Source.Mask.Height = 1;
+		Source.Mask.CellSize = 4.0f;
+		Source.Mask.GeometryStyle = EFragmentSourceGeometryStyle::VoxelBlocks;
+		Source.Mask.SolidMask = {1};
+		return Source;
+	};
+	TMap<
+		FIntPoint,
+		TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>> Chunks;
+	TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>& Sources =
+		Chunks.FindOrAdd(FIntPoint::ZeroValue);
+	Sources.Add(MakePart(
+		0, TEXT("InfiniteTreeTrunk"), TEXT("wood"), true));
+	Sources.Add(MakePart(
+		1, TEXT("InfiniteTreeLeaves"), TEXT("leaf"), false));
+	Proxy->SetSourceChunks(Chunks);
+	Proxy->SetVisibleChunks({FIntPoint::ZeroValue});
+
+	TestEqual(
+		TEXT("Overlapping voxel aggregate cells emit one exterior cube"),
+		CountProxyMeshVertices(*Owner),
+		24);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxFragmentSourceProxyUnifiedReactionOutputTest,
+	"MatterFlux.Game.FragmentSourceProxyCompilesTreeResidueIntoUnifiedVoxelObject",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxFragmentSourceProxyUnifiedReactionOutputTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AActor* Owner = World ? World->SpawnActor<AActor>() : nullptr;
+	if (!TestNotNull(TEXT("Proxy owner is spawned"), Owner))
+	{
+		return false;
+	}
+	USceneComponent* Root = NewObject<USceneComponent>(Owner, TEXT("Root"));
+	Owner->SetRootComponent(Root);
+	Owner->AddInstanceComponent(Root);
+	Root->RegisterComponent();
+	UMatterFluxFragmentSourceProxyComponent* Proxy =
+		NewObject<UMatterFluxFragmentSourceProxyComponent>(Owner, TEXT("Proxy"));
+	Owner->AddInstanceComponent(Proxy);
+	Proxy->RegisterComponent();
+	Proxy->Configure(Root, nullptr);
+
+	const FGuid AggregateId = FGuid::NewDeterministicGuid(
+		TEXT("UnifiedBurnedTree"), 1);
+	const auto MakePart = [AggregateId](
+		const int32 Index,
+		const FName Name,
+		const FName MaterialId,
+		const bool bRoot,
+		const float Height)
+	{
+		MatterFlux::PlayableLevel::FLevelFragmentSource Source;
+		Source.SourceId = MakeProxyBenchmarkSourceId(Index);
+		Source.AggregateId = AggregateId;
+		Source.bAggregateRoot = bRoot;
+		Source.Name = Name;
+		Source.MaterialId = MaterialId;
+		Source.Transform.SetLocation(FVector(0.0f, 0.0f, Height));
+		Source.Mask.Width = 1;
+		Source.Mask.Height = 1;
+		Source.Mask.CellSize = 4.0f;
+		Source.Mask.GeometryStyle =
+			EFragmentSourceGeometryStyle::VoxelBlocks;
+		Source.Mask.SolidMask = {1};
+		return Source;
+	};
+	const MatterFlux::PlayableLevel::FLevelFragmentSource Trunk =
+		MakePart(20, TEXT("TreeTrunk"), TEXT("wood"), true, 0.0f);
+	const MatterFlux::PlayableLevel::FLevelFragmentSource Leaves =
+		MakePart(21, TEXT("TreeLeaves"), TEXT("leaf"), false, 4.0f);
+	TMap<
+		FIntPoint,
+		TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>> Chunks;
+	Chunks.FindOrAdd(FIntPoint::ZeroValue) = {Trunk, Leaves};
+	Proxy->SetSourceChunks(Chunks);
+	Proxy->SetVisibleChunks({FIntPoint::ZeroValue});
+
+	TestEqual(
+		TEXT("Burning one trunk cell commits its residue state"),
+		Proxy->ApplySourceState(
+			Trunk.SourceId,
+			{0},
+			{1},
+			TEXT("charcoal"),
+			FLinearColor(0.10f, 0.08f, 0.06f),
+			false),
+		EMatterFluxFragmentSourceProxyApplyResult::Changed);
+	Proxy->FlushPendingChanges();
+	TestEqual(
+		TEXT("Charcoal is not drawn as a second 2D tree projection"),
+		Proxy->GetStandaloneTreeOutputProjectionCount(),
+		0);
+	return true;
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -178,13 +416,13 @@ bool FMatterFluxFragmentSourceProxyAtomicApplyTest::RunTest(
 	Proxy->SetSourceChunks(Chunks);
 
 	TArray<uint8> ChangedRuntime = {0, 1, 1, 1};
-	TArray<uint8> InvalidResidue = {1, 0, 0};
+	TArray<uint8> InvalidOutput = {1, 0, 0};
 	TestEqual(
-		TEXT("An invalid residue rejects the whole Source state"),
+		TEXT("An invalid output rejects the whole Source state"),
 		Proxy->ApplySourceState(
 			Source.SourceId,
 			ChangedRuntime,
-			InvalidResidue,
+			InvalidOutput,
 			TEXT("charcoal"),
 			FLinearColor::Black,
 			false),
@@ -192,25 +430,25 @@ bool FMatterFluxFragmentSourceProxyAtomicApplyTest::RunTest(
 
 	TArray<uint8> OriginalRuntime;
 	OriginalRuntime.Init(1, 4);
-	TArray<uint8> EmptyResidue;
-	EmptyResidue.Init(0, 4);
+	TArray<uint8> EmptyOutput;
+	EmptyOutput.Init(0, 4);
 	TestEqual(
 		TEXT("Rejected input leaves both previously committed masks unchanged"),
 		Proxy->ApplySourceState(
 			Source.SourceId,
 			OriginalRuntime,
-			EmptyResidue,
+			EmptyOutput,
 			NAME_None,
 			FLinearColor::Transparent,
 			false),
 		EMatterFluxFragmentSourceProxyApplyResult::Unchanged);
-	TArray<uint8> ValidResidue = {1, 0, 0, 0};
+	TArray<uint8> ValidOutput = {1, 0, 0, 0};
 	TestEqual(
 		TEXT("A valid pair commits as one changed Source state"),
 		Proxy->ApplySourceState(
 			Source.SourceId,
 			ChangedRuntime,
-			ValidResidue,
+			ValidOutput,
 			TEXT("charcoal"),
 			FLinearColor::Black,
 			false),
@@ -220,7 +458,7 @@ bool FMatterFluxFragmentSourceProxyAtomicApplyTest::RunTest(
 		Proxy->ApplySourceState(
 			Source.SourceId,
 			ChangedRuntime,
-			ValidResidue,
+			ValidOutput,
 			TEXT("charcoal"),
 			FLinearColor::Black,
 			false),
@@ -363,12 +601,12 @@ bool FMatterFluxFragmentSourceProxyCompactBatchTest::RunTest(
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FMatterFluxFragmentSourceProxyCombustionLiveUpdateTest,
-	"MatterFlux.Game.FragmentSourceProxyUpdatesCombustionGeometryWhileBurning",
+	FMatterFluxFragmentSourceProxyReactionLiveUpdateTest,
+	"MatterFlux.Game.FragmentSourceProxyUpdatesReactionGeometryWhileActive",
 	EAutomationTestFlags::EditorContext
 		| EAutomationTestFlags::ProductFilter)
 
-bool FMatterFluxFragmentSourceProxyCombustionLiveUpdateTest::RunTest(
+bool FMatterFluxFragmentSourceProxyReactionLiveUpdateTest::RunTest(
 	const FString& Parameters)
 {
 	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
@@ -410,18 +648,18 @@ bool FMatterFluxFragmentSourceProxyCombustionLiveUpdateTest::RunTest(
 	}
 
 	TArray<uint8> CutRuntime = {0, 1, 1, 1};
-	TArray<uint8> EmptyResidue;
-	EmptyResidue.Init(0, 4);
+	TArray<uint8> EmptyOutput;
+	EmptyOutput.Init(0, 4);
 	Proxy->ApplySourceState(
 		Source.SourceId,
 		CutRuntime,
-		EmptyResidue,
+		EmptyOutput,
 		NAME_None,
 		FLinearColor::Transparent,
 		true);
 	Proxy->FlushPendingChanges();
 	TestNotEqual(
-		TEXT("An active combustion update immediately replaces stale green geometry"),
+		TEXT("An active reaction update immediately replaces stale green geometry"),
 		CountProxyMeshVertices(*Owner),
 		InitialVertexCount);
 	return true;
@@ -469,8 +707,8 @@ bool FMatterFluxFragmentSourceProxyLookupPerformanceTest::RunTest(
 		MakeProxyBenchmarkSourceId(ProxyBenchmarkSourceCount - 1);
 	TArray<uint8> RuntimeMask;
 	RuntimeMask.Init(1, ProxyBenchmarkMaskCellCount);
-	TArray<uint8> ResidueMask;
-	ResidueMask.Init(0, ProxyBenchmarkMaskCellCount);
+	TArray<uint8> OutputMask;
+	OutputMask.Init(0, ProxyBenchmarkMaskCellCount);
 	bool bAllUpdatesAccepted = true;
 	const double StartSeconds = FPlatformTime::Seconds();
 	for (int32 Iteration = 0;
@@ -478,11 +716,11 @@ bool FMatterFluxFragmentSourceProxyLookupPerformanceTest::RunTest(
 		++Iteration)
 	{
 		RuntimeMask[0] = static_cast<uint8>(Iteration & 1);
-		ResidueMask[0] = static_cast<uint8>((Iteration + 1) & 1);
+		OutputMask[0] = static_cast<uint8>((Iteration + 1) & 1);
 		bAllUpdatesAccepted &= Proxy->ApplySourceState(
 			TailSourceId,
 			RuntimeMask,
-			ResidueMask,
+			OutputMask,
 			TEXT("charcoal"),
 			FLinearColor(0.08f, 0.07f, 0.06f),
 			false)

@@ -35,14 +35,14 @@ struct FMatterFluxMaterialDefinition
 	EMatterFluxMaterialPhase Phase = EMatterFluxMaterialPhase::StaticSolid;
 	uint8 Mobility = 255;
 	uint8 Dispersion = 128;
+	/** 物质格存在的固定模拟步数；0 表示不会自行消散。 */
+	uint8 LifetimeSteps = 0;
 	/** 浅水处的透明度；0 完全透明，1 完全不透明。 */
 	float ShallowOpacity = 1.0f;
 	/** 达到吸收距离后的不透明度，必须不小于 ShallowOpacity。 */
 	float DeepOpacity = 1.0f;
 	/** 从浅水过渡到深水不透明度所需的视线内液体深度（厘米）。 */
 	float OpacityDepth = 100.0f;
-	/** 传给 UE 折射输入的物理折射率；空气为 1，水约为 1.33。 */
-	float RefractionIndex = 1.0f;
 };
 
 struct FMatterFluxReactionDefinition
@@ -312,6 +312,8 @@ struct FMatterFluxSpellDefinition
 	float Lifetime = 0.0f;
 	float LifetimeMultiplier = 1.0f;
 	float Radius = 0.0f;
+	/** Fraction of world gravity applied while the projectile is in flight. */
+	float GravityScale = 0.0f;
 	float SpreadDelta = 0.0f;
 	float CastDelayDelta = 0.0f;
 	float RechargeTimeDelta = 0.0f;
@@ -325,7 +327,12 @@ struct FMatterFluxSpellDefinition
 	float VerticalImpulse = 0.0f;
 	/** Optional material composing the projectile body while it is in flight. */
 	FName BodyMaterial;
-	FName ImpactMaterial;
+	/** Number of body-material cells released into the simulation on impact. */
+	int32 MaterialAmount = 1;
+	/** Uses a thin plane instead of the default compact projectile body. */
+	bool bUsePlaneVisual = false;
+	/** Plane visual is vertical and extends along travel; false keeps it horizontal. */
+	bool bUseVerticalPlaneVisual = false;
 	int32 StarterCount = 0;
 };
 
@@ -446,6 +453,24 @@ struct FMatterFluxFragmentationSettings
 	int32 MinDetachedAreaPixels = 1;
 };
 
+/**
+ * Lua-authored structure profile. Generator selects a bounded C++ geometry
+ * capability; cutaway values configure the generic material projection.
+ */
+struct FMatterFluxStructureDefinition
+{
+	FName Id;
+	FName GeneratorId;
+	float ContactToleranceCentimeters = 12.0f;
+	float FloorSnapHeightCentimeters = 28.0f;
+	float PreferredFloorPaddingCentimeters = 90.0f;
+	float PreferredFloorVerticalRangeCentimeters = 420.0f;
+	float ExitGraceSeconds = 0.18f;
+	float FadeSpeed = 4.5f;
+	float WallGhostOpacity = 0.055f;
+	float RoofGhostOpacity = 0.025f;
+};
+
 enum class EMatterFluxCustomMapStampShape : uint8
 {
 	Rectangle,
@@ -536,6 +561,7 @@ struct FMatterFluxContentRegistry
 	TMap<FName, FMatterFluxWandDefinition> Wands;
 	TMap<FName, FMatterFluxItemDefinition> Items;
 	TMap<FName, FMatterFluxQuestDefinition> Quests;
+	TMap<FName, FMatterFluxStructureDefinition> Structures;
 	TMap<FName, FMatterFluxCustomMapDefinition> CustomMaps;
 };
 

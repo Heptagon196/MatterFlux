@@ -38,7 +38,7 @@ local function copy_fields(target, source, allowed, context)
 end
 
 -- 材质作者使用命名字段；C++ 仍只接收加载时编译后的不可变表。
--- 光学字段对所有材质都合法，但只有 liquid 阶段会走透明折射材质。
+-- 光学字段对所有材质都合法，但只有 liquid 阶段会走透明材质。
 material = {}
 
 function material.define(definition)
@@ -49,11 +49,31 @@ function material.define(definition)
 	copy_fields(compiled, definition, {
 		"id", "density", "hardness",
 		"color_r", "color_g", "color_b", "color_a",
-		"phase", "mobility", "dispersion",
-		"shallow_opacity", "deep_opacity", "opacity_depth",
-		"refraction_index"
+		"phase", "mobility", "dispersion", "lifetime_steps",
+		"shallow_opacity", "deep_opacity", "opacity_depth"
 	}, "material")
 	register_material_compiled(compiled)
+end
+
+-- 结构脚本选择一个有界 C++ 生成能力，并声明材质切面的策略。
+-- 运行时不会在 Actor Tick 中执行 Lua；这里的数据在加载时编译、校验。
+local register_structure_compiled = content.register_structure
+content.register_structure = nil
+structure = {}
+
+function structure.define(metadata, cutaway)
+	if type(metadata) ~= "table" then
+		error("structure.define expects a metadata table", 2)
+	end
+	local compiled = {}
+	copy_fields(compiled, metadata, { "id", "generator" }, "structure metadata")
+	copy_fields(compiled, cutaway, {
+		"contact_tolerance_cm", "floor_snap_height_cm",
+		"preferred_floor_padding_cm",
+		"preferred_floor_vertical_range_cm", "exit_grace_seconds",
+		"fade_speed", "wall_opacity", "roof_opacity"
+	}, "structure cutaway")
+	register_structure_compiled(compiled)
 end
 
 -- 自定义地图只描述有界的确定性填充操作。Lua 不直接创建 Actor，
@@ -131,7 +151,7 @@ end
 
 local projectile_fields = {
 	"damage", "speed", "lifetime", "radius", "body_material",
-	"impact_material",
+	"material_amount", "visual_shape", "gravity_scale",
 	"cast_delay", "recharge_time"
 }
 local modifier_fields = {

@@ -325,8 +325,11 @@ namespace MatterFluxShellUI
 			];
 			Content->AddSlot().AutoHeight().Padding(0.0f, 4.0f)
 			[Button(TEXT("单人游戏"), [Owner]() { Owner->ShowSinglePlayerMenu(); return FReply::Handled(); }, TEXT("新建或载入本地世界"), true, 260.0f)];
-			Content->AddSlot().AutoHeight().Padding(0.0f, 4.0f)
-			[Button(TEXT("多人游戏"), [Owner]() { Owner->ShowMultiplayerMenu(); return FReply::Handled(); }, TEXT("创建 Listen Server 房间或通过地址加入"), true, 260.0f)];
+			if (UMatterFluxShellWidget::IsMultiplayerEntryEnabled())
+			{
+				Content->AddSlot().AutoHeight().Padding(0.0f, 4.0f)
+				[Button(TEXT("多人游戏"), [Owner]() { Owner->ShowMultiplayerMenu(); return FReply::Handled(); }, TEXT("创建 Listen Server 房间或通过地址加入"), true, 260.0f)];
+			}
 			Content->AddSlot().AutoHeight().Padding(0.0f, 4.0f)
 			[Button(TEXT("设置"), [Owner]() { Owner->ShowSettings(); return FReply::Handled(); }, TEXT("调整画面、声音和窗口"), true, 260.0f)];
 			Content->AddSlot().AutoHeight().Padding(0.0f, 4.0f)

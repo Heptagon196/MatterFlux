@@ -7,16 +7,16 @@ namespace
 {
 	constexpr int32 GroundChunkSize = 64;
 	constexpr int32 ChunkCellCount = GroundChunkSize * GroundChunkSize;
-	constexpr int32 ResidueByteCount = ChunkCellCount / 8;
-	constexpr int32 PackedByteCount = ResidueByteCount + ChunkCellCount;
+	constexpr int32 OutputByteCount = ChunkCellCount / 8;
+	constexpr int32 PackedByteCount = OutputByteCount + ChunkCellCount;
 	constexpr int32 MaximumPayloadBytes = PackedByteCount;
 }
 
 bool FMatterFluxGroundStateChunk::Encode(
 	const FIntPoint InChunkCoordinate,
 	const int32 InRevision,
-	const TArray<uint8>& ResidueMask,
-	const TArray<uint8>& BurningMask,
+	const TArray<uint8>& OutputMask,
+	const TArray<uint8>& ActiveMask,
 	const int32 WorldWidth,
 	const int32 WorldHeight,
 	FString& OutError)
@@ -26,8 +26,8 @@ bool FMatterFluxGroundStateChunk::Encode(
 	if (WorldWidth <= 0 || WorldHeight <= 0
 		|| WorldWidth % GroundChunkSize != 0
 		|| WorldHeight % GroundChunkSize != 0
-		|| ResidueMask.Num() != WorldWidth * WorldHeight
-		|| BurningMask.Num() != ResidueMask.Num()
+		|| OutputMask.Num() != WorldWidth * WorldHeight
+		|| ActiveMask.Num() != OutputMask.Num()
 		|| InChunkCoordinate.X < 0 || InChunkCoordinate.Y < 0
 		|| InChunkCoordinate.X >= WorldWidth / GroundChunkSize
 		|| InChunkCoordinate.Y >= WorldHeight / GroundChunkSize)
@@ -46,14 +46,14 @@ bool FMatterFluxGroundStateChunk::Encode(
 			const int32 WorldIndex =
 				(InChunkCoordinate.Y * GroundChunkSize + LocalY) * WorldWidth
 				+ InChunkCoordinate.X * GroundChunkSize + LocalX;
-			if (ResidueMask[WorldIndex] > 1)
+			if (OutputMask[WorldIndex] > 1)
 			{
-				OutError = TEXT("Ground residue mask must be binary");
+				OutError = TEXT("Ground output mask must be binary");
 				return false;
 			}
 			Packed[LocalIndex / 8] |= static_cast<uint8>(
-				ResidueMask[WorldIndex] << (LocalIndex % 8));
-			Packed[ResidueByteCount + LocalIndex] = BurningMask[WorldIndex];
+				OutputMask[WorldIndex] << (LocalIndex % 8));
+			Packed[OutputByteCount + LocalIndex] = ActiveMask[WorldIndex];
 		}
 	}
 
@@ -87,8 +87,8 @@ bool FMatterFluxGroundStateChunk::Encode(
 }
 
 bool FMatterFluxGroundStateChunk::DecodeInto(
-	TArray<uint8>& InOutResidueMask,
-	TArray<uint8>& InOutBurningMask,
+	TArray<uint8>& InOutOutputMask,
+	TArray<uint8>& InOutActiveMask,
 	const int32 WorldWidth,
 	const int32 WorldHeight,
 	FString& OutError) const
@@ -97,8 +97,8 @@ bool FMatterFluxGroundStateChunk::DecodeInto(
 	if (WorldWidth <= 0 || WorldHeight <= 0
 		|| WorldWidth % GroundChunkSize != 0
 		|| WorldHeight % GroundChunkSize != 0
-		|| InOutResidueMask.Num() != WorldWidth * WorldHeight
-		|| InOutBurningMask.Num() != InOutResidueMask.Num()
+		|| InOutOutputMask.Num() != WorldWidth * WorldHeight
+		|| InOutActiveMask.Num() != InOutOutputMask.Num()
 		|| Revision < 0
 		|| ChunkCoordinate.X < 0 || ChunkCoordinate.Y < 0
 		|| ChunkCoordinate.X >= WorldWidth / GroundChunkSize
@@ -147,10 +147,10 @@ bool FMatterFluxGroundStateChunk::DecodeInto(
 			const int32 WorldIndex =
 				(ChunkCoordinate.Y * GroundChunkSize + LocalY) * WorldWidth
 				+ ChunkCoordinate.X * GroundChunkSize + LocalX;
-			InOutResidueMask[WorldIndex] =
+			InOutOutputMask[WorldIndex] =
 				(Packed[LocalIndex / 8] >> (LocalIndex % 8)) & 1;
-			InOutBurningMask[WorldIndex] =
-				Packed[ResidueByteCount + LocalIndex];
+			InOutActiveMask[WorldIndex] =
+				Packed[OutputByteCount + LocalIndex];
 		}
 	}
 	return true;

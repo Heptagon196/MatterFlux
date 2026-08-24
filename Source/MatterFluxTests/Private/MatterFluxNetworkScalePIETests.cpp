@@ -870,9 +870,9 @@ namespace MatterFluxNetworkScaleTests
 					SourceId,
 					TEXT("wood"))
 				: nullptr;
-			if (!Source || !Source->HasCombustionRule())
+			if (!Source || !Source->HasReactionRule())
 			{
-				Test->AddError(TEXT("Could not spawn a combustible replicated flame target."));
+				Test->AddError(TEXT("Could not spawn a reactive replicated flame target."));
 				return true;
 			}
 			FlameSourceIds.Add(SourceId);
@@ -1003,7 +1003,7 @@ namespace MatterFluxNetworkScaleTests
 			TransitionTo(EScenarioPhase::WaitForFinalConvergence);
 			return false;
 		}
-		// Burning is intentionally transient. Observe it immediately instead of
+		// Active is intentionally transient. Observe it immediately instead of
 		// waiting for the unrelated decoration streaming queue to drain; on a
 		// far-apart union that queue can outlive the complete wood burn cycle.
 		// Final convergence below still requires streaming to become idle.
@@ -1012,7 +1012,7 @@ namespace MatterFluxNetworkScaleTests
 			const int32 SourceIndex = FlameSourceIds.IndexOfByKey(SourceId);
 			const AFragment2DSourceActor* ServerSource =
 				FindSource(Server, SourceId);
-			if (!ServerSource || !ServerSource->IsCombusting())
+			if (!ServerSource || !ServerSource->IsReacting())
 			{
 				FString Diagnostics;
 				for (int32 Index = 0; Index < PlayerIds.Num(); ++Index)
@@ -1041,10 +1041,10 @@ namespace MatterFluxNetworkScaleTests
 						TargetLocation,
 						CharacterLocation + Direction * Along);
 					Diagnostics += FString::Printf(
-						TEXT(" p%d(target=%d burning=%d along=%.1f lateral=%.1f char=%s targetLoc=%s)"),
+						TEXT(" p%d(target=%d active=%d along=%.1f lateral=%.1f char=%s targetLoc=%s)"),
 						PlayerIds[Index],
 						Target != nullptr,
-						Target ? Target->IsCombusting() : false,
+						Target ? Target->IsReacting() : false,
 						Along,
 						Lateral,
 						*CharacterLocation.ToCompactString(),
@@ -1072,10 +1072,10 @@ namespace MatterFluxNetworkScaleTests
 					Client ? FindSource(*Client, SourceId) : nullptr;
 				if (!ClientSource
 					|| ClientSource->SourceMaterialId != TEXT("wood")
-					|| ClientSource->GetBurningCellCount() <= 0)
+					|| ClientSource->GetActiveCellCount() <= 0)
 				{
 					return FailOnTimeout(
-						TEXT("Burning source state did not replicate to every client."));
+						TEXT("Active source state did not replicate to every client."));
 				}
 			}
 		}

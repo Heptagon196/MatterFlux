@@ -17,8 +17,6 @@ namespace MatterFlux::ItemOcclusion
 	{
 		/** A narrow probe catches partial silhouette obstruction without fading nearby scenery. */
 		float ProbeRadiusCentimeters = 8.0f;
-		/** Independent items that physically touch are treated as one visual object. */
-		float ContactToleranceCentimeters = 12.0f;
 	};
 
 	struct MATTERFLUX_API FResult
@@ -29,9 +27,10 @@ namespace MatterFlux::ItemOcclusion
 	};
 
 	/**
-	 * Finds items between CameraLocation and the viewer silhouette, then expands
-	 * through aggregate identity and live bounds contact. The result is a local,
-	 * disposable rendering projection and never mutates gameplay state.
+	 * Finds items between CameraLocation and the viewer silhouette, then includes
+	 * every part with the same explicit connection identity. Bounds contact is not
+	 * connectivity: nearby independent scenery must stay solid. The result is a
+	 * local, disposable rendering projection and never mutates gameplay state.
 	 */
 	MATTERFLUX_API bool Resolve(
 		const FVector& CameraLocation,

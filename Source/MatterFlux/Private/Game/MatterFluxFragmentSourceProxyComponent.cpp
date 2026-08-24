@@ -4,6 +4,8 @@
 #include "Materials/MaterialInstanceDynamic.h"
 #include "MatterFluxLog.h"
 #include "ProceduralMeshComponent.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
+#include "Rendering/MatterFluxGhostFade.h"
 #include "Rendering/MatterFluxVoxelMaterialStyle.h"
 #include "Rendering/MatterFluxWholeObjectGeometry.h"
 
@@ -17,6 +19,7 @@ namespace
 		bool bSide = false;
 		bool bCollision = false;
 		bool bGhost = false;
+		FGuid GhostSourceId;
 		TArray<FVector> Vertices;
 		TArray<int32> Triangles;
 		TArray<FVector> Normals;
@@ -30,16 +33,18 @@ namespace
 		const float CellSize,
 		const bool bSide,
 		const bool bCollision = false,
-		const bool bGhost = false)
+		const bool bGhost = false,
+		const FGuid& GhostSourceId = FGuid())
 	{
 		return FString::Printf(
-			TEXT("%s|%08x|%08x|%s|%s|%s"),
+			TEXT("%s|%08x|%08x|%s|%s|%s|%s"),
 			*MaterialId.ToString(),
 			Color.ToFColor(false).DWColor(),
 			GetTypeHash(CellSize),
 			bSide ? TEXT("side") : TEXT("face"),
 			bCollision ? TEXT("collision") : TEXT("visual"),
-			bGhost ? TEXT("ghost") : TEXT("solid"));
+			bGhost ? TEXT("ghost") : TEXT("solid"),
+			bGhost ? *GhostSourceId.ToString(EGuidFormats::Digits) : TEXT("-"));
 	}
 
 	void AppendMeshPart(
@@ -116,10 +121,56 @@ namespace
 UMatterFluxFragmentSourceProxyComponent::
 	UMatterFluxFragmentSourceProxyComponent()
 {
-	PrimaryComponentTick.bCanEverTick = false;
+	PrimaryComponentTick.bCanEverTick = true;
+	PrimaryComponentTick.bStartWithTickEnabled = false;
 	GhostMaterialTemplate = LoadObject<UMaterialInterface>(
 		nullptr,
 		TEXT("/Game/MatterFlux/Materials/M_VoxelGas.M_VoxelGas"));
+}
+
+void UMatterFluxFragmentSourceProxyComponent::TickComponent(
+	const float DeltaTime,
+	const ELevelTick TickType,
+	FActorComponentTickFunction* ThisTickFunction)
+{
+	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+	TArray<FGuid, TInlineAllocator<16>> RestoredSourceIds;
+	bool bHasTransition = false;
+	for (const FGuid& SourceId : GhostedSourceIds)
+	{
+		float& Opacity = GhostOpacityBySourceId.FindOrAdd(SourceId, 1.0f);
+		const bool bGhostDesired = TargetGhostedSourceIds.Contains(SourceId);
+		Opacity = MatterFlux::GhostFade::AdvanceItemOpacity(
+			Opacity, bGhostDesired, DeltaTime);
+		UpdateGhostMaterialOpacity(SourceId, Opacity);
+		if (!bGhostDesired && Opacity >= 0.999f)
+		{
+			RestoredSourceIds.Add(SourceId);
+		}
+		else
+		{
+			const float TargetOpacity = bGhostDesired
+				? MatterFlux::GhostFade::DefaultItemOpacity : 1.0f;
+			bHasTransition |= !FMath::IsNearlyEqual(
+				Opacity, TargetOpacity, 0.001f);
+		}
+	}
+
+	for (const FGuid& SourceId : RestoredSourceIds)
+	{
+		if (const FSourceLocator* Locator = SourceLocatorById.Find(SourceId))
+		{
+			DirtyChunks.Add(Locator->Chunk);
+		}
+		GhostedSourceIds.Remove(SourceId);
+		GhostOpacityBySourceId.Remove(SourceId);
+		RemoveGhostMaterials(SourceId);
+	}
+	if (!RestoredSourceIds.IsEmpty())
+	{
+		FlushPendingChanges();
+	}
+	SetComponentTickEnabled(bHasTransition);
 }
 
 void UMatterFluxFragmentSourceProxyComponent::Configure(
@@ -176,6 +227,73 @@ void UMatterFluxFragmentSourceProxyComponent::SetSourceChunks(
 	}
 }
 
+void UMatterFluxFragmentSourceProxyComponent::ApplySourceChunkDelta(
+	const TArray<FIntPoint>& RemovedChunks,
+	const TMap<
+		FIntPoint,
+		TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>>& UpdatedChunks)
+{
+	TArray<FIntPoint> OrderedRemovedChunks = RemovedChunks;
+	OrderedRemovedChunks.Sort([](const FIntPoint Left, const FIntPoint Right)
+	{
+		return Left.Y == Right.Y ? Left.X < Right.X : Left.Y < Right.Y;
+	});
+	for (const FIntPoint Chunk : OrderedRemovedChunks)
+	{
+		RemoveSourceChunk(Chunk);
+	}
+
+	TArray<FIntPoint> OrderedUpdatedChunks;
+	UpdatedChunks.GenerateKeyArray(OrderedUpdatedChunks);
+	OrderedUpdatedChunks.Sort([](const FIntPoint Left, const FIntPoint Right)
+	{
+		return Left.Y == Right.Y ? Left.X < Right.X : Left.Y < Right.Y;
+	});
+	for (const FIntPoint Chunk : OrderedUpdatedChunks)
+	{
+		RemoveSourceChunk(Chunk);
+		const TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>& Sources =
+			UpdatedChunks.FindChecked(Chunk);
+		TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>& ProxySources =
+			SourceChunks.FindOrAdd(Chunk);
+		ProxySources.Reserve(Sources.Num());
+		for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
+			: Sources)
+		{
+			if (!Source.SourceId.IsValid() || !Source.Mask.IsValid())
+			{
+				continue;
+			}
+			const int32 SourceIndex = ProxySources.Add(Source);
+			SourceLocatorById.Add(Source.SourceId, {Chunk, SourceIndex});
+		}
+		if (ProxySources.IsEmpty())
+		{
+			SourceChunks.Remove(Chunk);
+			continue;
+		}
+		if (VisibleChunks.Contains(Chunk))
+		{
+			DirtyChunks.Add(Chunk);
+		}
+		else
+		{
+			// Procedural population is resident one chunk ring beyond the
+			// visible proxy window. Compile that one newly completed chunk while
+			// it is still off-screen, so crossing a boundary only reveals cached
+			// meshes instead of synchronously rebuilding the whole entering edge.
+			RebuildChunk(Chunk);
+			DirtyChunks.Remove(Chunk);
+			DeferredReactionChunks.Remove(Chunk);
+			if (UProceduralMeshComponent* Prepared = ChunkMeshes.FindRef(Chunk))
+			{
+				Prepared->SetVisibility(false, true);
+				Prepared->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+			}
+		}
+	}
+}
+
 void UMatterFluxFragmentSourceProxyComponent::SetVisibleChunks(
 	const TSet<FIntPoint>& InVisibleChunks)
 {
@@ -214,7 +332,7 @@ void UMatterFluxFragmentSourceProxyComponent::SetVisibleChunks(
 		if (UProceduralMeshComponent* Prepared = ChunkMeshes.FindRef(Chunk);
 			IsValid(Prepared)
 				&& !DirtyChunks.Contains(Chunk)
-				&& !DeferredCombustionChunks.Contains(Chunk))
+				&& !DeferredReactionChunks.Contains(Chunk))
 		{
 			Prepared->SetVisibility(true, true);
 			Prepared->SetCollisionEnabled(
@@ -227,7 +345,7 @@ void UMatterFluxFragmentSourceProxyComponent::SetVisibleChunks(
 			RebuildChunk(Chunk);
 		}
 		DirtyChunks.Remove(Chunk);
-		DeferredCombustionChunks.Remove(Chunk);
+		DeferredReactionChunks.Remove(Chunk);
 	}
 }
 
@@ -252,7 +370,7 @@ void UMatterFluxFragmentSourceProxyComponent::PrepareSourceChunks(
 	{
 		RebuildChunk(Chunk);
 		DirtyChunks.Remove(Chunk);
-		DeferredCombustionChunks.Remove(Chunk);
+		DeferredReactionChunks.Remove(Chunk);
 		if (!VisibleChunks.Contains(Chunk))
 		{
 			if (UProceduralMeshComponent* Prepared = ChunkMeshes.FindRef(Chunk))
@@ -271,7 +389,7 @@ void UMatterFluxFragmentSourceProxyComponent::SetSourceMaterialized(
 {
 	if (bMaterialized)
 	{
-		SetSourceCombustionActive(SourceId, false);
+		SetSourceReactionActive(SourceId, false);
 	}
 	const FSourceLocator* Locator = SourceLocatorById.Find(SourceId);
 	if (!Locator)
@@ -291,46 +409,50 @@ void UMatterFluxFragmentSourceProxyComponent::SetSourceMaterialized(
 	if (bChanged)
 	{
 		DirtyChunks.Add(Locator->Chunk);
-		DeferredCombustionChunks.Remove(Locator->Chunk);
+		DeferredReactionChunks.Remove(Locator->Chunk);
 	}
 }
 
 void UMatterFluxFragmentSourceProxyComponent::SetGhostedSources(
 	const TSet<FGuid>& SourceIds)
 {
-	bool bUnchanged = GhostedSourceIds.Num() == SourceIds.Num();
-	if (bUnchanged)
+	TSet<FGuid> ValidSourceIds;
+	for (const FGuid& SourceId : SourceIds)
 	{
-		for (const FGuid& SourceId : SourceIds)
+		if (SourceLocatorById.Contains(SourceId))
 		{
-			if (!GhostedSourceIds.Contains(SourceId))
+			ValidSourceIds.Add(SourceId);
+		}
+	}
+	bool bTargetsUnchanged =
+		ValidSourceIds.Num() == TargetGhostedSourceIds.Num();
+	if (bTargetsUnchanged)
+	{
+		for (const FGuid& SourceId : ValidSourceIds)
+		{
+			if (!TargetGhostedSourceIds.Contains(SourceId))
 			{
-				bUnchanged = false;
+				bTargetsUnchanged = false;
 				break;
 			}
 		}
 	}
-	if (bUnchanged)
+	if (bTargetsUnchanged)
 	{
 		return;
 	}
-	TSet<FGuid> ChangedSourceIds = GhostedSourceIds;
-	for (const FGuid& SourceId : SourceIds)
+	TargetGhostedSourceIds = MoveTemp(ValidSourceIds);
+	for (const FGuid& SourceId : TargetGhostedSourceIds)
 	{
-		if (!ChangedSourceIds.Remove(SourceId))
+		if (!GhostedSourceIds.Contains(SourceId))
 		{
-			ChangedSourceIds.Add(SourceId);
-		}
-	}
-	GhostedSourceIds = SourceIds;
-	for (const FGuid& SourceId : ChangedSourceIds)
-	{
-		if (const FSourceLocator* Locator = SourceLocatorById.Find(SourceId))
-		{
-			DirtyChunks.Add(Locator->Chunk);
+			GhostedSourceIds.Add(SourceId);
+			GhostOpacityBySourceId.Add(SourceId, 1.0f);
+			DirtyChunks.Add(SourceLocatorById.FindChecked(SourceId).Chunk);
 		}
 	}
 	FlushPendingChanges();
+	SetComponentTickEnabled(!GhostedSourceIds.IsEmpty());
 }
 
 void UMatterFluxFragmentSourceProxyComponent::SetDebugIsolatedAggregate(
@@ -348,7 +470,7 @@ void UMatterFluxFragmentSourceProxyComponent::SetDebugIsolatedAggregate(
 	FlushPendingChanges();
 }
 
-void UMatterFluxFragmentSourceProxyComponent::SetSourceCombustionActive(
+void UMatterFluxFragmentSourceProxyComponent::SetSourceReactionActive(
 	const FGuid& SourceId,
 	const bool bActive)
 {
@@ -359,33 +481,33 @@ void UMatterFluxFragmentSourceProxyComponent::SetSourceCombustionActive(
 	}
 	if (bActive)
 	{
-		CombustingSourceIds.Add(SourceId);
+		ReactingSourceIds.Add(SourceId);
 		return;
 	}
-	if (CombustingSourceIds.Remove(SourceId) > 0)
+	if (ReactingSourceIds.Remove(SourceId) > 0)
 	{
-		DeferredCombustionChunks.Add(Locator->Chunk);
+		DeferredReactionChunks.Add(Locator->Chunk);
 	}
 }
 
 void UMatterFluxFragmentSourceProxyComponent::
-	FlushDeferredCombustionChanges()
+	FlushDeferredReactionChanges()
 {
-	for (const FIntPoint Chunk : DeferredCombustionChunks)
+	for (const FIntPoint Chunk : DeferredReactionChunks)
 	{
 		DirtyChunks.Add(Chunk);
 	}
-	DeferredCombustionChunks.Reset();
+	DeferredReactionChunks.Reset();
 }
 
 EMatterFluxFragmentSourceProxyApplyResult
 UMatterFluxFragmentSourceProxyComponent::ApplySourceState(
 	const FGuid& SourceId,
 	const TArray<uint8>& RuntimeMask,
-	const TArray<uint8>& ResidueMask,
-	const FName ResidueMaterialId,
-	const FLinearColor& ResidueColor,
-	const bool bCombustionActive)
+	const TArray<uint8>& OutputMask,
+	const FName OutputMaterialId,
+	const FLinearColor& OutputColor,
+	const bool bReactionActive)
 {
 	const FSourceLocator* Locator = SourceLocatorById.Find(SourceId);
 	TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>* Sources =
@@ -399,36 +521,37 @@ UMatterFluxFragmentSourceProxyComponent::ApplySourceState(
 		return EMatterFluxFragmentSourceProxyApplyResult::Invalid;
 	}
 	const int32 CellCount = Source->Mask.Width * Source->Mask.Height;
-	if (RuntimeMask.Num() != CellCount || ResidueMask.Num() != CellCount)
+	if (RuntimeMask.Num() != CellCount || OutputMask.Num() != CellCount)
 	{
 		return EMatterFluxFragmentSourceProxyApplyResult::Invalid;
 	}
-	bool bHasResidue = false;
+	const bool bCanRenderOutput = OutputMaterialId != TEXT("empty");
+	bool bHasOutput = false;
 	for (int32 CellIndex = 0; CellIndex < CellCount; ++CellIndex)
 	{
-		if (RuntimeMask[CellIndex] > 1 || ResidueMask[CellIndex] > 1)
+		if (RuntimeMask[CellIndex] > 1 || OutputMask[CellIndex] > 1)
 		{
 			return EMatterFluxFragmentSourceProxyApplyResult::Invalid;
 		}
-		bHasResidue |= ResidueMask[CellIndex] != 0;
+		bHasOutput |= bCanRenderOutput && OutputMask[CellIndex] != 0;
 	}
 
 	const bool bRuntimeChanged = Source->Mask.SolidMask != RuntimeMask;
-	const FSourceResidueState* ExistingResidue =
-		SourceResidues.Find(SourceId);
-	const bool bResidueChanged = bHasResidue
-		? !ExistingResidue
-			|| ExistingResidue->Mask != ResidueMask
-			|| ExistingResidue->MaterialId != ResidueMaterialId
-			|| !ExistingResidue->Color.Equals(ResidueColor)
-		: ExistingResidue != nullptr;
-	const bool bWasCombustionActive =
-		CombustingSourceIds.Contains(SourceId);
-	const bool bCombustionStateChanged =
-		bWasCombustionActive != bCombustionActive;
+	const FSourceOutputState* ExistingOutput =
+		SourceOutputs.Find(SourceId);
+	const bool bOutputChanged = bHasOutput
+		? !ExistingOutput
+			|| ExistingOutput->Mask != OutputMask
+			|| ExistingOutput->MaterialId != OutputMaterialId
+			|| !ExistingOutput->Color.Equals(OutputColor)
+		: ExistingOutput != nullptr;
+	const bool bWasReactionActive =
+		ReactingSourceIds.Contains(SourceId);
+	const bool bReactionStateChanged =
+		bWasReactionActive != bReactionActive;
 	if (!bRuntimeChanged
-		&& !bResidueChanged
-		&& !bCombustionStateChanged)
+		&& !bOutputChanged
+		&& !bReactionStateChanged)
 	{
 		return EMatterFluxFragmentSourceProxyApplyResult::Unchanged;
 	}
@@ -438,43 +561,44 @@ UMatterFluxFragmentSourceProxyComponent::ApplySourceState(
 		Source->Mask.SolidMask = RuntimeMask;
 		CachedSourceMeshes.Remove(SourceId);
 	}
-	if (bHasResidue)
+	if (bHasOutput)
 	{
-		FSourceResidueState& State = SourceResidues.FindOrAdd(SourceId);
-		State.Mask = ResidueMask;
-		State.MaterialId = ResidueMaterialId;
-		State.Color = ResidueColor;
+		FSourceOutputState& State = SourceOutputs.FindOrAdd(SourceId);
+		State.Mask = OutputMask;
+		State.MaterialId = OutputMaterialId;
+		State.Color = OutputColor;
 	}
 	else
 	{
-		SourceResidues.Remove(SourceId);
+		SourceOutputs.Remove(SourceId);
 	}
-	if (bResidueChanged)
+	if (bOutputChanged)
 	{
-		CachedResidueMeshes.Remove(SourceId);
+		CachedOutputMeshes.Remove(SourceId);
 	}
-	if (bCombustionActive)
+	if (bReactionActive)
 	{
-		CombustingSourceIds.Add(SourceId);
+		ReactingSourceIds.Add(SourceId);
 	}
-	else if (CombustingSourceIds.Remove(SourceId) > 0)
+	else if (ReactingSourceIds.Remove(SourceId) > 0)
 	{
-		DeferredCombustionChunks.Add(Locator->Chunk);
+		DeferredReactionChunks.Add(Locator->Chunk);
 	}
 	// 燃烧状态与可视网格必须在同一个批次内提交。旧逻辑会在燃烧期间
 	// 一直保留绿色的 chunk 网格，直到整份 source 燃尽才一次性变黑；
 	// DirtyChunks 本身是集合，因此同一模拟批次内多格、多 source 的变化
 	// 仍只会触发一次 chunk 重建。
-	if (bRuntimeChanged || bResidueChanged)
+	if (bRuntimeChanged || bOutputChanged)
 	{
 		DirtyChunks.Add(Locator->Chunk);
-		DeferredCombustionChunks.Remove(Locator->Chunk);
+		DeferredReactionChunks.Remove(Locator->Chunk);
 	}
 	return EMatterFluxFragmentSourceProxyApplyResult::Changed;
 }
 
 void UMatterFluxFragmentSourceProxyComponent::FlushPendingChanges()
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(MatterFlux_Proxy_FlushPendingChanges);
 	TArray<FIntPoint> Chunks;
 	Chunks.Reserve(DirtyChunks.Num());
 	for (const FIntPoint Chunk : DirtyChunks)
@@ -515,16 +639,21 @@ void UMatterFluxFragmentSourceProxyComponent::ResetSources()
 	VisibleChunks.Reset();
 	CollisionChunks.Reset();
 	MaterializedSourceIds.Reset();
+	TargetGhostedSourceIds.Reset();
 	GhostedSourceIds.Reset();
+	GhostOpacityBySourceId.Reset();
 	DebugIsolatedAggregateId.Invalidate();
-	CombustingSourceIds.Reset();
+	ReactingSourceIds.Reset();
 	DirtyChunks.Reset();
-	DeferredCombustionChunks.Reset();
+	DeferredReactionChunks.Reset();
 	CachedSourceMeshes.Reset();
-	SourceResidues.Reset();
-	CachedResidueMeshes.Reset();
+	SourceOutputs.Reset();
+	CachedOutputMeshes.Reset();
+	StandaloneTreeOutputProjectionCounts.Reset();
 	Materials.Reset();
 	GhostMaterials.Reset();
+	GhostMaterialSourceIds.Reset();
+	SetComponentTickEnabled(false);
 }
 
 int32 UMatterFluxFragmentSourceProxyComponent::GetVisibleSourceCount() const
@@ -551,16 +680,61 @@ bool UMatterFluxFragmentSourceProxyComponent::IsProxySource(
 	return SourceLocatorById.Contains(SourceId);
 }
 
+int32 UMatterFluxFragmentSourceProxyComponent::
+	GetInputOutputOverlapCellCount() const
+{
+	int32 Count = 0;
+	for (const TPair<FGuid, FSourceOutputState>& Pair : SourceOutputs)
+	{
+		const FSourceLocator* Locator = SourceLocatorById.Find(Pair.Key);
+		const TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>* Sources =
+			Locator ? SourceChunks.Find(Locator->Chunk) : nullptr;
+		const MatterFlux::PlayableLevel::FLevelFragmentSource* Source =
+			Locator && Sources && Sources->IsValidIndex(Locator->SourceIndex)
+				? &(*Sources)[Locator->SourceIndex]
+				: nullptr;
+		if (!Source || Pair.Value.Mask.Num() != Source->Mask.SolidMask.Num())
+		{
+			continue;
+		}
+		for (int32 CellIndex = 0;
+			CellIndex < Pair.Value.Mask.Num();
+			++CellIndex)
+		{
+			Count += Source->Mask.SolidMask[CellIndex] != 0
+				&& Pair.Value.Mask[CellIndex] != 0
+				? 1
+				: 0;
+		}
+	}
+	return Count;
+}
+
+int32 UMatterFluxFragmentSourceProxyComponent::
+	GetStandaloneTreeOutputProjectionCount() const
+{
+	int32 Count = 0;
+	for (const TPair<FIntPoint, int32>& Pair
+		: StandaloneTreeOutputProjectionCounts)
+	{
+		Count += Pair.Value;
+	}
+	return Count;
+}
+
 void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 	const FIntPoint Chunk)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(MatterFlux_Proxy_RebuildChunk);
 	const TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>* Sources =
 		SourceChunks.Find(Chunk);
 	if (!Sources || !AttachParent || !GetOwner()
 		|| GetOwner()->GetNetMode() == NM_DedicatedServer)
 	{
+		StandaloneTreeOutputProjectionCounts.Remove(Chunk);
 		return;
 	}
+	int32 StandaloneTreeOutputProjectionCount = 0;
 
 	TMap<FString, FProxyMeshGroup> Groups;
 	TMap<FGuid, TArray<const MatterFlux::PlayableLevel::FLevelFragmentSource*>>
@@ -573,16 +747,11 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 		{
 			continue;
 		}
-		const bool bTreePart = Source.Name == TEXT("TreeTrunk")
-			|| Source.Name == TEXT("TreeBranch")
-			|| Source.Name == TEXT("TreeLeaves");
+		const bool bVoxelAggregatePart = Source.AggregateId.IsValid()
+			&& Source.Mask.GeometryStyle
+				== EFragmentSourceGeometryStyle::VoxelBlocks;
 		if (!MaterializedSourceIds.Contains(Source.SourceId)
-			&& bTreePart
-			&& Source.AggregateId.IsValid()
-			&& (Source.Name != TEXT("TreeLeaves")
-				|| (Source.MaterialId == TEXT("leaf")
-					&& Source.Mask.GeometryStyle
-						== EFragmentSourceGeometryStyle::VoxelBlocks)))
+			&& bVoxelAggregatePart)
 		{
 			TreeSourcesByAggregate.FindOrAdd(Source.AggregateId).Add(&Source);
 		}
@@ -610,6 +779,19 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 				return Source
 					&& GhostedSourceIds.Contains(Source->SourceId);
 			});
+		FGuid GhostSourceId;
+		if (bGhostAggregate)
+		{
+			for (const MatterFlux::PlayableLevel::FLevelFragmentSource* Source
+				: TreeSources)
+			{
+				if (Source && GhostedSourceIds.Contains(Source->SourceId))
+				{
+					GhostSourceId = Source->SourceId;
+					break;
+				}
+			}
+		}
 
 		// 新整体物体 Adapter：静态树与脱落后的动态树都把相同的
 		// mask 层交给 WholeObject 深模块。材料列表先按稳定键排序，
@@ -646,6 +828,31 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 					TreeSource->MaterialId,
 					TreeSource->Color,
 					TreeSource->bEnableCollision});
+			}
+			// 燃烧残留与尚未反应的材料必须由同一次体素表面编译生成。
+			// 若把 charcoal/ash 作为额外二维网格追加，原树外壳不会参与
+			// 它的遮挡与消面，画面就会像“正常树与烧焦树叠在一起”。
+			if (const FSourceOutputState* Output =
+				SourceOutputs.Find(TreeSource->SourceId))
+			{
+				const FString OutputStableKey = MakeGroupKey(
+					Output->MaterialId,
+					Output->Color,
+					TreeSource->Mask.CellSize,
+					false,
+					false);
+				if (!WholeMaterials.ContainsByPredicate(
+					[&OutputStableKey](const FWholeObjectMaterial& Existing)
+					{
+						return Existing.StableKey == OutputStableKey;
+					}))
+				{
+					WholeMaterials.Add({
+						OutputStableKey,
+						Output->MaterialId,
+						Output->Color,
+						false});
+				}
 			}
 		}
 		WholeMaterials.Sort([](
@@ -688,32 +895,80 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 				{
 					return Existing.StableKey == StableKey;
 				});
+			const int32 SourceLayerPriority =
+				TreeSource->MaterialId == TEXT("leaf") ? 100 : 10;
+			FTransform SourceLayerTransform =
+				TreeSource->Transform.GetRelativeTransform(AggregateFrame);
+			SourceLayerTransform.SetScale3D(FVector::OneVector);
 			MatterFlux::WholeObject::FLayer& Layer =
 				WholeLayers.AddDefaulted_GetRef();
 			Layer.MaterialIndex = MaterialIndex;
-			Layer.Priority = TreeSource->MaterialId == TEXT("leaf") ? 100 : 10;
+			Layer.Priority = SourceLayerPriority;
 			Layer.bEnableCollision = TreeSource->bEnableCollision;
 			Layer.Width = TreeSource->Mask.Width;
 			Layer.Height = TreeSource->Mask.Height;
 			Layer.CellSize = TreeSource->Mask.CellSize;
 			// 整棵树可以朝向镜头旋转，但编译器只需要处理树局部坐标中
 			// 的 90 度格点旋转。编译结束后再一次性应用 AggregateFrame。
-			Layer.LocalTransform =
-				TreeSource->Transform.GetRelativeTransform(AggregateFrame);
-			Layer.LocalTransform.SetScale3D(FVector::OneVector);
+			Layer.LocalTransform = SourceLayerTransform;
 			// 保留真实连接木体；若木叶占用同一体素，统一编译器会按
 			// leaf=100、wood=10 的优先级只输出叶片外壳。
 			Layer.SolidMask = TreeSource->Mask.SolidMask;
+
+			const FSourceOutputState* Output =
+				SourceOutputs.Find(TreeSource->SourceId);
+			if (!Output || !Output->Mask.Contains(1))
+			{
+				continue;
+			}
+			const FString OutputStableKey = MakeGroupKey(
+				Output->MaterialId,
+				Output->Color,
+				TreeSource->Mask.CellSize,
+				false,
+				false);
+			const int32 OutputMaterialIndex = WholeMaterials.IndexOfByPredicate(
+				[&OutputStableKey](const FWholeObjectMaterial& Existing)
+				{
+					return Existing.StableKey == OutputStableKey;
+				});
+			if (OutputMaterialIndex == INDEX_NONE)
+			{
+				continue;
+			}
+			MatterFlux::WholeObject::FLayer& OutputLayer =
+				WholeLayers.AddDefaulted_GetRef();
+			OutputLayer.MaterialIndex = OutputMaterialIndex;
+			// 残留物继承原 source 的空间优先级，但不继承碰撞；这样叶片
+			// 灰烬仍会遮住同格木材，而燃烧不会凭空制造新的阻挡体。
+			OutputLayer.Priority = SourceLayerPriority;
+			OutputLayer.bEnableCollision = false;
+			OutputLayer.Width = TreeSource->Mask.Width;
+			OutputLayer.Height = TreeSource->Mask.Height;
+			OutputLayer.CellSize = TreeSource->Mask.CellSize;
+			OutputLayer.LocalTransform = SourceLayerTransform;
+			OutputLayer.SolidMask = Output->Mask;
 		}
 		WholeLayers.RemoveAll(
 			[](const MatterFlux::WholeObject::FLayer& Layer)
 			{
 				return !Layer.SolidMask.Contains(1);
 			});
+		if (WholeLayers.IsEmpty())
+		{
+			for (const MatterFlux::PlayableLevel::FLevelFragmentSource* TreeSource
+				: TreeSources)
+			{
+				if (TreeSource)
+				{
+					VolumeRenderedTreeSourceIds.Add(TreeSource->SourceId);
+				}
+			}
+			continue;
+		}
 		MatterFlux::WholeObject::FBuildResult WholeMesh;
 		FString WholeObjectError;
-		if (!WholeLayers.IsEmpty()
-			&& MatterFlux::WholeObject::BuildMesh(
+		if (MatterFlux::WholeObject::BuildMesh(
 				WholeLayers,
 				WholeMesh,
 				&WholeObjectError))
@@ -739,7 +994,8 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 					CellSize,
 					bSide,
 					Section.bEnableCollision,
-					bGhostAggregate);
+					bGhostAggregate,
+					GhostSourceId);
 				FProxyMeshGroup& Group = Groups.FindOrAdd(Key);
 				Group.MaterialId = Material.MaterialId;
 				Group.Color = Material.Color;
@@ -747,6 +1003,7 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 				Group.bSide = bSide;
 				Group.bCollision = Section.bEnableCollision;
 				Group.bGhost = bGhostAggregate;
+				Group.GhostSourceId = GhostSourceId;
 				AppendMeshPart(
 					Group,
 					AggregateFrame,
@@ -959,7 +1216,8 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 					CellSize,
 					bSide,
 					Material.bCollision,
-					bGhostAggregate);
+					bGhostAggregate,
+					GhostSourceId);
 				FProxyMeshGroup& Group = Groups.FindOrAdd(Key);
 				Group.MaterialId = Material.MaterialId;
 				Group.Color = Material.Color;
@@ -967,6 +1225,7 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 				Group.bSide = bSide;
 				Group.bCollision = Material.bCollision;
 				Group.bGhost = bGhostAggregate;
+				Group.GhostSourceId = GhostSourceId;
 				AppendMeshPart(
 					Group,
 					FTransform(Anchor),
@@ -1012,20 +1271,25 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 		{
 				for (const bool bSide : { false, true })
 				{
+					const bool bGhost =
+						GhostedSourceIds.Contains(Source.SourceId);
 					const FString Key = MakeGroupKey(
 						MaterialId,
 						Color,
 						Source.Mask.CellSize,
 						bSide,
 						bCollision,
-						GhostedSourceIds.Contains(Source.SourceId));
+						bGhost,
+						Source.SourceId);
 					FProxyMeshGroup& Group = Groups.FindOrAdd(Key);
 					Group.MaterialId = MaterialId;
 					Group.Color = Color;
 					Group.CellSize = Source.Mask.CellSize;
 					Group.bSide = bSide;
 					Group.bCollision = bCollision;
-					Group.bGhost = GhostedSourceIds.Contains(Source.SourceId);
+					Group.bGhost = bGhost;
+					Group.GhostSourceId = bGhost
+						? Source.SourceId : FGuid();
 					AppendMeshPart(
 						Group,
 						Source.Transform,
@@ -1051,20 +1315,36 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 					Source.bEnableCollision);
 			}
 		}
-		if (const FSourceResidueState* Residue =
-			SourceResidues.Find(Source.SourceId))
+		// A successfully compiled aggregate already contains both the source
+		// material and any reaction-output layers. Gate both fallback paths on
+		// the same success marker so residue can never be appended as a second
+		// coplanar projection.
+		if (!VolumeRenderedTreeSourceIds.Contains(Source.SourceId))
 		{
-			if (const FCachedSourceMesh* Cached =
-				FindOrBuildResidueMesh(Source, *Residue))
+			if (const FSourceOutputState* Output =
+				SourceOutputs.Find(Source.SourceId))
 			{
-				AppendSource(
-					*Cached,
-					Residue->MaterialId,
-					Residue->Color,
-					false);
+				if (const FCachedSourceMesh* Cached =
+					FindOrBuildOutputMesh(Source, *Output))
+				{
+					AppendSource(
+						*Cached,
+						Output->MaterialId,
+						Output->Color,
+						false);
+					StandaloneTreeOutputProjectionCount +=
+						(Source.Name == TEXT("TreeTrunk")
+							|| Source.Name == TEXT("TreeBranch")
+							|| Source.Name == TEXT("TreeLeaves"))
+						? 1
+						: 0;
+				}
 			}
 		}
 	}
+	StandaloneTreeOutputProjectionCounts.Add(
+		Chunk,
+		StandaloneTreeOutputProjectionCount);
 	if (Groups.IsEmpty())
 	{
 		if (UProceduralMeshComponent* Existing = ChunkMeshes.FindRef(Chunk))
@@ -1129,7 +1409,8 @@ void UMatterFluxFragmentSourceProxyComponent::RebuildChunk(
 		Mesh->SetMaterial(
 			SectionIndex,
 			Group.bGhost
-				? FindOrCreateGhostMaterial(Group.Color, Group.CellSize)
+				? FindOrCreateGhostMaterial(
+					Group.GhostSourceId, Group.Color, Group.CellSize)
 				: FindOrCreateMaterial(
 					Group.MaterialId,
 					Group.Color,
@@ -1224,18 +1505,18 @@ const UMatterFluxFragmentSourceProxyComponent::FCachedSourceMesh*
 }
 
 const UMatterFluxFragmentSourceProxyComponent::FCachedSourceMesh*
-	UMatterFluxFragmentSourceProxyComponent::FindOrBuildResidueMesh(
+	UMatterFluxFragmentSourceProxyComponent::FindOrBuildOutputMesh(
 		const MatterFlux::PlayableLevel::FLevelFragmentSource& Source,
-		const FSourceResidueState& Residue)
+		const FSourceOutputState& Output)
 {
 	if (const FCachedSourceMesh* Existing =
-		CachedResidueMeshes.Find(Source.SourceId))
+		CachedOutputMeshes.Find(Source.SourceId))
 	{
 		return Existing;
 	}
 	MatterFlux::FragmentGeometry::FFragmentGeometry2D Geometry;
 	if (!MatterFlux::FragmentGeometry::BuildFragmentGeometryFromMask(
-		Residue.Mask,
+		Output.Mask,
 		Source.Mask.Width,
 		Source.Mask.Height,
 		Source.Mask.CellSize,
@@ -1247,7 +1528,7 @@ const UMatterFluxFragmentSourceProxyComponent::FCachedSourceMesh*
 	const bool bBuilt = Source.Mask.GeometryStyle
 		== EFragmentSourceGeometryStyle::RadialColumn
 		? MatterFlux::FragmentGeometry::BuildRadialColumnMeshFromMask(
-			Residue.Mask,
+			Output.Mask,
 			Source.Mask.Width,
 			Source.Mask.Height,
 			Source.Mask.CellSize,
@@ -1258,7 +1539,7 @@ const UMatterFluxFragmentSourceProxyComponent::FCachedSourceMesh*
 			Mesh.FaceIndexCount)
 		: Source.Mask.GeometryStyle == EFragmentSourceGeometryStyle::VoxelBlocks
 		? MatterFlux::FragmentGeometry::BuildVoxelBlockMeshFromMask(
-			Residue.Mask,
+			Output.Mask,
 			Source.Mask.Width,
 			Source.Mask.Height,
 			Source.Mask.CellSize,
@@ -1291,7 +1572,7 @@ const UMatterFluxFragmentSourceProxyComponent::FCachedSourceMesh*
 	{
 		return nullptr;
 	}
-	return &CachedResidueMeshes.Add(Source.SourceId, MoveTemp(Mesh));
+	return &CachedOutputMeshes.Add(Source.SourceId, MoveTemp(Mesh));
 }
 
 void UMatterFluxFragmentSourceProxyComponent::DestroyChunk(
@@ -1311,6 +1592,34 @@ void UMatterFluxFragmentSourceProxyComponent::DestroyChunk(
 	}
 	ChunkMeshes.Remove(Chunk);
 	CollisionChunks.Remove(Chunk);
+}
+
+void UMatterFluxFragmentSourceProxyComponent::RemoveSourceChunk(
+	const FIntPoint Chunk)
+{
+	if (const TArray<MatterFlux::PlayableLevel::FLevelFragmentSource>* Sources =
+		SourceChunks.Find(Chunk))
+	{
+		for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
+			: *Sources)
+		{
+			SourceLocatorById.Remove(Source.SourceId);
+			MaterializedSourceIds.Remove(Source.SourceId);
+			TargetGhostedSourceIds.Remove(Source.SourceId);
+			GhostedSourceIds.Remove(Source.SourceId);
+			GhostOpacityBySourceId.Remove(Source.SourceId);
+			ReactingSourceIds.Remove(Source.SourceId);
+			CachedSourceMeshes.Remove(Source.SourceId);
+			SourceOutputs.Remove(Source.SourceId);
+			CachedOutputMeshes.Remove(Source.SourceId);
+			RemoveGhostMaterials(Source.SourceId);
+		}
+	}
+	SourceChunks.Remove(Chunk);
+	DirtyChunks.Remove(Chunk);
+	DeferredReactionChunks.Remove(Chunk);
+	DestroyChunk(Chunk);
+	SetComponentTickEnabled(!GhostedSourceIds.IsEmpty());
 }
 
 UMaterialInstanceDynamic*
@@ -1358,6 +1667,7 @@ UMaterialInstanceDynamic*
 
 UMaterialInstanceDynamic*
 	UMatterFluxFragmentSourceProxyComponent::FindOrCreateGhostMaterial(
+		const FGuid& GhostSourceId,
 		const FLinearColor& Color,
 		const float CellSize)
 {
@@ -1366,23 +1676,60 @@ UMaterialInstanceDynamic*
 		return nullptr;
 	}
 	const FName Key(*FString::Printf(
-		TEXT("%08x_%08x"),
+		TEXT("%s_%08x_%08x"),
+		*GhostSourceId.ToString(EGuidFormats::Digits),
 		Color.ToFColor(false).DWColor(),
 		GetTypeHash(CellSize)));
 	if (UMaterialInstanceDynamic* Existing = GhostMaterials.FindRef(Key))
 	{
+		Existing->SetScalarParameterValue(
+			TEXT("Opacity"),
+			GhostOpacityBySourceId.FindRef(GhostSourceId));
 		return Existing;
 	}
 	UMaterialInstanceDynamic* Material = UMaterialInstanceDynamic::Create(
 		GhostMaterialTemplate, this);
 	Material->SetVectorParameterValue(
 		TEXT("Color"), FLinearColor(Color.R, Color.G, Color.B, 1.0f));
-	Material->SetScalarParameterValue(TEXT("Opacity"), 0.075f);
+	Material->SetScalarParameterValue(
+		TEXT("Opacity"),
+		GhostOpacityBySourceId.FindRef(GhostSourceId));
 	Material->SetScalarParameterValue(TEXT("FaceContrast"), 0.68f);
 	Material->SetScalarParameterValue(
 		TEXT("PixelSize"), FMath::Max(CellSize, 10.0f));
 	Material->SetScalarParameterValue(TEXT("Roughness"), 0.82f);
 	Material->SetScalarParameterValue(TEXT("ShadowLift"), 0.32f);
 	GhostMaterials.Add(Key, Material);
+	GhostMaterialSourceIds.Add(Key, GhostSourceId);
 	return Material;
+}
+
+void UMatterFluxFragmentSourceProxyComponent::UpdateGhostMaterialOpacity(
+	const FGuid& SourceId,
+	const float Opacity)
+{
+	for (const TPair<FName, FGuid>& Pair : GhostMaterialSourceIds)
+	{
+		if (Pair.Value == SourceId)
+		{
+			if (UMaterialInstanceDynamic* Material =
+				GhostMaterials.FindRef(Pair.Key))
+			{
+				Material->SetScalarParameterValue(TEXT("Opacity"), Opacity);
+			}
+		}
+	}
+}
+
+void UMatterFluxFragmentSourceProxyComponent::RemoveGhostMaterials(
+	const FGuid& SourceId)
+{
+	for (auto It = GhostMaterialSourceIds.CreateIterator(); It; ++It)
+	{
+		if (It.Value() == SourceId)
+		{
+			GhostMaterials.Remove(It.Key());
+			It.RemoveCurrent();
+		}
+	}
 }

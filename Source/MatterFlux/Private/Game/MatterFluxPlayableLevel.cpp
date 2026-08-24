@@ -11,6 +11,11 @@ namespace MatterFlux::PlayableLevel
 			-(static_cast<float>(TerrainCellsY) - 1.0f) * TerrainCellSize * 0.5f;
 		constexpr float DecorationFacingYaw = 45.0f;
 		constexpr float GroundAttachmentEmbedFraction = 0.5f;
+		constexpr int32 StreamWaterHalfWidthCells = 6;
+		constexpr int32 StreamBankHalfWidthCells = 15;
+		constexpr float StreamCenterDepth = 64.0f;
+		constexpr float StreamEdgeDepth = 24.0f;
+		constexpr float StreamSurfaceInset = 8.0f;
 
 		FVector2D MakeTerrainNoiseOffset(const int32 Seed)
 		{
@@ -175,12 +180,245 @@ namespace MatterFlux::PlayableLevel
 			FVector2D NoiseOffset = FVector2D::ZeroVector;
 			TArray<float> SurfaceHeights;
 			TArray<int32> StreamColumns;
+			TArray<float> StreamSurfaceHeights;
 			FVector2D LakeCenter = FVector2D::ZeroVector;
 			FVector2D LakeRadius = FVector2D(360.0f, 260.0f);
 			float LakeSurfaceZ = 100.0f;
 			FVector2D HouseCenter = FVector2D::ZeroVector;
 			TMap<FName, int32> SourceOrdinals;
 		};
+
+		float SmoothStep01(const float Value)
+		{
+			const float Clamped = FMath::Clamp(Value, 0.0f, 1.0f);
+			return Clamped * Clamped * (3.0f - 2.0f * Clamped);
+		}
+
+		constexpr int64 InfiniteRiverSpacingCells = 16 * 32;
+		constexpr int32 InfiniteRiverMeanderCells = 32;
+
+		int64 InfiniteRiverCenterCellX(
+			const int32 Seed,
+			const int64 WorldCellX,
+			const int64 WorldCellY)
+		{
+			const int64 RiverIndex = FMath::RoundToInt64(
+				static_cast<double>(WorldCellX)
+					/ static_cast<double>(InfiniteRiverSpacingCells));
+			const FVector2D NoiseOffset = MakeTerrainNoiseOffset(Seed);
+			const float Meander = FMath::PerlinNoise2D(FVector2D(
+				NoiseOffset.X + static_cast<float>(RiverIndex) * 0.731f,
+				NoiseOffset.Y + static_cast<double>(WorldCellY) * 0.0065));
+			return RiverIndex * InfiniteRiverSpacingCells
+				+ FMath::RoundToInt64(
+					Meander * InfiniteRiverMeanderCells);
+		}
+
+		void SelectLakeLowland(
+			FGenerationContext& Context,
+			FRandomStream& Random)
+		{
+			Context.LakeRadius = FVector2D(
+				Random.FRandRange(350.0f, 410.0f),
+				Random.FRandRange(250.0f, 300.0f));
+			const int32 MarginX = FMath::CeilToInt(
+				Context.LakeRadius.X / TerrainCellSize) + 3;
+			const int32 MarginY = FMath::CeilToInt(
+				Context.LakeRadius.Y / TerrainCellSize) + 3;
+			constexpr int32 CandidateRowStep = 12;
+			constexpr int32 CandidateColumnStep = 6;
+			constexpr int32 BasinSampleRadius = 12;
+			constexpr int32 BasinSampleStep = 6;
+			const int32 CorridorHalfWidth = FMath::Max(
+				1,
+				FMath::FloorToInt(
+					Context.LakeRadius.X * 0.35f / TerrainCellSize));
+			float BestScore = TNumericLimits<float>::Max();
+			FIntPoint BestCell(TerrainCellsX / 2, TerrainCellsY / 2);
+			for (int32 Y = MarginY;
+				Y < TerrainCellsY - MarginY;
+				Y += CandidateRowStep)
+			{
+				const int32 StreamColumn = Context.StreamColumns[Y];
+				for (int32 Offset = -CorridorHalfWidth;
+					Offset <= CorridorHalfWidth;
+					Offset += CandidateColumnStep)
+				{
+					const int32 X = FMath::Clamp(
+						StreamColumn + Offset,
+						MarginX,
+						TerrainCellsX - MarginX - 1);
+					float HeightSum = 0.0f;
+					int32 SampleCount = 0;
+					for (int32 SampleY = -BasinSampleRadius;
+						SampleY <= BasinSampleRadius;
+						SampleY += BasinSampleStep)
+					{
+						for (int32 SampleX = -BasinSampleRadius;
+							SampleX <= BasinSampleRadius;
+							SampleX += BasinSampleStep)
+						{
+							HeightSum += Context.SurfaceAtCell(
+								X + SampleX,
+								Y + SampleY);
+							++SampleCount;
+						}
+					}
+					const float MeanHeight = HeightSum
+						/ static_cast<float>(SampleCount);
+					const float CenterHeight = Context.SurfaceAtCell(X, Y);
+					const float LocalRelief = MeanHeight - CenterHeight;
+					const float Score = CenterHeight * 0.62f
+						+ MeanHeight * 0.38f
+						- FMath::Max(LocalRelief, 0.0f) * 0.20f
+						+ Random.FRandRange(0.0f, 0.01f);
+					if (Score < BestScore)
+					{
+						BestScore = Score;
+						BestCell = FIntPoint(X, Y);
+					}
+				}
+			}
+			Context.LakeCenter = FVector2D(
+				TerrainOriginX + BestCell.X * TerrainCellSize,
+				TerrainOriginY + BestCell.Y * TerrainCellSize);
+		}
+
+		void ResolveLakeSurface(FGenerationContext& Context)
+		{
+			float MinimumRimHeight = TNumericLimits<float>::Max();
+			for (int32 Y = 0; Y < TerrainCellsY; ++Y)
+			{
+				for (int32 X = 0; X < TerrainCellsX; ++X)
+				{
+					const float WorldX = TerrainOriginX + X * TerrainCellSize;
+					const float WorldY = TerrainOriginY + Y * TerrainCellSize;
+					const float NX = (WorldX - Context.LakeCenter.X)
+						/ Context.LakeRadius.X;
+					const float NY = (WorldY - Context.LakeCenter.Y)
+						/ Context.LakeRadius.Y;
+					const float Radius = FMath::Sqrt(NX * NX + NY * NY);
+					if (Radius >= 0.92f && Radius <= 1.08f)
+					{
+						MinimumRimHeight = FMath::Min(
+							MinimumRimHeight,
+							Context.SurfaceAtCell(X, Y));
+					}
+				}
+			}
+			Context.LakeSurfaceZ = FMath::GridSnap(
+				MinimumRimHeight - TerrainCellSize,
+				TerrainCellSize);
+		}
+
+		void CarveStreamChannel(FGenerationContext& Context)
+		{
+			Context.StreamSurfaceHeights.SetNumUninitialized(TerrainCellsY);
+			for (int32 Y = 0; Y < TerrainCellsY; ++Y)
+			{
+				const int32 CenterColumn = Context.StreamColumns[Y];
+				float MinimumWaterbedSource = TNumericLimits<float>::Max();
+				for (int32 Offset = -StreamWaterHalfWidthCells;
+					Offset <= StreamWaterHalfWidthCells;
+					++Offset)
+				{
+					MinimumWaterbedSource = FMath::Min(
+						MinimumWaterbedSource,
+						Context.SurfaceAtCell(CenterColumn + Offset, Y));
+				}
+				const float SurfaceZ = FMath::GridSnap(
+					MinimumWaterbedSource - StreamSurfaceInset,
+					TerrainCellSize);
+				Context.StreamSurfaceHeights[Y] = SurfaceZ;
+				const float EdgeBedZ = SurfaceZ - StreamEdgeDepth;
+				for (int32 Offset = -StreamBankHalfWidthCells;
+					Offset <= StreamBankHalfWidthCells;
+					++Offset)
+				{
+					const int32 X = CenterColumn + Offset;
+					const int32 Index = Y * TerrainCellsX + X;
+					const float OriginalHeight = Context.SurfaceHeights[Index];
+					const int32 Distance = FMath::Abs(Offset);
+					float TargetHeight = OriginalHeight;
+					if (Distance <= StreamWaterHalfWidthCells)
+					{
+						const float WaterAlpha = SmoothStep01(
+							static_cast<float>(Distance)
+								/ StreamWaterHalfWidthCells);
+						const float Depth = FMath::Lerp(
+							StreamCenterDepth,
+							StreamEdgeDepth,
+							WaterAlpha);
+						TargetHeight = SurfaceZ - Depth;
+					}
+					else
+					{
+						const float BankAlpha = SmoothStep01(
+							static_cast<float>(
+								Distance - StreamWaterHalfWidthCells)
+								/ static_cast<float>(
+									StreamBankHalfWidthCells
+										- StreamWaterHalfWidthCells));
+						TargetHeight = FMath::Lerp(
+							EdgeBedZ,
+							OriginalHeight,
+							BankAlpha);
+					}
+					Context.SurfaceHeights[Index] = FMath::GridSnap(
+						FMath::Min(OriginalHeight, TargetHeight),
+						TerrainCellSize);
+				}
+			}
+		}
+
+		void CarveLakeBasin(FGenerationContext& Context)
+		{
+			for (int32 Y = 0; Y < TerrainCellsY; ++Y)
+			{
+				for (int32 X = 0; X < TerrainCellsX; ++X)
+				{
+					const float WorldX = TerrainOriginX + X * TerrainCellSize;
+					const float WorldY = TerrainOriginY + Y * TerrainCellSize;
+					const float NX = (WorldX - Context.LakeCenter.X)
+						/ Context.LakeRadius.X;
+					const float NY = (WorldY - Context.LakeCenter.Y)
+						/ Context.LakeRadius.Y;
+					const float Radius = FMath::Sqrt(NX * NX + NY * NY);
+					if (Radius >= 1.0f)
+					{
+						continue;
+					}
+					const float SmoothInterior = SmoothStep01(
+						(1.0f - Radius) / 0.72f);
+					const float TargetDepth = FMath::Lerp(
+						16.0f,
+						128.0f,
+						SmoothInterior);
+					const float TargetBed = Context.LakeSurfaceZ - TargetDepth;
+					const int32 Index = Y * TerrainCellsX + X;
+					const float BlendWeight = SmoothStep01(
+						(1.0f - Radius) / 0.82f);
+					float CarvedHeight = FMath::GridSnap(
+						FMath::Lerp(
+							Context.SurfaceHeights[Index],
+							FMath::Min(
+								Context.SurfaceHeights[Index],
+								TargetBed),
+							BlendWeight),
+						TerrainCellSize);
+					// The selected Perlin basin may contain small high-frequency
+					// islands. Preserve an irregular outer shoreline, but keep the
+					// physical inner basin connected and at least two cells deep.
+					if (Radius <= 0.95f)
+					{
+						CarvedHeight = FMath::Min(
+							CarvedHeight,
+							Context.LakeSurfaceZ - TerrainCellSize * 2.0f);
+					}
+					Context.SurfaceHeights[Index] = CarvedHeight;
+				}
+			}
+		}
 
 		struct FSurfaceScatterRule
 		{
@@ -524,91 +762,44 @@ namespace MatterFlux::PlayableLevel
 					FMath::RoundToInt(
 						static_cast<float>(TerrainCellsX) * 0.5f
 							+ StreamNoise * static_cast<float>(TerrainCellsX) * 0.24f),
-					3,
-					TerrainCellsX - 3);
-				const int32 Column = Y == 0
-					? DesiredColumn
-					: FMath::Clamp(DesiredColumn, PreviousColumn - 1, PreviousColumn + 1);
+					StreamBankHalfWidthCells + 1,
+					TerrainCellsX - StreamBankHalfWidthCells - 2);
+				const int32 SearchMinimum = FMath::Clamp(
+					Y == 0 ? DesiredColumn - 24 : PreviousColumn - 1,
+					StreamBankHalfWidthCells + 1,
+					TerrainCellsX - StreamBankHalfWidthCells - 2);
+				const int32 SearchMaximum = FMath::Clamp(
+					Y == 0 ? DesiredColumn + 24 : PreviousColumn + 1,
+					StreamBankHalfWidthCells + 1,
+					TerrainCellsX - StreamBankHalfWidthCells - 2);
+				int32 Column = SearchMinimum;
+				float BestLowlandScore = TNumericLimits<float>::Max();
+				for (int32 Candidate = SearchMinimum;
+					Candidate <= SearchMaximum;
+					++Candidate)
+				{
+					const float MeanderPenalty = FMath::Abs(
+						static_cast<float>(Candidate - DesiredColumn)) * 0.75f;
+					const float LowlandScore = Context.SurfaceAtCell(Candidate, Y)
+						+ MeanderPenalty;
+					if (LowlandScore < BestLowlandScore)
+					{
+						BestLowlandScore = LowlandScore;
+						Column = Candidate;
+					}
+				}
 				Context.StreamColumns.Add(Column);
 				PreviousColumn = Column;
 			}
 
-			// 固定候选区附近生成一个 seed 可重复的大湖。先从原始柏林
-			// 地形取得岸线最低点，再用连续权重压出碗形湖床；边缘权重为
-			// 0，因此不会产生一圈突然断开的悬崖。
+			// 水体位置来自同一份 seed 柏林地形。候选点限制在溪流走廊，
+			// 再按中心高度、邻域均高和局部凹陷度选出最低盆地；因此同 seed
+			// 完全可复现，换 seed 才会改变湖泊和河流的空间关系。
 			FRandomStream LakeRandom = Context.MakeRuleStream(0x4c414b45u);
-			Context.LakeCenter = FVector2D(
-				-120.0f + LakeRandom.FRandRange(-90.0f, 90.0f),
-				140.0f + LakeRandom.FRandRange(-70.0f, 70.0f));
-			Context.LakeRadius = FVector2D(
-				LakeRandom.FRandRange(350.0f, 410.0f),
-				LakeRandom.FRandRange(250.0f, 300.0f));
-			float MinimumRimHeight = TNumericLimits<float>::Max();
-			for (int32 Y = 0; Y < TerrainCellsY; ++Y)
-			{
-				for (int32 X = 0; X < TerrainCellsX; ++X)
-				{
-					const float WorldX = TerrainOriginX
-						+ static_cast<float>(X) * TerrainCellSize;
-					const float WorldY = TerrainOriginY
-						+ static_cast<float>(Y) * TerrainCellSize;
-					const float NX = (WorldX - Context.LakeCenter.X)
-						/ Context.LakeRadius.X;
-					const float NY = (WorldY - Context.LakeCenter.Y)
-						/ Context.LakeRadius.Y;
-					const float Radius = FMath::Sqrt(NX * NX + NY * NY);
-					if (Radius >= 0.92f && Radius <= 1.08f)
-					{
-						MinimumRimHeight = FMath::Min(
-							MinimumRimHeight,
-							Context.SurfaceAtCell(X, Y));
-					}
-				}
-			}
-			Context.LakeSurfaceZ = FMath::GridSnap(
-				MinimumRimHeight - TerrainCellSize,
-				TerrainCellSize);
-			for (int32 Y = 0; Y < TerrainCellsY; ++Y)
-			{
-				for (int32 X = 0; X < TerrainCellsX; ++X)
-				{
-					const float WorldX = TerrainOriginX
-						+ static_cast<float>(X) * TerrainCellSize;
-					const float WorldY = TerrainOriginY
-						+ static_cast<float>(Y) * TerrainCellSize;
-					const float NX = (WorldX - Context.LakeCenter.X)
-						/ Context.LakeRadius.X;
-					const float NY = (WorldY - Context.LakeCenter.Y)
-						/ Context.LakeRadius.Y;
-					const float Radius = FMath::Sqrt(NX * NX + NY * NY);
-					if (Radius >= 1.0f)
-					{
-						continue;
-					}
-					const float Interior = FMath::Clamp(
-						(1.0f - Radius) / 0.72f,
-						0.0f,
-						1.0f);
-					const float SmoothInterior = Interior * Interior
-						* (3.0f - 2.0f * Interior);
-					const float TargetDepth = FMath::Lerp(
-						8.0f,
-						128.0f,
-						SmoothInterior);
-					const float TargetBed = Context.LakeSurfaceZ - TargetDepth;
-					const int32 Index = Y * TerrainCellsX + X;
-					const float BlendWeight = FMath::Clamp(
-						(1.0f - Radius) / 0.82f,
-						0.0f,
-						1.0f);
-					Context.SurfaceHeights[Index] = FMath::GridSnap(
-						FMath::Lerp(
-							Context.SurfaceHeights[Index],
-							FMath::Min(Context.SurfaceHeights[Index], TargetBed),
-							BlendWeight),
-						TerrainCellSize);
-				}
-			}
+			SelectLakeLowland(Context, LakeRandom);
+			ResolveLakeSurface(Context);
+			CarveStreamChannel(Context);
+			CarveLakeBasin(Context);
 			Layout.Terrain.Heights = Context.SurfaceHeights;
 			for (int32 Index = 0; Index < Context.SurfaceHeights.Num(); ++Index)
 			{
@@ -616,33 +807,50 @@ namespace MatterFlux::PlayableLevel
 					SelectTerrainColorBand(Context.SurfaceHeights[Index]);
 			}
 
-			// Backdrop 最初按未雕刻地形放置。湖床降低后再收紧与湖相交
-			// 的粗块上表面，保证远景代理永远在真实流式地形之下。
+			// Backdrop 最初按未雕刻地形放置。河床和湖床降低后重新扫描
+			// 每个粗块覆盖区，保证远景代理永远在真实流式地形之下。
 			for (FTransform& Instance : Backdrop.Instances)
 			{
 				const FVector Scale = Instance.GetScale3D();
 				const FVector Location = Instance.GetLocation();
 				const float HalfX = Scale.X * 50.0f;
 				const float HalfY = Scale.Y * 50.0f;
-				if (FMath::Abs(Location.X - Context.LakeCenter.X)
-						> HalfX + Context.LakeRadius.X
-					|| FMath::Abs(Location.Y - Context.LakeCenter.Y)
-						> HalfY + Context.LakeRadius.Y)
-				{
-					continue;
-				}
-				const int32 MinX = Context.ToCellX(Location.X - HalfX);
-				const int32 MaxX = Context.ToCellX(Location.X + HalfX);
-				const int32 MinY = Context.ToCellY(Location.Y - HalfY);
-				const int32 MaxY = Context.ToCellY(Location.Y + HalfY);
+				const int64 FirstWorldCellX = FMath::FloorToInt64(
+					static_cast<double>(Layout.Terrain.FirstCellCenter.X)
+						/ Layout.Terrain.CellSize);
+				const int64 FirstWorldCellY = FMath::FloorToInt64(
+					static_cast<double>(Layout.Terrain.FirstCellCenter.Y)
+						/ Layout.Terrain.CellSize);
+				const int64 MinX = FirstWorldCellX + FMath::FloorToInt64(
+					(Location.X - HalfX
+						- Layout.Terrain.FirstCellCenter.X)
+						/ Layout.Terrain.CellSize);
+				const int64 MaxX = FirstWorldCellX + FMath::CeilToInt64(
+					(Location.X + HalfX
+						- Layout.Terrain.FirstCellCenter.X)
+						/ Layout.Terrain.CellSize);
+				const int64 MinY = FirstWorldCellY + FMath::FloorToInt64(
+					(Location.Y - HalfY
+						- Layout.Terrain.FirstCellCenter.Y)
+						/ Layout.Terrain.CellSize);
+				const int64 MaxY = FirstWorldCellY + FMath::CeilToInt64(
+					(Location.Y + HalfY
+						- Layout.Terrain.FirstCellCenter.Y)
+						/ Layout.Terrain.CellSize);
 				float MinimumHeight = TNumericLimits<float>::Max();
-				for (int32 CellY = MinY; CellY <= MaxY; ++CellY)
+				for (int64 CellY = MinY; CellY <= MaxY; ++CellY)
 				{
-					for (int32 CellX = MinX; CellX <= MaxX; ++CellX)
+					for (int64 CellX = MinX; CellX <= MaxX; ++CellX)
 					{
-						MinimumHeight = FMath::Min(
-							MinimumHeight,
-							Context.SurfaceAtCell(CellX, CellY));
+						float Height = 0.0f;
+						uint8 ColorBand = 0;
+						if (Layout.Terrain.TrySampleWorldCell(
+							CellX, CellY, Height, ColorBand))
+						{
+							MinimumHeight = FMath::Min(
+								MinimumHeight,
+								Height);
+						}
 					}
 				}
 				const float CurrentTop = Location.Z + Scale.Z * 50.0f;
@@ -692,12 +900,16 @@ namespace MatterFlux::PlayableLevel
 				false,
 				ELevelLayerRenderMode::Liquid);
 			Stream.MaterialId = TEXT("water");
-			Stream.Instances.Reserve(TerrainCellsY * 6);
+			Stream.Instances.Reserve(
+				TerrainCellsY * (StreamWaterHalfWidthCells * 2 + 1));
 			for (int32 Y = 0; Y < TerrainCellsY; ++Y)
 			{
 				const float WorldY = TerrainOriginY + static_cast<float>(Y) * TerrainCellSize;
 				const int32 CenterColumn = Context.StreamColumns[Y];
-				for (int32 Offset = -2; Offset <= 1; ++Offset)
+				constexpr float SurfaceThickness = 8.0f;
+				for (int32 Offset = -StreamWaterHalfWidthCells;
+					Offset <= StreamWaterHalfWidthCells;
+					++Offset)
 				{
 					const int32 X = CenterColumn + Offset;
 					const float WorldX = TerrainOriginX + static_cast<float>(X) * TerrainCellSize;
@@ -706,11 +918,12 @@ namespace MatterFlux::PlayableLevel
 						FVector(
 							WorldX,
 							WorldY,
-							Context.SurfaceAtCell(X, Y) + 5.0f),
+							Context.StreamSurfaceHeights[Y]
+								- SurfaceThickness * 0.5f),
 						FVector(
 							TerrainCellSize * 1.004f / 100.0f,
 							TerrainCellSize * 1.004f / 100.0f,
-							0.07f));
+							SurfaceThickness / 100.0f));
 				}
 			}
 		}
@@ -738,7 +951,8 @@ namespace MatterFlux::PlayableLevel
 						+ static_cast<float>(Y) * TerrainCellSize;
 					if (!Context.IsInsideLake(WorldX, WorldY)
 						|| Context.LakeSurfaceZ
-							- Context.SurfaceAtCell(X, Y) < 4.0f)
+							- Context.SurfaceAtCell(X, Y)
+								< TerrainCellSize * 2.0f)
 					{
 						continue;
 					}
@@ -816,18 +1030,32 @@ namespace MatterFlux::PlayableLevel
 				Context,
 				TEXT("forest.rock"),
 				TEXT("rock"));
-			const FLinearColor RockColor = ResolveMaterialColor(
+			const FLinearColor BaseRockColor = ResolveMaterialColor(
 				Context,
 				Definition ? Definition->MaterialId : FName(TEXT("stone")),
 				FLinearColor(0.30f, 0.34f, 0.40f));
+			static const FLinearColor RockPaletteTints[] = {
+				FLinearColor(0.86f, 0.94f, 1.10f, 1.0f),
+				FLinearColor(0.96f, 1.00f, 1.04f, 1.0f),
+				FLinearColor(1.08f, 0.98f, 0.84f, 1.0f),
+				FLinearColor(1.12f, 1.08f, 1.02f, 1.0f)
+			};
 			FRandomStream Random = Context.MakeRuleStream(0x524f434bu);
 			const int32 Count = ResolveDecoratorCount(
 				Context,
 				Definition,
-				22,
+				12,
 				0x524f434bu);
 			for (int32 Index = 0; Index < Count; ++Index)
 			{
+				const FLinearColor& Tint = RockPaletteTints[
+					(Index + static_cast<uint32>(Context.Seed))
+						% UE_ARRAY_COUNT(RockPaletteTints)];
+				const FLinearColor RockColor(
+					BaseRockColor.R * Tint.R,
+					BaseRockColor.G * Tint.G,
+					BaseRockColor.B * Tint.B,
+					BaseRockColor.A);
 				FVector Location = FVector::ZeroVector;
 				if (!FindScatterLocation(
 					Context,
@@ -841,8 +1069,8 @@ namespace MatterFlux::PlayableLevel
 				constexpr float CellSize = 10.0f;
 				const FVector GroundedLocation =
 					EmbedGroundAttachment(Location, CellSize);
-				const int32 RockWidth = Random.RandRange(6, 10);
-				const int32 RockHeight = Random.RandRange(4, 7);
+				const int32 RockWidth = Random.RandRange(6, 12);
+				const int32 RockHeight = Random.RandRange(4, 9);
 				FFragmentSourceMask RockMask =
 					MakeEmptyMask(RockWidth + 2, RockHeight + 1, CellSize, 2);
 				const float Radius = static_cast<float>(RockWidth) * 0.5f;
@@ -1392,6 +1620,100 @@ namespace MatterFlux::PlayableLevel
 		};
 	}
 
+	bool FLevelTerrain::ContainsCachedWorldCell(
+		const int64 WorldCellX,
+		const int64 WorldCellY) const
+	{
+		if (!IsValid())
+		{
+			return false;
+		}
+		const int64 FirstWorldCellX = FMath::FloorToInt64(
+			static_cast<double>(FirstCellCenter.X) / CellSize);
+		const int64 FirstWorldCellY = FMath::FloorToInt64(
+			static_cast<double>(FirstCellCenter.Y) / CellSize);
+		const int64 LocalX = WorldCellX - FirstWorldCellX;
+		const int64 LocalY = WorldCellY - FirstWorldCellY;
+		return LocalX >= 0 && LocalX < Width
+			&& LocalY >= 0 && LocalY < Height;
+	}
+
+	bool FLevelTerrain::TrySampleInfiniteRiverCell(
+		const int64 WorldCellX,
+		const int64 WorldCellY,
+		float& OutCarvedHeight,
+		float& OutWaterSurface,
+		bool& bOutContainsWater) const
+	{
+		bOutContainsWater = false;
+		if (!IsValid() || !bInfinite || Seed == 0
+			|| ContainsCachedWorldCell(WorldCellX, WorldCellY))
+		{
+			return false;
+		}
+		const int64 FirstWorldCellX = FMath::FloorToInt64(
+			static_cast<double>(FirstCellCenter.X) / CellSize);
+		const int64 FirstWorldCellY = FMath::FloorToInt64(
+			static_cast<double>(FirstCellCenter.Y) / CellSize);
+		const int64 CenterCellX = InfiniteRiverCenterCellX(
+			Seed, WorldCellX, WorldCellY);
+		const int64 Distance = FMath::Abs(WorldCellX - CenterCellX);
+		if (Distance > StreamBankHalfWidthCells)
+		{
+			return false;
+		}
+		const FVector2D NoiseOffset = MakeTerrainNoiseOffset(Seed);
+		const auto SampleBaseHeight = [this, FirstWorldCellX, FirstWorldCellY,
+			&NoiseOffset](const int64 CellX, const int64 CellY)
+		{
+			const double WorldX = FirstCellCenter.X
+				+ static_cast<double>(CellX - FirstWorldCellX) * CellSize;
+			const double WorldY = FirstCellCenter.Y
+				+ static_cast<double>(CellY - FirstWorldCellY) * CellSize;
+			return SampleTerrainHeight(WorldX, WorldY, NoiseOffset);
+		};
+		float MinimumChannelSource = TNumericLimits<float>::Max();
+		for (int32 Offset = -StreamWaterHalfWidthCells;
+			Offset <= StreamWaterHalfWidthCells;
+			++Offset)
+		{
+			MinimumChannelSource = FMath::Min(
+				MinimumChannelSource,
+				SampleBaseHeight(CenterCellX + Offset, WorldCellY));
+		}
+		OutWaterSurface = FMath::GridSnap(
+			MinimumChannelSource - StreamSurfaceInset,
+			CellSize);
+		const float OriginalHeight = SampleBaseHeight(
+			WorldCellX, WorldCellY);
+		if (Distance <= StreamWaterHalfWidthCells)
+		{
+			const float WaterAlpha = SmoothStep01(
+				static_cast<float>(Distance)
+					/ StreamWaterHalfWidthCells);
+			const float Depth = FMath::Lerp(
+				StreamCenterDepth,
+				StreamEdgeDepth,
+				WaterAlpha);
+			OutCarvedHeight = FMath::GridSnap(
+				FMath::Min(OriginalHeight, OutWaterSurface - Depth),
+				CellSize);
+			bOutContainsWater = true;
+			return true;
+		}
+		const float EdgeBedZ = OutWaterSurface - StreamEdgeDepth;
+		const float BankAlpha = SmoothStep01(
+			static_cast<float>(Distance - StreamWaterHalfWidthCells)
+				/ static_cast<float>(
+					StreamBankHalfWidthCells - StreamWaterHalfWidthCells));
+		OutCarvedHeight = FMath::GridSnap(
+			FMath::Min(
+				OriginalHeight,
+				FMath::Lerp(EdgeBedZ, OriginalHeight, BankAlpha)),
+			CellSize);
+		return true;
+	}
+
 	bool FLevelTerrain::TrySampleWorldCell(
 		const int64 WorldCellX,
 		const int64 WorldCellY,
@@ -1415,6 +1737,19 @@ namespace MatterFlux::PlayableLevel
 		}
 		const int64 FirstWorldCellX = FMath::FloorToInt64(FirstCellX);
 		const int64 FirstWorldCellY = FMath::FloorToInt64(FirstCellY);
+		if (WorldCellX >= MIN_int32 && WorldCellX <= MAX_int32
+			&& WorldCellY >= MIN_int32 && WorldCellY <= MAX_int32)
+		{
+			if (const float* RuntimeHeight = RuntimeHeightOverrides.Find(
+				FIntPoint(
+					static_cast<int32>(WorldCellX),
+					static_cast<int32>(WorldCellY))))
+			{
+				OutHeight = *RuntimeHeight;
+				OutColorBand = SelectTerrainColorBand(OutHeight);
+				return FMath::IsFinite(OutHeight);
+			}
+		}
 		const int64 LocalX = WorldCellX - FirstWorldCellX;
 		const int64 LocalY = WorldCellY - FirstWorldCellY;
 		if (LocalX >= 0 && LocalX < Width
@@ -1446,7 +1781,643 @@ namespace MatterFlux::PlayableLevel
 			WorldX,
 			WorldY,
 			MakeTerrainNoiseOffset(Seed));
+		float RiverSurface = 0.0f;
+		bool bContainsWater = false;
+		float CarvedHeight = OutHeight;
+		if (TrySampleInfiniteRiverCell(
+			WorldCellX,
+			WorldCellY,
+			CarvedHeight,
+			RiverSurface,
+			bContainsWater))
+		{
+			OutHeight = CarvedHeight;
+		}
 		OutColorBand = SelectTerrainColorBand(OutHeight);
+		return true;
+	}
+
+	bool BuildStreamingChunkPopulation(
+		const int32 Seed,
+		const FLevelTerrain& Terrain,
+		const FIntPoint ChunkCoordinate,
+		const int32 ChunkSize,
+		FStreamingChunkPopulation& OutPopulation,
+		const FMatterFluxContentRegistry* Content)
+	{
+		OutPopulation = FStreamingChunkPopulation();
+		if (Seed == 0 || !Terrain.IsValid() || !Terrain.bInfinite
+			|| ChunkSize <= 0)
+		{
+			return false;
+		}
+		const int64 MinimumCellX =
+			static_cast<int64>(ChunkCoordinate.X) * ChunkSize;
+		const int64 MinimumCellY =
+			static_cast<int64>(ChunkCoordinate.Y) * ChunkSize;
+		const int64 MaximumCellX = MinimumCellX + ChunkSize;
+		const int64 MaximumCellY = MinimumCellY + ChunkSize;
+		if (MinimumCellX < MIN_int32 || MaximumCellX > MAX_int32
+			|| MinimumCellY < MIN_int32 || MaximumCellY > MAX_int32)
+		{
+			return false;
+		}
+		const int64 FirstWorldCellX = FMath::FloorToInt64(
+			static_cast<double>(Terrain.FirstCellCenter.X) / Terrain.CellSize);
+		const int64 FirstWorldCellY = FMath::FloorToInt64(
+			static_cast<double>(Terrain.FirstCellCenter.Y) / Terrain.CellSize);
+		const auto ToWorldLocation = [&Terrain, FirstWorldCellX, FirstWorldCellY](
+			const int64 CellX,
+			const int64 CellY,
+			const float Z)
+		{
+			return FVector(
+				Terrain.FirstCellCenter.X
+					+ static_cast<double>(CellX - FirstWorldCellX)
+						* Terrain.CellSize,
+				Terrain.FirstCellCenter.Y
+					+ static_cast<double>(CellY - FirstWorldCellY)
+						* Terrain.CellSize,
+				Z);
+		};
+
+		for (int64 CellY = MinimumCellY; CellY < MaximumCellY; ++CellY)
+		{
+			for (int64 CellX = MinimumCellX; CellX < MaximumCellX; ++CellX)
+			{
+				float CarvedHeight = 0.0f;
+				float WaterSurface = 0.0f;
+				bool bContainsWater = false;
+				if (Terrain.TrySampleInfiniteRiverCell(
+					CellX,
+					CellY,
+					CarvedHeight,
+					WaterSurface,
+					bContainsWater)
+					&& bContainsWater)
+				{
+					FStreamingRiverCell& RiverCell =
+						OutPopulation.RiverCells.AddDefaulted_GetRef();
+					RiverCell.WorldCell = FIntPoint(
+						static_cast<int32>(CellX),
+						static_cast<int32>(CellY));
+					RiverCell.WaterSurfaceZ = WaterSurface;
+				}
+			}
+		}
+
+		const auto ResolveColor = [Content](
+			const FName MaterialId,
+			const FLinearColor& Fallback)
+		{
+			const FMatterFluxMaterialDefinition* Material = Content
+				? Content->Materials.Find(MaterialId)
+				: nullptr;
+			return Material ? Material->Color : Fallback;
+		};
+		const auto FindDecorator = [Content](const FName ContentId)
+		{
+			return Content ? Content->Decorators.Find(ContentId) : nullptr;
+		};
+		const FMatterFluxDecoratorDefinition* TreeDefinition = Content
+			? Content->Decorators.Find(TEXT("forest.tree"))
+			: nullptr;
+		const FName WoodMaterial = TreeDefinition
+			&& TreeDefinition->GeneratorId == TEXT("tree")
+			? TreeDefinition->MaterialId
+			: FName(TEXT("wood"));
+		const FLinearColor WoodColor = ResolveColor(
+			WoodMaterial,
+			FLinearColor(0.38f, 0.18f, 0.05f));
+		const FLinearColor LeafColor = ResolveColor(
+			TEXT("leaf"),
+			FLinearColor(0.07f, 0.42f, 0.10f));
+		const auto MakeChunkRandom = [Seed, ChunkCoordinate](const uint32 Salt)
+		{
+			uint32 RandomSeed = HashCombineFast(
+				GetTypeHash(Seed),
+				GetTypeHash(ChunkCoordinate.X));
+			RandomSeed = HashCombineFast(
+				RandomSeed,
+				GetTypeHash(ChunkCoordinate.Y));
+			RandomSeed = HashCombineFast(RandomSeed, Salt);
+			return FRandomStream(static_cast<int32>(RandomSeed));
+		};
+		const auto FindDryCell = [
+			&Terrain,
+			MinimumCellX,
+			MinimumCellY,
+			ChunkSize](
+				FRandomStream& Random,
+				const int32 RiverMarginCells,
+				const bool bRequireFlatFootprint,
+				int64& OutCellX,
+				int64& OutCellY,
+				float& OutSurfaceHeight)
+		{
+			const int32 EdgeMargin = FMath::Clamp(
+				FMath::Max(RiverMarginCells, 2),
+				2,
+				FMath::Max(2, ChunkSize / 3));
+			for (int32 Attempt = 0; Attempt < 24; ++Attempt)
+			{
+				const int64 CandidateX = MinimumCellX
+					+ Random.RandRange(EdgeMargin, ChunkSize - EdgeMargin - 1);
+				const int64 CandidateY = MinimumCellY
+					+ Random.RandRange(EdgeMargin, ChunkSize - EdgeMargin - 1);
+				bool bNearWater = false;
+				const FIntPoint RiverOffsets[] = {
+					FIntPoint::ZeroValue,
+					FIntPoint(RiverMarginCells, 0),
+					FIntPoint(-RiverMarginCells, 0),
+					FIntPoint(0, RiverMarginCells),
+					FIntPoint(0, -RiverMarginCells)
+				};
+				for (const FIntPoint Offset : RiverOffsets)
+				{
+					float CarvedHeight = 0.0f;
+					float WaterSurface = 0.0f;
+					bool bContainsWater = false;
+					if (Terrain.TrySampleInfiniteRiverCell(
+						CandidateX + Offset.X,
+						CandidateY + Offset.Y,
+						CarvedHeight,
+						WaterSurface,
+						bContainsWater)
+						&& bContainsWater)
+					{
+						bNearWater = true;
+						break;
+					}
+				}
+				if (bNearWater)
+				{
+					continue;
+				}
+				uint8 ColorBand = 0;
+				if (!Terrain.TrySampleWorldCell(
+					CandidateX,
+					CandidateY,
+					OutSurfaceHeight,
+					ColorBand))
+				{
+					continue;
+				}
+				if (bRequireFlatFootprint)
+				{
+					bool bFlat = true;
+					const FIntPoint FootprintOffsets[] = {
+						FIntPoint(1, 0),
+						FIntPoint(-1, 0),
+						FIntPoint(0, 1),
+						FIntPoint(0, -1)
+					};
+					for (const FIntPoint Offset : FootprintOffsets)
+					{
+						float NeighborHeight = 0.0f;
+						uint8 NeighborBand = 0;
+						if (!Terrain.TrySampleWorldCell(
+							CandidateX + Offset.X,
+							CandidateY + Offset.Y,
+							NeighborHeight,
+							NeighborBand)
+							|| !FMath::IsNearlyEqual(
+								NeighborHeight,
+								OutSurfaceHeight,
+								0.5f))
+						{
+							bFlat = false;
+							break;
+						}
+					}
+					if (!bFlat)
+					{
+						continue;
+					}
+				}
+				OutCellX = CandidateX;
+				OutCellY = CandidateY;
+				return true;
+			}
+			return false;
+		};
+		const auto AddSource = [
+			&OutPopulation,
+			Seed,
+			ChunkCoordinate](
+				const FName Name,
+				const FName MaterialId,
+				const FLinearColor& Color,
+				const FTransform& Transform,
+				FFragmentSourceMask&& Mask,
+				const bool bEnableCollision,
+				const FString& Signature,
+				const FGuid AggregateId = FGuid(),
+				const bool bAggregateRoot = false)
+		{
+			FLevelFragmentSource& Source =
+				OutPopulation.FragmentSources.AddDefaulted_GetRef();
+			Source.Name = Name;
+			Source.MaterialId = MaterialId;
+			Source.SourceId = FGuid::NewDeterministicGuid(
+				FString::Printf(
+					TEXT("InfinitePopulation|Seed=%d|Chunk=%d,%d|%s"),
+					Seed,
+					ChunkCoordinate.X,
+					ChunkCoordinate.Y,
+					*Signature),
+				static_cast<uint64>(static_cast<uint32>(Seed)));
+			Source.AggregateId = AggregateId;
+			Source.bAggregateRoot = bAggregateRoot;
+			Source.Color = Color;
+			Source.Transform = Transform;
+			Source.Mask = MoveTemp(Mask);
+			Source.bEnableCollision = bEnableCollision;
+		};
+
+		FRandomStream TreeRandom = MakeChunkRandom(0x54524545u);
+		// Independent 0-2 rolls preserve the global average but leave visible
+		// runs of empty chunks and cluster the compensating trees elsewhere.
+		// Give every ordinary chunk two deterministic trees, matching the seed
+		// region's local density, with a sparse third for natural variation.
+		// River-only chunks can still reject placements through FindDryCell, so
+		// water remains unobstructed.
+		const int32 TreeCount = 2
+			+ (TreeRandom.RandRange(0, 7) == 0 ? 1 : 0);
+		constexpr float TreeCellSize = 18.0f;
+		for (int32 TreeIndex = 0; TreeIndex < TreeCount; ++TreeIndex)
+		{
+			int64 TreeCellX = 0;
+			int64 TreeCellY = 0;
+			float SurfaceHeight = 0.0f;
+			if (!FindDryCell(
+				TreeRandom,
+				5,
+				true,
+				TreeCellX,
+				TreeCellY,
+				SurfaceHeight))
+			{
+				continue;
+			}
+			const FString AggregateSignature = FString::Printf(
+				TEXT("InfinitePopulation|Seed=%d|Chunk=%d,%d|Tree=%d"),
+				Seed,
+				ChunkCoordinate.X,
+				ChunkCoordinate.Y,
+				TreeIndex);
+			const FGuid AggregateId = FGuid::NewDeterministicGuid(
+				AggregateSignature,
+				static_cast<uint64>(static_cast<uint32>(Seed)));
+			const FQuat Rotation = FRotator(
+				0.0f,
+				DecorationFacingYaw,
+				0.0f).Quaternion();
+			const FVector Ground = ToWorldLocation(
+				TreeCellX,
+				TreeCellY,
+				SurfaceHeight - TreeCellSize);
+			const FVector HalfCellLatticeOffset = Rotation.RotateVector(
+				FVector(TreeCellSize * 0.5f, TreeCellSize * 0.5f, 0.0f));
+			const int32 TrunkBlocks = TreeRandom.RandRange(10, 13);
+			for (int32 DepthSlice = 0; DepthSlice < 2; ++DepthSlice)
+			{
+				FFragmentSourceMask TrunkMask = MakeEmptyMask(
+					4, TrunkBlocks, TreeCellSize, 2);
+				TrunkMask.GeometryStyle =
+					EFragmentSourceGeometryStyle::VoxelBlocks;
+				for (int32 Y = 0; Y < TrunkBlocks; ++Y)
+				{
+					SetSolid(TrunkMask, 1, Y);
+					SetSolid(TrunkMask, 2, Y);
+				}
+				const float DepthOffset =
+					(static_cast<float>(DepthSlice) - 0.5f) * TreeCellSize;
+				AddSource(
+					TEXT("InfiniteTreeTrunk"),
+					WoodMaterial,
+					WoodColor,
+					FTransform(
+						Rotation,
+						Ground
+							+ Rotation.RotateVector(FVector(0.0f, DepthOffset, 0.0f))
+							+ FVector(0.0f, 0.0f,
+								TrunkBlocks * TreeCellSize * 0.5f)),
+					MoveTemp(TrunkMask),
+					TreeDefinition ? TreeDefinition->bEnableCollision : true,
+					FString::Printf(TEXT("Tree=%d|Trunk=%d"), TreeIndex, DepthSlice),
+					AggregateId,
+					DepthSlice == 0);
+			}
+			const int32 FirstBranchDirection = TreeRandom.RandRange(0, 3);
+			for (int32 BranchIndex = 0; BranchIndex < 2; ++BranchIndex)
+			{
+				const int32 DirectionIndex =
+					(FirstBranchDirection + BranchIndex) % 4;
+				const float BranchYaw = static_cast<float>(DirectionIndex) * 90.0f;
+				const FVector LocalBranchDirection(
+					FMath::Cos(FMath::DegreesToRadians(BranchYaw)),
+					FMath::Sin(FMath::DegreesToRadians(BranchYaw)),
+					0.0f);
+				const FVector BranchDirection =
+					Rotation.RotateVector(LocalBranchDirection);
+				const int32 AttachmentBlock = TrunkBlocks - 3 + BranchIndex;
+				const FVector BranchStart = Ground + FVector(
+					0.0f,
+					0.0f,
+					(static_cast<float>(AttachmentBlock) + 0.5f) * TreeCellSize);
+				const FVector BranchCenter = BranchStart
+					+ HalfCellLatticeOffset + BranchDirection * TreeCellSize;
+				FFragmentSourceMask BranchMask = MakeEmptyMask(3, 3, TreeCellSize, 2);
+				BranchMask.SupportMode = EFragmentSupportMode::None;
+				BranchMask.GeometryStyle =
+					EFragmentSourceGeometryStyle::VoxelBlocks;
+				SetSolid(BranchMask, 1, 1);
+				AddSource(
+					TEXT("InfiniteTreeBranch"),
+					WoodMaterial,
+					WoodColor * 0.92f,
+					FTransform(
+						FRotator(0.0f, DecorationFacingYaw + BranchYaw, 0.0f),
+						BranchCenter),
+					MoveTemp(BranchMask),
+					false,
+					FString::Printf(TEXT("Tree=%d|Branch=%d"), TreeIndex, BranchIndex),
+					AggregateId);
+			}
+			constexpr int32 CanopyDepthSlices = 5;
+			constexpr int32 CanopyHeightBlocks = 5;
+			constexpr int32 MaximumCanopyRadius = 2;
+			const float CanopyBottomBlock = static_cast<float>(TrunkBlocks - 4);
+			for (int32 SliceIndex = 0; SliceIndex < CanopyDepthSlices; ++SliceIndex)
+			{
+				const int32 DepthBlock = SliceIndex - CanopyDepthSlices / 2;
+				constexpr int32 MaskPadding = 1;
+				FFragmentSourceMask LeafMask = MakeEmptyMask(
+					7, 7, TreeCellSize, 3);
+				LeafMask.SupportMode = EFragmentSupportMode::None;
+				LeafMask.GeometryStyle =
+					EFragmentSourceGeometryStyle::VoxelBlocks;
+				for (int32 HeightBlock = 0;
+					HeightBlock < CanopyHeightBlocks;
+					++HeightBlock)
+				{
+					for (int32 HorizontalBlock = -MaximumCanopyRadius;
+						HorizontalBlock <= MaximumCanopyRadius;
+						++HorizontalBlock)
+					{
+						const int32 AbsX = FMath::Abs(HorizontalBlock);
+						const int32 AbsY = FMath::Abs(DepthBlock);
+						bool bLeafCell = false;
+						if (HeightBlock <= 2)
+						{
+							bLeafCell = AbsX <= 2 && AbsY <= 2
+								&& !(AbsX == 2 && AbsY == 2);
+							if (bLeafCell && HeightBlock == 2)
+							{
+								const int32 Notch =
+									(TreeIndex * 17 + Seed) & 3;
+								bLeafCell = !(
+									(Notch == 0 && HorizontalBlock == 0 && DepthBlock == -2)
+									|| (Notch == 1 && HorizontalBlock == 2 && DepthBlock == 0)
+									|| (Notch == 2 && HorizontalBlock == 0 && DepthBlock == 2)
+									|| (Notch == 3 && HorizontalBlock == -2 && DepthBlock == 0));
+							}
+						}
+						else if (HeightBlock == 3)
+						{
+							bLeafCell = AbsX <= 1 && AbsY <= 1;
+						}
+						else
+						{
+							bLeafCell = AbsX + AbsY <= 1;
+						}
+						if (bLeafCell)
+						{
+							SetSolid(
+								LeafMask,
+								HorizontalBlock + MaximumCanopyRadius + MaskPadding,
+								HeightBlock + MaskPadding);
+						}
+					}
+				}
+				AddSource(
+					TEXT("InfiniteTreeLeaves"),
+					TEXT("leaf"),
+					LeafColor,
+					FTransform(
+						Rotation,
+						Ground + HalfCellLatticeOffset
+							+ Rotation.RotateVector(FVector(
+								0.0f,
+								static_cast<float>(DepthBlock) * TreeCellSize,
+								(CanopyBottomBlock + CanopyHeightBlocks * 0.5f)
+									* TreeCellSize))),
+					MoveTemp(LeafMask),
+					false,
+					FString::Printf(TEXT("Tree=%d|Leaves=%d"), TreeIndex, SliceIndex),
+					AggregateId);
+			}
+		}
+
+		const FMatterFluxDecoratorDefinition* RockDefinition =
+			FindDecorator(TEXT("forest.rock"));
+		const FName RockMaterial = RockDefinition
+			? RockDefinition->MaterialId
+			: FName(TEXT("stone"));
+		const FLinearColor BaseRockColor = ResolveColor(
+			RockMaterial,
+			FLinearColor(0.30f, 0.34f, 0.40f));
+		static const FLinearColor RockPaletteTints[] = {
+			FLinearColor(0.86f, 0.94f, 1.10f, 1.0f),
+			FLinearColor(0.96f, 1.00f, 1.04f, 1.0f),
+			FLinearColor(1.08f, 0.98f, 0.84f, 1.0f),
+			FLinearColor(1.12f, 1.08f, 1.02f, 1.0f)
+		};
+		FRandomStream RockRandom = MakeChunkRandom(0x524f434bu);
+		// Twelve seed-region rocks across 48 chunks is one rock per four chunks.
+		const int32 RockCount = RockRandom.RandRange(0, 3) == 0 ? 1 : 0;
+		for (int32 RockIndex = 0; RockIndex < RockCount; ++RockIndex)
+		{
+			int64 CellX = 0;
+			int64 CellY = 0;
+			float SurfaceHeight = 0.0f;
+			if (!FindDryCell(
+				RockRandom, 4, false, CellX, CellY, SurfaceHeight))
+			{
+				continue;
+			}
+			constexpr float CellSize = 10.0f;
+			const int32 RockWidth = RockRandom.RandRange(6, 12);
+			const int32 RockHeight = RockRandom.RandRange(4, 9);
+			FFragmentSourceMask RockMask = MakeEmptyMask(
+				RockWidth + 2, RockHeight + 1, CellSize, 2);
+			const float Radius = static_cast<float>(RockWidth) * 0.5f;
+			for (int32 X = 0; X < RockWidth; ++X)
+			{
+				const float NormalizedDistance = FMath::Abs(
+					static_cast<float>(X) + 0.5f - Radius) / Radius;
+				const int32 ColumnHeight = FMath::Clamp(
+					FMath::RoundToInt(
+						static_cast<float>(RockHeight)
+							* (1.0f - 0.55f * NormalizedDistance)),
+					1,
+					RockHeight);
+				for (int32 Y = 0; Y < ColumnHeight; ++Y)
+				{
+					SetSolid(RockMask, X + 1, Y);
+				}
+			}
+			const FLinearColor& Tint = RockPaletteTints[
+				(static_cast<uint32>(RockIndex)
+					+ static_cast<uint32>(Seed)) % UE_ARRAY_COUNT(RockPaletteTints)];
+			const FLinearColor RockColor(
+				BaseRockColor.R * Tint.R,
+				BaseRockColor.G * Tint.G,
+				BaseRockColor.B * Tint.B,
+				BaseRockColor.A);
+			const FVector GroundedLocation = EmbedGroundAttachment(
+				ToWorldLocation(CellX, CellY, SurfaceHeight), CellSize);
+			AddSource(
+				TEXT("InfiniteRockCluster"),
+				RockMaterial,
+				RockColor,
+				FTransform(
+					FRotator(0.0f, DecorationFacingYaw, 0.0f),
+					GroundedLocation + FVector(
+						0.0f, 0.0f, RockMask.Height * CellSize * 0.5f),
+					FVector(1.0f, 2.0f, 1.0f)),
+				MoveTemp(RockMask),
+				RockDefinition ? RockDefinition->bEnableCollision : false,
+				FString::Printf(TEXT("Rock=%d"), RockIndex));
+		}
+
+		struct FGroundCoverSpec
+		{
+			FName DecoratorId;
+			FName Name;
+			FName FallbackMaterial;
+			FLinearColor FallbackColor;
+			uint32 Salt;
+			int32 SpawnDenominator;
+			bool bGrass;
+		};
+		const FGroundCoverSpec CoverSpecs[] = {
+			{TEXT("forest.grass"), TEXT("InfiniteGrassCluster"), TEXT("grass"),
+				FLinearColor(0.15f, 0.70f, 0.035f), 0x47524153u, 2, true},
+			{TEXT("forest.flower.pink"), TEXT("InfinitePinkFlowerCluster"), TEXT("flower_pink"),
+				FLinearColor(1.0f, 0.025f, 0.36f), 0x50494e4bu, 4, false},
+			{TEXT("forest.flower.gold"), TEXT("InfiniteYellowFlowerCluster"), TEXT("flower_gold"),
+				FLinearColor(1.0f, 0.55f, 0.015f), 0x59454c4cu, 4, false},
+			{TEXT("forest.flower.blue"), TEXT("InfinitePurpleFlowerCluster"), TEXT("flower_blue"),
+				FLinearColor(0.42f, 0.025f, 1.0f), 0x50555250u, 4, false}
+		};
+		for (const FGroundCoverSpec& Spec : CoverSpecs)
+		{
+			const FMatterFluxDecoratorDefinition* Definition =
+				FindDecorator(Spec.DecoratorId);
+			const FName MaterialId = Definition
+				? Definition->MaterialId
+				: Spec.FallbackMaterial;
+			const FLinearColor Color = ResolveColor(MaterialId, Spec.FallbackColor);
+			FRandomStream CoverRandom = MakeChunkRandom(Spec.Salt);
+			const int32 ClusterCount = CoverRandom.RandRange(
+				0,
+				FMath::Max(Spec.SpawnDenominator - 1, 0)) == 0 ? 1 : 0;
+			for (int32 ClusterIndex = 0; ClusterIndex < ClusterCount; ++ClusterIndex)
+			{
+				int64 CellX = 0;
+				int64 CellY = 0;
+				float SurfaceHeight = 0.0f;
+				if (!FindDryCell(
+					CoverRandom, 3, false, CellX, CellY, SurfaceHeight))
+				{
+					continue;
+				}
+				constexpr float CellSize = 6.0f;
+				const int32 ElementsPerCluster = Spec.bGrass ? 5 : 3;
+				FFragmentSourceMask Mask = MakeEmptyMask(
+					Spec.bGrass ? 17 : 13,
+					Spec.bGrass ? 10 : 12,
+					CellSize,
+					1);
+				const int32 BaseStart = Spec.bGrass ? 1 : 2;
+				const int32 BaseEnd = Spec.bGrass ? 15 : 10;
+				for (int32 X = BaseStart; X <= BaseEnd; ++X)
+				{
+					SetSolid(Mask, X, 0);
+				}
+				for (int32 Element = 0; Element < ElementsPerCluster; ++Element)
+				{
+					const int32 CenterX = Spec.bGrass
+						? 2 + Element * 3
+						: 3 + Element * 3;
+					const int32 Height = Spec.bGrass
+						? CoverRandom.RandRange(4, 9)
+						: CoverRandom.RandRange(6, 9);
+					for (int32 Y = 1; Y <= Height; ++Y)
+					{
+						const int32 Bend = Spec.bGrass && Y > Height / 2
+							? ((Element & 1) == 0 ? -1 : 1)
+							: 0;
+						SetSolid(Mask, CenterX + Bend, Y);
+					}
+					if (!Spec.bGrass)
+					{
+						SetSolid(Mask, CenterX - 1, Height);
+						SetSolid(Mask, CenterX + 1, Height);
+						SetSolid(Mask, CenterX, Height - 1);
+						SetSolid(Mask, CenterX, Height + 1);
+					}
+				}
+				const FVector GroundedLocation = EmbedGroundAttachment(
+					ToWorldLocation(CellX, CellY, SurfaceHeight), CellSize);
+				AddSource(
+					Spec.Name,
+					MaterialId,
+					Color,
+					FTransform(
+						FRotator(0.0f, DecorationFacingYaw, 0.0f),
+						GroundedLocation + FVector(
+							0.0f, 0.0f, Mask.Height * CellSize * 0.5f),
+						FVector(1.0f, 1.5f, 1.0f)),
+					MoveTemp(Mask),
+					Definition ? Definition->bEnableCollision : false,
+					FString::Printf(
+						TEXT("Cover=%s|Cluster=%d"),
+						*MaterialId.ToString(),
+						ClusterIndex));
+			}
+		}
+
+		const auto FloorDivide = [](const int32 Value, const int32 Divisor)
+		{
+			return FMath::FloorToInt(
+				static_cast<double>(Value) / Divisor);
+		};
+		const int32 HouseChunkX =
+			FloorDivide(ChunkCoordinate.X, 8) * 8 + 1;
+		const int32 HouseChunkY =
+			FloorDivide(ChunkCoordinate.Y, 8) * 8 + 1;
+		if (ChunkCoordinate == FIntPoint(HouseChunkX, HouseChunkY))
+		{
+			const int64 HouseCellX = MinimumCellX + ChunkSize / 2;
+			const int64 HouseCellY = MinimumCellY + ChunkSize / 2;
+			float HouseHeight = 0.0f;
+			uint8 HouseBand = 0;
+			if (Terrain.TrySampleWorldCell(
+				HouseCellX,
+				HouseCellY,
+				HouseHeight,
+				HouseBand))
+			{
+				OutPopulation.bHasHouse = true;
+				OutPopulation.HouseLocation = ToWorldLocation(
+					HouseCellX,
+					HouseCellY,
+					HouseHeight);
+			}
+		}
 		return true;
 	}
 

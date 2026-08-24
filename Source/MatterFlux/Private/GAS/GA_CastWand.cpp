@@ -1,6 +1,7 @@
 #include "GAS/GA_CastWand.h"
 
 #include "AbilitySystemComponent.h"
+#include "Components/PrimitiveComponent.h"
 #include "Game/MatterFluxPlayerState.h"
 #include "Game/MatterFluxCharacter.h"
 #include "GameFramework/CharacterMovementComponent.h"
@@ -27,6 +28,7 @@ namespace MatterFluxCastWand
 			|| !FMath::IsFinite(Projectile.Speed)
 			|| !FMath::IsFinite(Projectile.Lifetime)
 			|| !FMath::IsFinite(Projectile.Radius)
+			|| !FMath::IsFinite(Projectile.GravityScale)
 			|| !FMath::IsFinite(Projectile.SpreadDegrees)
 			|| !FMath::IsFinite(Projectile.SpawnAngleDegrees)
 			|| !FMath::IsFinite(Projectile.OrbitRadius)
@@ -40,6 +42,10 @@ namespace MatterFluxCastWand
 			|| Projectile.Lifetime > 30.0f
 			|| Projectile.Radius <= 0.0f
 			|| Projectile.Radius > 100.0f
+			|| Projectile.GravityScale < 0.0f
+			|| Projectile.GravityScale > 4.0f
+			|| Projectile.MaterialAmount < 1
+			|| Projectile.MaterialAmount > 64
 			|| Projectile.OrbitRadius < 0.0f
 			|| Projectile.OrbitRadius > 10000.0f)
 		{
@@ -210,6 +216,22 @@ bool UGA_CastWand::SpawnCastPlan(
 	};
 	TArray<FDeferredProjectile> Deferred;
 	Deferred.Reserve(Plan.Projectiles.Num());
+	FVector CasterBoundsExtent = FVector::ZeroVector;
+	FVector CasterBoundsOrigin = Avatar.GetActorLocation();
+	if (const UPrimitiveComponent* RootPrimitive =
+		Cast<UPrimitiveComponent>(Avatar.GetRootComponent()))
+	{
+		const FBoxSphereBounds& Bounds = RootPrimitive->Bounds;
+		CasterBoundsOrigin = Bounds.Origin;
+		CasterBoundsExtent = Bounds.BoxExtent;
+	}
+	else
+	{
+		Avatar.GetActorBounds(
+			true,
+			CasterBoundsOrigin,
+			CasterBoundsExtent);
+	}
 	for (int32 Index = 0; Index < Plan.Projectiles.Num(); ++Index)
 	{
 		const FMatterFluxMagicProjectilePlan& Projectile =
@@ -217,11 +239,18 @@ bool UGA_CastWand::SpawnCastPlan(
 		const FVector Direction = Forward.RotateAngleAxis(
 			Projectile.SpawnAngleDegrees,
 			FVector::UpVector);
+		const float DirectionalCasterExtent =
+			FMath::Abs(Direction.X) * CasterBoundsExtent.X
+			+ FMath::Abs(Direction.Y) * CasterBoundsExtent.Y
+			+ FMath::Abs(Direction.Z) * CasterBoundsExtent.Z;
+		const float SpawnDistance = FMath::Max(
+			80.0f,
+			DirectionalCasterExtent + Projectile.Radius + 8.0f);
 		const FTransform Transform(
 			Direction.Rotation(),
-			Avatar.GetActorLocation()
+			CasterBoundsOrigin
 				+ FVector(0.0f, 0.0f, 25.0f)
-				+ Direction * 80.0f);
+				+ Direction * SpawnDistance);
 		AMatterFluxMagicProjectile* Spawned =
 			World->SpawnActorDeferred<AMatterFluxMagicProjectile>(
 				AMatterFluxMagicProjectile::StaticClass(),

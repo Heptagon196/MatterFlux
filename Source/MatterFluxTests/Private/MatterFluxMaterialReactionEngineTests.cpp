@@ -26,18 +26,18 @@ bool FMatterFluxUnifiedMaterialReactionEngineTest::RunTest(const FString& Parame
 	TestEqual(TEXT("Reverse input preserves paired output"),
 		ContactResult.FirstMaterial, FName(TEXT("stone")));
 
-	FMatterFluxReactionDefinition Burning;
-	Burning.Id = TEXT("leaf_oxidation");
-	Burning.Kind = FMatterFluxReactionDefinition::EKind::Propagating;
-	Burning.InputA = TEXT("leaf");
-	Burning.InputB = TEXT("fire");
-	Burning.OutputA = TEXT("ash");
-	Burning.OutputB = TEXT("fire");
-	Burning.EmissionMaterial = TEXT("smoke");
-	Burning.ChancePermille = 1000;
-	Burning.PropagationChancePermille = 1000;
-	Burning.DurationSteps = 2;
-	Burning.EmissionChancePermille = 1000;
+	FMatterFluxReactionDefinition Active;
+	Active.Id = TEXT("leaf_oxidation");
+	Active.Kind = FMatterFluxReactionDefinition::EKind::Propagating;
+	Active.InputA = TEXT("leaf");
+	Active.InputB = TEXT("fire");
+	Active.OutputA = TEXT("ash");
+	Active.OutputB = TEXT("fire");
+	Active.EmissionMaterial = TEXT("smoke");
+	Active.ChancePermille = 1000;
+	Active.PropagationChancePermille = 1000;
+	Active.DurationSteps = 2;
+	Active.EmissionChancePermille = 1000;
 
 	FFragmentSourceMask Mask;
 	Mask.Width = 3;
@@ -47,7 +47,7 @@ bool FMatterFluxUnifiedMaterialReactionEngineTest::RunTest(const FString& Parame
 	MatterFlux::Reaction::FMaterialReactionEngine Engine;
 	FString Error;
 	if (!TestTrue(TEXT("Propagating rule initializes the same engine"),
-		Engine.InitializeGrid(Mask, Burning, 77, Error)))
+		Engine.InitializeGrid(Mask, Active, 77, Error)))
 	{
 		AddError(Error);
 		return false;
@@ -66,7 +66,7 @@ bool FMatterFluxUnifiedMaterialReactionEngineTest::RunTest(const FString& Parame
 	TestEqual(TEXT("Completed cell enters the output mask"),
 		static_cast<int32>(Engine.GetOutputMask()[0]), 1);
 
-	FMatterFluxReactionDefinition Corrosion = Burning;
+	FMatterFluxReactionDefinition Corrosion = Active;
 	Corrosion.Id = TEXT("metal_acid_corrosion");
 	Corrosion.InputA = TEXT("metal");
 	Corrosion.InputB = TEXT("acid");

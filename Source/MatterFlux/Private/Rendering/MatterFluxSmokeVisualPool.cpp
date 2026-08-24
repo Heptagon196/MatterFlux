@@ -21,12 +21,12 @@ namespace MatterFlux::Rendering
 		}
 	}
 
-	FSmokeEmissionAnchor::FSmokeEmissionAnchor() = default;
+	FMaterialEmissionAnchor::FMaterialEmissionAnchor() = default;
 	FSmokeVisualSettings::FSmokeVisualSettings() = default;
 	FSmokeVisualPool::FSmokeVisualPool() = default;
 	FSmokeVisualPool::~FSmokeVisualPool() = default;
 
-	bool FSmokeEmissionAnchor::IsValid() const
+	bool FMaterialEmissionAnchor::IsValid() const
 	{
 		return !WorldPosition.ContainsNaN()
 			&& FMath::IsFinite(CellSize)
@@ -73,10 +73,10 @@ namespace MatterFlux::Rendering
 	}
 
 	void FSmokeVisualPool::SetEmissionAnchors(
-		const TConstArrayView<FSmokeEmissionAnchor> InAnchors)
+		const TConstArrayView<FMaterialEmissionAnchor> InAnchors)
 	{
 		Anchors.Reset(InAnchors.Num());
-		for (const FSmokeEmissionAnchor& Anchor : InAnchors)
+		for (const FMaterialEmissionAnchor& Anchor : InAnchors)
 		{
 			if (Anchor.IsValid() && Anchor.EmissionProbability > 0.0f)
 			{
@@ -84,8 +84,8 @@ namespace MatterFlux::Rendering
 			}
 		}
 		Anchors.Sort([](
-			const FSmokeEmissionAnchor& Left,
-			const FSmokeEmissionAnchor& Right)
+			const FMaterialEmissionAnchor& Left,
+			const FMaterialEmissionAnchor& Right)
 		{
 			if (Left.Seed != Right.Seed)
 			{
@@ -159,7 +159,7 @@ namespace MatterFlux::Rendering
 				&& Particles.Num() < Settings.MaximumParticles;
 			++AnchorIndex)
 		{
-			const FSmokeEmissionAnchor& Anchor = Anchors[AnchorIndex];
+			const FMaterialEmissionAnchor& Anchor = Anchors[AnchorIndex];
 			const uint32 Hash = MixSmokeHash(
 				Anchor.Seed
 					^ SpawnSequence * 0x9e3779b9u

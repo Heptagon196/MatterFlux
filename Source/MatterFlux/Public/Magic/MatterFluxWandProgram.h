@@ -24,13 +24,16 @@ struct MATTERFLUX_API FMatterFluxMagicProjectilePlan
 	float Speed = 0.0f;
 	float Lifetime = 0.0f;
 	float Radius = 0.0f;
+	float GravityScale = 0.0f;
 	float SpreadDegrees = 0.0f;
 	float SpawnAngleDegrees = 0.0f;
 	bool bOverrideColor = false;
 	FLinearColor Color = FLinearColor::White;
 	float OrbitRadius = 0.0f;
 	FName BodyMaterial;
-	FName ImpactMaterial;
+	int32 MaterialAmount = 1;
+	bool bUsePlaneVisual = false;
+	bool bUseVerticalPlaneVisual = false;
 	TArray<FMatterFluxMagicProjectilePlan> OnImpactProjectiles;
 	TArray<FMatterFluxMagicProjectilePlan> OnExpireProjectiles;
 	bool bTriggerRandomDirection = false;
@@ -43,13 +46,16 @@ struct MATTERFLUX_API FMatterFluxMagicProjectilePlan
 			&& Speed == Other.Speed
 			&& Lifetime == Other.Lifetime
 			&& Radius == Other.Radius
+			&& GravityScale == Other.GravityScale
 			&& SpreadDegrees == Other.SpreadDegrees
 			&& SpawnAngleDegrees == Other.SpawnAngleDegrees
 			&& bOverrideColor == Other.bOverrideColor
 			&& Color == Other.Color
 			&& OrbitRadius == Other.OrbitRadius
 			&& BodyMaterial == Other.BodyMaterial
-			&& ImpactMaterial == Other.ImpactMaterial
+			&& MaterialAmount == Other.MaterialAmount
+			&& bUsePlaneVisual == Other.bUsePlaneVisual
+			&& bUseVerticalPlaneVisual == Other.bUseVerticalPlaneVisual
 			&& OnImpactProjectiles == Other.OnImpactProjectiles
 			&& OnExpireProjectiles == Other.OnExpireProjectiles
 			&& bTriggerRandomDirection == Other.bTriggerRandomDirection;

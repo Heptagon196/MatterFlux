@@ -21,6 +21,7 @@
 #include "Settings/MatterFluxGameUserSettings.h"
 #include "UI/MatterFluxShellWidget.h"
 #include "UI/MatterFluxInteractionWidget.h"
+#include "UI/MatterFluxPlayerStatusWidget.h"
 #include "Progression/MatterFluxQuestTrackerWidget.h"
 #include "Save/MatterFluxSaveSubsystem.h"
 
@@ -41,6 +42,7 @@ void AMatterFluxPlayerController::BeginPlay()
 	CreateShell();
 	CreateMagicWorkbench();
 	CreateQuestTracker();
+	CreatePlayerStatusHud();
 	CreateInteractionWidget();
 	if (ShellWidget
 		&& HasAuthority()
@@ -102,6 +104,11 @@ void AMatterFluxPlayerController::EndPlay(
 		QuestTracker->RemoveFromParent();
 		QuestTracker = nullptr;
 	}
+	if (PlayerStatusHud)
+	{
+		PlayerStatusHud->RemoveFromParent();
+		PlayerStatusHud = nullptr;
+	}
 	if (InteractionWidget)
 	{
 		InteractionWidget->RemoveFromParent();
@@ -137,6 +144,27 @@ void AMatterFluxPlayerController::OnPossess(APawn* InPawn)
 	if (QuestTracker)
 	{
 		QuestTracker->RefreshTracker();
+	}
+	if (PlayerStatusHud)
+	{
+		PlayerStatusHud->RefreshStatus();
+	}
+}
+
+void AMatterFluxPlayerController::OnRep_PlayerState()
+{
+	Super::OnRep_PlayerState();
+	if (MagicWorkbench)
+	{
+		MagicWorkbench->RefreshWorkbench();
+	}
+	if (QuestTracker)
+	{
+		QuestTracker->RefreshTracker();
+	}
+	if (PlayerStatusHud)
+	{
+		PlayerStatusHud->RefreshStatus();
 	}
 }
 
@@ -268,6 +296,25 @@ void AMatterFluxPlayerController::CreateQuestTracker()
 	}
 	QuestTracker->InitializeForPlayer(this);
 	QuestTracker->AddToPlayerScreen(5);
+}
+
+void AMatterFluxPlayerController::CreatePlayerStatusHud()
+{
+	if (!IsLocalController() || PlayerStatusHud)
+	{
+		return;
+	}
+	PlayerStatusHud = CreateWidget<UMatterFluxPlayerStatusWidget>(
+		this,
+		UMatterFluxPlayerStatusWidget::StaticClass());
+	if (!PlayerStatusHud)
+	{
+		UE_LOG(LogMatterFlux, Error,
+			TEXT("Failed to create player status HUD widget."));
+		return;
+	}
+	PlayerStatusHud->InitializeForPlayer(this);
+	PlayerStatusHud->AddToPlayerScreen(5);
 }
 
 void AMatterFluxPlayerController::CreateInteractionWidget()
@@ -816,6 +863,10 @@ void AMatterFluxPlayerController::HideUIForVisualCapture()
 	{
 		QuestTracker->SetVisibility(ESlateVisibility::Collapsed);
 	}
+	if (PlayerStatusHud)
+	{
+		PlayerStatusHud->SetVisibility(ESlateVisibility::Collapsed);
+	}
 	if (MagicWorkbench)
 	{
 		MagicWorkbench->SetVisibility(ESlateVisibility::Collapsed);
@@ -837,6 +888,11 @@ void AMatterFluxPlayerController::HandleShellStateChanged(
 	if (QuestTracker)
 	{
 		QuestTracker->SetSuppressedByFrontEnd(
+			ShellWidget && ShellWidget->IsStartMenuOpen());
+	}
+	if (PlayerStatusHud)
+	{
+		PlayerStatusHud->SetSuppressedByFrontEnd(
 			ShellWidget && ShellWidget->IsStartMenuOpen());
 	}
 	if (GetNetMode() == NM_Standalone)

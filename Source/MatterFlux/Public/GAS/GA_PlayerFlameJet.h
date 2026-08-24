@@ -23,7 +23,7 @@ public:
 		float Range,
 		float StartRadius,
 		float EndRadius,
-		FName FlameMaterial,
+		FName StimulusMaterial,
 		int32 EventSeed);
 
 protected:
@@ -37,7 +37,7 @@ protected:
 	float EndRadius = 180.0f;
 
 	UPROPERTY(EditDefaultsOnly, Category = "Player Ability|Flame")
-	FName FlameMaterial = TEXT("fire");
+	FName StimulusMaterial = TEXT("fire");
 
 private:
 	int32 ActivationSerial = 0;

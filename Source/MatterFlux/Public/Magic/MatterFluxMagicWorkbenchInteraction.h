@@ -28,6 +28,16 @@ struct MATTERFLUX_API FMatterFluxMagicDragPayload
 class MATTERFLUX_API FMatterFluxMagicWorkbenchInteraction
 {
 public:
+	/** 所有法术背包、法术树、备用区和拖拽图标共用的外框尺寸。 */
+	static FVector2D GetSpellSlotSize();
+
+	/** 拖拽装饰器必须与源法术槽逐像素同尺寸。 */
+	static FVector2D GetSpellDragDecoratorSize();
+
+	/** 计算装饰器左上角，使鼠标热点固定落在拖拽 item 的中心。 */
+	static FVector2D CalculateSpellDragDecoratorPosition(
+		const FVector2D& CursorScreenPosition);
+
 	/** 为法杖容量中的每一个槽生成落点；空槽也绝不能被布局省略。 */
 	static void BuildSpellDropTargets(
 		const FMatterFluxOwnedWand& Wand,

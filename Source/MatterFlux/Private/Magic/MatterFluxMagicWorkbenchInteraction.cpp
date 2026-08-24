@@ -1,5 +1,21 @@
 #include "Magic/MatterFluxMagicWorkbenchInteraction.h"
 
+FVector2D FMatterFluxMagicWorkbenchInteraction::GetSpellSlotSize()
+{
+	return FVector2D(72.0f, 72.0f);
+}
+
+FVector2D FMatterFluxMagicWorkbenchInteraction::GetSpellDragDecoratorSize()
+{
+	return GetSpellSlotSize();
+}
+
+FVector2D FMatterFluxMagicWorkbenchInteraction::CalculateSpellDragDecoratorPosition(
+	const FVector2D& CursorScreenPosition)
+{
+	return CursorScreenPosition - GetSpellDragDecoratorSize() * 0.5f;
+}
+
 void FMatterFluxMagicWorkbenchInteraction::BuildSpellDropTargets(
 	const FMatterFluxOwnedWand& Wand,
 	TArray<int32>& OutSlotIndices)

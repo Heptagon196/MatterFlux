@@ -3,7 +3,7 @@
 #include "CoreMinimal.h"
 #include "MatterFluxGroundStateChunk.generated.h"
 
-/** Atomic wire payload for one 64 x 64 ground-combustion chunk. */
+/** Atomic wire payload for one 64 x 64 ground-reaction chunk. */
 USTRUCT()
 struct MATTERFLUX_API FMatterFluxGroundStateChunk
 {
@@ -12,14 +12,14 @@ struct MATTERFLUX_API FMatterFluxGroundStateChunk
 	bool Encode(
 		FIntPoint InChunkCoordinate,
 		int32 InRevision,
-		const TArray<uint8>& ResidueMask,
-		const TArray<uint8>& BurningMask,
+		const TArray<uint8>& OutputMask,
+		const TArray<uint8>& ActiveMask,
 		int32 WorldWidth,
 		int32 WorldHeight,
 		FString& OutError);
 	bool DecodeInto(
-		TArray<uint8>& InOutResidueMask,
-		TArray<uint8>& InOutBurningMask,
+		TArray<uint8>& InOutOutputMask,
+		TArray<uint8>& InOutActiveMask,
 		int32 WorldWidth,
 		int32 WorldHeight,
 		FString& OutError) const;

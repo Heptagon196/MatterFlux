@@ -1,6 +1,12 @@
 #include "IMatterFluxScriptRuntime.h"
+#include "Components/CapsuleComponent.h"
+#include "Components/InstancedStaticMeshComponent.h"
+#include "Components/PointLightComponent.h"
 #include "Components/SphereComponent.h"
+#include "Components/StaticMeshComponent.h"
 #include "EngineUtils.h"
+#include "Fragment/Fragment2DSourceActor.h"
+#include "Fragment/FragmentGeometry.h"
 #include "GAS/GA_CastWand.h"
 #include "Game/MatterFluxCharacter.h"
 #include "Game/MatterFluxPlayableWorldActor.h"
@@ -8,6 +14,7 @@
 #include "Magic/MatterFluxWandProgram.h"
 #include "Magic/MatterFluxSpellProgramLayout.h"
 #include "Magic/MatterFluxMagicInventoryComponent.h"
+#include "Magic/MatterFluxMagicIconResolver.h"
 #include "Magic/MatterFluxMagicWorkbenchInteraction.h"
 #include "Magic/MatterFluxMagicProjectile.h"
 #include "Misc/AutomationTest.h"
@@ -90,8 +97,7 @@ content.register_material({
 })
 content.register_spell({
 	id = "spell.direct_flame", name = "Direct Flame", kind = "flame",
-	range = 800, radius = 45, end_radius = 180,
-	impact_material = "fire"
+	range = 800, radius = 45, end_radius = 180
 })
 )LUA");
 
@@ -430,6 +436,108 @@ bool FMatterFluxMagicProgramCombinationMatrixTest::RunTest(
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxMagicIncompleteBranchCastTest,
+	"MatterFlux.Magic.ProgramLayout.IncompleteMulticastBranchRemainsCastable",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxMagicIncompleteBranchCastTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(
+		TEXT("Default content pack loads"),
+		Runtime.ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	const FMatterFluxContentRegistryPtr Registry =
+		Runtime.GetActiveRegistry();
+	const FMatterFluxWandDefinition* CuttingWand = Registry.IsValid()
+		? Registry->Wands.Find(TEXT("wand.cutting"))
+		: nullptr;
+	if (!TestTrue(TEXT("Default registry exists"), Registry.IsValid())
+		|| !TestNotNull(TEXT("Cutting wand exists"), CuttingWand))
+	{
+		return false;
+	}
+
+	// This is the exact prefix program reported from the workbench screenshot:
+	// spark trigger -> double cast -> flame jet + one deliberately empty branch.
+	const TArray<FName> Slots = {
+		TEXT("spell.spark_trigger"),
+		TEXT("spell.double_cast"),
+		TEXT("spell.flame_jet"),
+		NAME_None
+	};
+	FMatterFluxSpellProgramLayout Layout;
+	TestTrue(
+		TEXT("The screenshot program has a valid structural layout"),
+		FMatterFluxSpellProgramLayoutBuilder::Build(
+			*Registry,
+			Slots,
+			Layout,
+			Error));
+	TestEqual(TEXT("Trigger, multicast and payload occupy three columns"),
+		Layout.Columns.Num(), 3);
+	if (Layout.Columns.Num() == 3)
+	{
+		TestEqual(TEXT("Double cast exposes both child slots"),
+			Layout.Columns[2].Nodes.Num(), 2);
+		if (Layout.Columns[2].Nodes.Num() == 2)
+		{
+			TestEqual(TEXT("The second multicast branch is the empty slot"),
+				Layout.Columns[2].Nodes[1].SlotIndex, 3);
+			TestEqual(TEXT("The empty branch remains connected to double cast"),
+				Layout.Columns[2].Nodes[1].ParentSlotIndex, 1);
+		}
+	}
+	TestEqual(TEXT("A structural empty child is not reserve capacity"),
+		Layout.ReserveSlotIndices.Num(), 0);
+
+	FMatterFluxWandProgramState State;
+	State.Mana = CuttingWand->ManaMax;
+	FMatterFluxWandCastPlan Plan;
+	Error.Reset();
+	if (TestTrue(
+		TEXT("An incomplete multicast branch still casts its populated branch"),
+		FMatterFluxWandProgram::Evaluate(
+			*Registry,
+			CuttingWand->Id,
+			Slots,
+			State,
+			20260824,
+			Plan,
+			Error)))
+	{
+		TestEqual(TEXT("The trigger emits one carrier projectile"),
+			Plan.Projectiles.Num(), 1);
+		if (Plan.Projectiles.Num() == 1)
+		{
+			TestEqual(TEXT("Only the populated multicast branch is attached"),
+				Plan.Projectiles[0].OnImpactProjectiles.Num(), 1);
+			if (Plan.Projectiles[0].OnImpactProjectiles.Num() == 1)
+			{
+				TestEqual(TEXT("The populated branch is the flame jet"),
+					Plan.Projectiles[0].OnImpactProjectiles[0].SpellId,
+					FName(TEXT("spell.flame_jet")));
+			}
+		}
+		TestEqual(TEXT("Every populated spell card consumes mana"),
+			Plan.ManaSpent, 30.0f);
+	}
+	else
+	{
+		AddError(Error);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxMagicPaperMagicLibraryTest,
 	"MatterFlux.Magic.Content.PaperMagicSpellLibraryIsComplete",
 	EAutomationTestFlags::EditorContext
@@ -466,13 +574,111 @@ bool FMatterFluxMagicPaperMagicLibraryTest::RunTest(
 	};
 	for (const FName SpellId : PaperMagicSpellIds)
 	{
+		const FMatterFluxSpellDefinition* Spell = Registry->Spells.Find(SpellId);
 		TestNotNull(
 			*FString::Printf(TEXT("PaperMagic spell %s is registered"),
 				*SpellId.ToString()),
-			Registry->Spells.Find(SpellId));
+			Spell);
+		if (Spell)
+		{
+			FString IconPath;
+			TestTrue(
+				*FString::Printf(TEXT("PaperMagic spell %s icon resolves"),
+					*SpellId.ToString()),
+				FMatterFluxMagicIconResolver::TryResolveIconPath(
+					Spell->Icon,
+					IconPath));
+			TestTrue(TEXT("Resolved magic icon stays under the Lua icon root"),
+				IconPath.StartsWith(
+					FMatterFluxMagicIconResolver::GetIconRoot(),
+					ESearchCase::IgnoreCase));
+		}
 	}
+	const TArray<FName> MatterFluxSpellIds = {
+		TEXT("spell.accelerate"),
+		TEXT("spell.add_damage"),
+		TEXT("spell.acid_spray"),
+		TEXT("spell.double_cast"),
+		TEXT("spell.flame_jet"),
+		TEXT("spell.heavy_orb"),
+		TEXT("spell.sand_spray"),
+		TEXT("spell.spark_bolt"),
+		TEXT("spell.spark_trigger"),
+		TEXT("spell.terrain_cut"),
+		TEXT("spell.vertical_terrain_cut"),
+		TEXT("spell.water_spray")
+	};
+	for (const FName SpellId : MatterFluxSpellIds)
+	{
+		const FMatterFluxSpellDefinition* Spell = Registry->Spells.Find(SpellId);
+		if (TestNotNull(
+			*FString::Printf(TEXT("MatterFlux spell %s is registered"),
+				*SpellId.ToString()),
+			Spell))
+		{
+			FString IconPath;
+			TestTrue(
+				*FString::Printf(TEXT("MatterFlux spell %s icon resolves"),
+					*SpellId.ToString()),
+				FMatterFluxMagicIconResolver::TryResolveIconPath(
+					Spell->Icon,
+					IconPath));
+		}
+	}
+	const TArray<FName> MigratedWandIds = {
+		TEXT("std.default"),
+		TEXT("std.default_shoe")
+	};
+	for (const FName WandId : MigratedWandIds)
+	{
+		const FMatterFluxWandDefinition* Wand = Registry->Wands.Find(WandId);
+		if (TestNotNull(
+			*FString::Printf(TEXT("PaperMagic wand %s is registered"),
+				*WandId.ToString()),
+			Wand))
+		{
+			FString IconPath;
+			TestTrue(
+				*FString::Printf(TEXT("PaperMagic wand %s icon resolves"),
+					*WandId.ToString()),
+				FMatterFluxMagicIconResolver::TryResolveIconPath(
+					Wand->Icon,
+					IconPath));
+		}
+	}
+	const TArray<FName> MigratedItemIds = {
+		TEXT("std.coin"),
+		TEXT("std.heal_item")
+	};
+	for (const FName ItemId : MigratedItemIds)
+	{
+		const FMatterFluxItemDefinition* Item = Registry->Items.Find(ItemId);
+		if (TestNotNull(
+			*FString::Printf(TEXT("PaperMagic item %s is registered"),
+				*ItemId.ToString()),
+			Item))
+		{
+			FString IconPath;
+			TestTrue(
+				*FString::Printf(TEXT("PaperMagic item %s icon resolves"),
+					*ItemId.ToString()),
+				FMatterFluxMagicIconResolver::TryResolveIconPath(
+					Item->Icon,
+					IconPath));
+		}
+	}
+	FString AddSignIconPath;
+	TestTrue(TEXT("PaperMagic empty-slot add icon resolves"),
+		FMatterFluxMagicIconResolver::TryResolveIconPath(
+			TEXT("paper/add_sign"),
+			AddSignIconPath));
+	FString RejectedIconPath;
+	TestFalse(TEXT("Magic icon keys cannot traverse out of the Lua icon root"),
+		FMatterFluxMagicIconResolver::TryResolveIconPath(
+			TEXT("../Spells/PaperMagic/Default.lua"),
+			RejectedIconPath));
 	TestEqual(TEXT("MatterFlux and PaperMagic libraries coexist"),
-		Registry->Spells.Num(), 18);
+		Registry->Spells.Num(), 21);
 
 	const FMatterFluxSpellDefinition* DefaultProjectile =
 		Registry->Spells.Find(TEXT("std.default"));
@@ -947,8 +1153,11 @@ bool FMatterFluxMagicRegularWorldSpellProjectileTest::RunTest(
 		Registry->Wands.Find(TEXT("wand.cutting"));
 	const FMatterFluxWandDefinition* FlameWand =
 		Registry->Wands.Find(TEXT("wand.flame"));
+	const FMatterFluxSpellDefinition* VerticalCut =
+		Registry->Spells.Find(TEXT("spell.vertical_terrain_cut"));
 	if (!TestNotNull(TEXT("Cutting starter wand exists"), CuttingWand)
-		|| !TestNotNull(TEXT("Flame starter wand exists"), FlameWand))
+		|| !TestNotNull(TEXT("Flame starter wand exists"), FlameWand)
+		|| !TestNotNull(TEXT("Vertical cut spell exists"), VerticalCut))
 	{
 		return false;
 	}
@@ -979,6 +1188,37 @@ bool FMatterFluxMagicRegularWorldSpellProjectileTest::RunTest(
 			CutPlan.Projectiles[0].Speed > 0.0f);
 		TestTrue(TEXT("Cut projectile can damage material on impact"),
 			CutPlan.Projectiles[0].Damage > 0.0f);
+		TestTrue(TEXT("Cut projectile requests the Lua-configured plane visual"),
+			CutPlan.Projectiles[0].bUsePlaneVisual);
+		TestFalse(TEXT("Original cut remains the horizontal plane variant"),
+			CutPlan.Projectiles[0].bUseVerticalPlaneVisual);
+	}
+
+	FMatterFluxContentRegistry VerticalRegistry = *Registry;
+	FMatterFluxWandDefinition VerticalWand = *CuttingWand;
+	VerticalWand.Id = TEXT("wand.vertical_cut_test");
+	VerticalWand.StarterDeck = { VerticalCut->Id };
+	VerticalRegistry.Wands.Add(VerticalWand.Id, VerticalWand);
+	FMatterFluxWandCastPlan VerticalPlan;
+	State.Mana = VerticalWand.ManaMax;
+	Error.Reset();
+	TestTrue(TEXT("Vertical cut evaluates through the generic compiler"),
+		FMatterFluxWandProgram::Evaluate(
+			VerticalRegistry,
+			VerticalWand.Id,
+			VerticalWand.StarterDeck,
+			State,
+			9,
+			VerticalPlan,
+			Error));
+	TestEqual(TEXT("Vertical cut emits one projectile"),
+		VerticalPlan.Projectiles.Num(), 1);
+	if (VerticalPlan.Projectiles.Num() == 1)
+	{
+		TestTrue(TEXT("Vertical cut keeps a plane visual"),
+			VerticalPlan.Projectiles[0].bUsePlaneVisual);
+		TestTrue(TEXT("Vertical cut orientation comes from Lua"),
+			VerticalPlan.Projectiles[0].bUseVerticalPlaneVisual);
 	}
 
 	FMatterFluxWandCastPlan FlamePlan;
@@ -1002,12 +1242,694 @@ bool FMatterFluxMagicRegularWorldSpellProjectileTest::RunTest(
 		TestEqual(TEXT("Flame projectile body is made from fire material"),
 			FlamePlan.Projectiles[0].BodyMaterial,
 			FName(TEXT("fire")));
-		TestEqual(TEXT("Flame impact material comes from Lua"),
-			FlamePlan.Projectiles[0].ImpactMaterial,
-			FName(TEXT("fire")));
+		TestEqual(TEXT("Flame carries authored material volume"),
+			FlamePlan.Projectiles[0].MaterialAmount, 5);
 		TestTrue(TEXT("Flame projectile travels forward"),
 			FlamePlan.Projectiles[0].Speed > 0.0f);
 	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxMagicWorkbenchDragVisualTest,
+	"MatterFlux.Magic.Workbench.DragVisualMatchesSlotAndCentersCursor",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxMagicWorkbenchDragVisualTest::RunTest(
+	const FString& Parameters)
+{
+	const FVector2D SlotSize =
+		FMatterFluxMagicWorkbenchInteraction::GetSpellSlotSize();
+	TestEqual(TEXT("Spell workbench uses the enlarged readable slot size"),
+		SlotSize, FVector2D(72.0f, 72.0f));
+	const FVector2D DecoratorSize =
+		FMatterFluxMagicWorkbenchInteraction::GetSpellDragDecoratorSize();
+	TestEqual(TEXT("Dragged icon has exactly the same size as every spell slot"),
+		DecoratorSize, SlotSize);
+
+	const FVector2D CursorPosition(640.0f, 360.0f);
+	const FVector2D DecoratorPosition =
+		FMatterFluxMagicWorkbenchInteraction::
+			CalculateSpellDragDecoratorPosition(CursorPosition);
+	TestEqual(TEXT("Mouse hotspot is the dragged item center"),
+		DecoratorPosition + DecoratorSize * 0.5f,
+		CursorPosition);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxMagicProjectileSpawnClearanceTest,
+	"MatterFlux.Magic.ProjectileSpawnClearsCasterAndCutUsesPlane",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxMagicProjectileSpawnClearanceTest::RunTest(
+	const FString& Parameters)
+{
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(TEXT("Default content pack loads"),
+		Runtime.ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry =
+		Runtime.GetActiveRegistry();
+	const FMatterFluxWandDefinition* CuttingWand = Registry.IsValid()
+		? Registry->Wands.Find(TEXT("wand.cutting"))
+		: nullptr;
+	const FMatterFluxWandDefinition* FlameWand = Registry.IsValid()
+		? Registry->Wands.Find(TEXT("wand.flame"))
+		: nullptr;
+	const FMatterFluxSpellDefinition* VerticalCut = Registry.IsValid()
+		? Registry->Spells.Find(TEXT("spell.vertical_terrain_cut"))
+		: nullptr;
+	if (!TestNotNull(TEXT("Cutting wand exists"), CuttingWand)
+		|| !TestNotNull(TEXT("Flame wand exists"), FlameWand)
+		|| !TestNotNull(TEXT("Vertical cut spell exists"), VerticalCut))
+	{
+		return false;
+	}
+
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxCharacter* Avatar = World
+		? World->SpawnActor<AMatterFluxCharacter>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Caster character spawns"), Avatar)
+		|| !TestNotNull(TEXT("Caster capsule exists"),
+			Avatar ? Avatar->GetCapsuleComponent() : nullptr))
+	{
+		return false;
+	}
+
+	const auto SpawnWandProjectile = [
+		this,
+		Registry,
+		Avatar,
+		World,
+		&Error](
+		const FMatterFluxWandDefinition& Wand,
+		const FName ExpectedSpellId,
+		const int32 EventSeed)
+		-> AMatterFluxMagicProjectile*
+	{
+		FMatterFluxWandProgramState State;
+		State.Mana = Wand.ManaMax;
+		FMatterFluxWandCastPlan Plan;
+		Error.Reset();
+		if (!TestTrue(
+			*FString::Printf(TEXT("%s compiles"), *Wand.Id.ToString()),
+			FMatterFluxWandProgram::Evaluate(
+				*Registry,
+				Wand.Id,
+				Wand.StarterDeck,
+				State,
+				EventSeed,
+				Plan,
+				Error)))
+		{
+			AddError(Error);
+			return nullptr;
+		}
+		if (!TestTrue(
+			*FString::Printf(TEXT("%s spawns"), *ExpectedSpellId.ToString()),
+			UGA_CastWand::SpawnCastPlan(*Avatar, Plan, EventSeed)))
+		{
+			return nullptr;
+		}
+		for (TActorIterator<AMatterFluxMagicProjectile> It(World); It; ++It)
+		{
+			if (It->GetPresentation().SpellId == ExpectedSpellId)
+			{
+				return *It;
+			}
+		}
+		return nullptr;
+	};
+
+	AMatterFluxMagicProjectile* CutProjectile =
+		SpawnWandProjectile(*CuttingWand, TEXT("spell.terrain_cut"), 6101);
+	AMatterFluxMagicProjectile* FlameProjectile =
+		SpawnWandProjectile(*FlameWand, TEXT("spell.flame_jet"), 6102);
+	FMatterFluxWandCastPlan VerticalCastPlan;
+	FMatterFluxMagicProjectilePlan& VerticalProjectilePlan =
+		VerticalCastPlan.Projectiles.AddDefaulted_GetRef();
+	VerticalProjectilePlan.SpellId = VerticalCut->Id;
+	VerticalProjectilePlan.Damage = VerticalCut->Damage;
+	VerticalProjectilePlan.Speed = VerticalCut->Speed;
+	VerticalProjectilePlan.Lifetime = VerticalCut->Lifetime;
+	VerticalProjectilePlan.Radius = VerticalCut->Radius;
+	VerticalProjectilePlan.bUsePlaneVisual = VerticalCut->bUsePlaneVisual;
+	VerticalProjectilePlan.bUseVerticalPlaneVisual =
+		VerticalCut->bUseVerticalPlaneVisual;
+	TestTrue(TEXT("Vertical cut spawns"),
+		UGA_CastWand::SpawnCastPlan(*Avatar, VerticalCastPlan, 6103));
+	AMatterFluxMagicProjectile* VerticalProjectile = nullptr;
+	for (TActorIterator<AMatterFluxMagicProjectile> It(World); It; ++It)
+	{
+		if (It->GetPresentation().SpellId == VerticalCut->Id)
+		{
+			VerticalProjectile = *It;
+			break;
+		}
+	}
+	if (!TestNotNull(TEXT("Cut projectile exists"), CutProjectile)
+		|| !TestNotNull(TEXT("Flame projectile exists"), FlameProjectile)
+		|| !TestNotNull(TEXT("Vertical cut projectile exists"), VerticalProjectile))
+	{
+		return false;
+	}
+	// CreateNewMap produces an editor world, so explicitly cross the same
+	// BeginPlay seam that applies collision radius and visual presentation in a
+	// game world before asserting the first-frame geometry.
+	if (!CutProjectile->HasActorBegunPlay())
+	{
+		CutProjectile->DispatchBeginPlay();
+	}
+	if (!FlameProjectile->HasActorBegunPlay())
+	{
+		FlameProjectile->DispatchBeginPlay();
+	}
+	if (!VerticalProjectile->HasActorBegunPlay())
+	{
+		VerticalProjectile->DispatchBeginPlay();
+	}
+
+	const auto TestSpawnClearance = [
+		this,
+		Avatar](
+		const TCHAR* Label,
+		const AMatterFluxMagicProjectile& Projectile)
+	{
+		const UCapsuleComponent* Capsule = Avatar->GetCapsuleComponent();
+		const FVector Relative =
+			Projectile.GetActorLocation() - Avatar->GetActorLocation();
+		const float CapsuleRadius = Capsule->GetScaledCapsuleRadius();
+		const float CapsuleSegmentHalfLength = FMath::Max(
+			0.0f,
+			Capsule->GetScaledCapsuleHalfHeight() - CapsuleRadius);
+		const FVector ClosestCapsulePoint =
+			Avatar->GetActorLocation() + FVector(
+				0.0f,
+				0.0f,
+				FMath::Clamp(
+					Relative.Z,
+					-CapsuleSegmentHalfLength,
+					CapsuleSegmentHalfLength));
+		const float RequiredSeparation =
+			CapsuleRadius + Projectile.Collision->GetScaledSphereRadius();
+		TestTrue(
+			Label,
+			FVector::DistSquared(
+				Projectile.GetActorLocation(),
+				ClosestCapsulePoint)
+				> FMath::Square(RequiredSeparation));
+	};
+	TestSpawnClearance(
+		TEXT("Cut projectile is born clear of the caster capsule"),
+		*CutProjectile);
+	TestSpawnClearance(
+		TEXT("Flame projectile is born clear of the caster capsule"),
+		*FlameProjectile);
+
+	const FVector CutScale = CutProjectile->Visual->GetRelativeScale3D();
+	TestTrue(TEXT("Cut projectile is a thin horizontal plane at cast height"),
+		CutScale.Z <= 0.10f
+			&& CutScale.X >= CutScale.Z * 5.0f
+			&& CutScale.Y >= CutScale.Z * 5.0f
+			&& FVector::DotProduct(
+				CutProjectile->Visual->GetUpVector(),
+				FVector::UpVector) >= 0.99f);
+	const FVector VerticalCutScale =
+		VerticalProjectile->Visual->GetRelativeScale3D();
+	TestTrue(TEXT("Vertical cut travels edge-first as an upright blade"),
+		VerticalCutScale.Y <= 0.10f
+			&& VerticalCutScale.X >= VerticalCutScale.Y * 5.0f
+			&& VerticalCutScale.Z >= VerticalCutScale.Y * 5.0f
+			&& FVector::DotProduct(
+				VerticalProjectile->Visual->GetForwardVector(),
+				VerticalProjectile->GetActorForwardVector()) >= 0.99f);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxCutProjectileImpactShapeTest,
+	"MatterFlux.Magic.Projectile.CutImpactIsSingleCellLine",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxCutProjectileImpactShapeTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	FMatterFluxMagicProjectilePlan HorizontalPlan;
+	HorizontalPlan.Radius = 60.0f;
+	HorizontalPlan.bUsePlaneVisual = true;
+	FMatterFluxMagicProjectilePlan VerticalPlan = HorizontalPlan;
+	VerticalPlan.bUseVerticalPlaneVisual = true;
+	FMatterFluxMagicProjectilePlan OrbPlan;
+	OrbPlan.Radius = 20.0f;
+
+	const FFragmentDamageShape Horizontal =
+		AMatterFluxMagicProjectile::BuildImpactCutShape(
+			HorizontalPlan,
+			FVector::ForwardVector,
+			FVector::ZeroVector);
+	const FFragmentDamageShape Vertical =
+		AMatterFluxMagicProjectile::BuildImpactCutShape(
+			VerticalPlan,
+			FVector::ForwardVector,
+			FVector::ZeroVector);
+	const FFragmentDamageShape Orb =
+		AMatterFluxMagicProjectile::BuildImpactCutShape(
+			OrbPlan,
+			FVector::ForwardVector,
+			FVector::ZeroVector);
+
+	TestEqual(TEXT("Ordinary projectile damage remains radial"),
+		Orb.Type, EFragmentDamageShapeType::Circle);
+	TestTrue(TEXT("Ordinary projectile keeps its configured radius"),
+		FMath::IsNearlyEqual(Orb.Radius, 20.0f));
+	TestEqual(TEXT("Horizontal cut uses a line shape"),
+		Horizontal.Type, EFragmentDamageShapeType::Line);
+	TestEqual(TEXT("Vertical cut uses a line shape"),
+		Vertical.Type, EFragmentDamageShapeType::Line);
+	TestTrue(TEXT("Horizontal cut spans the projectile diameter"),
+		FMath::IsNearlyEqual(Horizontal.Extents.X, 120.0f));
+	TestTrue(TEXT("Vertical cut spans the projectile diameter"),
+		FMath::IsNearlyEqual(Vertical.Extents.X, 120.0f));
+	TestTrue(TEXT("Horizontal cut is no thicker than one material cell"),
+		Horizontal.Thickness <= 10.0f);
+	TestTrue(TEXT("Vertical cut is no thicker than one material cell"),
+		Vertical.Thickness <= 10.0f);
+	TestTrue(TEXT("Horizontal cut runs along world right"),
+		FMath::Abs(FVector::DotProduct(
+			Horizontal.WorldTransform.GetUnitAxis(EAxis::X),
+			FVector::RightVector)) >= 0.99f);
+	TestTrue(TEXT("Horizontal cut thickness is vertical"),
+		FMath::Abs(FVector::DotProduct(
+			Horizontal.WorldTransform.GetUnitAxis(EAxis::Z),
+			FVector::UpVector)) >= 0.99f);
+	TestTrue(TEXT("Vertical cut runs along world up"),
+		FMath::Abs(FVector::DotProduct(
+			Vertical.WorldTransform.GetUnitAxis(EAxis::X),
+			FVector::UpVector)) >= 0.99f);
+	TestTrue(TEXT("Vertical cut thickness runs across world right"),
+		FMath::Abs(FVector::DotProduct(
+			Vertical.WorldTransform.GetUnitAxis(EAxis::Z),
+			FVector::RightVector)) >= 0.99f);
+
+	// Fragment masks occupy local XZ with Y as their face normal. Build a
+	// second pair aimed into that normal so the raster audit measures a real
+	// face-on projectile impact rather than a coplanar/edge-on intersection.
+	const FFragmentDamageShape FaceOnHorizontal =
+		AMatterFluxMagicProjectile::BuildImpactCutShape(
+			HorizontalPlan,
+			FVector::RightVector,
+			FVector::ZeroVector);
+	const FFragmentDamageShape FaceOnVertical =
+		AMatterFluxMagicProjectile::BuildImpactCutShape(
+			VerticalPlan,
+			FVector::RightVector,
+			FVector::ZeroVector);
+	const auto CountRemovedCells = [](
+		const FFragmentDamageShape& Shape)
+	{
+		constexpr int32 Side = 21;
+		TArray<uint8> Mask;
+		Mask.Init(1, Side * Side);
+		MatterFlux::FragmentGeometry::ApplyDamageShape(
+			Mask,
+			Side,
+			Side,
+			10.0f,
+			Shape);
+		int32 RemovedCells = 0;
+		for (const uint8 Cell : Mask)
+		{
+			RemovedCells += Cell == 0 ? 1 : 0;
+		}
+		return RemovedCells;
+	};
+	TestEqual(TEXT("Horizontal cut removes exactly one 13-cell line"),
+		CountRemovedCells(FaceOnHorizontal), 13);
+	TestEqual(TEXT("Vertical cut removes exactly one 13-cell line"),
+		CountRemovedCells(FaceOnVertical), 13);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxMagicMaterialSpraySpellTest,
+	"MatterFlux.Magic.Content.WaterAndSandSpraysCompileAsForwardMaterialProjectiles",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxMagicMaterialSpraySpellTest::RunTest(
+	const FString& Parameters)
+{
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(TEXT("Default content pack loads"),
+		Runtime.ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry =
+		Runtime.GetActiveRegistry();
+	const FMatterFluxWandDefinition* SprayWand = Registry.IsValid()
+		? Registry->Wands.Find(TEXT("wand.flame"))
+		: nullptr;
+	if (!TestTrue(TEXT("Default registry exists"), Registry.IsValid())
+		|| !TestNotNull(TEXT("A rapid-casting wand exists"), SprayWand))
+	{
+		return false;
+	}
+
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* MaterialWorld = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	AActor* Avatar = World ? World->SpawnActor<AActor>() : nullptr;
+	if (!TestNotNull(TEXT("Material world spawns"), MaterialWorld)
+		|| !TestNotNull(TEXT("Authority avatar spawns"), Avatar))
+	{
+		return false;
+	}
+	MaterialWorld->Regenerate(24680);
+
+	struct FExpectedSpray
+	{
+		FName SpellId;
+		FName MaterialId;
+		FVector ImpactPoint;
+		float GravityScale;
+		int32 MaterialAmount;
+	};
+	const FExpectedSpray ExpectedSprays[] = {
+		{ TEXT("spell.water_spray"), TEXT("water"),
+			FVector(0.0f, 0.0f, 0.0f), 0.85f, 5 },
+		{ TEXT("spell.sand_spray"), TEXT("sand"),
+			FVector(100.0f, 0.0f, 0.0f), 1.0f, 5 },
+		{ TEXT("spell.acid_spray"), TEXT("acid"),
+			FVector(200.0f, 0.0f, 0.0f), 0.45f, 5 }
+	};
+
+	for (const FExpectedSpray& Expected : ExpectedSprays)
+	{
+		const FMatterFluxSpellDefinition* Definition =
+			Registry->Spells.Find(Expected.SpellId);
+		if (!TestNotNull(
+			*FString::Printf(TEXT("%s is registered"),
+				*Expected.SpellId.ToString()),
+			Definition))
+		{
+			continue;
+		}
+		TestEqual(TEXT("Spray uses the generic projectile compiler"),
+			Definition->Kind, EMatterFluxSpellKind::Projectile);
+		TestEqual(TEXT("In-flight spray uses its MatterFlux material"),
+			Definition->BodyMaterial, Expected.MaterialId);
+		TestEqual(TEXT("Spray authors its carried material volume"),
+			Definition->MaterialAmount, Expected.MaterialAmount);
+		TestTrue(TEXT("Spray is included in the starter spell inventory"),
+			Definition->StarterCount > 0);
+
+		FMatterFluxWandProgramState State;
+		State.Mana = SprayWand->ManaMax;
+		const TArray<FName> Slots = { Expected.SpellId };
+		FMatterFluxWandCastPlan Plan;
+		Error.Reset();
+		if (!TestTrue(TEXT("Spray compiles through the wand program"),
+			FMatterFluxWandProgram::Evaluate(
+				*Registry,
+				SprayWand->Id,
+				Slots,
+				State,
+				77,
+				Plan,
+				Error)))
+		{
+			AddError(Error);
+			continue;
+		}
+		if (!TestEqual(TEXT("Spray emits one short-lived material body"),
+			Plan.Projectiles.Num(), 1))
+		{
+			continue;
+		}
+		TestTrue(TEXT("Spray projectile has forward travel speed"),
+			Plan.Projectiles[0].Speed > 0.0f);
+		TestEqual(TEXT("Compiled spray retains its carried material volume"),
+			Plan.Projectiles[0].MaterialAmount,
+			Expected.MaterialAmount);
+		TestTrue(TEXT("Spray keeps its authored gravity scale"),
+			FMath::IsNearlyEqual(
+				Plan.Projectiles[0].GravityScale,
+				Expected.GravityScale));
+		TestTrue(TEXT("Spray remains short range"),
+			Plan.Projectiles[0].Lifetime < 1.0f);
+		if (!TestTrue(TEXT("Spray projectile spawns"),
+			UGA_CastWand::SpawnCastPlan(*Avatar, Plan, 77)))
+		{
+			continue;
+		}
+
+		AMatterFluxMagicProjectile* Projectile = nullptr;
+		for (TActorIterator<AMatterFluxMagicProjectile> It(World); It; ++It)
+		{
+			if (It->GetPresentation().SpellId == Expected.SpellId)
+			{
+				Projectile = *It;
+				break;
+			}
+		}
+		if (!TestNotNull(TEXT("Spawned spray projectile exists"), Projectile))
+		{
+			continue;
+		}
+		TestTrue(TEXT("Spawned spray travels in front of the caster"),
+			FVector::DotProduct(
+				Projectile->ProjectileMovement->Velocity,
+				Avatar->GetActorForwardVector()) > 0.0f);
+		TestTrue(TEXT("Material projectile uses swept collision"),
+			Projectile->ProjectileMovement->bSweepCollision);
+		TestTrue(TEXT("Blocking movement stop is wired to material impact"),
+			Projectile->ProjectileMovement->OnProjectileStop.IsBound());
+		TestTrue(TEXT("Material projectile blocks world geometry"),
+			Projectile->Collision->GetCollisionResponseToChannel(ECC_WorldStatic)
+				== ECR_Block);
+		TestTrue(TEXT("Projectile movement applies authored gravity"),
+			FMath::IsNearlyEqual(
+				Projectile->ProjectileMovement->ProjectileGravityScale,
+				Expected.GravityScale));
+
+		for (int32 Y = -4; Y <= 4; ++Y)
+		{
+			for (int32 X = -4; X <= 4; ++X)
+			{
+				MaterialWorld->SetSimulatedMaterialAtWorldLocation(
+					Expected.ImpactPoint
+						+ FVector(X * 8.0f, Y * 8.0f, 0.0f),
+					NAME_None);
+			}
+		}
+		const int32 MaterialCellsBefore =
+			MaterialWorld->GetSimulatedMaterialCount(Expected.MaterialId);
+		const int64 MaterialAmountBefore =
+			MaterialWorld->GetSimulatedMaterialAmount(Expected.MaterialId);
+		FHitResult Hit;
+		Hit.ImpactPoint = Expected.ImpactPoint;
+		TestTrue(TEXT("Spray resolves its authority impact"),
+			Projectile->ResolveImpactAuthority(Hit));
+		TestTrue(TEXT("Impact retires the flight-only projectile state"),
+			Projectile->IsActorBeingDestroyed());
+		TestEqual(TEXT("Spray conserves its authored material volume"),
+			MaterialWorld->GetSimulatedMaterialAmount(Expected.MaterialId)
+				- MaterialAmountBefore,
+			static_cast<int64>(Expected.MaterialAmount) * 255);
+		const int32 DepositedCells =
+			MaterialWorld->GetSimulatedMaterialCount(Expected.MaterialId)
+				- MaterialCellsBefore;
+		if (Expected.MaterialId == TEXT("water")
+			|| Expected.MaterialId == TEXT("acid"))
+		{
+			TestTrue(TEXT("Liquid spray lands as a shallow connected splash"),
+				DepositedCells > Expected.MaterialAmount);
+		}
+		else
+		{
+			TestEqual(TEXT("Powder spray enters one stackable impact column"),
+				DepositedCells,
+				1);
+		}
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxMagicAcidCorrosionSpellTest,
+	"MatterFlux.Magic.Content.AcidSprayCorrodesSourcesAndEmitsGas",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxMagicAcidCorrosionSpellTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(TEXT("Default content pack loads"),
+		Runtime.ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry = Runtime.GetActiveRegistry();
+	if (!TestTrue(TEXT("Default registry exists"), Registry.IsValid()))
+	{
+		return false;
+	}
+	const FMatterFluxReactionDefinition* TerrainCorrosion =
+		Registry->Reactions.Find(TEXT("acid_stone_corrosion"));
+	const FMatterFluxReactionDefinition* SourceCorrosion =
+		Registry->Reactions.Find(TEXT("wood_corrosion_acid"));
+	const FMatterFluxSpellDefinition* AcidSpell =
+		Registry->Spells.Find(TEXT("spell.acid_spray"));
+	if (!TestNotNull(TEXT("Acid corrodes stone terrain"), TerrainCorrosion)
+		|| !TestNotNull(TEXT("Acid corrodes wood sources"), SourceCorrosion)
+		|| !TestNotNull(TEXT("Acid spell is registered"), AcidSpell))
+	{
+		return false;
+	}
+	TestTrue(TEXT("Acid relies on corrosion instead of generic impact damage"),
+		FMath::IsNearlyZero(AcidSpell->Damage));
+	TestTrue(TEXT("Terrain corrosion is a contact reaction"),
+		TerrainCorrosion->Kind
+			== FMatterFluxReactionDefinition::EKind::Contact);
+	TestTrue(TEXT("Source corrosion propagates through the item"),
+		SourceCorrosion->Kind
+			== FMatterFluxReactionDefinition::EKind::Propagating);
+	TestEqual(TEXT("Source corrosion emits acid gas"),
+		SourceCorrosion->EmissionMaterial, FName(TEXT("acid_gas")));
+	TestEqual(TEXT("Corroded source cells leave no solid residue"),
+		SourceCorrosion->OutputA, FName(TEXT("empty")));
+
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AFragment2DSourceActor* Source = World
+		? World->SpawnActor<AFragment2DSourceActor>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Corrodible source spawns"), Source))
+	{
+		return false;
+	}
+	FFragmentSourceMask Mask;
+	Mask.Width = 5;
+	Mask.Height = 5;
+	Mask.CellSize = 10.0f;
+	Mask.MinFragmentAreaPixels = 1;
+	Mask.MaxFragmentsPerBreak = 4;
+	Mask.SolidMask.Init(1, Mask.Width * Mask.Height);
+	if (!TestTrue(TEXT("Wood source initializes"),
+		Source->InitializeFromProceduralMask(
+			Mask,
+			FGuid::NewDeterministicGuid(TEXT("AcidSpellSource"), 1),
+			FLinearColor::White,
+			TEXT("wood"))))
+	{
+		return false;
+	}
+	TestTrue(TEXT("Acid activates corrosion on an item source"),
+		Source->ApplyMaterialStimulusAtWorldLocation(
+			Source->GetActorLocation()
+				+ FVector(0.0f, 0.0f, Mask.CellSize * 2.0f),
+			TEXT("acid"),
+			991));
+	TestTrue(TEXT("Acid source starts reacting"), Source->IsReacting());
+	TArray<MatterFlux::Rendering::FMaterialEmissionAnchor> SmokeAnchors;
+	Source->GatherReactionSmokeAnchors(SmokeAnchors, 16);
+	TestTrue(TEXT("Active corrosion exposes smoke anchors"),
+		!SmokeAnchors.IsEmpty());
+	for (int32 Step = 0; Step < 5; ++Step)
+	{
+		Source->Tick(0.1f);
+	}
+	UInstancedStaticMeshComponent* CorrosionFlames = nullptr;
+	UPointLightComponent* CorrosionFireLight = nullptr;
+	TInlineComponentArray<UInstancedStaticMeshComponent*> InstanceComponents(
+		Source);
+	for (UInstancedStaticMeshComponent* Component : InstanceComponents)
+	{
+		if (Component && Component->GetFName() == TEXT("ReactionFlames"))
+		{
+			CorrosionFlames = Component;
+			break;
+		}
+	}
+	TInlineComponentArray<UPointLightComponent*> PointLights(Source);
+	for (UPointLightComponent* Component : PointLights)
+	{
+		if (Component && Component->GetFName() == TEXT("ReactionFireLight"))
+		{
+			CorrosionFireLight = Component;
+			break;
+		}
+	}
+	TestTrue(TEXT("Corrosion owns no flame instances"),
+		!CorrosionFlames || CorrosionFlames->GetInstanceCount() == 0);
+	TestTrue(TEXT("Corrosion does not illuminate wood like fire"),
+		!CorrosionFireLight || !CorrosionFireLight->IsVisible());
+	TestTrue(TEXT("Acid consumes source material"),
+		Source->GetRemainingInputCellCount() < Mask.SolidMask.Num());
+
+	AFragment2DSourceActor* BurningSource =
+		World->SpawnActor<AFragment2DSourceActor>();
+	if (!TestNotNull(TEXT("Combustible control source spawns"), BurningSource))
+	{
+		return false;
+	}
+	BurningSource->SetActorLocation(FVector(1000.0f, 0.0f, 0.0f));
+	if (!TestTrue(TEXT("Combustible control source initializes"),
+		BurningSource->InitializeFromProceduralMask(
+			Mask,
+			FGuid::NewDeterministicGuid(TEXT("AcidSpellFireControl"), 1),
+			FLinearColor::White,
+			TEXT("wood"))))
+	{
+		return false;
+	}
+	TestTrue(TEXT("Fire still activates combustion"),
+		BurningSource->ApplyMaterialStimulusAtWorldLocation(
+			BurningSource->GetActorLocation(),
+			TEXT("fire"),
+			992));
+	BurningSource->Tick(0.1f);
+	UInstancedStaticMeshComponent* FireFlames = nullptr;
+	TInlineComponentArray<UInstancedStaticMeshComponent*> FireInstances(
+		BurningSource);
+	for (UInstancedStaticMeshComponent* Component : FireInstances)
+	{
+		if (Component && Component->GetFName() == TEXT("ReactionFlames"))
+		{
+			FireFlames = Component;
+			break;
+		}
+	}
+	UPointLightComponent* FireLight = nullptr;
+	TInlineComponentArray<UPointLightComponent*> FireLights(BurningSource);
+	for (UPointLightComponent* Component : FireLights)
+	{
+		if (Component && Component->GetFName() == TEXT("ReactionFireLight"))
+		{
+			FireLight = Component;
+			break;
+		}
+	}
+	TestTrue(TEXT("Real combustion retains flame instances"),
+		FireFlames && FireFlames->GetInstanceCount() > 0);
+	TestTrue(TEXT("Real combustion retains its fire light"),
+		FireLight && FireLight->IsVisible());
 	return true;
 }
 
@@ -1146,6 +2068,40 @@ bool FMatterFluxMagicProjectileMaterialImpactTest::RunTest(
 		return false;
 	}
 	MaterialWorld->Regenerate(13579);
+	float ContactSurfaceZ = 0.0f;
+	if (!TestTrue(
+		TEXT("Material impact contact has a simulated terrain surface"),
+		MaterialWorld->TrySampleTerrainHeightAtWorldLocation(
+			FVector::ZeroVector,
+			ContactSurfaceZ)))
+	{
+		return false;
+	}
+	const FVector ContactLocation(0.0f, 0.0f, ContactSurfaceZ);
+	AFragment2DSourceActor* ReactiveSource =
+		World->SpawnActor<AFragment2DSourceActor>();
+	if (!TestNotNull(TEXT("Reactive source spawns"), ReactiveSource))
+	{
+		return false;
+	}
+	ReactiveSource->SetActorLocation(ContactLocation);
+	FFragmentSourceMask ReactiveMask;
+	ReactiveMask.Width = 3;
+	ReactiveMask.Height = 3;
+	ReactiveMask.CellSize = 20.0f;
+	ReactiveMask.MinFragmentAreaPixels = 1;
+	ReactiveMask.MaxFragmentsPerBreak = 4;
+	ReactiveMask.SolidMask.Init(1, 9);
+	if (!TestTrue(
+		TEXT("Reactive source initializes"),
+		ReactiveSource->InitializeFromProceduralMask(
+			ReactiveMask,
+			FGuid::NewDeterministicGuid(TEXT("MaterialImpactSource"), 1),
+			FLinearColor::White,
+			TEXT("wood"))))
+	{
+		return false;
+	}
 	const int32 FireCellsBefore =
 		MaterialWorld->GetSimulatedMaterialCount(TEXT("fire"));
 
@@ -1156,8 +2112,9 @@ bool FMatterFluxMagicProjectileMaterialImpactTest::RunTest(
 	ProjectilePlan.Speed = 800.0f;
 	ProjectilePlan.Lifetime = 1.0f;
 	ProjectilePlan.Radius = 20.0f;
+	ProjectilePlan.Damage = 12.0f;
 	ProjectilePlan.BodyMaterial = TEXT("fire");
-	ProjectilePlan.ImpactMaterial = TEXT("fire");
+	ProjectilePlan.MaterialAmount = 1;
 	if (!TestTrue(TEXT("Material projectile spawns"),
 		UGA_CastWand::SpawnCastPlan(*Avatar, Plan, 502)))
 	{
@@ -1178,12 +2135,24 @@ bool FMatterFluxMagicProjectileMaterialImpactTest::RunTest(
 		return false;
 	}
 	FHitResult Hit;
-	Hit.ImpactPoint = FVector::ZeroVector;
+	Hit.ImpactPoint = ContactLocation;
+	const int32 SourceRevisionBeforeImpact = ReactiveSource->Revision;
 	TestTrue(TEXT("Projectile resolves its material impact"),
 		Projectile->ResolveImpactAuthority(Hit));
+	TestEqual(
+		TEXT("A conventional damage projectile cannot directly cut world state"),
+		ReactiveSource->Revision,
+		SourceRevisionBeforeImpact);
 	TestTrue(TEXT("Impact material enters the falling-sand world"),
 		MaterialWorld->GetSimulatedMaterialCount(TEXT("fire"))
 			> FireCellsBefore);
+	TestFalse(
+		TEXT("Projectile impact does not mutate a reactive source synchronously"),
+		ReactiveSource->IsReacting());
+	MaterialWorld->Tick(0.06f);
+	TestTrue(
+		TEXT("The material interaction step applies the deposited stimulus"),
+		ReactiveSource->IsReacting());
 	return true;
 }
 

@@ -538,3 +538,93 @@ bool FMatterFluxProgressionMagicEffectsTransactionTest::RunTest(
 		Inventory->GetOwnedWands().Num(), BeforeWandCount);
 	return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxRetiredEmberSpellMigrationTest,
+	"MatterFlux.Progression.RetiredEmberSpellMigratesToFlameProjectile",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxRetiredEmberSpellMigrationTest::RunTest(
+	const FString& Parameters)
+{
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(TEXT("Default content reloads for spell migration"),
+		Runtime.ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayerState* PlayerState = World
+		? World->SpawnActor<AMatterFluxPlayerState>() : nullptr;
+	UMatterFluxMagicInventoryComponent* Inventory = PlayerState
+		? PlayerState->GetMagicInventory() : nullptr;
+	if (!TestNotNull(TEXT("Magic inventory exists for migration"), Inventory)
+		|| !TestTrue(TEXT("Starter inventory initializes for migration"),
+			Inventory->ResetToStarterLoadoutAuthority(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	FMatterFluxMagicInventorySaveState LegacyState;
+	if (!TestTrue(TEXT("Legacy migration snapshot captures"),
+		Inventory->CaptureSaveState(LegacyState, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	LegacyState.Spells.RemoveAll([](const FMatterFluxSavedSpell& Spell)
+	{
+		return Spell.SpellId == TEXT("spell.ember_bolt")
+			|| Spell.SpellId == TEXT("spell.flame_jet");
+	});
+	FMatterFluxSavedSpell& LegacyEmber = LegacyState.Spells.AddDefaulted_GetRef();
+	LegacyEmber.SpellId = TEXT("spell.ember_bolt");
+	LegacyEmber.Quantity = 3;
+	FMatterFluxSavedWand* LegacyWand = LegacyState.Wands.FindByPredicate(
+		[](const FMatterFluxSavedWand& Wand)
+		{
+			return !Wand.SpellSlots.IsEmpty();
+		});
+	if (!TestNotNull(TEXT("Legacy snapshot owns a programmable wand"), LegacyWand))
+	{
+		return false;
+	}
+	LegacyWand->SpellSlots[0] = TEXT("spell.ember_bolt");
+	const FGuid LegacyWandId = LegacyWand->InstanceId;
+
+	if (!TestTrue(TEXT("Legacy ember inventory restores"),
+		Inventory->RestoreSaveStateAuthority(LegacyState, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	TestFalse(TEXT("Retired ember spell does not survive inventory restore"),
+		Inventory->GetOwnedSpells().ContainsByPredicate(
+			[](const FMatterFluxOwnedSpell& Spell)
+			{
+				return Spell.SpellId == TEXT("spell.ember_bolt");
+			}));
+	const FMatterFluxOwnedSpell* MigratedFlame =
+		Inventory->GetOwnedSpells().FindByPredicate(
+			[](const FMatterFluxOwnedSpell& Spell)
+			{
+				return Spell.SpellId == TEXT("spell.flame_jet");
+			});
+	if (TestNotNull(TEXT("Ember stack becomes flame projectile stack"),
+		MigratedFlame))
+	{
+		TestEqual(TEXT("Retired spell quantity is preserved"),
+			MigratedFlame->Quantity, 3);
+	}
+	const FMatterFluxOwnedWand* MigratedWand = Inventory->FindWand(LegacyWandId);
+	if (TestNotNull(TEXT("Wand survives retired spell migration"), MigratedWand))
+	{
+		TestEqual(TEXT("Wand slot now references the flame projectile"),
+			MigratedWand->SpellSlots[0], FName(TEXT("spell.flame_jet")));
+	}
+	return true;
+}

@@ -6,6 +6,7 @@
 #include "Fragment/FragmentSimulationSubsystem.h"
 #include "Fragment/FragmentSourceSpatialIndex.h"
 #include "FragmentTestActors.h"
+#include "HAL/PlatformTime.h"
 #include "IMatterFluxScriptRuntime.h"
 #include "Algo/Count.h"
 #include "Engine/World.h"
@@ -970,10 +971,13 @@ bool FMatterFluxDetachedItemRepeatedCutTest::RunTest(
 	Request.EventSeed = 908;
 	Request.MaxAffectedSources = 1;
 	const int32 RequiredCuts = Item->GetCutsBeforeFade();
-	if (!TestTrue(TEXT("Detached items require multiple cuts"), RequiredCuts > 1))
+	if (!TestEqual(TEXT("Detached items allow ten exact cuts"), RequiredCuts, 10))
 	{
 		return false;
 	}
+	const int32 InitialVertexCount = Item->SpawnPayload.Vertices2D.Num();
+	const int32 InitialTriangleIndexCount =
+		Item->SpawnPayload.TriangleIndices.Num();
 	for (int32 CutIndex = 0; CutIndex < RequiredCuts; ++CutIndex)
 	{
 		Request.EventSeed += CutIndex;
@@ -987,9 +991,26 @@ bool FMatterFluxDetachedItemRepeatedCutTest::RunTest(
 			CutIndex + 1);
 		if (CutIndex + 1 < RequiredCuts)
 		{
+			int32 CarrierCount = 0;
+			for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+			{
+				++CarrierCount;
+			}
 			TestFalse(
 				TEXT("Item remains physical before its cut threshold"),
 				Item->IsCutFadeActive());
+			TestEqual(
+				TEXT("Repeated item cuts do not spawn additional carriers"),
+				CarrierCount,
+				1);
+			TestEqual(
+				TEXT("Repeated item cuts do not grow the carrier mesh"),
+				Item->SpawnPayload.Vertices2D.Num(),
+				InitialVertexCount);
+			TestEqual(
+				TEXT("Repeated item cuts do not add carrier triangles"),
+				Item->SpawnPayload.TriangleIndices.Num(),
+				InitialTriangleIndexCount);
 		}
 	}
 	TestTrue(
@@ -1009,6 +1030,116 @@ bool FMatterFluxDetachedItemRepeatedCutTest::RunTest(
 		TEXT("A fading item does not consume another cut target"),
 		UFragmentSimulationSubsystem::ExecuteWorldCut(World, Request),
 		0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxDetachedItemCutThresholdPerformanceTest,
+	"MatterFlux.Performance.DetachedItemTenCutThresholdHasConstantPerCutCost",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::PerfFilter)
+
+bool FMatterFluxDetachedItemCutThresholdPerformanceTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Detached-item performance world exists"), World))
+	{
+		return false;
+	}
+
+	MatterFlux::FragmentGeometry::FFragmentComponent Component;
+	for (int32 Y = 0; Y < 3; ++Y)
+	{
+		for (int32 X = 0; X < 3; ++X)
+		{
+			Component.Cells.Add(FIntPoint(X, Y));
+		}
+	}
+	Component.Min = FIntPoint::ZeroValue;
+	Component.Max = FIntPoint(2, 2);
+	TArray<FFragmentSpawnPayload> Payloads;
+	if (!TestTrue(
+		TEXT("Performance carrier payload builds"),
+		MatterFlux::FragmentGeometry::BuildSpawnPayloadsFromComponents(
+			{Component},
+			FGuid::NewDeterministicGuid(TEXT("CutThresholdPerformance"), 1),
+			FTransform::Identity,
+			3,
+			3,
+			1,
+			10.0f,
+			1,
+			1,
+			FVector::ZeroVector,
+			0.0f,
+			909,
+			Payloads))
+		|| !TestEqual(TEXT("One performance payload is produced"),
+			Payloads.Num(), 1))
+	{
+		return false;
+	}
+	Payloads[0].MaterialId = TEXT("wood");
+	Payloads[0].bEnableCollision = true;
+	AFragment2DActor* Item = World->SpawnActor<AFragment2DActor>();
+	if (!TestNotNull(TEXT("Performance carrier spawns"), Item)
+		|| !TestTrue(TEXT("Performance carrier initializes"),
+			Item->InitializeFromPayload(Payloads[0])))
+	{
+		return false;
+	}
+
+	FFragmentWorldCutRequest Request;
+	Request.CutShape.Type = EFragmentDamageShapeType::Line;
+	Request.CutShape.WorldTransform = Item->GetActorTransform();
+	Request.CutShape.Extents.X = 40.0f;
+	Request.CutShape.Thickness = 8.0f;
+	Request.DamagePower = 0.0f;
+	Request.EventSeed = 910;
+	Request.MaxAffectedSources = 1;
+	constexpr int32 BenchmarkCutCount = 4096;
+	bool bAllCutsAccepted = true;
+	const auto MeasurePerCutMilliseconds = [
+		World,
+		Item,
+		&Request,
+		&bAllCutsAccepted](const int32 Threshold)
+	{
+		Item->CutsBeforeFade = Threshold;
+		Item->AcceptedCutCount = 0;
+		Item->ActiveCutFadeDuration = 0.0f;
+		const double StartSeconds = FPlatformTime::Seconds();
+		for (int32 CutIndex = 0; CutIndex < BenchmarkCutCount; ++CutIndex)
+		{
+			// Keep the benchmark on the physical pre-fade path. Resetting one
+			// integer models separate carriers without adding actor-spawn noise.
+			if (Item->AcceptedCutCount >= Threshold - 1)
+			{
+				Item->AcceptedCutCount = 0;
+			}
+			Request.EventSeed += CutIndex + Threshold;
+			bAllCutsAccepted &=
+				UFragmentSimulationSubsystem::ExecuteWorldCut(World, Request) == 1;
+		}
+		return (FPlatformTime::Seconds() - StartSeconds)
+			* 1000.0 / static_cast<double>(BenchmarkCutCount);
+	};
+
+	const double ThreeCutMilliseconds = MeasurePerCutMilliseconds(3);
+	const double TenCutMilliseconds = MeasurePerCutMilliseconds(10);
+	AddInfo(FString::Printf(
+		TEXT("Detached item world-cut cost: threshold 3 = %.4f ms/cut, threshold 10 = %.4f ms/cut (%d cuts each)"),
+		ThreeCutMilliseconds,
+		TenCutMilliseconds,
+		BenchmarkCutCount));
+	TestTrue(TEXT("Every benchmark cut reaches the detached carrier"),
+		bAllCutsAccepted);
+	TestTrue(TEXT("Ten-cut threshold keeps per-command cost bounded"),
+		TenCutMilliseconds < 0.5);
+	TestTrue(TEXT("Threshold value does not multiply per-command work"),
+		TenCutMilliseconds
+			<= ThreeCutMilliseconds * 1.5 + 0.01);
 	return true;
 }
 

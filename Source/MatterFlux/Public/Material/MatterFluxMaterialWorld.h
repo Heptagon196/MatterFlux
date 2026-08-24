@@ -38,8 +38,10 @@ namespace MatterFlux::Material
 		FIntPoint WorldCell = FIntPoint::ZeroValue;
 		FName MaterialId = NAME_None;
 		int32 SupportHeight = 0;
-		/** 物质格占用量；液体使用 1..255，其他相态保持 255。 */
-		uint8 Amount = 255;
+		/** Conserved column volume. Liquids use 1..255; surface powders may stack above 255. */
+		uint16 Amount = 255;
+		/** 剩余存在步数；0 表示不会自行消散。 */
+		uint8 RemainingLifetime = 0;
 	};
 
 	struct FSeedCell
@@ -48,7 +50,7 @@ namespace MatterFlux::Material
 		FName MaterialId = NAME_None;
 		int32 SupportHeight = 0;
 		/** Initial conserved occupancy for liquids; empty/static cells remain full. */
-		uint8 Amount = 255;
+		uint16 Amount = 255;
 	};
 
 	/**
@@ -87,6 +89,11 @@ namespace MatterFlux::Material
 			int32 Seed,
 			FString& OutError);
 		bool SetCell(const FIntPoint& WorldCell, FName MaterialId);
+		/** Sets an exact conserved occupancy; intended for liquid injection. */
+		bool SetCellAmount(
+			const FIntPoint& WorldCell,
+			FName MaterialId,
+			uint16 Amount);
 		bool SetSupportHeight(const FIntPoint& WorldCell, int32 Height);
 		bool SeedSurface(const TArray<FSeedCell>& SeedCells);
 		/**

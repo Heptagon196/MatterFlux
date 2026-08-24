@@ -195,20 +195,20 @@ namespace
 				|| Left.MaterialId != Right.MaterialId
 				|| !Left.Color.Equals(Right.Color)
 				|| Left.bEnableCollision != Right.bEnableCollision
-				|| Left.bHasCombustionState != Right.bHasCombustionState
-				|| Left.CombustionRuleId != Right.CombustionRuleId
-				|| Left.ResidueMaterialId != Right.ResidueMaterialId
-				|| !Left.ResidueColor.Equals(Right.ResidueColor)
-				|| Left.CombustionSeed != Right.CombustionSeed
-				|| Left.CombustionTick != Right.CombustionTick
-				|| Left.CombustionAccumulator != Right.CombustionAccumulator
-				|| Left.TotalSmokeEmissionCount != Right.TotalSmokeEmissionCount
-				|| Left.ResidueMask.Width != Right.ResidueMask.Width
-				|| Left.ResidueMask.Height != Right.ResidueMask.Height
-				|| Left.ResidueMask.SolidMask != Right.ResidueMask.SolidMask
-				|| Left.BurningMask.Width != Right.BurningMask.Width
-				|| Left.BurningMask.Height != Right.BurningMask.Height
-				|| Left.BurningMask.SolidMask != Right.BurningMask.SolidMask)
+				|| Left.bHasReactionState != Right.bHasReactionState
+				|| Left.ReactionRuleId != Right.ReactionRuleId
+				|| Left.OutputMaterialId != Right.OutputMaterialId
+				|| !Left.OutputColor.Equals(Right.OutputColor)
+				|| Left.ReactionSeed != Right.ReactionSeed
+				|| Left.ReactionTick != Right.ReactionTick
+				|| Left.ReactionAccumulator != Right.ReactionAccumulator
+				|| Left.TotalMaterialEmissionCount != Right.TotalMaterialEmissionCount
+				|| Left.OutputMask.Width != Right.OutputMask.Width
+				|| Left.OutputMask.Height != Right.OutputMask.Height
+				|| Left.OutputMask.SolidMask != Right.OutputMask.SolidMask
+				|| Left.ActiveMask.Width != Right.ActiveMask.Width
+				|| Left.ActiveMask.Height != Right.ActiveMask.Height
+				|| Left.ActiveMask.SolidMask != Right.ActiveMask.SolidMask)
 			{
 				return false;
 			}
@@ -285,12 +285,12 @@ namespace
 				return false;
 			}
 
-			if (!bRequestedLogicalCombustion)
+			if (!bRequestedLogicalReaction)
 			{
 				AMatterFluxPlayableWorldActor* ServerWorldActor =
 					FindPlayableWorldActor(Server);
 				if (!ServerWorldActor
-					|| !ServerWorldActor->IgniteFirstGeneratedTree(7331))
+					|| !ServerWorldActor->ApplyMaterialStimulusToFirstGeneratedTree(7331))
 				{
 					return FailOnTimeout(
 						TEXT("The server could not ignite a logical tree source."));
@@ -300,12 +300,12 @@ namespace
 				// disabled.
 				ServerWorldActor->SetActorTickEnabled(false);
 				ServerWorldActor->ForceNetUpdate();
-				bRequestedLogicalCombustion = true;
+				bRequestedLogicalReaction = true;
 				BeginNextPhase();
 				return false;
 			}
 
-			if (!bValidatedLogicalCombustion)
+			if (!bValidatedLogicalReaction)
 			{
 				AMatterFluxPlayableWorldActor* ServerWorldActor =
 					FindPlayableWorldActor(Server);
@@ -313,23 +313,23 @@ namespace
 					FindPlayableWorldActor(Clients[0]);
 				AMatterFluxPlayableWorldActor* ClientBWorldActor =
 					FindPlayableWorldActor(Clients[1]);
-				const int32 ServerFuel = ServerWorldActor
-					? ServerWorldActor->GetLogicalCombustionFuelCellCount(TEXT("wood"))
+				const int32 ServerInput = ServerWorldActor
+					? ServerWorldActor->GetLogicalReactionInputCellCount(TEXT("wood"))
 					: 0;
 				if (!ServerWorldActor
 					|| !ClientAWorldActor
 					|| !ClientBWorldActor
-					|| ServerWorldActor->GetCombustingSourceCount() <= 0
-					|| ClientAWorldActor->GetCombustingSourceCount() <= 0
-					|| ClientBWorldActor->GetCombustingSourceCount() <= 0
-					|| ServerFuel <= 0
-					|| ClientAWorldActor->GetLogicalCombustionFuelCellCount(TEXT("wood"))
-						!= ServerFuel
-					|| ClientBWorldActor->GetLogicalCombustionFuelCellCount(TEXT("wood"))
-						!= ServerFuel)
+					|| ServerWorldActor->GetReactingSourceCount() <= 0
+					|| ClientAWorldActor->GetReactingSourceCount() <= 0
+					|| ClientBWorldActor->GetReactingSourceCount() <= 0
+					|| ServerInput <= 0
+					|| ClientAWorldActor->GetLogicalReactionInputCellCount(TEXT("wood"))
+						!= ServerInput
+					|| ClientBWorldActor->GetLogicalReactionInputCellCount(TEXT("wood"))
+						!= ServerInput)
 				{
 					return FailOnTimeout(
-						TEXT("Logical source combustion Fast Array state did not converge on both clients."));
+						TEXT("Logical source reaction Fast Array state did not converge on both clients."));
 				}
 				UWorld* NetworkWorlds[] = {
 					Server, Clients[0], Clients[1]
@@ -340,15 +340,15 @@ namespace
 					for (TActorIterator<AFragment2DSourceActor> It(
 						NetworkWorld); It; ++It)
 					{
-						if (!It->IsActorBeingDestroyed() && It->IsCombusting())
+						if (!It->IsActorBeingDestroyed() && It->IsReacting())
 						{
 							return FailOnTimeout(
-								TEXT("Logical tree combustion was incorrectly assigned to a materialized Source Actor."));
+								TEXT("Logical tree reaction was incorrectly assigned to a materialized Source Actor."));
 						}
 					}
 				}
 				ServerWorldActor->SetActorTickEnabled(true);
-				bValidatedLogicalCombustion = true;
+				bValidatedLogicalReaction = true;
 				BeginNextPhase();
 				return false;
 			}
@@ -428,7 +428,7 @@ namespace
 							return Source
 								&& Source->SourceId == Definition.SourceId;
 						});
-					if (Entry && *Entry && !(*Entry)->IsCombusting())
+					if (Entry && *Entry && !(*Entry)->IsReacting())
 					{
 						Root = *Entry;
 						ExpectedAggregateMemberCount = 0;
@@ -439,14 +439,14 @@ namespace
 								Member.AggregateId == Definition.AggregateId ? 1 : 0;
 						}
 						// Carrier 的根部体素保存在 SpawnPayload /
-						// RootCombustionState；AggregateSources 只记录其余层。
+						// RootReactionState；AggregateSources 只记录其余层。
 						--ExpectedAggregateMemberCount;
 						break;
 					}
 				}
 				if (!Root || ExpectedAggregateMemberCount <= 1)
 				{
-					return FailOnTimeout(TEXT("A non-burning generated tree root could not be materialized."));
+					return FailOnTimeout(TEXT("A non-active generated tree root could not be materialized."));
 				}
 
 				FFragmentDamageEvent Event;
@@ -850,8 +850,8 @@ namespace
 		double PhaseStartTime = 0.0;
 		bool bSpawnedSource = false;
 		bool bValidatedMaterialState = false;
-		bool bRequestedLogicalCombustion = false;
-		bool bValidatedLogicalCombustion = false;
+		bool bRequestedLogicalReaction = false;
+		bool bValidatedLogicalReaction = false;
 		bool bAggregateCutCommitted = false;
 		bool bRequestedAggregateFelling = false;
 		bool bValidatedAggregateCarrier = false;

@@ -1,4 +1,5 @@
 #include "Magic/MatterFluxWandProgram.h"
+#include "Magic/MatterFluxSpellProgramLayout.h"
 
 #include "Misc/Crc.h"
 
@@ -32,6 +33,7 @@ namespace MatterFluxWandProgram
 		int32 InstructionCount = 0;
 		int32 ProjectileCount = 0;
 		int32 CasterEffectCount = 0;
+		int32 RemainingSlotsBeforeWrap = 0;
 		FString Error;
 
 		FEvaluationContext(
@@ -48,18 +50,30 @@ namespace MatterFluxWandProgram
 			Plan.NextState = InState;
 			Plan.CastDelay = InWand.CastDelay;
 			Plan.RechargeTime = InWand.RechargeTime;
-			DrawOrder.Reserve(InSlots.Num());
-			for (int32 Index = 0; Index < InSlots.Num(); ++Index)
+
+			// The workbench stores a compact prefix tree. Empty slots that are
+			// children of a modifier, multicast, or trigger are executable blank
+			// branches; only disconnected reserve capacity must be skipped. Build
+			// the draw order from the same structural model used by the editor so
+			// presentation and execution cannot disagree.
+			FMatterFluxSpellProgramLayout Layout;
+			if (!FMatterFluxSpellProgramLayoutBuilder::Build(
+				InRegistry,
+				InSlots,
+				Layout,
+				Error))
 			{
-				// Capacity describes how many spells a wand can hold; an empty
-				// editor slot is not a blank card in the runtime deck. Including
-				// NAME_None here made every starter wand cast once and then draw
-				// several no-op slots before its spell came around again.
-				if (!InSlots[Index].IsNone())
+				return;
+			}
+			DrawOrder.Reserve(InSlots.Num());
+			for (const FMatterFluxSpellProgramColumn& Column : Layout.Columns)
+			{
+				for (const FMatterFluxSpellProgramNode& Node : Column.Nodes)
 				{
-					DrawOrder.Add(Index);
+					DrawOrder.Add(Node.SlotIndex);
 				}
 			}
+			DrawOrder.Sort();
 			if (InWand.bShuffle)
 			{
 				for (int32 Index = DrawOrder.Num() - 1;
@@ -69,6 +83,12 @@ namespace MatterFluxWandProgram
 					const int32 SwapIndex = Random.RandRange(0, Index);
 					DrawOrder.Swap(Index, SwapIndex);
 				}
+			}
+			if (!DrawOrder.IsEmpty())
+			{
+				const int32 StartIndex =
+					InState.DeckCursor % DrawOrder.Num();
+				RemainingSlotsBeforeWrap = DrawOrder.Num() - StartIndex;
 			}
 		}
 
@@ -85,6 +105,14 @@ namespace MatterFluxWandProgram
 				Error = TEXT("wand program exceeded its instruction budget");
 				return false;
 			}
+			// A child draw may reach the physical end of the prefix program. It
+			// is an empty branch, not permission to wrap into the next cast and
+			// recursively execute the root again.
+			if (RemainingSlotsBeforeWrap <= 0)
+			{
+				return true;
+			}
+			--RemainingSlotsBeforeWrap;
 			const int32 OrderedIndex =
 				Plan.NextState.DeckCursor % DrawOrder.Num();
 			const int32 SlotIndex = DrawOrder[OrderedIndex];
@@ -257,6 +285,7 @@ namespace MatterFluxWandProgram
 					Projectile.Lifetime =
 						Spell->Lifetime * Pending.LifetimeMultiplier;
 					Projectile.Radius = Spell->Radius;
+					Projectile.GravityScale = Spell->GravityScale;
 					Projectile.SpreadDegrees = Pending.SpreadDegrees;
 					Projectile.SpawnAngleDegrees =
 						FMath::IsNearlyZero(Pending.SpreadDegrees)
@@ -264,8 +293,11 @@ namespace MatterFluxWandProgram
 							: Random.FRandRange(
 								-Pending.SpreadDegrees,
 								Pending.SpreadDegrees);
-					Projectile.ImpactMaterial = Spell->ImpactMaterial;
 					Projectile.BodyMaterial = Spell->BodyMaterial;
+					Projectile.MaterialAmount = Spell->MaterialAmount;
+					Projectile.bUsePlaneVisual = Spell->bUsePlaneVisual;
+					Projectile.bUseVerticalPlaneVisual =
+						Spell->bUseVerticalPlaneVisual;
 					Projectile.bOverrideColor = Pending.bOverrideColor;
 					Projectile.Color = Pending.Color;
 					Projectile.OrbitRadius = Pending.OrbitRadius;
@@ -366,6 +398,11 @@ bool FMatterFluxWandProgram::Evaluate(
 		SpellSlots,
 		CurrentState,
 		static_cast<int32>(DeterministicSeed));
+	if (!Context.Error.IsEmpty())
+	{
+		OutError = Context.Error;
+		return false;
+	}
 	if (!Context.CompileSequence(
 		Wand->DrawCount,
 		0,

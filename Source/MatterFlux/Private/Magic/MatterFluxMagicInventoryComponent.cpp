@@ -10,6 +10,13 @@ namespace MatterFluxMagicInventory
 {
 	constexpr int32 EquipmentSlotCount = 4;
 
+	FName ResolveRetiredSpellId(const FName SpellId)
+	{
+		return SpellId == TEXT("spell.ember_bolt")
+			? FName(TEXT("spell.flame_jet"))
+			: SpellId;
+	}
+
 	FMatterFluxOwnedWand* FindWand(
 		TArray<FMatterFluxOwnedWand>& Wands,
 		const FGuid WandId)
@@ -756,18 +763,36 @@ bool UMatterFluxMagicInventoryComponent::RestoreSaveStateAuthority(
 	TSet<FName> SeenSpells;
 	for (const FMatterFluxSavedSpell& Saved : State.Spells)
 	{
+		const FName RuntimeSpellId = ResolveRetiredSpellId(Saved.SpellId);
 		if (Saved.SpellId.IsNone()
 			|| Saved.Quantity <= 0
-			|| !Registry->Spells.Contains(Saved.SpellId)
+			|| !Registry->Spells.Contains(RuntimeSpellId)
 			|| SeenSpells.Contains(Saved.SpellId))
 		{
 			OutError = TEXT("saved magic inventory contains an invalid spell stack");
 			return false;
 		}
 		SeenSpells.Add(Saved.SpellId);
-		FMatterFluxOwnedSpell& Spell = CandidateSpells.AddDefaulted_GetRef();
-		Spell.SpellId = Saved.SpellId;
-		Spell.Quantity = Saved.Quantity;
+		FMatterFluxOwnedSpell* Existing = FindSpell(
+			CandidateSpells,
+			RuntimeSpellId);
+		if (Existing)
+		{
+			const int64 MergedQuantity = static_cast<int64>(Existing->Quantity)
+				+ static_cast<int64>(Saved.Quantity);
+			if (MergedQuantity > MAX_int32)
+			{
+				OutError = TEXT("saved spell migration exceeds the quantity limit");
+				return false;
+			}
+			Existing->Quantity = static_cast<int32>(MergedQuantity);
+		}
+		else
+		{
+			FMatterFluxOwnedSpell& Spell = CandidateSpells.AddDefaulted_GetRef();
+			Spell.SpellId = RuntimeSpellId;
+			Spell.Quantity = Saved.Quantity;
+		}
 	}
 
 	const double Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
@@ -792,9 +817,11 @@ bool UMatterFluxMagicInventoryComponent::RestoreSaveStateAuthority(
 			OutError = TEXT("saved magic inventory contains an invalid wand");
 			return false;
 		}
-		for (const FName SpellId : Saved.SpellSlots)
+		for (const FName SavedSpellId : Saved.SpellSlots)
 		{
-			if (!SpellId.IsNone() && !Registry->Spells.Contains(SpellId))
+			const FName RuntimeSpellId = ResolveRetiredSpellId(SavedSpellId);
+			if (!RuntimeSpellId.IsNone()
+				&& !Registry->Spells.Contains(RuntimeSpellId))
 			{
 				OutError = TEXT("saved wand references an unknown spell");
 				return false;
@@ -805,6 +832,10 @@ bool UMatterFluxMagicInventoryComponent::RestoreSaveStateAuthority(
 		Wand.InstanceId = Saved.InstanceId;
 		Wand.DefinitionId = Saved.DefinitionId;
 		Wand.SpellSlots = Saved.SpellSlots;
+		for (FName& SpellId : Wand.SpellSlots)
+		{
+			SpellId = ResolveRetiredSpellId(SpellId);
+		}
 		Wand.Mana = FMath::Clamp(Saved.Mana, 0.0f, Definition->ManaMax);
 		Wand.DeckCursor = Saved.DeckCursor;
 		Wand.CastSerial = Saved.CastSerial;
@@ -952,6 +983,27 @@ void UMatterFluxMagicInventoryComponent::HandleContentReloaded(
 	}
 
 	bool bChanged = false;
+	int32 RetiredEmberQuantity = 0;
+	for (const FMatterFluxOwnedSpell& Spell : OwnedSpells.Items)
+	{
+		if (Spell.SpellId == TEXT("spell.ember_bolt"))
+		{
+			RetiredEmberQuantity += Spell.Quantity;
+		}
+	}
+	if (RetiredEmberQuantity > 0
+		&& Registry->Spells.Contains(TEXT("spell.flame_jet")))
+	{
+		OwnedSpells.Items.RemoveAll([](const FMatterFluxOwnedSpell& Spell)
+		{
+			return Spell.SpellId == TEXT("spell.ember_bolt");
+		});
+		MatterFluxMagicInventory::AddSpell(
+			OwnedSpells.Items,
+			TEXT("spell.flame_jet"),
+			RetiredEmberQuantity);
+		bChanged = true;
+	}
 	for (FMatterFluxOwnedWand& Wand : OwnedWands.Items)
 	{
 		bool bWandChanged = false;
@@ -963,7 +1015,9 @@ void UMatterFluxMagicInventoryComponent::HandleContentReloaded(
 		}
 		while (Wand.SpellSlots.Num() > Definition->Capacity)
 		{
-			const FName Removed = Wand.SpellSlots.Pop();
+			const FName Removed =
+				MatterFluxMagicInventory::ResolveRetiredSpellId(
+					Wand.SpellSlots.Pop());
 			if (Registry->Spells.Contains(Removed))
 			{
 				MatterFluxMagicInventory::AddSpell(
@@ -980,6 +1034,13 @@ void UMatterFluxMagicInventoryComponent::HandleContentReloaded(
 		}
 		for (FName& SpellId : Wand.SpellSlots)
 		{
+			const FName RuntimeSpellId =
+				MatterFluxMagicInventory::ResolveRetiredSpellId(SpellId);
+			if (RuntimeSpellId != SpellId)
+			{
+				SpellId = RuntimeSpellId;
+				bWandChanged = true;
+			}
 			if (!SpellId.IsNone() && !Registry->Spells.Contains(SpellId))
 			{
 				SpellId = NAME_None;

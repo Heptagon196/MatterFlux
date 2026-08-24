@@ -6,7 +6,7 @@
 #include "Game/MatterFluxPlayableWorldActor.h"
 #include "IMatterFluxScriptRuntime.h"
 #include "MatterFluxLog.h"
-#include "Material/MatterFluxSourceCombustionRuntime.h"
+#include "Material/MatterFluxSourceReactionRuntime.h"
 #include "Material/MatterFluxBuoyancyComponent.h"
 #include "UObject/ConstructorHelpers.h"
 #include "EngineUtils.h"
@@ -75,14 +75,14 @@ namespace
 			WorldTransform.ToMatrixWithScale());
 	}
 
-	const FMatterFluxReactionDefinition* FindCombustionRule(
+	const FMatterFluxReactionDefinition* FindReactionRule(
 		const FMatterFluxContentRegistry& Registry,
-		const FName FuelMaterial,
-		const FName FlameMaterial)
+		const FName InputMaterial,
+		const FName StimulusMaterial)
 	{
 		return MatterFlux::Reaction::FMaterialReactionEngine::
 			FindPropagatingRule(
-				Registry, FuelMaterial, FlameMaterial);
+				Registry, InputMaterial, StimulusMaterial);
 	}
 
 	int32 CountSetCells(const TArray<uint8>& Mask)
@@ -249,29 +249,29 @@ bool FFragmentAggregateSourceState::IsValid() const
 		&& Revision >= 0
 		&& SourceMask.HasValidLayout()
 		&& (SourceMask.SolidMask.Contains(1)
-			|| (bHasCombustionState
-				&& ResidueMask.SolidMask.Contains(1)))
+			|| (bHasReactionState
+				&& OutputMask.SolidMask.Contains(1)))
 		&& LocalTransform.IsValid()
 		&& !MaterialId.IsNone()
 		&& FMath::IsFinite(Color.R)
 		&& FMath::IsFinite(Color.G)
 		&& FMath::IsFinite(Color.B)
 		&& FMath::IsFinite(Color.A)
-		&& ResidueMask.HasValidLayout()
-		&& BurningMask.HasValidLayout()
-		&& ResidueMask.Width == SourceMask.Width
-		&& ResidueMask.Height == SourceMask.Height
-		&& BurningMask.Width == SourceMask.Width
-		&& BurningMask.Height == SourceMask.Height
-		&& (!bHasCombustionState
-			|| (!CombustionRuleId.IsNone()
-				&& FMath::IsFinite(CombustionAccumulator)
-				&& CombustionAccumulator >= 0.0f
-				&& TotalSmokeEmissionCount >= 0
-				&& FMath::IsFinite(ResidueColor.R)
-				&& FMath::IsFinite(ResidueColor.G)
-				&& FMath::IsFinite(ResidueColor.B)
-				&& FMath::IsFinite(ResidueColor.A)));
+		&& OutputMask.HasValidLayout()
+		&& ActiveMask.HasValidLayout()
+		&& OutputMask.Width == SourceMask.Width
+		&& OutputMask.Height == SourceMask.Height
+		&& ActiveMask.Width == SourceMask.Width
+		&& ActiveMask.Height == SourceMask.Height
+		&& (!bHasReactionState
+			|| (!ReactionRuleId.IsNone()
+				&& FMath::IsFinite(ReactionAccumulator)
+				&& ReactionAccumulator >= 0.0f
+				&& TotalMaterialEmissionCount >= 0
+				&& FMath::IsFinite(OutputColor.R)
+				&& FMath::IsFinite(OutputColor.G)
+				&& FMath::IsFinite(OutputColor.B)
+				&& FMath::IsFinite(OutputColor.A)));
 }
 
 AFragment2DActor::AFragment2DActor()
@@ -350,13 +350,13 @@ void AFragment2DActor::BeginPlay()
 void AFragment2DActor::Tick(const float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
-	AdvanceRootCombustion(DeltaSeconds);
-	AdvanceDetachedAggregateCombustion(DeltaSeconds);
+	AdvanceRootReaction(DeltaSeconds);
+	AdvanceDetachedAggregateReaction(DeltaSeconds);
 	if (SpawnPayload.FadeOutDuration <= 0.0f)
 	{
 		SetActorTickEnabled(
-			IsRootCombusting()
-			|| !DetachedAggregateCombustionRuntimes.IsEmpty());
+			IsRootReacting()
+			|| !DetachedAggregateReactionRuntimes.IsEmpty());
 		return;
 	}
 
@@ -393,7 +393,7 @@ bool AFragment2DActor::InitializeFromPayload(const FFragmentSpawnPayload& Payloa
 	SpawnPayload = Payload;
 	AcceptedCutCount = 0;
 	ActiveCutFadeDuration = 0.0f;
-	InitializeRootCombustionState();
+	InitializeRootReactionState();
 	RefreshBuoyancyDensity();
 	const bool bReady = RebuildMeshFromPayload();
 	if (bReady)
@@ -428,7 +428,7 @@ void AFragment2DActor::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out
 	DOREPLIFETIME_CONDITION(AFragment2DActor, FragmentMaterial, COND_InitialOnly);
 	DOREPLIFETIME_CONDITION(AFragment2DActor, FragmentColor, COND_InitialOnly);
 	DOREPLIFETIME(AFragment2DActor, AggregateSources);
-	DOREPLIFETIME(AFragment2DActor, RootCombustionState);
+	DOREPLIFETIME(AFragment2DActor, RootReactionState);
 	DOREPLIFETIME(AFragment2DActor, AcceptedCutCount);
 	DOREPLIFETIME_CONDITION(
 		AFragment2DActor,
@@ -443,7 +443,7 @@ void AFragment2DActor::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out
 
 void AFragment2DActor::OnRep_SpawnPayload()
 {
-	InitializeRootCombustionState();
+	InitializeRootReactionState();
 	RefreshBuoyancyDensity();
 	RebuildMeshFromPayload();
 	SynchronizeCutFadeState();
@@ -455,10 +455,10 @@ void AFragment2DActor::OnRep_SpawnPayload()
 
 void AFragment2DActor::OnRep_FragmentMaterial()
 {
-	if (RootCombustionState.SourceId == SpawnPayload.FragmentId)
+	if (RootReactionState.SourceId == SpawnPayload.FragmentId)
 	{
-		RootCombustionState.Material = FragmentMaterial;
-		RootCombustionState.Color = FragmentColor;
+		RootReactionState.Material = FragmentMaterial;
+		RootReactionState.Color = FragmentColor;
 	}
 	RebuildMeshFromPayload();
 }
@@ -468,15 +468,15 @@ void AFragment2DActor::OnRep_AggregateSources()
 	RefreshBuoyancyDensity();
 	RebuildMeshFromPayload();
 	NotifyWorldOfAggregateSources();
-	MarkCombustionVisualizationDirty();
+	MarkReactionVisualizationDirty();
 }
 
-void AFragment2DActor::OnRep_RootCombustionState()
+void AFragment2DActor::OnRep_RootReactionState()
 {
 	RebuildMeshFromPayload();
 	SetActorTickEnabled(
-		SpawnPayload.FadeOutDuration > 0.0f || IsRootCombusting());
-	MarkCombustionVisualizationDirty();
+		SpawnPayload.FadeOutDuration > 0.0f || IsRootReacting());
+	MarkReactionVisualizationDirty();
 }
 
 void AFragment2DActor::OnRep_CutState()
@@ -508,9 +508,9 @@ bool AFragment2DActor::DoesCutShapeIntersect(
 	};
 
 	const FFragmentSourceMask* RootMask = nullptr;
-	if (RootCombustionState.IsValid())
+	if (RootReactionState.IsValid())
 	{
-		RootMask = &RootCombustionState.SourceMask;
+		RootMask = &RootReactionState.SourceMask;
 	}
 	else if (SpawnPayload.DetachedVoxelMask.IsValid())
 	{
@@ -655,13 +655,13 @@ bool AFragment2DActor::GetAggregateSourceState(
 	return true;
 }
 
-bool AFragment2DActor::IsRootCombusting() const
+bool AFragment2DActor::IsRootReacting() const
 {
-	return RootCombustionState.bHasCombustionState
-		&& RootCombustionState.BurningMask.SolidMask.Contains(1);
+	return RootReactionState.bHasReactionState
+		&& RootReactionState.ActiveMask.SolidMask.Contains(1);
 }
 
-bool AFragment2DActor::IsAggregateSourceCombusting(
+bool AFragment2DActor::IsAggregateSourceReacting(
 	const FGuid& SourceId) const
 {
 	const FFragmentAggregateSourceState* Source =
@@ -671,36 +671,36 @@ bool AFragment2DActor::IsAggregateSourceCombusting(
 				return Candidate.SourceId == SourceId;
 			});
 	return Source
-		&& Source->bHasCombustionState
-		&& Source->BurningMask.SolidMask.Contains(1);
+		&& Source->bHasReactionState
+		&& Source->ActiveMask.SolidMask.Contains(1);
 }
 
-bool AFragment2DActor::IsAnyAggregateMaterialCombusting(
+bool AFragment2DActor::IsAnyAggregateMaterialReacting(
 	const FName MaterialId) const
 {
 	return AggregateSources.ContainsByPredicate(
 		[MaterialId](const FFragmentAggregateSourceState& Source)
 		{
 			return Source.MaterialId == MaterialId
-				&& Source.bHasCombustionState
-				&& Source.BurningMask.SolidMask.Contains(1);
+				&& Source.bHasReactionState
+				&& Source.ActiveMask.SolidMask.Contains(1);
 		});
 }
 
-int32 AFragment2DActor::GetRootCombustionResidueCellCount() const
+int32 AFragment2DActor::GetRootReactionOutputCellCount() const
 {
-	return RootCombustionState.bHasCombustionState
-		? CountSetCells(RootCombustionState.ResidueMask.SolidMask)
+	return RootReactionState.bHasReactionState
+		? CountSetCells(RootReactionState.OutputMask.SolidMask)
 		: 0;
 }
 
-FBox AFragment2DActor::GetCombustibleWorldBounds() const
+FBox AFragment2DActor::GetReactiveWorldBounds() const
 {
 	FBox Bounds(ForceInit);
-	if (RootCombustionState.IsValid())
+	if (RootReactionState.IsValid())
 	{
 		Bounds += BuildMaskWorldBounds(
-			RootCombustionState.SourceMask,
+			RootReactionState.SourceMask,
 			GetActorTransform());
 	}
 	for (const FFragmentAggregateSourceState& Source : AggregateSources)
@@ -715,59 +715,59 @@ FBox AFragment2DActor::GetCombustibleWorldBounds() const
 	return Bounds;
 }
 
-void AFragment2DActor::InitializeRootCombustionState()
+void AFragment2DActor::InitializeRootReactionState()
 {
-	const bool bSupportsCombustion = SpawnPayload.FragmentId.IsValid()
+	const bool bSupportsReaction = SpawnPayload.FragmentId.IsValid()
 		&& !SpawnPayload.MaterialId.IsNone()
 		&& SpawnPayload.DetachedVoxelMask.IsValid()
 		&& SpawnPayload.DetachedVoxelMask.GeometryStyle
 			== EFragmentSourceGeometryStyle::VoxelBlocks;
-	if (!bSupportsCombustion)
+	if (!bSupportsReaction)
 	{
-		RootCombustionState = FFragmentAggregateSourceState();
-		RootCombustionRuntime.Reset();
+		RootReactionState = FFragmentAggregateSourceState();
+		RootReactionRuntime.Reset();
 		return;
 	}
-	if (RootCombustionState.SourceId == SpawnPayload.FragmentId
-		&& RootCombustionState.SourceMask.HasValidLayout())
+	if (RootReactionState.SourceId == SpawnPayload.FragmentId
+		&& RootReactionState.SourceMask.HasValidLayout())
 	{
-		RootCombustionState.Material = FragmentMaterial;
-		RootCombustionState.Color = FragmentColor;
+		RootReactionState.Material = FragmentMaterial;
+		RootReactionState.Color = FragmentColor;
 		return;
 	}
 
-	RootCombustionState = FFragmentAggregateSourceState();
-	RootCombustionState.SourceId = SpawnPayload.FragmentId;
-	RootCombustionState.DefinitionSourceId = SpawnPayload.FragmentId;
-	RootCombustionState.bOwnsLogicalSource = false;
-	RootCombustionState.Revision = SpawnPayload.Revision;
-	RootCombustionState.SourceMask = SpawnPayload.DetachedVoxelMask;
-	RootCombustionState.LocalTransform = FTransform::Identity;
-	RootCombustionState.Material = FragmentMaterial;
-	RootCombustionState.MaterialId = SpawnPayload.MaterialId;
-	RootCombustionState.Color = FragmentColor;
-	RootCombustionState.bEnableCollision = SpawnPayload.bEnableCollision;
-	RootCombustionState.ResidueMask = SpawnPayload.DetachedVoxelMask;
-	RootCombustionState.ResidueMask.SolidMask.Init(
+	RootReactionState = FFragmentAggregateSourceState();
+	RootReactionState.SourceId = SpawnPayload.FragmentId;
+	RootReactionState.DefinitionSourceId = SpawnPayload.FragmentId;
+	RootReactionState.bOwnsLogicalSource = false;
+	RootReactionState.Revision = SpawnPayload.Revision;
+	RootReactionState.SourceMask = SpawnPayload.DetachedVoxelMask;
+	RootReactionState.LocalTransform = FTransform::Identity;
+	RootReactionState.Material = FragmentMaterial;
+	RootReactionState.MaterialId = SpawnPayload.MaterialId;
+	RootReactionState.Color = FragmentColor;
+	RootReactionState.bEnableCollision = SpawnPayload.bEnableCollision;
+	RootReactionState.OutputMask = SpawnPayload.DetachedVoxelMask;
+	RootReactionState.OutputMask.SolidMask.Init(
 		0,
 		SpawnPayload.DetachedVoxelMask.SolidMask.Num());
-	RootCombustionState.BurningMask = SpawnPayload.DetachedVoxelMask;
-	RootCombustionState.BurningMask.SolidMask.Init(
+	RootReactionState.ActiveMask = SpawnPayload.DetachedVoxelMask;
+	RootReactionState.ActiveMask.SolidMask.Init(
 		0,
 		SpawnPayload.DetachedVoxelMask.SolidMask.Num());
-	RootCombustionRuntime.Reset();
+	RootReactionRuntime.Reset();
 }
 
-bool AFragment2DActor::IgniteRootAtWorldLocation(
+bool AFragment2DActor::ApplyMaterialStimulusToRootAtWorldLocation(
 	const FVector& WorldLocation,
-	const FName FlameMaterial,
+	const FName StimulusMaterial,
 	const int32 EventSeed)
 {
 	if (!HasAuthority()
 		|| WorldLocation.ContainsNaN()
-		|| FlameMaterial.IsNone()
-		|| !RootCombustionState.IsValid()
-		|| IsRootCombusting())
+		|| StimulusMaterial.IsNone()
+		|| !RootReactionState.IsValid()
+		|| IsRootReacting())
 	{
 		return false;
 	}
@@ -779,21 +779,21 @@ bool AFragment2DActor::IgniteRootAtWorldLocation(
 	{
 		return false;
 	}
-	const FMatterFluxReactionDefinition* Rule = FindCombustionRule(
+	const FMatterFluxReactionDefinition* Rule = FindReactionRule(
 		*Registry,
-		RootCombustionState.MaterialId,
-		FlameMaterial);
+		RootReactionState.MaterialId,
+		StimulusMaterial);
 	if (!Rule)
 	{
 		return false;
 	}
 
-	TUniquePtr<MatterFlux::Combustion::FSourceCombustionRuntime> Candidate =
-		MakeUnique<MatterFlux::Combustion::FSourceCombustionRuntime>();
+	TUniquePtr<MatterFlux::Reaction::FSourceReactionRuntime> Candidate =
+		MakeUnique<MatterFlux::Reaction::FSourceReactionRuntime>();
 	FString Error;
 	if (!Candidate->Initialize(
-		MatterFlux::Combustion::FSourceRuntimeSettings(),
-		RootCombustionState.SourceMask,
+		MatterFlux::Reaction::FSourceRuntimeSettings(),
+		RootReactionState.SourceMask,
 		*Rule,
 		EventSeed,
 		Error))
@@ -801,13 +801,13 @@ bool AFragment2DActor::IgniteRootAtWorldLocation(
 		UE_LOG(
 			LogMatterFlux,
 			Error,
-			TEXT("Detached fragment combustion initialization failed: %s"),
+			TEXT("Detached fragment reaction initialization failed: %s"),
 			*Error);
 		return false;
 	}
 	const FVector Local = GetActorTransform().InverseTransformPosition(
 		WorldLocation);
-	const FFragmentSourceMask& Mask = RootCombustionState.SourceMask;
+	const FFragmentSourceMask& Mask = RootReactionState.SourceMask;
 	const FIntPoint RequestedCell(
 		FMath::FloorToInt(
 			Local.X / Mask.CellSize
@@ -815,31 +815,31 @@ bool AFragment2DActor::IgniteRootAtWorldLocation(
 		FMath::FloorToInt(
 			Local.Z / Mask.CellSize
 				+ static_cast<double>(Mask.Height) * 0.5));
-	if (!Candidate->IgniteNearest(RequestedCell, FlameMaterial))
+	if (!Candidate->ActivateNearest(RequestedCell, StimulusMaterial))
 	{
 		return false;
 	}
-	RootCombustionRuntime = MoveTemp(Candidate);
-	if (!SynchronizeRootCombustionState())
+	RootReactionRuntime = MoveTemp(Candidate);
+	if (!SynchronizeRootReactionState())
 	{
-		RootCombustionRuntime.Reset();
+		RootReactionRuntime.Reset();
 		return false;
 	}
-	RootCombustionPropagationAccumulator = 0.0f;
+	RootReactionPropagationAccumulator = 0.0f;
 	SetActorTickEnabled(true);
 	ForceNetUpdate();
-	MarkCombustionVisualizationDirty();
+	MarkReactionVisualizationDirty();
 	return true;
 }
 
-bool AFragment2DActor::IgniteAtWorldLocation(
+bool AFragment2DActor::ApplyMaterialStimulusAtWorldLocation(
 	const FVector& WorldLocation,
-	const FName FlameMaterial,
+	const FName StimulusMaterial,
 	const int32 EventSeed)
 {
 	if (!HasAuthority()
 		|| WorldLocation.ContainsNaN()
-		|| FlameMaterial.IsNone())
+		|| StimulusMaterial.IsNone())
 	{
 		return false;
 	}
@@ -850,17 +850,17 @@ bool AFragment2DActor::IgniteAtWorldLocation(
 		bool bRoot = false;
 	};
 	TArray<FCandidate, TInlineAllocator<17>> Candidates;
-	if (RootCombustionState.IsValid()
-		&& RootCombustionState.SourceMask.SolidMask.Contains(1)
-		&& !IsRootCombusting())
+	if (RootReactionState.IsValid()
+		&& RootReactionState.SourceMask.SolidMask.Contains(1)
+		&& !IsRootReacting())
 	{
 		const FBox Bounds = BuildMaskWorldBounds(
-			RootCombustionState.SourceMask,
+			RootReactionState.SourceMask,
 			GetActorTransform());
 		if (Bounds.IsValid)
 		{
 			Candidates.Add({
-				RootCombustionState.SourceId,
+				RootReactionState.SourceId,
 				Bounds.ComputeSquaredDistanceToPoint(WorldLocation),
 				true});
 		}
@@ -869,7 +869,7 @@ bool AFragment2DActor::IgniteAtWorldLocation(
 	{
 		if (!Source.IsValid()
 			|| !Source.SourceMask.SolidMask.Contains(1)
-			|| IsAggregateSourceCombusting(Source.SourceId))
+			|| IsAggregateSourceReacting(Source.SourceId))
 		{
 			continue;
 		}
@@ -903,28 +903,28 @@ bool AFragment2DActor::IgniteAtWorldLocation(
 	}
 	if (Candidates[0].bRoot)
 	{
-		return IgniteRootAtWorldLocation(
+		return ApplyMaterialStimulusToRootAtWorldLocation(
 			WorldLocation,
-			FlameMaterial,
+			StimulusMaterial,
 			EventSeed);
 	}
-	return IgniteAggregateSourceAtWorldLocation(
+	return ApplyMaterialStimulusToAggregateAtWorldLocation(
 		Candidates[0].SourceId,
 		WorldLocation,
-		FlameMaterial,
+		StimulusMaterial,
 		EventSeed);
 }
 
-bool AFragment2DActor::IgniteAggregateSourceAtWorldLocation(
+bool AFragment2DActor::ApplyMaterialStimulusToAggregateAtWorldLocation(
 	const FGuid& SourceId,
 	const FVector& WorldLocation,
-	const FName FlameMaterial,
+	const FName StimulusMaterial,
 	const int32 EventSeed)
 {
 	if (!HasAuthority()
 		|| !SourceId.IsValid()
 		|| WorldLocation.ContainsNaN()
-		|| FlameMaterial.IsNone())
+		|| StimulusMaterial.IsNone())
 	{
 		return false;
 	}
@@ -940,10 +940,10 @@ bool AFragment2DActor::IgniteAggregateSourceAtWorldLocation(
 	}
 	if (!Layer->bOwnsLogicalSource)
 	{
-		return IgniteDetachedAggregateAtWorldLocation(
+		return ApplyMaterialStimulusToDetachedAggregateAtWorldLocation(
 			SourceId,
 			WorldLocation,
-			FlameMaterial,
+			StimulusMaterial,
 			EventSeed);
 	}
 	UWorld* World = GetWorld();
@@ -954,20 +954,20 @@ bool AFragment2DActor::IgniteAggregateSourceAtWorldLocation(
 	if (AMatterFluxPlayableWorldActor* OwnerWorld =
 		Cast<AMatterFluxPlayableWorldActor>(GetOwner()))
 	{
-		return OwnerWorld->IgniteDynamicAggregateSource(
+		return OwnerWorld->ApplyMaterialStimulusToDynamicAggregateSource(
 			*this,
 			SourceId,
 			WorldLocation,
-			FlameMaterial,
+			StimulusMaterial,
 			EventSeed);
 	}
 	for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
 	{
-		if (It->IgniteDynamicAggregateSource(
+		if (It->ApplyMaterialStimulusToDynamicAggregateSource(
 			*this,
 			SourceId,
 			WorldLocation,
-			FlameMaterial,
+			StimulusMaterial,
 			EventSeed))
 		{
 			return true;
@@ -976,13 +976,13 @@ bool AFragment2DActor::IgniteAggregateSourceAtWorldLocation(
 	return false;
 }
 
-bool AFragment2DActor::IgniteInCone(
+bool AFragment2DActor::ApplyMaterialStimulusInCone(
 	const FVector& Start,
 	const FVector& Direction,
 	const float Range,
 	const float StartRadius,
 	const float EndRadius,
-	const FName FlameMaterial,
+	const FName StimulusMaterial,
 	const int32 EventSeed)
 {
 	const FVector Forward = Direction.GetSafeNormal();
@@ -995,7 +995,7 @@ bool AFragment2DActor::IgniteInCone(
 		|| Range <= 0.0f
 		|| StartRadius <= 0.0f
 		|| EndRadius < StartRadius
-		|| FlameMaterial.IsNone())
+		|| StimulusMaterial.IsNone())
 	{
 		return false;
 	}
@@ -1052,13 +1052,13 @@ bool AFragment2DActor::IgniteInCone(
 			Candidates.Add({SourceId, BestContact, BestScore, bRoot});
 		}
 	};
-	if (RootCombustionState.IsValid()
-		&& RootCombustionState.SourceMask.SolidMask.Contains(1)
-		&& !IsRootCombusting())
+	if (RootReactionState.IsValid()
+		&& RootReactionState.SourceMask.SolidMask.Contains(1)
+		&& !IsRootReacting())
 	{
 		AddCandidate(
-			RootCombustionState.SourceId,
-			RootCombustionState.SourceMask,
+			RootReactionState.SourceId,
+			RootReactionState.SourceMask,
 			GetActorTransform(),
 			true);
 	}
@@ -1066,7 +1066,7 @@ bool AFragment2DActor::IgniteInCone(
 	{
 		if (Source.IsValid()
 			&& Source.SourceMask.SolidMask.Contains(1)
-			&& !IsAggregateSourceCombusting(Source.SourceId))
+			&& !IsAggregateSourceReacting(Source.SourceId))
 		{
 			AddCandidate(
 				Source.SourceId,
@@ -1095,9 +1095,9 @@ bool AFragment2DActor::IgniteInCone(
 	const FConeCandidate& Best = Candidates[0];
 	if (Best.bRoot)
 	{
-		return IgniteRootAtWorldLocation(
+		return ApplyMaterialStimulusToRootAtWorldLocation(
 			Best.Contact,
-			FlameMaterial,
+			StimulusMaterial,
 			EventSeed);
 	}
 	if (const FFragmentAggregateSourceState* DetachedLayer =
@@ -1108,31 +1108,31 @@ bool AFragment2DActor::IgniteInCone(
 			});
 		DetachedLayer && !DetachedLayer->bOwnsLogicalSource)
 	{
-		return IgniteDetachedAggregateAtWorldLocation(
+		return ApplyMaterialStimulusToDetachedAggregateAtWorldLocation(
 			DetachedLayer->SourceId,
 			Best.Contact,
-			FlameMaterial,
+			StimulusMaterial,
 			EventSeed);
 	}
 	if (AMatterFluxPlayableWorldActor* OwnerWorld =
 		Cast<AMatterFluxPlayableWorldActor>(GetOwner()))
 	{
-		return OwnerWorld->IgniteDynamicAggregateSource(
+		return OwnerWorld->ApplyMaterialStimulusToDynamicAggregateSource(
 			*this,
 			Best.SourceId,
 			Best.Contact,
-			FlameMaterial,
+			StimulusMaterial,
 			EventSeed);
 	}
 	if (UWorld* World = GetWorld())
 	{
 		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
 		{
-			if (It->IgniteDynamicAggregateSource(
+			if (It->ApplyMaterialStimulusToDynamicAggregateSource(
 				*this,
 				Best.SourceId,
 				Best.Contact,
-				FlameMaterial,
+				StimulusMaterial,
 				EventSeed))
 			{
 				return true;
@@ -1145,8 +1145,8 @@ bool AFragment2DActor::IgniteInCone(
 bool AFragment2DActor::ApplyAggregateSourceStreamingState(
 	const FGuid& SourceId,
 	const FFragment2DSourceStreamingState& State,
-	const FName InResidueMaterialId,
-	const FLinearColor& InResidueColor)
+	const FName InOutputMaterialId,
+	const FLinearColor& InOutputColor)
 {
 	if (!SourceId.IsValid())
 	{
@@ -1163,9 +1163,9 @@ bool AFragment2DActor::ApplyAggregateSourceStreamingState(
 		: 0;
 	if (!Source
 		|| State.GetRuntimeMask().Num() != CellCount
-		|| !State.bHasCombustionState
-		|| State.CombustionState.ResidueMask.Num() != CellCount
-		|| State.CombustionState.BurningMask.Num() != CellCount)
+		|| !State.bHasReactionState
+		|| State.ReactionState.OutputMask.Num() != CellCount
+		|| State.ReactionState.ActiveMask.Num() != CellCount)
 	{
 		return false;
 	}
@@ -1173,22 +1173,22 @@ bool AFragment2DActor::ApplyAggregateSourceStreamingState(
 	const FFragmentAggregateSourceState Previous = *Source;
 	Source->Revision = State.Revision;
 	Source->SourceMask.SolidMask = State.GetRuntimeMask();
-	Source->ResidueMask = Source->SourceMask;
-	Source->ResidueMask.SolidMask = State.CombustionState.ResidueMask;
-	Source->BurningMask = Source->SourceMask;
-	Source->BurningMask.SolidMask = State.CombustionState.BurningMask;
-	for (uint8& Value : Source->BurningMask.SolidMask)
+	Source->OutputMask = Source->SourceMask;
+	Source->OutputMask.SolidMask = State.ReactionState.OutputMask;
+	Source->ActiveMask = Source->SourceMask;
+	Source->ActiveMask.SolidMask = State.ReactionState.ActiveMask;
+	for (uint8& Value : Source->ActiveMask.SolidMask)
 	{
 		Value = Value != 0 ? 1 : 0;
 	}
-	Source->bHasCombustionState = true;
-	Source->CombustionRuleId = State.CombustionState.RuleId;
-	Source->ResidueMaterialId = InResidueMaterialId;
-	Source->ResidueColor = InResidueColor;
-	Source->CombustionSeed = State.CombustionState.Seed;
-	Source->CombustionTick = State.CombustionState.Tick;
-	Source->CombustionAccumulator = State.CombustionAccumulator;
-	Source->TotalSmokeEmissionCount = State.TotalSmokeEmissionCount;
+	Source->bHasReactionState = true;
+	Source->ReactionRuleId = State.ReactionState.RuleId;
+	Source->OutputMaterialId = InOutputMaterialId;
+	Source->OutputColor = InOutputColor;
+	Source->ReactionSeed = State.ReactionState.Seed;
+	Source->ReactionTick = State.ReactionState.Tick;
+	Source->ReactionAccumulator = State.ReactionAccumulator;
+	Source->TotalMaterialEmissionCount = State.TotalMaterialEmissionCount;
 	const bool bUpdated = Source->IsValid()
 		&& (Source->bEnableCollision
 			? RebuildMeshFromPayload()
@@ -1200,119 +1200,119 @@ bool AFragment2DActor::ApplyAggregateSourceStreamingState(
 		return false;
 	}
 	ForceNetUpdate();
-	MarkCombustionVisualizationDirty();
+	MarkReactionVisualizationDirty();
 	return true;
 }
 
-bool AFragment2DActor::SynchronizeRootCombustionState()
+bool AFragment2DActor::SynchronizeRootReactionState()
 {
-	if (!RootCombustionRuntime || !RootCombustionRuntime->IsInitialized())
+	if (!RootReactionRuntime || !RootReactionRuntime->IsInitialized())
 	{
 		return false;
 	}
-	MatterFlux::Combustion::FSourceRuntimeSnapshot Snapshot;
-	if (!RootCombustionRuntime->CaptureState(Snapshot))
+	MatterFlux::Reaction::FSourceRuntimeSnapshot Snapshot;
+	if (!RootReactionRuntime->CaptureState(Snapshot))
 	{
 		return false;
 	}
-	RootCombustionState.SourceMask.SolidMask =
-		MoveTemp(Snapshot.CombustionState.FuelMask);
-	RootCombustionState.ResidueMask = RootCombustionState.SourceMask;
-	RootCombustionState.ResidueMask.SolidMask =
-		MoveTemp(Snapshot.CombustionState.ResidueMask);
-	RootCombustionState.BurningMask = RootCombustionState.SourceMask;
-	RootCombustionState.BurningMask.SolidMask =
-		MoveTemp(Snapshot.CombustionState.BurningMask);
-	for (uint8& Value : RootCombustionState.BurningMask.SolidMask)
+	RootReactionState.SourceMask.SolidMask =
+		MoveTemp(Snapshot.ReactionState.InputMask);
+	RootReactionState.OutputMask = RootReactionState.SourceMask;
+	RootReactionState.OutputMask.SolidMask =
+		MoveTemp(Snapshot.ReactionState.OutputMask);
+	RootReactionState.ActiveMask = RootReactionState.SourceMask;
+	RootReactionState.ActiveMask.SolidMask =
+		MoveTemp(Snapshot.ReactionState.ActiveMask);
+	for (uint8& Value : RootReactionState.ActiveMask.SolidMask)
 	{
 		Value = Value != 0 ? 1 : 0;
 	}
-	RootCombustionState.bHasCombustionState = true;
-	RootCombustionState.CombustionRuleId = Snapshot.CombustionState.RuleId;
-	RootCombustionState.CombustionSeed = Snapshot.CombustionState.Seed;
-	RootCombustionState.CombustionTick = Snapshot.CombustionState.Tick;
-	RootCombustionState.CombustionAccumulator =
-		Snapshot.CombustionAccumulator;
-	RootCombustionState.TotalSmokeEmissionCount =
-		Snapshot.TotalSmokeEmissionCount;
+	RootReactionState.bHasReactionState = true;
+	RootReactionState.ReactionRuleId = Snapshot.ReactionState.RuleId;
+	RootReactionState.ReactionSeed = Snapshot.ReactionState.Seed;
+	RootReactionState.ReactionTick = Snapshot.ReactionState.Tick;
+	RootReactionState.ReactionAccumulator =
+		Snapshot.ReactionAccumulator;
+	RootReactionState.TotalMaterialEmissionCount =
+		Snapshot.TotalMaterialEmissionCount;
 	if (const FMatterFluxReactionDefinition* Rule =
-		RootCombustionRuntime->GetRule())
+		RootReactionRuntime->GetRule())
 	{
-		RootCombustionState.ResidueMaterialId = Rule->OutputA;
+		RootReactionState.OutputMaterialId = Rule->OutputA;
 		const FMatterFluxContentRegistryPtr Registry =
 			IMatterFluxScriptRuntime::IsAvailable()
 				? IMatterFluxScriptRuntime::Get().GetActiveRegistry()
 				: nullptr;
 		if (Registry.IsValid())
 		{
-			if (const FMatterFluxMaterialDefinition* Residue =
+			if (const FMatterFluxMaterialDefinition* Output =
 				Registry->Materials.Find(Rule->OutputA))
 			{
-				RootCombustionState.ResidueColor = Residue->Color;
+				RootReactionState.OutputColor = Output->Color;
 			}
 		}
 	}
-	if (!RootCombustionState.IsValid() || !RebuildMeshFromPayload())
+	if (!RootReactionState.IsValid() || !RebuildMeshFromPayload())
 	{
 		UE_LOG(
 			LogMatterFlux,
 			Error,
-			TEXT("Detached fragment rejected its combustion mesh update"));
+			TEXT("Detached fragment rejected its reaction mesh update"));
 		return false;
 	}
 	ForceNetUpdate();
-	MarkCombustionVisualizationDirty();
+	MarkReactionVisualizationDirty();
 	return true;
 }
 
-void AFragment2DActor::AdvanceRootCombustion(const float DeltaSeconds)
+void AFragment2DActor::AdvanceRootReaction(const float DeltaSeconds)
 {
 	if (!HasAuthority()
-		|| !RootCombustionRuntime
-		|| !RootCombustionRuntime->IsBurning())
+		|| !RootReactionRuntime
+		|| !RootReactionRuntime->IsActive())
 	{
 		return;
 	}
 	const float ClampedDelta = FMath::Clamp(DeltaSeconds, 0.0f, 0.25f);
-	const MatterFlux::Combustion::FSourceAdvanceResult Result =
-		RootCombustionRuntime->AdvanceAuthority(ClampedDelta);
+	const MatterFlux::Reaction::FSourceAdvanceResult Result =
+		RootReactionRuntime->AdvanceAuthority(ClampedDelta);
 	if (Result.Steps > 0)
 	{
-		SynchronizeRootCombustionState();
+		SynchronizeRootReactionState();
 	}
 
-	RootCombustionPropagationAccumulator += ClampedDelta;
-	if (RootCombustionRuntime->IsBurning()
-		&& RootCombustionPropagationAccumulator >= 0.2f)
+	RootReactionPropagationAccumulator += ClampedDelta;
+	if (RootReactionRuntime->IsActive()
+		&& RootReactionPropagationAccumulator >= 0.2f)
 	{
-		RootCombustionPropagationAccumulator = FMath::Fmod(
-			RootCombustionPropagationAccumulator,
+		RootReactionPropagationAccumulator = FMath::Fmod(
+			RootReactionPropagationAccumulator,
 			0.2f);
 		const FMatterFluxReactionDefinition* Rule =
-			RootCombustionRuntime->GetRule();
+			RootReactionRuntime->GetRule();
 		if (Rule)
 		{
-			const int32 Seed = RootCombustionState.CombustionSeed
-				^ static_cast<int32>(RootCombustionState.CombustionTick)
+			const int32 Seed = RootReactionState.ReactionSeed
+				^ static_cast<int32>(RootReactionState.ReactionTick)
 				^ static_cast<int32>(GetTypeHash(SpawnPayload.FragmentId));
-			PropagateCombustionToAdjacentLayer(
-				RootCombustionState,
+			EmitReactionParticleToAdjacentLayer(
+				RootReactionState,
 				GetActorTransform(),
 				Rule->InputB,
 				Seed);
 		}
 	}
-	if (!RootCombustionRuntime->IsBurning())
+	if (!RootReactionRuntime->IsActive())
 	{
-		RootCombustionRuntime.Reset();
+		RootReactionRuntime.Reset();
 		SetActorTickEnabled(SpawnPayload.FadeOutDuration > 0.0f);
 	}
 }
 
-bool AFragment2DActor::IgniteDetachedAggregateAtWorldLocation(
+bool AFragment2DActor::ApplyMaterialStimulusToDetachedAggregateAtWorldLocation(
 	const FGuid& SourceId,
 	const FVector& WorldLocation,
-	const FName FlameMaterial,
+	const FName StimulusMaterial,
 	const int32 EventSeed)
 {
 	FFragmentAggregateSourceState* Source = AggregateSources.FindByPredicate(
@@ -1322,11 +1322,11 @@ bool AFragment2DActor::IgniteDetachedAggregateAtWorldLocation(
 		});
 	if (!HasAuthority()
 		|| WorldLocation.ContainsNaN()
-		|| FlameMaterial.IsNone()
+		|| StimulusMaterial.IsNone()
 		|| !Source
 		|| Source->bOwnsLogicalSource
 		|| !Source->IsValid()
-		|| IsAggregateSourceCombusting(SourceId))
+		|| IsAggregateSourceReacting(SourceId))
 	{
 		return false;
 	}
@@ -1338,20 +1338,20 @@ bool AFragment2DActor::IgniteDetachedAggregateAtWorldLocation(
 	{
 		return false;
 	}
-	const FMatterFluxReactionDefinition* Rule = FindCombustionRule(
+	const FMatterFluxReactionDefinition* Rule = FindReactionRule(
 		*Registry,
 		Source->MaterialId,
-		FlameMaterial);
+		StimulusMaterial);
 	if (!Rule)
 	{
 		return false;
 	}
 
-	TUniquePtr<MatterFlux::Combustion::FSourceCombustionRuntime> Runtime =
-		MakeUnique<MatterFlux::Combustion::FSourceCombustionRuntime>();
+	TUniquePtr<MatterFlux::Reaction::FSourceReactionRuntime> Runtime =
+		MakeUnique<MatterFlux::Reaction::FSourceReactionRuntime>();
 	FString Error;
 	if (!Runtime->Initialize(
-		MatterFlux::Combustion::FSourceRuntimeSettings(),
+		MatterFlux::Reaction::FSourceRuntimeSettings(),
 		Source->SourceMask,
 		*Rule,
 		EventSeed,
@@ -1360,7 +1360,7 @@ bool AFragment2DActor::IgniteDetachedAggregateAtWorldLocation(
 		UE_LOG(
 			LogMatterFlux,
 			Error,
-			TEXT("Detached aggregate layer combustion initialization failed: %s"),
+			TEXT("Detached aggregate layer reaction initialization failed: %s"),
 			*Error);
 		return false;
 	}
@@ -1375,28 +1375,28 @@ bool AFragment2DActor::IgniteDetachedAggregateAtWorldLocation(
 		FMath::FloorToInt(
 			Local.Z / Source->SourceMask.CellSize
 				+ static_cast<double>(Source->SourceMask.Height) * 0.5));
-	if (!Runtime->IgniteNearest(RequestedCell, FlameMaterial))
+	if (!Runtime->ActivateNearest(RequestedCell, StimulusMaterial))
 	{
 		return false;
 	}
-	DetachedAggregateCombustionRuntimes.Add(
+	DetachedAggregateReactionRuntimes.Add(
 		SourceId,
 		MoveTemp(Runtime));
-	if (!SynchronizeDetachedAggregateCombustionState(SourceId))
+	if (!SynchronizeDetachedAggregateReactionState(SourceId))
 	{
-		DetachedAggregateCombustionRuntimes.Remove(SourceId);
+		DetachedAggregateReactionRuntimes.Remove(SourceId);
 		return false;
 	}
-	DetachedAggregateCombustionPropagationAccumulator = 0.0f;
+	DetachedAggregateReactionPropagationAccumulator = 0.0f;
 	SetActorTickEnabled(true);
 	return true;
 }
 
-bool AFragment2DActor::SynchronizeDetachedAggregateCombustionState(
+bool AFragment2DActor::SynchronizeDetachedAggregateReactionState(
 	const FGuid& SourceId)
 {
-	TUniquePtr<MatterFlux::Combustion::FSourceCombustionRuntime>* RuntimePtr =
-		DetachedAggregateCombustionRuntimes.Find(SourceId);
+	TUniquePtr<MatterFlux::Reaction::FSourceReactionRuntime>* RuntimePtr =
+		DetachedAggregateReactionRuntimes.Find(SourceId);
 	FFragmentAggregateSourceState* Source = AggregateSources.FindByPredicate(
 		[&SourceId](const FFragmentAggregateSourceState& Candidate)
 		{
@@ -1406,43 +1406,43 @@ bool AFragment2DActor::SynchronizeDetachedAggregateCombustionState(
 	{
 		return false;
 	}
-	MatterFlux::Combustion::FSourceRuntimeSnapshot Snapshot;
+	MatterFlux::Reaction::FSourceRuntimeSnapshot Snapshot;
 	if (!(*RuntimePtr)->CaptureState(Snapshot))
 	{
 		return false;
 	}
 	Source->SourceMask.SolidMask = MoveTemp(
-		Snapshot.CombustionState.FuelMask);
-	Source->ResidueMask = Source->SourceMask;
-	Source->ResidueMask.SolidMask = MoveTemp(
-		Snapshot.CombustionState.ResidueMask);
-	Source->BurningMask = Source->SourceMask;
-	Source->BurningMask.SolidMask = MoveTemp(
-		Snapshot.CombustionState.BurningMask);
-	for (uint8& Value : Source->BurningMask.SolidMask)
+		Snapshot.ReactionState.InputMask);
+	Source->OutputMask = Source->SourceMask;
+	Source->OutputMask.SolidMask = MoveTemp(
+		Snapshot.ReactionState.OutputMask);
+	Source->ActiveMask = Source->SourceMask;
+	Source->ActiveMask.SolidMask = MoveTemp(
+		Snapshot.ReactionState.ActiveMask);
+	for (uint8& Value : Source->ActiveMask.SolidMask)
 	{
 		Value = Value != 0 ? 1 : 0;
 	}
-	Source->bHasCombustionState = true;
-	Source->CombustionRuleId = Snapshot.CombustionState.RuleId;
-	Source->CombustionSeed = Snapshot.CombustionState.Seed;
-	Source->CombustionTick = Snapshot.CombustionState.Tick;
-	Source->CombustionAccumulator = Snapshot.CombustionAccumulator;
-	Source->TotalSmokeEmissionCount = Snapshot.TotalSmokeEmissionCount;
+	Source->bHasReactionState = true;
+	Source->ReactionRuleId = Snapshot.ReactionState.RuleId;
+	Source->ReactionSeed = Snapshot.ReactionState.Seed;
+	Source->ReactionTick = Snapshot.ReactionState.Tick;
+	Source->ReactionAccumulator = Snapshot.ReactionAccumulator;
+	Source->TotalMaterialEmissionCount = Snapshot.TotalMaterialEmissionCount;
 	if (const FMatterFluxReactionDefinition* Rule =
 		(*RuntimePtr)->GetRule())
 	{
-		Source->ResidueMaterialId = Rule->OutputA;
+		Source->OutputMaterialId = Rule->OutputA;
 		const FMatterFluxContentRegistryPtr Registry =
 			IMatterFluxScriptRuntime::IsAvailable()
 				? IMatterFluxScriptRuntime::Get().GetActiveRegistry()
 				: nullptr;
 		if (Registry.IsValid())
 		{
-			if (const FMatterFluxMaterialDefinition* Residue =
+			if (const FMatterFluxMaterialDefinition* Output =
 				Registry->Materials.Find(Rule->OutputA))
 			{
-				Source->ResidueColor = Residue->Color;
+				Source->OutputColor = Output->Color;
 			}
 		}
 	}
@@ -1451,63 +1451,63 @@ bool AFragment2DActor::SynchronizeDetachedAggregateCombustionState(
 		return false;
 	}
 	ForceNetUpdate();
-	MarkCombustionVisualizationDirty();
+	MarkReactionVisualizationDirty();
 	return true;
 }
 
-void AFragment2DActor::AdvanceDetachedAggregateCombustion(
+void AFragment2DActor::AdvanceDetachedAggregateReaction(
 	const float DeltaSeconds)
 {
-	if (!HasAuthority() || DetachedAggregateCombustionRuntimes.IsEmpty())
+	if (!HasAuthority() || DetachedAggregateReactionRuntimes.IsEmpty())
 	{
 		return;
 	}
 	const float ClampedDelta = FMath::Clamp(DeltaSeconds, 0.0f, 0.25f);
 	TArray<FGuid> Completed;
-	TArray<FGuid> BurningIds;
-	DetachedAggregateCombustionRuntimes.GetKeys(BurningIds);
-	BurningIds.Sort([](const FGuid& A, const FGuid& B)
+	TArray<FGuid> ActiveIds;
+	DetachedAggregateReactionRuntimes.GetKeys(ActiveIds);
+	ActiveIds.Sort([](const FGuid& A, const FGuid& B)
 	{
 		return A.ToString(EGuidFormats::Digits)
 			< B.ToString(EGuidFormats::Digits);
 	});
-	for (const FGuid& SourceId : BurningIds)
+	for (const FGuid& SourceId : ActiveIds)
 	{
-		TUniquePtr<MatterFlux::Combustion::FSourceCombustionRuntime>* Runtime =
-			DetachedAggregateCombustionRuntimes.Find(SourceId);
+		TUniquePtr<MatterFlux::Reaction::FSourceReactionRuntime>* Runtime =
+			DetachedAggregateReactionRuntimes.Find(SourceId);
 		if (!Runtime || !Runtime->Get())
 		{
 			Completed.Add(SourceId);
 			continue;
 		}
-		const MatterFlux::Combustion::FSourceAdvanceResult Result =
+		const MatterFlux::Reaction::FSourceAdvanceResult Result =
 			(*Runtime)->AdvanceAuthority(ClampedDelta);
 		if (Result.Steps > 0)
 		{
-			SynchronizeDetachedAggregateCombustionState(SourceId);
+			SynchronizeDetachedAggregateReactionState(SourceId);
 		}
-		if (!(*Runtime)->IsBurning())
+		if (!(*Runtime)->IsActive())
 		{
 			Completed.Add(SourceId);
 		}
 	}
 	for (const FGuid& SourceId : Completed)
 	{
-		DetachedAggregateCombustionRuntimes.Remove(SourceId);
+		DetachedAggregateReactionRuntimes.Remove(SourceId);
 	}
 
-	DetachedAggregateCombustionPropagationAccumulator += ClampedDelta;
-	if (!DetachedAggregateCombustionRuntimes.IsEmpty()
-		&& DetachedAggregateCombustionPropagationAccumulator >= 0.2f)
+	DetachedAggregateReactionPropagationAccumulator += ClampedDelta;
+	if (!DetachedAggregateReactionRuntimes.IsEmpty()
+		&& DetachedAggregateReactionPropagationAccumulator >= 0.2f)
 	{
-		DetachedAggregateCombustionPropagationAccumulator = FMath::Fmod(
-			DetachedAggregateCombustionPropagationAccumulator,
+		DetachedAggregateReactionPropagationAccumulator = FMath::Fmod(
+			DetachedAggregateReactionPropagationAccumulator,
 			0.2f);
-		for (const FGuid& SourceId : BurningIds)
+		for (const FGuid& SourceId : ActiveIds)
 		{
 			const TUniquePtr<
-				MatterFlux::Combustion::FSourceCombustionRuntime>* Runtime =
-				DetachedAggregateCombustionRuntimes.Find(SourceId);
+				MatterFlux::Reaction::FSourceReactionRuntime>* Runtime =
+				DetachedAggregateReactionRuntimes.Find(SourceId);
 			const FFragmentAggregateSourceState* Source =
 				AggregateSources.FindByPredicate(
 					[&SourceId](const FFragmentAggregateSourceState& Candidate)
@@ -1521,53 +1521,54 @@ void AFragment2DActor::AdvanceDetachedAggregateCombustion(
 			const FMatterFluxReactionDefinition* Rule = (*Runtime)->GetRule();
 			if (Rule)
 			{
-				PropagateCombustionToAdjacentLayer(
+				EmitReactionParticleToAdjacentLayer(
 					*Source,
 					Source->LocalTransform * GetActorTransform(),
 					Rule->InputB,
-					Source->CombustionSeed
-						^ static_cast<int32>(Source->CombustionTick));
+					Source->ReactionSeed
+						^ static_cast<int32>(Source->ReactionTick));
 				break;
 			}
 		}
 	}
 }
 
-bool AFragment2DActor::PropagateCombustionToAdjacentLayer(
-	const FFragmentAggregateSourceState& BurningSource,
-	const FTransform& BurningWorldTransform,
-	const FName FlameMaterial,
+bool AFragment2DActor::EmitReactionParticleToAdjacentLayer(
+	const FFragmentAggregateSourceState& ActiveSource,
+	const FTransform& ActiveWorldTransform,
+	const FName StimulusMaterial,
 	const int32 EventSeed)
 {
 	if (!HasAuthority()
-		|| !BurningSource.IsValid()
-		|| !BurningSource.bHasCombustionState
-		|| FlameMaterial.IsNone()
-		|| !BurningWorldTransform.IsValid())
+		|| !ActiveSource.IsValid()
+		|| !ActiveSource.bHasReactionState
+		|| StimulusMaterial.IsNone()
+		|| !ActiveWorldTransform.IsValid())
 	{
 		return false;
 	}
-	TArray<FVector, TInlineAllocator<64>> BurningCellCenters;
+	(void)EventSeed;
+	TArray<FVector, TInlineAllocator<64>> ActiveCellCenters;
 	for (int32 Index = 0;
-		Index < BurningSource.BurningMask.SolidMask.Num();
+		Index < ActiveSource.ActiveMask.SolidMask.Num();
 		++Index)
 	{
-		if (BurningSource.BurningMask.SolidMask[Index] == 0)
+		if (ActiveSource.ActiveMask.SolidMask[Index] == 0)
 		{
 			continue;
 		}
-		const int32 X = Index % BurningSource.SourceMask.Width;
-		const int32 Y = Index / BurningSource.SourceMask.Width;
-		BurningCellCenters.Add(BurningWorldTransform.TransformPosition(FVector(
+		const int32 X = Index % ActiveSource.SourceMask.Width;
+		const int32 Y = Index / ActiveSource.SourceMask.Width;
+		ActiveCellCenters.Add(ActiveWorldTransform.TransformPosition(FVector(
 			(static_cast<float>(X) + 0.5f
-				- BurningSource.SourceMask.Width * 0.5f)
-				* BurningSource.SourceMask.CellSize,
+				- ActiveSource.SourceMask.Width * 0.5f)
+				* ActiveSource.SourceMask.CellSize,
 			0.0f,
 			(static_cast<float>(Y) + 0.5f
-				- BurningSource.SourceMask.Height * 0.5f)
-				* BurningSource.SourceMask.CellSize)));
+				- ActiveSource.SourceMask.Height * 0.5f)
+				* ActiveSource.SourceMask.CellSize)));
 	}
-	if (BurningCellCenters.IsEmpty())
+	if (ActiveCellCenters.IsEmpty())
 	{
 		return false;
 	}
@@ -1584,22 +1585,22 @@ bool AFragment2DActor::PropagateCombustionToAdjacentLayer(
 	FAdjacentLayerContact Best;
 	const auto ConsiderLayer = [
 		&Best,
-		&BurningCellCenters,
-		&BurningSource](
+		&ActiveCellCenters,
+		&ActiveSource](
 			const FFragmentAggregateSourceState& Candidate,
 			const FTransform& CandidateWorldTransform,
 			const bool bRoot)
 	{
-		if (Candidate.SourceId == BurningSource.SourceId
+		if (Candidate.SourceId == ActiveSource.SourceId
 			|| !Candidate.IsValid()
-			|| Candidate.bHasCombustionState
-				&& Candidate.BurningMask.SolidMask.Contains(1))
+			|| Candidate.bHasReactionState
+				&& Candidate.ActiveMask.SolidMask.Contains(1))
 		{
 			return;
 		}
 		const double MaximumDistanceSquared = FMath::Square(
 			FMath::Max(
-				BurningSource.SourceMask.CellSize,
+				ActiveSource.SourceMask.CellSize,
 				Candidate.SourceMask.CellSize) * 1.05);
 		for (int32 Index = 0;
 			Index < Candidate.SourceMask.SolidMask.Num();
@@ -1620,10 +1621,10 @@ bool AFragment2DActor::PropagateCombustionToAdjacentLayer(
 					(static_cast<float>(Y) + 0.5f
 						- Candidate.SourceMask.Height * 0.5f)
 						* Candidate.SourceMask.CellSize));
-			for (const FVector& BurningCenter : BurningCellCenters)
+			for (const FVector& ActiveCenter : ActiveCellCenters)
 			{
 				const double DistanceSquared = FVector::DistSquared(
-					BurningCenter,
+					ActiveCenter,
 					CandidateCenter);
 				if (DistanceSquared > MaximumDistanceSquared)
 				{
@@ -1651,10 +1652,10 @@ bool AFragment2DActor::PropagateCombustionToAdjacentLayer(
 			}
 		}
 	};
-	if (RootCombustionState.IsValid())
+	if (RootReactionState.IsValid())
 	{
 		ConsiderLayer(
-			RootCombustionState,
+			RootReactionState,
 			GetActorTransform(),
 			true);
 	}
@@ -1669,41 +1670,20 @@ bool AFragment2DActor::PropagateCombustionToAdjacentLayer(
 	{
 		return false;
 	}
-	if (Best.bRoot)
-	{
-		return IgniteRootAtWorldLocation(
-			Best.WorldLocation,
-			FlameMaterial,
-			EventSeed);
-	}
-	if (!Best.Source->bOwnsLogicalSource)
-	{
-		return IgniteDetachedAggregateAtWorldLocation(
-			Best.Source->SourceId,
-			Best.WorldLocation,
-			FlameMaterial,
-			EventSeed);
-	}
 	if (AMatterFluxPlayableWorldActor* WorldOwner =
 		Cast<AMatterFluxPlayableWorldActor>(GetOwner()))
 	{
-		return WorldOwner->IgniteDynamicAggregateSource(
-			*this,
-			Best.Source->SourceId,
+		return WorldOwner->SetSimulatedMaterialAtWorldLocation(
 			Best.WorldLocation,
-			FlameMaterial,
-			EventSeed);
+			StimulusMaterial);
 	}
 	if (UWorld* World = GetWorld())
 	{
 		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
 		{
-			if (It->IgniteDynamicAggregateSource(
-				*this,
-				Best.Source->SourceId,
+			if (It->SetSimulatedMaterialAtWorldLocation(
 				Best.WorldLocation,
-				FlameMaterial,
-				EventSeed))
+				StimulusMaterial))
 			{
 				return true;
 			}
@@ -1712,9 +1692,9 @@ bool AFragment2DActor::PropagateCombustionToAdjacentLayer(
 	return false;
 }
 
-void AFragment2DActor::GatherRootCombustionVisualTransforms(
+void AFragment2DActor::GatherRootReactionVisualTransforms(
 	TArray<FTransform>& OutFlameTransforms,
-	TArray<MatterFlux::Rendering::FSmokeEmissionAnchor>& OutSmokeAnchors,
+	TArray<MatterFlux::Rendering::FMaterialEmissionAnchor>& OutSmokeAnchors,
 	const int32 MaxVisualInstances) const
 {
 	if (MaxVisualInstances <= 0)
@@ -1735,34 +1715,39 @@ void AFragment2DActor::GatherRootCombustionVisualTransforms(
 			const FTransform& VisualTransform)
 	{
 		if (!State.IsValid()
-			|| !State.bHasCombustionState
-			|| !State.BurningMask.SolidMask.Contains(1))
+			|| !State.bHasReactionState
+			|| !State.ActiveMask.SolidMask.Contains(1))
 		{
 			return;
 		}
+		const FMatterFluxReactionDefinition* Rule = Registry.IsValid()
+			? Registry->Reactions.Find(State.ReactionRuleId)
+			: nullptr;
+		const bool bRenderFlames = Rule
+			&& MatterFlux::Reaction::UsesFlamePresentation(*Rule);
 		TArray<uint8> Occupied = State.SourceMask.SolidMask;
-		if (State.ResidueMask.SolidMask.Num() == Occupied.Num())
+		if (State.OutputMask.SolidMask.Num() == Occupied.Num())
 		{
 			for (int32 Index = 0; Index < Occupied.Num(); ++Index)
 			{
 				Occupied[Index] = Occupied[Index] != 0
-					|| State.ResidueMask.SolidMask[Index] != 0;
+					|| State.OutputMask.SolidMask[Index] != 0;
 			}
 		}
-		TArray<int32> VisibleBurningCells;
+		TArray<int32> VisibleActiveCells;
 		for (int32 Index = 0;
-			Index < State.BurningMask.SolidMask.Num();
+			Index < State.ActiveMask.SolidMask.Num();
 			++Index)
 		{
-			if (State.BurningMask.SolidMask[Index] != 0)
+			if (State.ActiveMask.SolidMask[Index] != 0)
 			{
-				VisibleBurningCells.Add(Index);
+				VisibleActiveCells.Add(Index);
 			}
 		}
 		TArray<int32> SmokeSourceCells;
-		MatterFlux::FragmentGeometry::GatherTopExposedBurningMaskCells(
+		MatterFlux::FragmentGeometry::GatherTopExposedActiveMaskCells(
 			Occupied,
-			State.BurningMask.SolidMask,
+			State.ActiveMask.SolidMask,
 			State.SourceMask.Width,
 			State.SourceMask.Height,
 			SmokeSourceCells);
@@ -1772,9 +1757,10 @@ void AFragment2DActor::GatherRootCombustionVisualTransforms(
 			SmokeSourceCellSet.Add(SmokeSourceCell);
 		}
 		const FFragmentSourceMask& Mask = State.SourceMask;
-		for (const int32 Index : VisibleBurningCells)
+		for (const int32 Index : VisibleActiveCells)
 		{
-			if (OutFlameTransforms.Num() >= MaxVisualInstances)
+			if (OutFlameTransforms.Num() >= MaxVisualInstances
+				&& OutSmokeAnchors.Num() >= MaxVisualInstances)
 			{
 				break;
 			}
@@ -1795,27 +1781,27 @@ void AFragment2DActor::GatherRootCombustionVisualTransforms(
 				BaseScale * 1.06f,
 				BaseScale * 1.06f,
 				BaseScale * 1.18f);
-			OutFlameTransforms.Emplace(
-				VisualTransform.Rotator(),
-				Position,
-				FlameScale);
+			if (bRenderFlames
+				&& OutFlameTransforms.Num() < MaxVisualInstances)
+			{
+				OutFlameTransforms.Emplace(
+					VisualTransform.Rotator(),
+					Position,
+					FlameScale);
+			}
 			if (SmokeSourceCellSet.Contains(Index)
 				&& OutSmokeAnchors.Num() < MaxVisualInstances)
 			{
 				float SmokeProbability = 0.7f;
-				if (Registry.IsValid())
+				if (Rule)
 				{
-					if (const FMatterFluxReactionDefinition* Rule =
-						Registry->Reactions.Find(State.CombustionRuleId))
-					{
-						SmokeProbability = FMath::Clamp(
-							static_cast<float>(Rule->EmissionChancePermille)
-								/ 1000.0f,
-							0.0f,
-							1.0f);
-					}
+					SmokeProbability = FMath::Clamp(
+						static_cast<float>(Rule->EmissionChancePermille)
+							/ 1000.0f,
+						0.0f,
+						1.0f);
 				}
-				MatterFlux::Rendering::FSmokeEmissionAnchor& Anchor =
+				MatterFlux::Rendering::FMaterialEmissionAnchor& Anchor =
 					OutSmokeAnchors.AddDefaulted_GetRef();
 				Anchor.WorldPosition = Position + FVector(
 					0.0f,
@@ -1828,9 +1814,9 @@ void AFragment2DActor::GatherRootCombustionVisualTransforms(
 			}
 		}
 	};
-	if (IsRootCombusting())
+	if (IsRootReacting())
 	{
-		AppendState(RootCombustionState, GetActorTransform());
+		AppendState(RootReactionState, GetActorTransform());
 	}
 	for (const FFragmentAggregateSourceState& Source : AggregateSources)
 	{
@@ -1843,13 +1829,13 @@ void AFragment2DActor::GatherRootCombustionVisualTransforms(
 	}
 }
 
-void AFragment2DActor::MarkCombustionVisualizationDirty() const
+void AFragment2DActor::MarkReactionVisualizationDirty() const
 {
 	if (UWorld* World = GetWorld())
 	{
 		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
 		{
-			It->MarkSourceCombustionVisualizationDirty();
+			It->MarkSourceReactionVisualizationDirty();
 		}
 	}
 }
@@ -1929,35 +1915,35 @@ bool AFragment2DActor::AbsorbAggregateSource(
 	Candidate.MaterialId = SourceActor.SourceMaterialId;
 	Candidate.Color = SourceActor.FragmentColor;
 	Candidate.bEnableCollision = SourceActor.bEnableSourceCollision;
-	Candidate.ResidueMask = Candidate.SourceMask;
-	Candidate.ResidueMask.SolidMask.Init(
+	Candidate.OutputMask = Candidate.SourceMask;
+	Candidate.OutputMask.SolidMask.Init(
 		0,
 		Candidate.SourceMask.SolidMask.Num());
-	Candidate.BurningMask = Candidate.SourceMask;
-	Candidate.BurningMask.SolidMask.Init(
+	Candidate.ActiveMask = Candidate.SourceMask;
+	Candidate.ActiveMask.SolidMask.Init(
 		0,
 		Candidate.SourceMask.SolidMask.Num());
-	if (StreamingState.bHasCombustionState)
+	if (StreamingState.bHasReactionState)
 	{
-		Candidate.ResidueMask.SolidMask =
-			StreamingState.CombustionState.ResidueMask;
-		Candidate.BurningMask.SolidMask =
-			StreamingState.CombustionState.BurningMask;
-		for (uint8& Value : Candidate.BurningMask.SolidMask)
+		Candidate.OutputMask.SolidMask =
+			StreamingState.ReactionState.OutputMask;
+		Candidate.ActiveMask.SolidMask =
+			StreamingState.ReactionState.ActiveMask;
+		for (uint8& Value : Candidate.ActiveMask.SolidMask)
 		{
 			Value = Value != 0 ? 1 : 0;
 		}
-		Candidate.bHasCombustionState = true;
-		Candidate.CombustionRuleId =
-			StreamingState.CombustionState.RuleId;
-		Candidate.CombustionSeed =
-			StreamingState.CombustionState.Seed;
-		Candidate.CombustionTick =
-			StreamingState.CombustionState.Tick;
-		Candidate.CombustionAccumulator =
-			StreamingState.CombustionAccumulator;
-		Candidate.TotalSmokeEmissionCount =
-			StreamingState.TotalSmokeEmissionCount;
+		Candidate.bHasReactionState = true;
+		Candidate.ReactionRuleId =
+			StreamingState.ReactionState.RuleId;
+		Candidate.ReactionSeed =
+			StreamingState.ReactionState.Seed;
+		Candidate.ReactionTick =
+			StreamingState.ReactionState.Tick;
+		Candidate.ReactionAccumulator =
+			StreamingState.ReactionAccumulator;
+		Candidate.TotalMaterialEmissionCount =
+			StreamingState.TotalMaterialEmissionCount;
 		const FMatterFluxContentRegistryPtr Registry =
 			IMatterFluxScriptRuntime::IsAvailable()
 				? IMatterFluxScriptRuntime::Get().GetActiveRegistry()
@@ -1965,13 +1951,13 @@ bool AFragment2DActor::AbsorbAggregateSource(
 		if (Registry.IsValid())
 		{
 			if (const FMatterFluxReactionDefinition* Rule =
-				Registry->Reactions.Find(Candidate.CombustionRuleId))
+				Registry->Reactions.Find(Candidate.ReactionRuleId))
 			{
-				Candidate.ResidueMaterialId = Rule->OutputA;
+				Candidate.OutputMaterialId = Rule->OutputA;
 				if (const FMatterFluxMaterialDefinition* Material =
 					Registry->Materials.Find(Rule->OutputA))
 				{
-					Candidate.ResidueColor = Material->Color;
+					Candidate.OutputColor = Material->Color;
 				}
 			}
 		}
@@ -2006,12 +1992,12 @@ bool AFragment2DActor::AbsorbAggregateSourceFragment(
 	Candidate.MaterialId = Payload.MaterialId;
 	Candidate.Color = SourceActor.FragmentColor;
 	Candidate.bEnableCollision = Payload.bEnableCollision;
-	Candidate.ResidueMask = Candidate.SourceMask;
-	Candidate.ResidueMask.SolidMask.Init(
+	Candidate.OutputMask = Candidate.SourceMask;
+	Candidate.OutputMask.SolidMask.Init(
 		0,
 		Candidate.SourceMask.SolidMask.Num());
-	Candidate.BurningMask = Candidate.SourceMask;
-	Candidate.BurningMask.SolidMask.Init(
+	Candidate.ActiveMask = Candidate.SourceMask;
+	Candidate.ActiveMask.SolidMask.Init(
 		0,
 		Candidate.SourceMask.SolidMask.Num());
 	return AddAggregateSourceState(MoveTemp(Candidate), nullptr);
@@ -2284,7 +2270,7 @@ void AFragment2DActor::ConfigureTransientFade()
 	{
 		TransientFadeElapsed = 0.0f;
 		TransientFadeAlpha = 1.0f;
-		SetActorTickEnabled(IsRootCombusting());
+		SetActorTickEnabled(IsRootReacting());
 		return;
 	}
 
@@ -2497,11 +2483,11 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 		&& SpawnPayload.DetachedVoxelMask.GeometryStyle
 			== EFragmentSourceGeometryStyle::VoxelBlocks
 		&& !SpawnPayload.MaterialId.IsNone();
-	const bool bUseRootCombustionState = bIncludeRootVoxel
-		&& RootCombustionState.SourceId == SpawnPayload.FragmentId
-		&& RootCombustionState.IsValid();
-	const FFragmentSourceMask& RootRenderMask = bUseRootCombustionState
-		? RootCombustionState.SourceMask
+	const bool bUseRootReactionState = bIncludeRootVoxel
+		&& RootReactionState.SourceId == SpawnPayload.FragmentId
+		&& RootReactionState.IsValid();
+	const FFragmentSourceMask& RootRenderMask = bUseRootReactionState
+		? RootReactionState.SourceMask
 		: SpawnPayload.DetachedVoxelMask;
 	if (bIncludeRootVoxel)
 	{
@@ -2518,23 +2504,23 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 				FragmentColor,
 				RootRenderMask.CellSize});
 		}
-		if (bUseRootCombustionState
-			&& RootCombustionState.bHasCombustionState
-			&& RootCombustionState.ResidueMask.SolidMask.Contains(1))
+		if (bUseRootReactionState
+			&& RootReactionState.bHasReactionState
+			&& RootReactionState.OutputMask.SolidMask.Contains(1))
 		{
-			const FName ResidueMaterialId =
-				RootCombustionState.ResidueMaterialId.IsNone()
-					? FName(TEXT("residue"))
-					: RootCombustionState.ResidueMaterialId;
+			const FName OutputMaterialId =
+				RootReactionState.OutputMaterialId.IsNone()
+					? FName(TEXT("output"))
+					: RootReactionState.OutputMaterialId;
 			WholeMaterials.Add({
 				FString::Printf(
 					TEXT("%s|%08x|%08x"),
-					*ResidueMaterialId.ToString(),
-					RootCombustionState.ResidueColor.ToFColor(false).DWColor(),
+					*OutputMaterialId.ToString(),
+					RootReactionState.OutputColor.ToFColor(false).DWColor(),
 					GetTypeHash(RootRenderMask.CellSize)),
 				FragmentMaterial,
-				ResidueMaterialId,
-				RootCombustionState.ResidueColor,
+				OutputMaterialId,
+				RootReactionState.OutputColor,
 				RootRenderMask.CellSize});
 		}
 	}
@@ -2573,14 +2559,14 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 		{
 			AddMaterial(Source.MaterialId, Source.Color);
 		}
-		if (Source.bHasCombustionState
-			&& Source.ResidueMask.SolidMask.Contains(1))
+		if (Source.bHasReactionState
+			&& Source.OutputMask.SolidMask.Contains(1))
 		{
 			AddMaterial(
-				Source.ResidueMaterialId.IsNone()
-					? FName(TEXT("residue"))
-					: Source.ResidueMaterialId,
-				Source.ResidueColor);
+				Source.OutputMaterialId.IsNone()
+					? FName(TEXT("output"))
+					: Source.OutputMaterialId,
+				Source.OutputColor);
 		}
 	}
 	WholeMaterials.Sort([](const FWholeMaterial& A, const FWholeMaterial& B)
@@ -2636,15 +2622,15 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 			SpawnPayload.MaterialId,
 			FragmentColor,
 			SpawnPayload.MaterialId == TEXT("leaf") ? 100 : 10);
-		if (bUseRootCombustionState
-			&& RootCombustionState.bHasCombustionState)
+		if (bUseRootReactionState
+			&& RootReactionState.bHasReactionState)
 		{
 			AddRootLayer(
-				RootCombustionState.ResidueMask.SolidMask,
-				RootCombustionState.ResidueMaterialId.IsNone()
-					? FName(TEXT("residue"))
-					: RootCombustionState.ResidueMaterialId,
-				RootCombustionState.ResidueColor,
+				RootReactionState.OutputMask.SolidMask,
+				RootReactionState.OutputMaterialId.IsNone()
+					? FName(TEXT("output"))
+					: RootReactionState.OutputMaterialId,
+				RootReactionState.OutputColor,
 				200);
 		}
 	}
@@ -2702,14 +2688,14 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 			Source.MaterialId,
 			Source.Color,
 			Source.MaterialId == TEXT("leaf") ? 100 : 10);
-		if (Source.bHasCombustionState)
+		if (Source.bHasReactionState)
 		{
 			AddLayer(
-				Source.ResidueMask.SolidMask,
-				Source.ResidueMaterialId.IsNone()
-					? FName(TEXT("residue"))
-					: Source.ResidueMaterialId,
-				Source.ResidueColor,
+				Source.OutputMask.SolidMask,
+				Source.OutputMaterialId.IsNone()
+					? FName(TEXT("output"))
+					: Source.OutputMaterialId,
+				Source.OutputColor,
 				200);
 		}
 	}
@@ -2794,15 +2780,15 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 				Source.MaterialId,
 				Source.Color});
 		}
-		if (Source.bHasCombustionState
-			&& Source.ResidueMask.SolidMask.Contains(1))
+		if (Source.bHasReactionState
+			&& Source.OutputMask.SolidMask.Contains(1))
 		{
 			RenderLayers.Add({
-				&Source.ResidueMask.SolidMask,
-				Source.ResidueMaterialId.IsNone()
-					? FName(TEXT("residue"))
-					: Source.ResidueMaterialId,
-				Source.ResidueColor});
+				&Source.OutputMask.SolidMask,
+				Source.OutputMaterialId.IsNone()
+					? FName(TEXT("output"))
+					: Source.OutputMaterialId,
+				Source.OutputColor});
 		}
 
 		for (const FRenderLayer& Layer : RenderLayers)
@@ -3044,13 +3030,13 @@ bool AFragment2DActor::RebuildSimpleCollision()
 			continue;
 		}
 		TArray<uint8> CollisionMask = Source.SourceMask.SolidMask;
-		if (Source.bHasCombustionState
-			&& Source.ResidueMask.SolidMask.Num() == CollisionMask.Num())
+		if (Source.bHasReactionState
+			&& Source.OutputMask.SolidMask.Num() == CollisionMask.Num())
 		{
 			for (int32 Index = 0; Index < CollisionMask.Num(); ++Index)
 			{
 				CollisionMask[Index] = CollisionMask[Index] != 0
-					|| Source.ResidueMask.SolidMask[Index] != 0
+					|| Source.OutputMask.SolidMask[Index] != 0
 					? 1
 					: 0;
 			}

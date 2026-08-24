@@ -1,5 +1,7 @@
 #include "Game/MatterFluxTwoStoreyHouseActor.h"
 
+#include "Camera/CameraComponent.h"
+#include "IMatterFluxScriptRuntime.h"
 #include "Components/BoxComponent.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
@@ -14,6 +16,7 @@
 #include "Materials/MaterialInterface.h"
 #include "Misc/Crc.h"
 #include "ProceduralMeshComponent.h"
+#include "Rendering/MatterFluxGhostFade.h"
 #include "Rendering/MatterFluxVoxelMaterialStyle.h"
 #include "Rendering/MatterFluxWholeObjectGeometry.h"
 #include "UObject/ConstructorHelpers.h"
@@ -26,14 +29,10 @@ namespace
 		+ AMatterFluxTwoStoreyHouseActor::StoreyHeight;
 	constexpr float WallThickness = 34.0f;
 	constexpr float WallHeight = 326.0f;
-	constexpr float InteriorActorGhostOpacity = 0.48f;
-	constexpr float FadeSpeed = 4.5f;
 	constexpr float InteriorMargin = 46.0f;
 	// Entering a floor is precise, but leaving uses a Schmitt-trigger envelope.
 	// CharacterMovement may briefly depenetrate a capsule beyond the strict
 	// interior bounds at walls, stair lips and low-FPS floor corrections.
-	constexpr float CutawayExitPadding = 80.0f;
-	constexpr float CutawayExitGraceSeconds = 0.18f;
 	constexpr int32 RoofStepCount = 12;
 	constexpr float RoofRun = 36.0f;
 	constexpr float RoofRise = 18.0f;
@@ -101,6 +100,26 @@ namespace
 			FMath::RoundToFloat(FirstInHouse.Z / Mask.CellSize) * Mask.CellSize);
 		Snapped.AddToTranslation(SnappedFirst - FirstInHouse);
 		return Snapped;
+	}
+
+	FGuid MakeHouseSourceId(
+		const FVector& HouseLocation,
+		const FName GroupName,
+		const int32 PieceIndex)
+	{
+		return FGuid::NewDeterministicGuid(
+			FString::Printf(
+				TEXT("MatterFluxHouse|%.0f|%.0f|%.0f|Group=%s|Piece=%d"),
+				HouseLocation.X,
+				HouseLocation.Y,
+				HouseLocation.Z,
+				*GroupName.ToString(),
+				PieceIndex),
+			static_cast<uint64>(HashCombineFast(
+				GetTypeHash(HouseLocation.X),
+				HashCombineFast(
+					GetTypeHash(HouseLocation.Y),
+					GetTypeHash(HouseLocation.Z)))));
 	}
 }
 
@@ -171,6 +190,17 @@ AMatterFluxTwoStoreyHouseActor::AMatterFluxTwoStoreyHouseActor()
 void AMatterFluxTwoStoreyHouseActor::BeginPlay()
 {
 	Super::BeginPlay();
+	InitializeStructureDefinition(StructureDefinitionId);
+	if (IMatterFluxScriptRuntime::IsAvailable())
+	{
+		StructureReloadHandle = IMatterFluxScriptRuntime::Get()
+			.OnContentReloaded().AddWeakLambda(
+				this,
+				[this](const FMatterFluxContentRegistryPtr)
+				{
+					InitializeStructureDefinition(StructureDefinitionId);
+				});
+	}
 	SpawnCuttableStructureSources();
 	RebuildCuttableWholeObjectMesh(true);
 	ConfigureGroupMaterials();
@@ -181,9 +211,152 @@ void AMatterFluxTwoStoreyHouseActor::BeginPlay()
 	}
 }
 
+void AMatterFluxTwoStoreyHouseActor::InitializeStructureDefinition(
+	const FName DefinitionId)
+{
+	StructureDefinitionId = DefinitionId;
+	if (!IMatterFluxScriptRuntime::IsAvailable())
+	{
+		return;
+	}
+	const FMatterFluxContentRegistryPtr Registry =
+		IMatterFluxScriptRuntime::Get().GetActiveRegistry();
+	const FMatterFluxStructureDefinition* Definition = Registry.IsValid()
+		? Registry->Structures.Find(DefinitionId) : nullptr;
+	if (!Definition || Definition->GeneratorId != TEXT("two_storey_house"))
+	{
+		return;
+	}
+	CutawayPolicy.ContactToleranceCentimeters =
+		Definition->ContactToleranceCentimeters;
+	CutawayPolicy.FloorSnapHeightCentimeters =
+		Definition->FloorSnapHeightCentimeters;
+	CutawayPolicy.PreferredFloorPaddingCentimeters =
+		Definition->PreferredFloorPaddingCentimeters;
+	CutawayPolicy.PreferredFloorVerticalRangeCentimeters =
+		Definition->PreferredFloorVerticalRangeCentimeters;
+	CutawayExitGraceSeconds = Definition->ExitGraceSeconds;
+	StructureFadeSpeed = Definition->FadeSpeed;
+	WallGhostOpacity = Definition->WallGhostOpacity;
+	RoofGhostOpacity = Definition->RoofGhostOpacity;
+	for (FStructureFadeGroup& Group : StructureFadeGroups)
+	{
+		if (Group.StructuralRole
+			== EMatterFluxMaterialStructuralRole::Wall)
+		{
+			Group.GhostOpacity = Group.MaterialId == TEXT("roof")
+				? RoofGhostOpacity : WallGhostOpacity;
+		}
+	}
+}
+
+void AMatterFluxTwoStoreyHouseActor::DeactivateForStreamingPool()
+{
+	for (AFragment2DSourceActor* Source : CuttableStructureSources)
+	{
+		if (IsValid(Source))
+		{
+			Source->SetActorHiddenInGame(true);
+			Source->SetActorEnableCollision(false);
+			Source->SetActorTickEnabled(false);
+		}
+	}
+	CurrentFloorSourceId.Invalidate();
+	CurrentGhostSourceIds.Reset();
+	CurrentCutawayFloor = INDEX_NONE;
+	CurrentStructureOpacity = 1.0f;
+	SetActorTickEnabled(false);
+	SetActorEnableCollision(false);
+	SetActorHiddenInGame(true);
+	MoveHouseAndCuttableSources(FTransform(
+		GetActorQuat(),
+		FVector(0.0, 0.0, -10000000.0),
+		GetActorScale3D()));
+}
+
+void AMatterFluxTwoStoreyHouseActor::ReactivateFromStreamingPool(
+	const FTransform& WorldTransform,
+	const FName DefinitionId)
+{
+	MoveHouseAndCuttableSources(WorldTransform);
+	InitializeStructureDefinition(DefinitionId);
+	int32 PieceIndex = 0;
+	for (AFragment2DSourceActor* Source : CuttableStructureSources)
+	{
+		if (!IsValid(Source))
+		{
+			continue;
+		}
+		FName GroupName = TEXT("Unknown");
+		for (const FName Tag : Source->Tags)
+		{
+			FString TagText = Tag.ToString();
+			if (TagText.RemoveFromStart(TEXT("MatterFluxHouseGroup.")))
+			{
+				GroupName = FName(*TagText);
+				break;
+			}
+		}
+		Source->ResetForStreamingReuse(MakeHouseSourceId(
+			GetActorLocation(),
+			GroupName,
+			PieceIndex++));
+		Source->SetActorHiddenInGame(false);
+		Source->SetActorEnableCollision(true);
+		Source->SetActorTickEnabled(true);
+	}
+	CuttableWholeObjectSignature = MAX_uint32;
+	RebuildCuttableWholeObjectMesh(true);
+	SetActorHiddenInGame(false);
+	SetActorEnableCollision(true);
+	SetActorTickEnabled(GetNetMode() != NM_DedicatedServer);
+	RefreshCutawayImmediately();
+}
+
+void AMatterFluxTwoStoreyHouseActor::MoveHouseAndCuttableSources(
+	const FTransform& WorldTransform)
+{
+	const FTransform PreviousHouseTransform = GetActorTransform();
+	TArray<FTransform> RelativeSourceTransforms;
+	RelativeSourceTransforms.Reserve(CuttableStructureSources.Num());
+	for (const AFragment2DSourceActor* Source : CuttableStructureSources)
+	{
+		RelativeSourceTransforms.Add(IsValid(Source)
+			? Source->GetActorTransform().GetRelativeTransform(
+				PreviousHouseTransform)
+			: FTransform::Identity);
+	}
+	SetActorTransform(
+		WorldTransform,
+		false,
+		nullptr,
+		ETeleportType::TeleportPhysics);
+	for (int32 SourceIndex = 0;
+		SourceIndex < CuttableStructureSources.Num();
+		++SourceIndex)
+	{
+		AFragment2DSourceActor* Source = CuttableStructureSources[SourceIndex];
+		if (IsValid(Source))
+		{
+			Source->SetActorTransform(
+				RelativeSourceTransforms[SourceIndex] * WorldTransform,
+				false,
+				nullptr,
+				ETeleportType::TeleportPhysics);
+		}
+	}
+}
+
 void AMatterFluxTwoStoreyHouseActor::EndPlay(
 	const EEndPlayReason::Type EndPlayReason)
 {
+	if (StructureReloadHandle.IsValid()
+		&& IMatterFluxScriptRuntime::IsAvailable())
+	{
+		IMatterFluxScriptRuntime::Get().OnContentReloaded().Remove(
+			StructureReloadHandle);
+		StructureReloadHandle.Reset();
+	}
 	DestroyCuttableStructureSources();
 	Super::EndPlay(EndPlayReason);
 }
@@ -201,14 +374,7 @@ void AMatterFluxTwoStoreyHouseActor::Tick(const float DeltaSeconds)
 	RebuildCuttableWholeObjectMesh();
 	ACharacter* Viewer = ResolveLocalViewer();
 	UpdateCutawayFloor(Viewer, DeltaSeconds);
-	UpdateStructureFade(DeltaSeconds, false);
-
-	InteriorScanAccumulator += FMath::Max(DeltaSeconds, 0.0f);
-	if (InteriorScanAccumulator >= 0.15f || !TrackedInteriorMeshes.IsEmpty())
-	{
-		InteriorScanAccumulator = FMath::Fmod(InteriorScanAccumulator, 0.15f);
-		UpdateInteriorActorFade(DeltaSeconds, false);
-	}
+	UpdateStructureFade(DeltaSeconds);
 }
 
 UInstancedStaticMeshComponent*
@@ -281,7 +447,7 @@ void AMatterFluxTwoStoreyHouseActor::BuildFoundationAndFloors()
 	UInstancedStaticMeshComponent* GroundFloor = CreateVoxelGroup(
 		TEXT("GroundFloor"), true, 0,
 		FLinearColor(0.48f, 0.25f, 0.095f), true, true, 0.12f,
-		false, false, TEXT("wood"));
+		true, false, TEXT("wood"));
 	AddBox(*GroundFloor,
 		FVector(0.0f, 0.0f, GroundFloorTop - FloorThickness * 0.5f),
 		FVector(1080.0f, 800.0f, FloorThickness));
@@ -289,7 +455,7 @@ void AMatterFluxTwoStoreyHouseActor::BuildFoundationAndFloors()
 	UInstancedStaticMeshComponent* UpperFloor = CreateVoxelGroup(
 		TEXT("UpperFloor"), true, 1,
 		FLinearColor(0.54f, 0.30f, 0.12f), false, true, 0.16f,
-		false, false, TEXT("wood"));
+		true, false, TEXT("wood"));
 	// 二楼地板围绕楼梯井分成四块，避免视觉地板和坡面碰撞互相穿插。
 	AddBox(*UpperFloor, FVector(-410.0f, 0.0f,
 		UpperFloorTop - FloorThickness * 0.5f),
@@ -297,10 +463,10 @@ void AMatterFluxTwoStoreyHouseActor::BuildFoundationAndFloors()
 	AddBox(*UpperFloor, FVector(430.0f, 0.0f,
 		UpperFloorTop - FloorThickness * 0.5f),
 		FVector(220.0f, 800.0f, FloorThickness));
-	AddBox(*UpperFloor, FVector(10.0f, -175.0f,
+	AddBox(*UpperFloor, FVector(10.0f, 175.0f,
 		UpperFloorTop - FloorThickness * 0.5f),
 		FVector(580.0f, 450.0f, FloorThickness));
-	AddBox(*UpperFloor, FVector(10.0f, 365.0f,
+	AddBox(*UpperFloor, FVector(10.0f, -365.0f,
 		UpperFloorTop - FloorThickness * 0.5f),
 		FVector(580.0f, 70.0f, FloorThickness));
 }
@@ -399,13 +565,17 @@ void AMatterFluxTwoStoreyHouseActor::BuildStairs()
 	constexpr int32 StepCount = 14;
 	constexpr float StartX = -330.0f;
 	constexpr float Run = 660.0f;
-	constexpr float StairY = 245.0f;
+	constexpr float StairY = -245.0f;
 	constexpr float StairWidth = 190.0f;
 	for (int32 Step = 0; Step < StepCount; ++Step)
 	{
 		const float Alpha = static_cast<float>(Step)
 			/ static_cast<float>(StepCount - 1);
-		const float StepHeight = 24.0f + Alpha * (StoreyHeight - 34.0f);
+		// The visible stair is a projection of the same walkable span as the
+		// collision ramp.  Its first and last treads must meet the two canonical
+		// floor surfaces; stopping below UpperFloorTop leaves a capsule stranded
+		// in the stair opening and prevents upper-floor material selection.
+		const float StepHeight = GroundFloorTop + Alpha * StoreyHeight;
 		AddBox(*Stairs,
 			FVector(StartX + Alpha * Run, StairY, StepHeight * 0.5f),
 			FVector(Run / static_cast<float>(StepCount) + 5.0f,
@@ -417,7 +587,7 @@ void AMatterFluxTwoStoreyHouseActor::BuildStairs()
 		const float Alpha = static_cast<float>(Rail) / 5.0f;
 		const float Z = 95.0f + Alpha * (StoreyHeight - 34.0f);
 		AddBox(*Stairs,
-			FVector(StartX + Alpha * Run, StairY - StairWidth * 0.52f, Z),
+			FVector(StartX + Alpha * Run, StairY + StairWidth * 0.52f, Z),
 			FVector(22.0f, 22.0f, 150.0f));
 	}
 }
@@ -441,33 +611,34 @@ void AMatterFluxTwoStoreyHouseActor::BuildFurniture()
 		FLinearColor(0.64f, 0.16f, 0.24f), false, false, 0.22f,
 		true, true, TEXT("fabric"));
 
+	// 楼梯移到后侧后，家具整体让到前侧，保持后侧坡面与楼梯井净空。
 	// 一楼：长桌、凳子、书架和地毯。
-	AddBox(*LowerWood, FVector(-115.0f, -120.0f, 118.0f),
+	AddBox(*LowerWood, FVector(-115.0f, 120.0f, 118.0f),
 		FVector(300.0f, 145.0f, 28.0f));
 	for (const FVector2D Leg : {
-		FVector2D(-225.0f, -165.0f), FVector2D(-5.0f, -165.0f),
-		FVector2D(-225.0f, -75.0f), FVector2D(-5.0f, -75.0f) })
+		FVector2D(-225.0f, 165.0f), FVector2D(-5.0f, 165.0f),
+		FVector2D(-225.0f, 75.0f), FVector2D(-5.0f, 75.0f) })
 	{
 		AddBox(*LowerWood, FVector(Leg, 66.0f), FVector(24.0f, 24.0f, 104.0f));
 	}
-	AddBox(*LowerWood, FVector(465.0f, -300.0f, 150.0f),
+	AddBox(*LowerWood, FVector(465.0f, 300.0f, 150.0f),
 		FVector(90.0f, 180.0f, 265.0f));
-	AddBox(*LowerAccent, FVector(-120.0f, -115.0f, 40.0f),
+	AddBox(*LowerAccent, FVector(-120.0f, 115.0f, 40.0f),
 		FVector(390.0f, 235.0f, 12.0f));
-	AddBox(*LowerAccent, FVector(285.0f, 50.0f, 78.0f),
+	AddBox(*LowerAccent, FVector(285.0f, -50.0f, 78.0f),
 		FVector(145.0f, 92.0f, 88.0f));
 
 	// 二楼：床、床头柜、矮书桌与彩色床毯。
 	const float UpperBase = UpperFloorTop;
-	AddBox(*UpperWood, FVector(-170.0f, -235.0f, UpperBase + 62.0f),
+	AddBox(*UpperWood, FVector(-170.0f, 235.0f, UpperBase + 62.0f),
 		FVector(350.0f, 205.0f, 58.0f));
-	AddBox(*UpperWood, FVector(-326.0f, -235.0f, UpperBase + 120.0f),
+	AddBox(*UpperWood, FVector(-326.0f, 235.0f, UpperBase + 120.0f),
 		FVector(38.0f, 205.0f, 175.0f));
-	AddBox(*UpperAccent, FVector(-150.0f, -235.0f, UpperBase + 96.0f),
+	AddBox(*UpperAccent, FVector(-150.0f, 235.0f, UpperBase + 96.0f),
 		FVector(300.0f, 185.0f, 24.0f));
-	AddBox(*UpperWood, FVector(350.0f, -170.0f, UpperBase + 102.0f),
+	AddBox(*UpperWood, FVector(350.0f, 170.0f, UpperBase + 102.0f),
 		FVector(225.0f, 115.0f, 26.0f));
-	AddBox(*UpperAccent, FVector(360.0f, -168.0f, UpperBase + 145.0f),
+	AddBox(*UpperAccent, FVector(360.0f, 168.0f, UpperBase + 145.0f),
 		FVector(58.0f, 58.0f, 58.0f));
 }
 
@@ -494,24 +665,21 @@ void AMatterFluxTwoStoreyHouseActor::SpawnCuttableStructureSources()
 		{
 			return;
 		}
-		const FGuid SourceId = FGuid::NewDeterministicGuid(
-			FString::Printf(
-				TEXT("MatterFluxHouse|%.0f|%.0f|%.0f|Group=%s|Piece=%d"),
-				GetActorLocation().X,
-				GetActorLocation().Y,
-				GetActorLocation().Z,
-				*GroupName.ToString(),
-				PieceIndex++),
-			static_cast<uint64>(HashCombineFast(
-				GetTypeHash(GetActorLocation().X),
-				HashCombineFast(
-					GetTypeHash(GetActorLocation().Y),
-					GetTypeHash(GetActorLocation().Z)))));
+		const FGuid SourceId = MakeHouseSourceId(
+			GetActorLocation(),
+			GroupName,
+			PieceIndex++);
 		Source->FragmentMaterial = SolidMaterialTemplate;
 		Source->bDestroySourceOnFirstBreak = false;
 		Source->SetSourceCollisionEnabled(bEnableCollision);
+		const EMatterFluxMaterialStructuralRole StructuralRole =
+			Group.bFloorSurface
+				? EMatterFluxMaterialStructuralRole::Floor
+				: Group.bInteriorFixture
+					? EMatterFluxMaterialStructuralRole::Furniture
+					: EMatterFluxMaterialStructuralRole::Wall;
 		if (!Source->InitializeFromProceduralMask(
-			Mask, SourceId, Group.Color, MaterialId))
+			Mask, SourceId, Group.Color, MaterialId, StructuralRole))
 		{
 			Source->Destroy();
 			return;
@@ -770,6 +938,9 @@ uint32 AMatterFluxTwoStoreyHouseActor::
 		Signature = HashCombineFast(Signature, GetTypeHash(Source->SourceId));
 		Signature = HashCombineFast(Signature, GetTypeHash(Source->Revision));
 		Signature = HashCombineFast(Signature, GetTypeHash(Source->bBroken));
+		Signature = HashCombineFast(
+			Signature,
+			GetTypeHash(static_cast<uint8>(Source->StructuralRole)));
 		const TArray<uint8>& Mask = Source->GetRuntimeMask();
 		Signature = HashCombineFast(
 			Signature,
@@ -806,8 +977,9 @@ void AMatterFluxTwoStoreyHouseActor::RebuildCuttableWholeObjectMesh(
 		AFragment2DSourceActor* Source = nullptr;
 		FTransform LocalTransform = FTransform::Identity;
 		float CellSize = 0.0f;
+		EMatterFluxMaterialStructuralRole StructuralRole =
+			EMatterFluxMaterialStructuralRole::None;
 		int32 FloorTier = 0;
-		bool bInteriorFixture = false;
 	};
 	TArray<FSourceView> SourceViews;
 	for (AFragment2DSourceActor* Source : CuttableStructureSources)
@@ -822,25 +994,22 @@ void AMatterFluxTwoStoreyHouseActor::RebuildCuttableWholeObjectMesh(
 		}
 		const FTransform LocalTransform =
 			Source->GetActorTransform().GetRelativeTransform(GetActorTransform());
-		const float LocalZ = LocalTransform.GetLocation().Z;
-		const int32 FloorTier = Source->ActorHasTag(
-			TEXT("MatterFluxHouseGroup.Roof"))
-			|| Source->ActorHasTag(TEXT("MatterFluxHouseGroup.RoofGable"))
-				? 2
-				: (LocalZ >= UpperFloorTop ? 1 : 0);
 		SourceViews.Add({
 			Source,
 			LocalTransform,
 			Source->GetCellSize(),
-			FloorTier,
-			Source->ActorHasTag(TEXT("MatterFluxHouseFurniture"))
-				|| Source->SourceMaterialId == TEXT("wood")
-				|| Source->SourceMaterialId == TEXT("fabric")});
+			Source->StructuralRole,
+			Source->ActorHasTag(TEXT("MatterFluxHouseGroup.UpperFloor"))
+				? 1 : 0});
 	}
 	SourceViews.Sort([](const FSourceView& A, const FSourceView& B)
 	{
 		if (A.CellSize != B.CellSize) return A.CellSize < B.CellSize;
-		if (A.FloorTier != B.FloorTier) return A.FloorTier < B.FloorTier;
+		if (A.StructuralRole != B.StructuralRole)
+		{
+			return static_cast<uint8>(A.StructuralRole)
+				< static_cast<uint8>(B.StructuralRole);
+		}
 		const FGuid& Left = A.Source->SourceId;
 		const FGuid& Right = B.Source->SourceId;
 		if (Left.A != Right.A) return Left.A < Right.A;
@@ -870,8 +1039,10 @@ void AMatterFluxTwoStoreyHouseActor::RebuildCuttableWholeObjectMesh(
 			TObjectPtr<UMaterialInterface> Parent;
 			FName MaterialId = NAME_None;
 			FLinearColor Color = FLinearColor::White;
+			FGuid SourceId;
+			EMatterFluxMaterialStructuralRole StructuralRole =
+				EMatterFluxMaterialStructuralRole::None;
 			int32 FloorTier = 0;
-			bool bInteriorFixture = false;
 		};
 		TArray<FMaterialInfo> Materials;
 		for (const FSourceView& View : SourceViews)
@@ -881,9 +1052,9 @@ void AMatterFluxTwoStoreyHouseActor::RebuildCuttableWholeObjectMesh(
 				continue;
 			}
 			const FString StableKey = FString::Printf(
-				TEXT("%d|%d|%s|%08x"),
-				View.FloorTier,
-				View.bInteriorFixture ? 1 : 0,
+				TEXT("%s|%d|%s|%08x"),
+				*View.Source->SourceId.ToString(EGuidFormats::Digits),
+				static_cast<int32>(View.StructuralRole),
 				*View.Source->SourceMaterialId.ToString(),
 				View.Source->FragmentColor.ToFColor(false).DWColor());
 			if (!Materials.ContainsByPredicate(
@@ -897,8 +1068,9 @@ void AMatterFluxTwoStoreyHouseActor::RebuildCuttableWholeObjectMesh(
 					View.Source->FragmentMaterial,
 					View.Source->SourceMaterialId,
 					View.Source->FragmentColor,
-					View.FloorTier,
-					View.bInteriorFixture});
+					View.Source->SourceId,
+					View.StructuralRole,
+					View.FloorTier});
 			}
 		}
 		Materials.Sort([](const FMaterialInfo& A, const FMaterialInfo& B)
@@ -914,9 +1086,9 @@ void AMatterFluxTwoStoreyHouseActor::RebuildCuttableWholeObjectMesh(
 				continue;
 			}
 			const FString StableKey = FString::Printf(
-				TEXT("%d|%d|%s|%08x"),
-				View.FloorTier,
-				View.bInteriorFixture ? 1 : 0,
+				TEXT("%s|%d|%s|%08x"),
+				*View.Source->SourceId.ToString(EGuidFormats::Digits),
+				static_cast<int32>(View.StructuralRole),
 				*View.Source->SourceMaterialId.ToString(),
 				View.Source->FragmentColor.ToFColor(false).DWColor());
 			const int32 MaterialIndex = Materials.IndexOfByPredicate(
@@ -943,7 +1115,8 @@ void AMatterFluxTwoStoreyHouseActor::RebuildCuttableWholeObjectMesh(
 				MatterFlux::WholeObject::FLayer& Layer =
 					WholeLayers.AddDefaulted_GetRef();
 				Layer.MaterialIndex = MaterialIndex;
-				Layer.Priority = View.FloorTier * 10 + 10;
+				Layer.Priority =
+					static_cast<int32>(View.StructuralRole) * 10 + 10;
 				Layer.bEnableCollision = View.Source->bEnableSourceCollision;
 				Layer.Width = View.Source->GetMaskWidth();
 				Layer.Height = View.Source->GetMaskHeight();
@@ -1011,11 +1184,17 @@ void AMatterFluxTwoStoreyHouseActor::RebuildCuttableWholeObjectMesh(
 				StructureFadeGroups.AddDefaulted_GetRef();
 			Fade.Component = CuttableWholeObjectMesh;
 			Fade.Color = Info.Color;
+			Fade.SourceId = Info.SourceId;
+			Fade.StructuralRole = Info.StructuralRole;
 			Fade.FloorTier = Info.FloorTier;
 			Fade.bCuttable = true;
-			Fade.bInteriorFixture = Info.bInteriorFixture;
+			Fade.bFloorSurface = Info.StructuralRole
+				== EMatterFluxMaterialStructuralRole::Floor;
+			Fade.bInteriorFixture = Info.StructuralRole
+				== EMatterFluxMaterialStructuralRole::Furniture;
 			Fade.MaterialId = Info.MaterialId;
-			Fade.GhostOpacity = Info.FloorTier == 2 ? 0.025f : 0.055f;
+			Fade.GhostOpacity = Info.MaterialId == TEXT("roof")
+				? RoofGhostOpacity : WallGhostOpacity;
 			Fade.MaterialSlots.Add(SectionIndex);
 			Fade.SolidMaterials.Add(Solid);
 			if (GhostMaterialTemplate)
@@ -1061,37 +1240,6 @@ void AMatterFluxTwoStoreyHouseActor::RebuildCuttableWholeObjectMesh(
 	CuttableWholeObjectMesh->SetCastShadow(true);
 }
 
-void AMatterFluxTwoStoreyHouseActor::RegisterCuttableSourceFade(
-	AFragment2DSourceActor& Source,
-	const FStructureFadeGroup& TemplateGroup)
-{
-	FStructureFadeGroup& Fade = StructureFadeGroups.AddDefaulted_GetRef();
-	Fade.Component = Source.MeshComponent;
-	Fade.Color = TemplateGroup.Color;
-	Fade.MaterialId = TemplateGroup.MaterialId;
-	Fade.FloorTier = TemplateGroup.FloorTier;
-	Fade.bInteriorFixture = TemplateGroup.bInteriorFixture;
-	Fade.GhostOpacity = TemplateGroup.GhostOpacity;
-	for (int32 SlotIndex = 0;
-		SlotIndex < Source.MeshComponent->GetNumMaterials(); ++SlotIndex)
-	{
-		Fade.SolidMaterials.Add(Source.MeshComponent->GetMaterial(SlotIndex));
-	}
-	if (GhostMaterialTemplate)
-	{
-		UMaterialInstanceDynamic* Ghost = UMaterialInstanceDynamic::Create(
-			GhostMaterialTemplate, this);
-		Ghost->SetVectorParameterValue(TEXT("Color"), Fade.Color);
-		Ghost->SetScalarParameterValue(TEXT("Opacity"), 1.0f);
-		Ghost->SetScalarParameterValue(TEXT("FaceContrast"), 0.70f);
-		Ghost->SetScalarParameterValue(TEXT("PixelSize"), 10.0f);
-		Ghost->SetScalarParameterValue(TEXT("Roughness"), 0.86f);
-		Ghost->SetScalarParameterValue(TEXT("ShadowLift"), 0.30f);
-		Fade.GhostMaterial = Ghost;
-		HouseMaterials.Add(Ghost);
-	}
-}
-
 void AMatterFluxTwoStoreyHouseActor::
 	RefreshReplicatedCuttableStructureSources(const float DeltaSeconds)
 {
@@ -1121,13 +1269,6 @@ void AMatterFluxTwoStoreyHouseActor::
 		{
 			continue;
 		}
-		const float LocalZ = GetActorTransform().InverseTransformPosition(
-			Source->GetActorLocation()).Z;
-		FStructureFadeGroup Template;
-		Template.Color = Source->FragmentColor;
-		Template.FloorTier = LocalZ >= UpperFloorTop + WallHeight
-			? 2 : LocalZ >= UpperFloorTop ? 1 : 0;
-		Template.GhostOpacity = Template.FloorTier == 2 ? 0.025f : 0.055f;
 		CuttableStructureSources.Add(Source);
 		Source->SetSourceMeshProjectionEnabled(false);
 		CuttableWholeObjectSignature = MAX_uint32;
@@ -1212,13 +1353,15 @@ void AMatterFluxTwoStoreyHouseActor::ConfigureGroupMaterials()
 void AMatterFluxTwoStoreyHouseActor::ConfigureRampCollision()
 {
 	constexpr float Run = 660.0f;
-	constexpr float Rise = StoreyHeight - 34.0f;
+	// Span the complete surface-to-surface rise.  The previous subtraction of
+	// FloorThickness ended the ramp roughly one floor slab below its landing.
+	constexpr float Rise = StoreyHeight;
 	const float RampLength = FMath::Sqrt(Run * Run + Rise * Rise);
 	const float Pitch = FMath::RadiansToDegrees(FMath::Atan2(Rise, Run));
 	StairRampCollision->SetBoxExtent(FVector(
 		RampLength * 0.5f, 88.0f, 12.0f));
 	StairRampCollision->SetRelativeLocation(FVector(
-		0.0f, 245.0f, 34.0f + Rise * 0.5f - 6.0f));
+		0.0f, -245.0f, 34.0f + Rise * 0.5f - 6.0f));
 	StairRampCollision->SetRelativeRotation(FRotator(Pitch, 0.0f, 0.0f));
 }
 
@@ -1270,14 +1413,14 @@ FVector AMatterFluxTwoStoreyHouseActor::GetIndoorPatrolWaypoint(
 	const int32 WaypointIndex) const
 {
 	const FVector LocalWaypoints[] = {
-		FVector(-300.0f, -180.0f, GroundFloorTop),
-		FVector(-330.0f, 245.0f, GroundFloorTop),
-		FVector(330.0f, 245.0f, UpperFloorTop),
-		FVector(360.0f, -170.0f, UpperFloorTop),
-		FVector(-270.0f, -170.0f, UpperFloorTop),
-		FVector(330.0f, 245.0f, UpperFloorTop),
-		FVector(-330.0f, 245.0f, GroundFloorTop),
-		FVector(260.0f, -150.0f, GroundFloorTop)
+		FVector(-300.0f, 180.0f, GroundFloorTop),
+		FVector(-330.0f, -245.0f, GroundFloorTop),
+		FVector(330.0f, -245.0f, UpperFloorTop),
+		FVector(360.0f, 170.0f, UpperFloorTop),
+		FVector(-270.0f, 170.0f, UpperFloorTop),
+		FVector(330.0f, -245.0f, UpperFloorTop),
+		FVector(-330.0f, -245.0f, GroundFloorTop),
+		FVector(260.0f, 150.0f, GroundFloorTop)
 	};
 	const int32 Count = UE_ARRAY_COUNT(LocalWaypoints);
 	const int32 Wrapped = ((WaypointIndex % Count) + Count) % Count;
@@ -1307,52 +1450,112 @@ ACharacter* AMatterFluxTwoStoreyHouseActor::ResolveLocalViewer() const
 	return nullptr;
 }
 
-int32 AMatterFluxTwoStoreyHouseActor::ResolveViewerFloor(
-	const ACharacter& Viewer) const
+bool AMatterFluxTwoStoreyHouseActor::ResolveViewerCameraLocation(
+	ACharacter& Viewer,
+	FVector& OutCameraLocation) const
 {
-	float FeetZ = Viewer.GetActorLocation().Z;
-	if (const UCapsuleComponent* Capsule = Viewer.GetCapsuleComponent())
+	if (APlayerController* Controller = Cast<APlayerController>(
+		Viewer.GetController()))
 	{
-		FeetZ -= Capsule->GetScaledCapsuleHalfHeight();
+		FRotator ViewRotation;
+		Controller->GetPlayerViewPoint(OutCameraLocation, ViewRotation);
+		if (!OutCameraLocation.ContainsNaN())
+		{
+			return true;
+		}
 	}
-	FVector Feet = Viewer.GetActorLocation();
-	Feet.Z = FeetZ;
-	return GetFloorIndexAtWorldLocation(Feet);
-}
-
-bool AMatterFluxTwoStoreyHouseActor::IsInsideCutawayRetentionVolume(
-	const FVector& WorldLocation) const
-{
-	const FVector Local = GetActorTransform().InverseTransformPosition(
-		WorldLocation);
-	return FMath::Abs(Local.X) <= HalfSizeX + CutawayExitPadding
-		&& FMath::Abs(Local.Y) <= HalfSizeY + CutawayExitPadding
-		&& Local.Z >= -40.0f - CutawayExitPadding
-		&& Local.Z <= UpperFloorTop + WallHeight + 100.0f
-			+ CutawayExitPadding;
+	if (const UCameraComponent* Camera =
+		Viewer.FindComponentByClass<UCameraComponent>())
+	{
+		OutCameraLocation = Camera->GetComponentLocation();
+		return !OutCameraLocation.ContainsNaN();
+	}
+	return false;
 }
 
 void AMatterFluxTwoStoreyHouseActor::UpdateCutawayFloor(
 	ACharacter* Viewer,
 	const float DeltaSeconds)
 {
-	const int32 NewFloor = Viewer ? ResolveViewerFloor(*Viewer) : INDEX_NONE;
-	if (NewFloor != INDEX_NONE)
+	MatterFlux::MaterialCutaway::FResult Result;
+	bool bResolved = false;
+	if (Viewer)
 	{
-		CurrentCutawayFloor = NewFloor;
+		FVector ViewerFeet = Viewer->GetActorLocation();
+		if (const UCapsuleComponent* Capsule = Viewer->GetCapsuleComponent())
+		{
+			ViewerFeet.Z -= Capsule->GetScaledCapsuleHalfHeight();
+		}
+		CutawaySourceView.Reset(CuttableStructureSources.Num());
+		for (AFragment2DSourceActor* Source : CuttableStructureSources)
+		{
+			CutawaySourceView.Add(Source);
+		}
+		bResolved = MatterFlux::MaterialCutaway::Resolve(
+			ViewerFeet,
+			CutawaySourceView,
+			CurrentFloorSourceId,
+			CutawayPolicy,
+			Result);
+	}
+	if (bResolved)
+	{
+		CurrentFloorSourceId = Result.FloorSourceId;
+		CurrentCutawayFloor = Result.FloorOrdinal;
+		CurrentGhostSourceIds = MoveTemp(Result.GhostSourceIds);
+		bExteriorOcclusionActive = false;
 		CutawayExitAccumulator = 0.0f;
 		return;
 	}
 
-	if (CurrentCutawayFloor == INDEX_NONE)
+	if (CurrentCutawayFloor != INDEX_NONE)
 	{
+		CutawayExitAccumulator += FMath::Max(DeltaSeconds, 0.0f);
+		if (CutawayExitAccumulator < CutawayExitGraceSeconds)
+		{
+			return;
+		}
+		CurrentCutawayFloor = INDEX_NONE;
+		CurrentFloorSourceId.Invalidate();
+		CurrentGhostSourceIds.Reset();
+		CutawayExitAccumulator = 0.0f;
+	}
+
+	FVector CameraLocation;
+	MatterFlux::MaterialCutaway::FResult ExteriorResult;
+	bool bExteriorResolved = false;
+	if (Viewer && ResolveViewerCameraLocation(*Viewer, CameraLocation))
+	{
+		const FVector ViewerCenter = Viewer->GetActorLocation();
+		FVector ViewerExtent(44.0f, 44.0f, 88.0f);
+		if (const UCapsuleComponent* Capsule = Viewer->GetCapsuleComponent())
+		{
+			ViewerExtent = FVector(
+				Capsule->GetScaledCapsuleRadius(),
+				Capsule->GetScaledCapsuleRadius(),
+				Capsule->GetScaledCapsuleHalfHeight());
+		}
+		const FBox ViewerBounds(
+			ViewerCenter - ViewerExtent,
+			ViewerCenter + ViewerExtent);
+		bExteriorResolved = MatterFlux::MaterialCutaway::ResolveOccludingWalls(
+			CameraLocation,
+			ViewerBounds,
+			CutawaySourceView,
+			CutawayPolicy,
+			ExteriorResult);
+	}
+	if (bExteriorResolved)
+	{
+		CurrentFloorSourceId.Invalidate();
+		CurrentCutawayFloor = INDEX_NONE;
+		CurrentGhostSourceIds = MoveTemp(ExteriorResult.GhostSourceIds);
+		bExteriorOcclusionActive = true;
 		CutawayExitAccumulator = 0.0f;
 		return;
 	}
 
-	// Preserve the last unambiguous floor throughout stairs and near the house
-	// shell.  Only samples outside the wider exit envelope count as leaving.
-	if (Viewer && IsInsideCutawayRetentionVolume(Viewer->GetActorLocation()))
+	if (!bExteriorOcclusionActive)
 	{
 		CutawayExitAccumulator = 0.0f;
 		return;
@@ -1361,7 +1564,8 @@ void AMatterFluxTwoStoreyHouseActor::UpdateCutawayFloor(
 	CutawayExitAccumulator += FMath::Max(DeltaSeconds, 0.0f);
 	if (CutawayExitAccumulator >= CutawayExitGraceSeconds)
 	{
-		CurrentCutawayFloor = INDEX_NONE;
+		CurrentGhostSourceIds.Reset();
+		bExteriorOcclusionActive = false;
 		CutawayExitAccumulator = 0.0f;
 	}
 }
@@ -1375,49 +1579,58 @@ void AMatterFluxTwoStoreyHouseActor::SetCutawayViewerOverride(
 void AMatterFluxTwoStoreyHouseActor::RefreshCutawayImmediately()
 {
 	ACharacter* Viewer = ResolveLocalViewer();
-	CurrentCutawayFloor = Viewer ? ResolveViewerFloor(*Viewer) : INDEX_NONE;
-	CutawayExitAccumulator = 0.0f;
-	UpdateStructureFade(0.0f, true);
-	UpdateInteriorActorFade(0.0f, true);
+	CurrentCutawayFloor = INDEX_NONE;
+	CurrentFloorSourceId.Invalidate();
+	CurrentGhostSourceIds.Reset();
+	bExteriorOcclusionActive = false;
+	UpdateCutawayFloor(Viewer, CutawayExitGraceSeconds);
+	// Resolve targets immediately but let opacity converge on subsequent ticks.
+	UpdateStructureFade(0.0f);
 }
 
 void AMatterFluxTwoStoreyHouseActor::UpdateStructureFade(
-	const float DeltaSeconds,
-	const bool bImmediate)
+	const float DeltaSeconds)
 {
 	float LowestOpacity = 1.0f;
 	for (FStructureFadeGroup& Group : StructureFadeGroups)
 	{
 		UMeshComponent* Component = Group.Component.Get();
-		if (!Component || Group.bNeverFade)
+		if (!Component)
 		{
 			continue;
 		}
-		// 墙和屋顶是相机遮挡层，因此从观察者所在楼层开始虚化；
-		// 地板和家具是室内内容，只隐藏更高楼层。同层家具必须保持
-		// 实显，否则玩家一进房间，真正想观察/切割的内容反而消失。
-		const bool bOnlyFadeAboveViewer =
-			Group.bFloorSurface || Group.bInteriorFixture;
-		const bool bGhost = CurrentCutawayFloor != INDEX_NONE
-			&& (bOnlyFadeAboveViewer
-				? Group.FloorTier > CurrentCutawayFloor
-				: Group.FloorTier >= CurrentCutawayFloor);
+		const bool bCanGhost = Group.StructuralRole
+				== EMatterFluxMaterialStructuralRole::Wall
+			|| (bExteriorOcclusionActive
+				&& Group.StructuralRole
+					== EMatterFluxMaterialStructuralRole::Floor);
+		const bool bGhost = bCanGhost
+			&& Group.SourceId.IsValid()
+			&& CurrentGhostSourceIds.Contains(Group.SourceId);
+		if (Group.bNeverFade && !bGhost)
+		{
+			continue;
+		}
 		UMaterialInstanceDynamic* Ghost = Group.GhostMaterial.Get();
 		if (!Ghost)
 		{
-			Component->SetVisibility(!bGhost, true);
-			Group.CurrentOpacity = bGhost ? 0.0f : 1.0f;
-			LowestOpacity = FMath::Min(
-				LowestOpacity, Group.CurrentOpacity);
+			// Never replace a missing fade material with a visibility pop.
+			Component->SetVisibility(true, true);
+			Group.CurrentOpacity = 1.0f;
 			continue;
 		}
-		float CurrentOpacity = 1.0f;
-		Ghost->GetScalarParameterValue(TEXT("Opacity"), CurrentOpacity);
-		const float TargetOpacity = bGhost ? Group.GhostOpacity : 1.0f;
-		const float NextOpacity = bImmediate
-			? TargetOpacity
-			: FMath::FInterpConstantTo(
-				CurrentOpacity, TargetOpacity, DeltaSeconds, FadeSpeed);
+		const float TargetOpacity = bGhost
+			? MatterFlux::GhostFade::ResolveStructureTargetOpacity(
+				Group.GhostOpacity)
+			: 1.0f;
+		const float MaximumSpeed = bGhost
+			? MatterFlux::GhostFade::FadeToGhostSpeed
+			: MatterFlux::GhostFade::FadeToSolidSpeed;
+		const float NextOpacity = MatterFlux::GhostFade::AdvanceOpacity(
+			Group.CurrentOpacity,
+			TargetOpacity,
+			DeltaSeconds,
+			FMath::Min(StructureFadeSpeed, MaximumSpeed));
 		if (bGhost || NextOpacity < 0.999f)
 		{
 			TArray<int32> TargetSlots = Group.MaterialSlots;
@@ -1465,14 +1678,15 @@ void AMatterFluxTwoStoreyHouseActor::UpdateStructureFade(
 float AMatterFluxTwoStoreyHouseActor::GetFloorSurfaceOpacity(
 	const int32 FloorIndex) const
 {
+	float Opacity = 1.0f;
 	for (const FStructureFadeGroup& Group : StructureFadeGroups)
 	{
 		if (Group.bFloorSurface && Group.FloorTier == FloorIndex)
 		{
-			return Group.CurrentOpacity;
+			Opacity = FMath::Min(Opacity, Group.CurrentOpacity);
 		}
 	}
-	return 1.0f;
+	return Opacity;
 }
 
 float AMatterFluxTwoStoreyHouseActor::GetFurnitureOpacity(
@@ -1489,162 +1703,9 @@ float AMatterFluxTwoStoreyHouseActor::GetFurnitureOpacity(
 	return Opacity;
 }
 
-void AMatterFluxTwoStoreyHouseActor::TrackInteriorMesh(UMeshComponent& Mesh)
-{
-	if (TrackedInteriorMeshes.Contains(&Mesh))
-	{
-		return;
-	}
-	FTrackedMeshFade& Entry = TrackedInteriorMeshes.Add(&Mesh);
-	Entry.Mesh = &Mesh;
-	for (int32 Slot = 0; Slot < Mesh.GetNumMaterials(); ++Slot)
-	{
-		Entry.OriginalMaterials.Add(Mesh.GetMaterial(Slot));
-		Entry.GhostMaterials.Add(nullptr);
-	}
-}
-
-FLinearColor AMatterFluxTwoStoreyHouseActor::ResolveMeshColor(
-	const UMeshComponent& Mesh) const
-{
-	FLinearColor Color = FLinearColor(0.55f, 0.70f, 0.78f);
-	if (const UMaterialInstanceDynamic* Dynamic =
-		Cast<UMaterialInstanceDynamic>(Mesh.GetMaterial(0)))
-	{
-		Dynamic->GetVectorParameterValue(TEXT("Color"), Color);
-	}
-	return Color;
-}
-
-void AMatterFluxTwoStoreyHouseActor::ApplyTrackedMeshOpacity(
-	FTrackedMeshFade& Entry,
-	const float Opacity)
-{
-	UMeshComponent* Mesh = Entry.Mesh.Get();
-	if (!Mesh || !GhostMaterialTemplate)
-	{
-		return;
-	}
-	const FLinearColor Color = ResolveMeshColor(*Mesh);
-	for (int32 Slot = 0; Slot < Entry.GhostMaterials.Num(); ++Slot)
-	{
-		UMaterialInstanceDynamic* Ghost = Entry.GhostMaterials[Slot].Get();
-		if (!Ghost)
-		{
-			Ghost = UMaterialInstanceDynamic::Create(GhostMaterialTemplate, this);
-			Entry.GhostMaterials[Slot] = Ghost;
-		}
-		Ghost->SetVectorParameterValue(TEXT("Color"), FLinearColor(
-			Color.R, Color.G, Color.B, Opacity));
-		Ghost->SetScalarParameterValue(TEXT("Opacity"), Opacity);
-		Ghost->SetScalarParameterValue(TEXT("FaceContrast"), 0.70f);
-		Ghost->SetScalarParameterValue(TEXT("PixelSize"), 8.0f);
-		Ghost->SetScalarParameterValue(TEXT("ShadowLift"), 0.34f);
-		Mesh->SetMaterial(Slot, Ghost);
-	}
-	Mesh->SetCastShadow(Opacity > 0.72f);
-	Entry.Opacity = Opacity;
-}
-
-void AMatterFluxTwoStoreyHouseActor::RestoreTrackedMesh(
-	FTrackedMeshFade& Entry)
-{
-	UMeshComponent* Mesh = Entry.Mesh.Get();
-	if (!Mesh)
-	{
-		return;
-	}
-	for (int32 Slot = 0; Slot < Entry.OriginalMaterials.Num(); ++Slot)
-	{
-		Mesh->SetMaterial(Slot, Entry.OriginalMaterials[Slot].Get());
-	}
-	Mesh->SetCastShadow(true);
-	Entry.Opacity = 1.0f;
-}
-
-void AMatterFluxTwoStoreyHouseActor::UpdateInteriorActorFade(
-	const float DeltaSeconds,
-	const bool bImmediate)
-{
-	ACharacter* Viewer = ResolveLocalViewer();
-	for (TPair<TWeakObjectPtr<UMeshComponent>, FTrackedMeshFade>& Pair
-		: TrackedInteriorMeshes)
-	{
-		Pair.Value.bWantsGhost = false;
-	}
-	if (CurrentCutawayFloor != INDEX_NONE && GetWorld())
-	{
-		for (TActorIterator<ACharacter> It(GetWorld()); It; ++It)
-		{
-			ACharacter* Character = *It;
-			if (!IsValid(Character) || Character == Viewer
-				|| !IsInsideHouse(Character->GetActorLocation()))
-			{
-				continue;
-			}
-			float FeetZ = Character->GetActorLocation().Z;
-			if (const UCapsuleComponent* Capsule = Character->GetCapsuleComponent())
-			{
-				FeetZ -= Capsule->GetScaledCapsuleHalfHeight();
-			}
-			FVector Feet = Character->GetActorLocation();
-			Feet.Z = FeetZ;
-			const int32 ActorFloor = GetFloorIndexAtWorldLocation(Feet);
-			if (ActorFloor == INDEX_NONE || ActorFloor < CurrentCutawayFloor)
-			{
-				continue;
-			}
-			TArray<UMeshComponent*> Meshes;
-			Character->GetComponents(Meshes);
-			for (UMeshComponent* Mesh : Meshes)
-			{
-				if (Mesh && Mesh->IsVisible())
-				{
-					TrackInteriorMesh(*Mesh);
-					TrackedInteriorMeshes.FindChecked(Mesh).bWantsGhost = true;
-				}
-			}
-		}
-	}
-
-	for (auto It = TrackedInteriorMeshes.CreateIterator(); It; ++It)
-	{
-		FTrackedMeshFade& Entry = It.Value();
-		if (!Entry.Mesh.IsValid())
-		{
-			It.RemoveCurrent();
-			continue;
-		}
-		const float Target = Entry.bWantsGhost
-			? InteriorActorGhostOpacity : 1.0f;
-		const float Next = bImmediate
-			? Target
-			: FMath::FInterpConstantTo(
-				Entry.Opacity, Target, DeltaSeconds, FadeSpeed);
-		if (Entry.bWantsGhost || Next < 0.999f)
-		{
-			ApplyTrackedMeshOpacity(Entry, Next);
-		}
-		else
-		{
-			RestoreTrackedMesh(Entry);
-			It.RemoveCurrent();
-		}
-	}
-}
-
 int32 AMatterFluxTwoStoreyHouseActor::GetTrackedInteriorActorCount() const
 {
-	TSet<const AActor*> Actors;
-	for (const TPair<TWeakObjectPtr<UMeshComponent>, FTrackedMeshFade>& Pair
-		: TrackedInteriorMeshes)
-	{
-		if (const UMeshComponent* Mesh = Pair.Key.Get())
-		{
-			Actors.Add(Mesh->GetOwner());
-		}
-	}
-	return Actors.Num();
+	return 0;
 }
 
 AMatterFluxTwoStoreyHouseActor*

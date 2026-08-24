@@ -2,41 +2,6 @@
 
 namespace
 {
-	float AxisGap(
-		const float MinimumA,
-		const float MaximumA,
-		const float MinimumB,
-		const float MaximumB)
-	{
-		return FMath::Max(
-			FMath::Max(MinimumA - MaximumB, MinimumB - MaximumA),
-			0.0f);
-	}
-
-	bool AreConnected(
-		const MatterFlux::ItemOcclusion::FItem& A,
-		const MatterFlux::ItemOcclusion::FItem& B,
-		const float ConfiguredTolerance)
-	{
-		if (A.ConnectionId.IsValid()
-			&& A.ConnectionId == B.ConnectionId)
-		{
-			return true;
-		}
-		const float ContactTolerance = FMath::Max(
-			FMath::Max(ConfiguredTolerance, 0.0f),
-			FMath::Max(A.CellSize, B.CellSize) * 0.25f);
-		return AxisGap(
-			A.WorldBounds.Min.X, A.WorldBounds.Max.X,
-			B.WorldBounds.Min.X, B.WorldBounds.Max.X) <= ContactTolerance
-			&& AxisGap(
-				A.WorldBounds.Min.Y, A.WorldBounds.Max.Y,
-				B.WorldBounds.Min.Y, B.WorldBounds.Max.Y) <= ContactTolerance
-			&& AxisGap(
-				A.WorldBounds.Min.Z, A.WorldBounds.Max.Z,
-				B.WorldBounds.Min.Z, B.WorldBounds.Max.Z) <= ContactTolerance;
-	}
-
 	bool SegmentIntersectsBox(
 		const FVector& Start,
 		const FVector& End,
@@ -116,7 +81,7 @@ namespace MatterFlux::ItemOcclusion
 
 		TArray<FVector, TInlineAllocator<5>> ProbePoints;
 		BuildViewerProbePoints(CameraLocation, ViewerBounds, ProbePoints);
-		TArray<int32, TInlineAllocator<32>> ConnectedIndices;
+		TSet<FGuid> OccludingConnectionIds;
 		for (int32 ItemIndex = 0; ItemIndex < Items.Num(); ++ItemIndex)
 		{
 			const FItem& Item = Items[ItemIndex];
@@ -135,30 +100,23 @@ namespace MatterFlux::ItemOcclusion
 			if (bBlocksViewer)
 			{
 				OutResult.GhostItemIds.Add(Item.ItemId);
-				ConnectedIndices.Add(ItemIndex);
+				if (Item.ConnectionId.IsValid())
+				{
+					OccludingConnectionIds.Add(Item.ConnectionId);
+				}
 			}
 		}
 
-		for (int32 ConnectedIndex = 0;
-			ConnectedIndex < ConnectedIndices.Num();
-			++ConnectedIndex)
+		if (!OccludingConnectionIds.IsEmpty())
 		{
-			const FItem& Connected = Items[ConnectedIndices[ConnectedIndex]];
-			for (int32 ItemIndex = 0; ItemIndex < Items.Num(); ++ItemIndex)
+			for (const FItem& Candidate : Items)
 			{
-				const FItem& Candidate = Items[ItemIndex];
-				if (!Candidate.ItemId.IsValid()
-					|| OutResult.GhostItemIds.Contains(Candidate.ItemId)
-					|| !Candidate.WorldBounds.IsValid
-					|| !AreConnected(
-						Connected,
-						Candidate,
-						Policy.ContactToleranceCentimeters))
+				if (Candidate.ItemId.IsValid()
+					&& Candidate.ConnectionId.IsValid()
+					&& OccludingConnectionIds.Contains(Candidate.ConnectionId))
 				{
-					continue;
+					OutResult.GhostItemIds.Add(Candidate.ItemId);
 				}
-				OutResult.GhostItemIds.Add(Candidate.ItemId);
-				ConnectedIndices.Add(ItemIndex);
 			}
 		}
 		return !OutResult.IsEmpty();

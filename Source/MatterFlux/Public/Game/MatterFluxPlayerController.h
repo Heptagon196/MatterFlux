@@ -10,6 +10,7 @@ class ULocalPlayer;
 class UMatterFluxMagicWorkbenchWidget;
 class UMatterFluxShellWidget;
 class UMatterFluxQuestTrackerWidget;
+class UMatterFluxPlayerStatusWidget;
 class UMatterFluxInteractionWidget;
 class AMatterFluxCreatureActor;
 
@@ -25,6 +26,7 @@ public:
 	virtual void EndPlay(
 		const EEndPlayReason::Type EndPlayReason) override;
 	virtual void OnPossess(APawn* InPawn) override;
+	virtual void OnRep_PlayerState() override;
 	virtual void SetupInputComponent() override;
 	bool AreDebugControlsEnabled() const { return bEnableDebugControls; }
 	void ToggleMagicWorkbench();
@@ -81,6 +83,7 @@ private:
 	void CreateMagicWorkbench();
 	void CreateShell();
 	void CreateQuestTracker();
+	void CreatePlayerStatusHud();
 	void CreateInteractionWidget();
 	void CloseMagicWorkbench();
 	void TryInteract();
@@ -148,6 +151,9 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMatterFluxQuestTrackerWidget> QuestTracker;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMatterFluxPlayerStatusWidget> PlayerStatusHud;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMatterFluxInteractionWidget> InteractionWidget;

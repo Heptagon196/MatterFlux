@@ -30,7 +30,7 @@ namespace MatterFlux::PlayableLevel
 	struct MATTERFLUX_API FLevelLayer
 	{
 		FName Name = NAME_None;
-		/** 可选的 Lua 材质 ID；液体层用它读取透明度和折射参数。 */
+		/** 可选的 Lua 材质 ID；液体层用它读取透明度参数。 */
 		FName MaterialId = NAME_None;
 		ELayerPrimitive Primitive = ELayerPrimitive::Cube;
 		ELevelLayerRenderMode RenderMode = ELevelLayerRenderMode::Lit;
@@ -64,6 +64,12 @@ namespace MatterFlux::PlayableLevel
 		TArray<float> Heights;
 		TArray<uint8> ColorBands;
 		TArray<FLinearColor> BandColors;
+		/**
+		 * Sparse authoritative edits keyed by global terrain cell. Generated
+		 * heights are immutable inputs; every cut, save, replicated client and
+		 * streamed mesh samples this same runtime fact overlay.
+		 */
+		TMap<FIntPoint, float> RuntimeHeightOverrides;
 
 		bool IsValid() const
 		{
@@ -105,6 +111,36 @@ namespace MatterFlux::PlayableLevel
 			int64 WorldCellY,
 			float& OutHeight,
 			uint8& OutColorBand) const;
+
+		/** True when the global cell belongs to the eagerly generated seed area. */
+		bool ContainsCachedWorldCell(int64 WorldCellX, int64 WorldCellY) const;
+
+		/**
+		 * Samples the deterministic river network used beyond the seed area.
+		 * Returns true for both the wet channel and its sloped banks; callers can
+		 * distinguish water from bank-only cells through bOutContainsWater.
+		 */
+		bool TrySampleInfiniteRiverCell(
+			int64 WorldCellX,
+			int64 WorldCellY,
+			float& OutCarvedHeight,
+			float& OutWaterSurface,
+			bool& bOutContainsWater) const;
+	};
+
+	struct MATTERFLUX_API FStreamingRiverCell
+	{
+		FIntPoint WorldCell = FIntPoint::ZeroValue;
+		float WaterSurfaceZ = 0.0f;
+	};
+
+	/** Deterministic content authored only for one resident terrain chunk. */
+	struct MATTERFLUX_API FStreamingChunkPopulation
+	{
+		TArray<FLevelFragmentSource> FragmentSources;
+		TArray<FStreamingRiverCell> RiverCells;
+		bool bHasHouse = false;
+		FVector HouseLocation = FVector::ZeroVector;
 	};
 
 	struct MATTERFLUX_API FLevelLayout
@@ -121,5 +157,13 @@ namespace MatterFlux::PlayableLevel
 	MATTERFLUX_API bool BuildLevelLayout(
 		int32 Seed,
 		FLevelLayout& OutLayout,
+		const FMatterFluxContentRegistry* Content = nullptr);
+
+	MATTERFLUX_API bool BuildStreamingChunkPopulation(
+		int32 Seed,
+		const FLevelTerrain& Terrain,
+		FIntPoint ChunkCoordinate,
+		int32 ChunkSize,
+		FStreamingChunkPopulation& OutPopulation,
 		const FMatterFluxContentRegistry* Content = nullptr);
 }

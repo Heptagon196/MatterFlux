@@ -1,16 +1,16 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Material/MatterFluxCombustion.h"
+#include "Material/MatterFluxReaction.h"
 
-namespace MatterFlux::Combustion
+namespace MatterFlux::Reaction
 {
 	struct MATTERFLUX_API FSourceRuntimeSettings
 	{
 		float StepSeconds = 0.1f;
 		int32 MaxStepsPerAdvance = 3;
-		/** Limits the deterministic fire front instead of igniting an entire crown at once. */
-		int32 MaxSpreadIgnitionsPerStep = 1;
+		/** Limits deterministic activation instead of changing an entire mask at once. */
+		int32 MaxActivationsPerStep = 1;
 
 		bool IsValid() const;
 	};
@@ -20,31 +20,31 @@ namespace MatterFlux::Combustion
 		bool bStateChanged = false;
 		bool bGeometryChanged = false;
 		int32 Steps = 0;
-		TArray<FIntPoint> SmokeEmissionCells;
+		TArray<FIntPoint> MaterialEmissionCells;
 		TArray<int32> ChangedCellIndices;
 	};
 
 	struct MATTERFLUX_API FSourceRuntimeSnapshot
 	{
-		FStateSnapshot CombustionState;
-		float CombustionAccumulator = 0.0f;
-		int32 TotalSmokeEmissionCount = 0;
+		FStateSnapshot ReactionState;
+		float ReactionAccumulator = 0.0f;
+		int32 TotalMaterialEmissionCount = 0;
 	};
 
 	/**
-	 * Owns one source's deterministic combustion state and fixed-step debt.
+	 * Owns one source's deterministic reaction state and fixed-step debt.
 	 * It deliberately has no UObject or Actor dependency, so a world-level
 	 * store can simulate many logical sources and render them in shared batches.
 	 */
-	class MATTERFLUX_API FSourceCombustionRuntime
+	class MATTERFLUX_API FSourceReactionRuntime
 	{
 	public:
-		FSourceCombustionRuntime();
-		~FSourceCombustionRuntime();
+		FSourceReactionRuntime();
+		~FSourceReactionRuntime();
 
-		FSourceCombustionRuntime(const FSourceCombustionRuntime&) = delete;
-		FSourceCombustionRuntime& operator=(
-			const FSourceCombustionRuntime&) = delete;
+		FSourceReactionRuntime(const FSourceReactionRuntime&) = delete;
+		FSourceReactionRuntime& operator=(
+			const FSourceReactionRuntime&) = delete;
 
 		bool Initialize(
 			const FSourceRuntimeSettings& Settings,
@@ -60,33 +60,33 @@ namespace MatterFlux::Combustion
 		bool CaptureState(FSourceRuntimeSnapshot& OutState) const;
 		void Reset();
 
-		bool IgniteNearest(FIntPoint RequestedCell, FName IgnitionMaterial);
-		bool ConstrainFuelMask(const TArray<uint8>& AllowedFuelMask);
+		bool ActivateNearest(FIntPoint RequestedCell, FName StimulusMaterial);
+		bool ConstrainInputMask(const TArray<uint8>& AllowedInputMask);
 		FSourceAdvanceResult AdvanceAuthority(float DeltaSeconds);
 
 		bool IsInitialized() const { return Simulation.IsValid(); }
-		bool IsBurning() const
+		bool IsActive() const
 		{
-			return Simulation && Simulation->IsBurning();
+			return Simulation && Simulation->IsActive();
 		}
-		const TArray<uint8>& GetFuelMask() const;
-		const TArray<uint8>& GetResidueMask() const;
-		const TArray<uint8>& GetBurningMask() const;
+		const TArray<uint8>& GetInputMask() const;
+		const TArray<uint8>& GetOutputMask() const;
+		const TArray<uint8>& GetActiveMask() const;
 		const FMatterFluxReactionDefinition* GetRule() const
 		{
 			return Simulation ? &Simulation->GetRule() : nullptr;
 		}
-		int32 GetTotalSmokeEmissionCount() const
+		int32 GetTotalMaterialEmissionCount() const
 		{
-			return TotalSmokeEmissionCount;
+			return TotalMaterialEmissionCount;
 		}
 
 	private:
-		TUniquePtr<FMaskCombustion> Simulation;
+		TUniquePtr<FMaskReaction> Simulation;
 		FSourceRuntimeSettings RuntimeSettings;
 		int32 Width = 0;
 		int32 Height = 0;
 		float StepAccumulator = 0.0f;
-		int32 TotalSmokeEmissionCount = 0;
+		int32 TotalMaterialEmissionCount = 0;
 	};
 }

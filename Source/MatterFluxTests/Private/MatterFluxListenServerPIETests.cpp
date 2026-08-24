@@ -1,3 +1,4 @@
+#include "Camera/CameraComponent.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -8,6 +9,7 @@
 #include "Game/MatterFluxCharacter.h"
 #include "Game/MatterFluxPlayerOperation.h"
 #include "GameFramework/GameStateBase.h"
+#include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
 #include "HAL/PlatformTime.h"
@@ -342,6 +344,306 @@ namespace
 		float MaximumAngularSpeed = 0.0f;
 		bool bPushing = false;
 		bool bFinishedPushing = false;
+	};
+
+	class FVerifyStandingCutFragmentCameraCommand final
+		: public IAutomationLatentCommand
+	{
+	public:
+		explicit FVerifyStandingCutFragmentCameraCommand(
+			FAutomationTestBase* InTest)
+			: Test(InTest)
+			, PhaseStart(FPlatformTime::Seconds())
+		{
+		}
+
+		virtual bool Update() override
+		{
+			UWorld* Host = nullptr;
+			TArray<UWorld*> Clients;
+			FindListenPIEWorlds(Host, Clients);
+			APlayerController* HostController = Host
+				? FindLocalController(Host)
+				: nullptr;
+			AMatterFluxCharacter* Character = HostController
+				? Cast<AMatterFluxCharacter>(HostController->GetPawn())
+				: nullptr;
+			if (!Host || Clients.Num() != 1 || !Character
+				|| !Character->FollowCamera)
+			{
+				return FailOnTimeout(
+					TEXT("Cut-fragment camera test did not create the expected listen PIE character and camera."));
+			}
+
+			if (!FragmentId.IsValid())
+			{
+				StandingGroundLocation = Character->GetActorLocation();
+				const FVector FragmentLocation = StandingGroundLocation
+					+ FVector(300.0f, 0.0f, -55.0f);
+				AFragment2DActor* Fragment = Host->SpawnActor<AFragment2DActor>(
+					FragmentLocation,
+					FRotator::ZeroRotator);
+				FFragmentSpawnPayload Payload =
+					MakeFallenTreePayload(FragmentLocation);
+				Payload.FragmentId = FGuid::NewDeterministicGuid(
+					TEXT("MatterFlux.StandingCutFragmentCamera"),
+					1);
+				Payload.Vertices2D = {
+					FVector2D(-80.0, -20.0),
+					FVector2D(80.0, -20.0),
+					FVector2D(80.0, 20.0),
+					FVector2D(-80.0, 20.0)
+				};
+				Payload.OuterContours[0].Vertices = Payload.Vertices2D;
+				Payload.CollisionContours[0].Vertices = Payload.Vertices2D;
+				Payload.Thickness = 40.0f;
+				// Real cut products bottom out at 0.5 kg; the old 48 kg fallen-tree
+				// fixture cannot reproduce the player/fragment feedback loop.
+				Payload.Mass = 0.5f;
+				if (!Fragment || !Fragment->InitializeFromPayload(Payload))
+				{
+					Test->AddError(
+						TEXT("Listen host could not initialize the standing cut fragment."));
+					return true;
+				}
+				FragmentId = Payload.FragmentId;
+				BeginNextPhase();
+				return false;
+			}
+
+			AFragment2DActor* Fragment = FindAnyFragmentById(Host, FragmentId);
+			if (!Fragment)
+			{
+				return FailOnTimeout(
+					TEXT("Standing cut fragment disappeared before the camera stability sample."));
+			}
+
+			if (!bPlacedCharacter)
+			{
+				if (FPlatformTime::Seconds() - PhaseStart < 1.0)
+				{
+					return false;
+				}
+				StandingGroundLocation = Character->GetActorLocation();
+				const FVector FragmentLocation = StandingGroundLocation
+					+ FVector(0.0f, 0.0f, -68.0f);
+				Fragment->MeshComponent->SetWorldLocation(
+					FragmentLocation,
+					false,
+					nullptr,
+					ETeleportType::TeleportPhysics);
+				Fragment->MeshComponent->SetPhysicsLinearVelocity(FVector::ZeroVector);
+				Fragment->MeshComponent->SetPhysicsAngularVelocityInDegrees(
+					FVector::ZeroVector);
+				Character->SetActorLocation(
+					StandingGroundLocation + FVector(0.0f, 0.0f, 40.0f),
+					false,
+					nullptr,
+					ETeleportType::TeleportPhysics);
+				bPlacedCharacter = true;
+				PlacementAttemptCount = 1;
+				BeginNextPhase();
+				return false;
+			}
+
+			if (!bSampling)
+			{
+				const bool bStandingOnFragment =
+					Character->GetCharacterMovement()->GetMovementBaseObject()
+						== Fragment->MeshComponent;
+				ConsecutiveBasedFrameCount = bStandingOnFragment
+					? ConsecutiveBasedFrameCount + 1
+					: 0;
+				if (ConsecutiveBasedFrameCount < 10)
+				{
+					bSettlingCamera = false;
+					if (FPlatformTime::Seconds() - PhaseStart < 1.0)
+					{
+						return false;
+					}
+					if (PlacementAttemptCount >= 5)
+					{
+						Test->AddError(
+							TEXT("The test character could not establish a stable movement base on the cut fragment."));
+						return true;
+					}
+					Fragment->MeshComponent->SetWorldLocation(
+						StandingGroundLocation + FVector(0.0f, 0.0f, -68.0f),
+						false,
+						nullptr,
+						ETeleportType::TeleportPhysics);
+					Fragment->MeshComponent->SetPhysicsLinearVelocity(
+						FVector::ZeroVector);
+					Fragment->MeshComponent->SetPhysicsAngularVelocityInDegrees(
+						FVector::ZeroVector);
+					Character->SetActorLocation(
+						StandingGroundLocation + FVector(0.0f, 0.0f, 40.0f),
+						false,
+						nullptr,
+						ETeleportType::TeleportPhysics);
+					++PlacementAttemptCount;
+					BeginNextPhase();
+					return false;
+				}
+				if (!bSettlingCamera)
+				{
+					bSettlingCamera = true;
+					BeginNextPhase();
+					return false;
+				}
+				if (FPlatformTime::Seconds() - PhaseStart < 2.0)
+				{
+					return false;
+				}
+				PreviousCharacterLocation = Character->GetActorLocation();
+				PreviousCameraLocation =
+					Character->FollowCamera->GetComponentLocation();
+				PreviousFragmentLocation = Fragment->GetActorLocation();
+				PreviousFragmentRotation = Fragment->GetActorQuat();
+				bWasBasedOnFragment = true;
+				bWasFragmentAwake = Fragment->MeshComponent->IsAnyRigidBodyAwake();
+				bSampling = true;
+				BeginNextPhase();
+				return false;
+			}
+
+			const bool bStandingOnFragment =
+				Character->GetCharacterMovement()->GetMovementBaseObject()
+					== Fragment->MeshComponent;
+			++SampleFrameCount;
+			if (bStandingOnFragment)
+			{
+				++BasedSampleCount;
+			}
+			if (bStandingOnFragment != bWasBasedOnFragment)
+			{
+				++MovementBaseTransitionCount;
+				bWasBasedOnFragment = bStandingOnFragment;
+			}
+			const bool bFragmentAwake =
+				Fragment->MeshComponent->IsAnyRigidBodyAwake();
+			if (bFragmentAwake != bWasFragmentAwake)
+			{
+				++FragmentAwakeTransitionCount;
+				bWasFragmentAwake = bFragmentAwake;
+			}
+			const FVector CharacterLocation = Character->GetActorLocation();
+			const FVector CameraLocation =
+				Character->FollowCamera->GetComponentLocation();
+			const FVector FragmentLocation = Fragment->GetActorLocation();
+			const FQuat FragmentRotation = Fragment->GetActorQuat();
+			MaximumCharacterFrameDisplacement = FMath::Max(
+				MaximumCharacterFrameDisplacement,
+				static_cast<float>(FVector::Distance(
+					CharacterLocation,
+					PreviousCharacterLocation)));
+			MaximumCameraFrameDisplacement = FMath::Max(
+				MaximumCameraFrameDisplacement,
+				static_cast<float>(FVector::Distance(
+					CameraLocation,
+					PreviousCameraLocation)));
+			MaximumFragmentFrameDisplacement = FMath::Max(
+				MaximumFragmentFrameDisplacement,
+				static_cast<float>(FVector::Distance(
+					FragmentLocation,
+					PreviousFragmentLocation)));
+			MaximumFragmentFrameRotationDegrees = FMath::Max(
+				MaximumFragmentFrameRotationDegrees,
+				FMath::RadiansToDegrees(
+					FragmentRotation.AngularDistance(PreviousFragmentRotation)));
+			MaximumFragmentLinearSpeed = FMath::Max(
+				MaximumFragmentLinearSpeed,
+				static_cast<float>(Fragment->MeshComponent
+					->GetPhysicsLinearVelocity().Size()));
+			MaximumFragmentAngularSpeed = FMath::Max(
+				MaximumFragmentAngularSpeed,
+				static_cast<float>(Fragment->MeshComponent
+					->GetPhysicsAngularVelocityInDegrees().Size()));
+			PreviousCharacterLocation = CharacterLocation;
+			PreviousCameraLocation = CameraLocation;
+			PreviousFragmentLocation = FragmentLocation;
+			PreviousFragmentRotation = FragmentRotation;
+
+			if (FPlatformTime::Seconds() - PhaseStart < 2.0)
+			{
+				return false;
+			}
+
+			Test->AddInfo(FString::Printf(
+				TEXT("Cut-fragment standing sample: movement=%s, base mass=%.3f kg, character mass=%.3f kg, based=%d/%d, placement attempts=%d, base transitions=%d, awake transitions=%d, downward scale=%.3f, character max=%.3f cm/frame, camera max=%.3f cm/frame, fragment max=%.3f cm/frame / %.3f deg/frame, speed max=%.3f cm/s / %.3f deg/s"),
+				*Character->GetCharacterMovement()->GetClass()->GetName(),
+				Fragment->MeshComponent->GetMass(),
+				Character->GetCharacterMovement()->Mass,
+				BasedSampleCount,
+				SampleFrameCount,
+				PlacementAttemptCount,
+				MovementBaseTransitionCount,
+				FragmentAwakeTransitionCount,
+				Character->GetCharacterMovement()->StandingDownwardForceScale,
+				MaximumCharacterFrameDisplacement,
+				MaximumCameraFrameDisplacement,
+				MaximumFragmentFrameDisplacement,
+				MaximumFragmentFrameRotationDegrees,
+				MaximumFragmentLinearSpeed,
+				MaximumFragmentAngularSpeed));
+			Test->TestTrue(
+				TEXT("The character remains based on the cut fragment while sampled"),
+				SampleFrameCount >= 10
+					&& BasedSampleCount * 5 >= SampleFrameCount * 4);
+			Test->TestTrue(
+				*FString::Printf(
+					TEXT("Standing on a cut fragment keeps character frame displacement below 2 cm (observed %.3f cm)"),
+					MaximumCharacterFrameDisplacement),
+				MaximumCharacterFrameDisplacement < 2.0f);
+			Test->TestTrue(
+				*FString::Printf(
+					TEXT("Standing on a cut fragment keeps camera frame displacement below 2 cm (observed %.3f cm)"),
+					MaximumCameraFrameDisplacement),
+				MaximumCameraFrameDisplacement < 2.0f);
+			return true;
+		}
+
+	private:
+		void BeginNextPhase()
+		{
+			PhaseStart = FPlatformTime::Seconds();
+		}
+
+		bool FailOnTimeout(const TCHAR* Message)
+		{
+			if (FPlatformTime::Seconds() - PhaseStart < 30.0)
+			{
+				return false;
+			}
+			Test->AddError(Message);
+			return true;
+		}
+
+		FAutomationTestBase* Test = nullptr;
+		double PhaseStart = 0.0;
+		FGuid FragmentId;
+		FVector StandingGroundLocation = FVector::ZeroVector;
+		FVector PreviousCharacterLocation = FVector::ZeroVector;
+		FVector PreviousCameraLocation = FVector::ZeroVector;
+		FVector PreviousFragmentLocation = FVector::ZeroVector;
+		FQuat PreviousFragmentRotation = FQuat::Identity;
+		float MaximumCharacterFrameDisplacement = 0.0f;
+		float MaximumCameraFrameDisplacement = 0.0f;
+		float MaximumFragmentFrameDisplacement = 0.0f;
+		float MaximumFragmentFrameRotationDegrees = 0.0f;
+		float MaximumFragmentLinearSpeed = 0.0f;
+		float MaximumFragmentAngularSpeed = 0.0f;
+		int32 BasedSampleCount = 0;
+		int32 SampleFrameCount = 0;
+		int32 PlacementAttemptCount = 0;
+		int32 ConsecutiveBasedFrameCount = 0;
+		int32 MovementBaseTransitionCount = 0;
+		int32 FragmentAwakeTransitionCount = 0;
+		bool bPlacedCharacter = false;
+		bool bSettlingCamera = false;
+		bool bSampling = false;
+		bool bWasBasedOnFragment = false;
+		bool bWasFragmentAwake = false;
 	};
 
 	class FVerifyMatterFluxListenServerPIECommand final
@@ -849,6 +1151,45 @@ namespace
 		ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
 		return true;
 	}
+
+	bool RunStandingCutFragmentCameraScenario(FAutomationTestBase& Test)
+	{
+		if (!Test.TestNotNull(
+			TEXT("Isolated standing cut-fragment map created"),
+			FAutomationEditorCommonUtils::CreateNewMap()))
+		{
+			return false;
+		}
+
+		Test.AddExpectedError(
+			TEXT("FNetGUIDCache::SupportsObject: Level /Temp/"),
+			EAutomationExpectedErrorFlags::Contains,
+			-1,
+			false);
+		Test.AddExpectedError(
+			TEXT("RegisterNetGUID_Client: Guid with pathname"),
+			EAutomationExpectedErrorFlags::Contains,
+			-1,
+			false);
+
+		FRequestPlaySessionParams RequestParams;
+		ULevelEditorPlaySettings* PlaySettings =
+			NewObject<ULevelEditorPlaySettings>();
+		PlaySettings->SetPlayNetMode(EPlayNetMode::PIE_ListenServer);
+		PlaySettings->SetRunUnderOneProcess(true);
+		PlaySettings->SetPlayNumberOfClients(2);
+		PlaySettings->bLaunchSeparateServer = false;
+		RequestParams.EditorPlaySettings = PlaySettings;
+		FAutomationEditorCommonUtils::SetPlaySessionStartToActiveViewport(
+			RequestParams);
+		PlaySettings->AddToRoot();
+		ADD_LATENT_AUTOMATION_COMMAND(
+			FStartPIEForAutomationCommand(RequestParams));
+		ADD_LATENT_AUTOMATION_COMMAND(
+			FVerifyStandingCutFragmentCameraCommand(&Test));
+		ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+		return true;
+	}
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -890,4 +1231,16 @@ bool FMatterFluxFallenTreeCharacterContactPIETest::RunTest(
 	const FString& Parameters)
 {
 	return RunFallenTreeContactScenario(*this);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxStandingCutFragmentCameraPIETest,
+	"MatterFlux.Fragment.Physics.StandingOnCutFragmentKeepsCameraStable",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxStandingCutFragmentCameraPIETest::RunTest(
+	const FString& Parameters)
+{
+	return RunStandingCutFragmentCameraScenario(*this);
 }

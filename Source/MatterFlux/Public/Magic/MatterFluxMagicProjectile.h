@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Fragment/FragmentTypes.h"
 #include "GameFramework/Actor.h"
 #include "Magic/MatterFluxWandProgram.h"
 #include "MatterFluxMagicProjectile.generated.h"
@@ -29,6 +30,9 @@ struct MATTERFLUX_API FMatterFluxMagicProjectilePresentation
 	float Radius = 8.0f;
 
 	UPROPERTY()
+	float GravityScale = 0.0f;
+
+	UPROPERTY()
 	bool bOverrideColor = false;
 
 	UPROPERTY()
@@ -41,7 +45,10 @@ struct MATTERFLUX_API FMatterFluxMagicProjectilePresentation
 	FName BodyMaterial;
 
 	UPROPERTY()
-	FName ImpactMaterial;
+	bool bUsePlaneVisual = false;
+
+	UPROPERTY()
+	bool bUseVerticalPlaneVisual = false;
 };
 
 /** Server-authoritative replicated projectile produced by a wand cast plan. */
@@ -62,6 +69,10 @@ public:
 	void InitializeProjectile(
 		const FMatterFluxMagicProjectilePlan& Plan,
 		int32 EventSeed);
+	static FFragmentDamageShape BuildImpactCutShape(
+		const FMatterFluxMagicProjectilePlan& Plan,
+		const FVector& ProjectileForward,
+		const FVector& ImpactPoint);
 	bool ResolveImpactAuthority(const FHitResult& Hit);
 	const FMatterFluxMagicProjectilePresentation& GetPresentation() const
 	{
@@ -85,6 +96,7 @@ public:
 private:
 	void ApplyPresentation();
 	void BuildMaterialBodyPresentation(float Radius);
+	void ReleaseMaterialBodyAtWorldLocation(const FVector& WorldLocation);
 	void ApplyWorldImpact(const FHitResult& Hit);
 	void SpawnTriggerPayload(
 		TConstArrayView<FMatterFluxMagicProjectilePlan> Payload,
@@ -99,6 +111,9 @@ private:
 		UPrimitiveComponent* OtherComponent,
 		FVector NormalImpulse,
 		const FHitResult& Hit);
+
+	UFUNCTION()
+	void OnProjectileStopped(const FHitResult& Hit);
 
 	UFUNCTION()
 	void OnRep_Presentation();

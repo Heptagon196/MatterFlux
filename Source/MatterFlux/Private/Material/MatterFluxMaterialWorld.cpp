@@ -1,5 +1,6 @@
 #include "Material/MatterFluxMaterialWorld.h"
 #include "Material/MatterFluxMaterialReactionEngine.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 
 namespace MatterFlux::Material
 {
@@ -10,9 +11,11 @@ namespace MatterFlux::Material
 		constexpr uint16 PreviousActiveStateVersion = 2;
 		constexpr uint16 CompactActiveStateVersion = 3;
 		constexpr uint16 BaselineDeltaActiveStateVersion = 4;
-		constexpr uint16 ActiveStateVersion = 5;
+		constexpr uint16 ActiveStateVersion = 7;
 		constexpr int32 MaximumActiveStateBytes = 1024 * 1024;
-		constexpr uint8 FullCellAmount = 255;
+		constexpr uint16 FullCellAmount = 255;
+		/** World-space pile height represented by one full powder unit. */
+		constexpr int32 PowderFullColumnHeight = 14;
 		constexpr uint8 MinimumLiquidEdgeAmount = 24;
 		constexpr int32 MaximumLiquidTransferPerStep = 72;
 		// A vacancy is a canonical, short-lived body/material interaction fact.
@@ -255,13 +258,15 @@ namespace MatterFlux::Material
 			uint16 Density = 1;
 			uint8 Mobility = 255;
 			uint8 Dispersion = 128;
+			uint8 LifetimeSteps = 0;
 		};
 
 		struct FCell
 		{
 			uint16 MaterialIndex = 0;
 			int16 SupportHeight = 0;
-			uint8 Amount = 0;
+			uint16 Amount = 0;
+			uint8 RemainingLifetime = 0;
 			uint32 LastUpdatedTick = 0;
 			// A transient body displaced volume from this world column. This is
 			// location state, not material state: it must not travel with liquid.
@@ -310,7 +315,7 @@ namespace MatterFlux::Material
 		{
 			uint16 MaterialIndex = 0;
 			int16 SupportHeight = 0;
-			uint8 Amount = 0;
+			uint16 Amount = 0;
 			uint16 Length = 0;
 		};
 
@@ -335,6 +340,12 @@ namespace MatterFlux::Material
 		FIntPoint FocusCell = FIntPoint::ZeroValue;
 		TArray<FIntPoint> FocusCells;
 		TSet<FIntPoint> ActiveChunks;
+		/**
+		 * Surface chunks temporarily kept resident while liquid crosses the
+		 * player-focused simulation window. They retire as soon as their dirty
+		 * work settles, so a streaming seam can never act as physical terrain.
+		 */
+		TSet<FIntPoint> SurfaceFlowChunks;
 		uint32 Seed = 0;
 		uint32 Tick = 0;
 		bool bInitialized = false;
@@ -376,6 +387,24 @@ namespace MatterFlux::Material
 		bool IsChunkActive(const FIntPoint& ChunkCoordinate) const
 		{
 			return ActiveChunks.Contains(ChunkCoordinate);
+		}
+
+		bool IsChunkSimulated(const FIntPoint& ChunkCoordinate) const
+		{
+			return IsChunkActive(ChunkCoordinate)
+				|| (Settings.bUseSurfaceTopology
+					&& SurfaceFlowChunks.Contains(ChunkCoordinate));
+		}
+
+		void WakeSurfaceFlow(const FIntPoint& WorldCell)
+		{
+			if (!Settings.bUseSurfaceTopology
+				|| (Settings.bCullOutsideSurfaceBounds
+					&& !IsInsideSurfaceBounds(WorldCell)))
+			{
+				return;
+			}
+			SurfaceFlowChunks.Add(ToChunkCoordinate(WorldCell));
 		}
 
 		void BuildFocusState(
@@ -497,7 +526,7 @@ namespace MatterFlux::Material
 
 			uint16 CurrentMaterial = Chunk.Cells[0].MaterialIndex;
 			int16 CurrentSupport = Chunk.Cells[0].SupportHeight;
-			uint8 CurrentAmount = Chunk.Cells[0].Amount;
+			uint16 CurrentAmount = Chunk.Cells[0].Amount;
 			uint16 CurrentLength = 0;
 			for (const FCell& Cell : Chunk.Cells)
 			{
@@ -552,6 +581,7 @@ namespace MatterFlux::Material
 					OutChunk.Cells[CellIndex].SupportHeight =
 						Run.SupportHeight;
 					OutChunk.Cells[CellIndex].Amount = Run.Amount;
+					OutChunk.Cells[CellIndex].RemainingLifetime = 0;
 					OutChunk.Cells[CellIndex].LastUpdatedTick = 0;
 					OutChunk.Cells[CellIndex].BodyDisplacedTick = 0;
 					OutChunk.Cells[CellIndex].BodyDisplacedMaterialIndex = 0;
@@ -568,6 +598,22 @@ namespace MatterFlux::Material
 			if (!Chunk || !Chunk->IsValid())
 			{
 				return;
+			}
+			bool bDiscardedTransientMaterial = false;
+			for (FCell& Cell : (*Chunk)->Cells)
+			{
+				if (Cell.RemainingLifetime == 0)
+				{
+					continue;
+				}
+				Cell.MaterialIndex = 0;
+				Cell.Amount = 0;
+				Cell.RemainingLifetime = 0;
+				bDiscardedTransientMaterial = true;
+			}
+			if (bDiscardedTransientMaterial)
+			{
+				ProjectionDirtyChunks.Add(ChunkCoordinate);
 			}
 			if (HasPersistentData(**Chunk))
 			{
@@ -642,7 +688,7 @@ namespace MatterFlux::Material
 			return 0;
 		}
 
-		uint8 FindArchivedAmount(const FIntPoint& WorldCell) const
+		uint16 FindArchivedAmount(const FIntPoint& WorldCell) const
 		{
 			const FArchivedChunk* Archive =
 				ArchivedChunks.Find(ToChunkCoordinate(WorldCell));
@@ -666,7 +712,7 @@ namespace MatterFlux::Material
 			const FIntPoint& WorldCell,
 			uint16& OutMaterialIndex,
 			int16& OutSupportHeight,
-			uint8& OutAmount) const
+			uint16& OutAmount) const
 		{
 			OutMaterialIndex = 0;
 			OutSupportHeight = 0;
@@ -783,7 +829,7 @@ namespace MatterFlux::Material
 						+ CellIndex / Settings.ChunkSize);
 				uint16 BaselineMaterial = 0;
 				int16 BaselineSupport = 0;
-				uint8 BaselineAmount = 0;
+				uint16 BaselineAmount = 0;
 				FindBaselineCell(
 					WorldCell,
 					BaselineMaterial,
@@ -845,7 +891,7 @@ namespace MatterFlux::Material
 				return;
 			}
 			const FIntPoint ChunkCoordinate = ToChunkCoordinate(WorldCell);
-			if (!IsChunkActive(ChunkCoordinate))
+			if (!IsChunkSimulated(ChunkCoordinate))
 			{
 				return;
 			}
@@ -968,6 +1014,118 @@ namespace MatterFlux::Material
 				return false;
 			}
 
+			if (Material.Phase == EMatterFluxMaterialPhase::Powder)
+			{
+				FCell* SourceCell = FindCell(Source);
+				if (!SourceCell || SourceCell->Amount == 0)
+				{
+					return false;
+				}
+
+				// Surface powder is a conserved height column. It flows toward the
+				// lowest neighboring powder surface until adjacent columns differ by
+				// at most one full grain layer, which produces a stable angle of
+				// repose instead of a disk of identical-height tiles.
+				const int64 SourceSurface255 =
+					static_cast<int64>(SourceSupport) * FullCellAmount
+						+ static_cast<int64>(PowderFullColumnHeight)
+							* SourceCell->Amount;
+				int64 LowestSurface255 = SourceSurface255;
+				FIntPoint LowestDestination = Source;
+				uint16 LowestAmount = 0;
+				for (int32 Offset = 0;
+					Offset < UE_ARRAY_COUNT(Directions);
+					++Offset)
+				{
+					FIntPoint Destination;
+					if (!TryOffsetCell(
+							Source,
+							Directions[(FirstDirection + Offset)
+								% UE_ARRAY_COUNT(Directions)],
+							Destination)
+						|| (Settings.bCullOutsideSurfaceBounds
+							&& !IsInsideSurfaceBounds(Destination)))
+					{
+						continue;
+					}
+
+					int16 DestinationSupport = 0;
+					if (!FindSupportHeight(Destination, DestinationSupport))
+					{
+						continue;
+					}
+					const FCell* DestinationCell = FindCell(Destination);
+					const uint16 DestinationMaterialIndex = DestinationCell
+						? DestinationCell->MaterialIndex
+						: FindArchivedMaterialIndex(Destination);
+					if (DestinationMaterialIndex != 0
+						&& DestinationMaterialIndex != SourceCell->MaterialIndex)
+					{
+						continue;
+					}
+					const uint16 DestinationAmount = DestinationCell
+						? DestinationCell->Amount
+						: FindArchivedAmount(Destination);
+					const int64 DestinationSurface255 =
+						static_cast<int64>(DestinationSupport) * FullCellAmount
+							+ static_cast<int64>(PowderFullColumnHeight)
+								* DestinationAmount;
+					if (DestinationSurface255 < LowestSurface255)
+					{
+						LowestSurface255 = DestinationSurface255;
+						LowestDestination = Destination;
+						LowestAmount = DestinationAmount;
+					}
+				}
+
+				constexpr int64 MaximumStableSlope255 =
+					static_cast<int64>(PowderFullColumnHeight)
+						* FullCellAmount;
+				const int64 ExcessSurface255 =
+					SourceSurface255 - LowestSurface255
+						- MaximumStableSlope255;
+				if (LowestDestination == Source || ExcessSurface255 <= 0)
+				{
+					return false;
+				}
+
+				const int32 RequestedTransfer = FMath::Max<int32>(
+					static_cast<int32>(
+						ExcessSurface255
+							/ (2 * PowderFullColumnHeight)),
+					1);
+				const int32 TransferAmount = FMath::Min3(
+					RequestedTransfer,
+					static_cast<int32>(SourceCell->Amount),
+					static_cast<int32>(MAX_uint16 - LowestAmount));
+				if (TransferAmount <= 0)
+				{
+					return false;
+				}
+
+				WakeSurfaceFlow(LowestDestination);
+				FCell& DestinationCell = FindOrAddCell(LowestDestination);
+				SourceCell = FindCell(Source);
+				DestinationCell.MaterialIndex = SourceCell->MaterialIndex;
+				DestinationCell.Amount = static_cast<uint16>(
+					DestinationCell.Amount + TransferAmount);
+				DestinationCell.RemainingLifetime =
+					SourceCell->RemainingLifetime;
+				SourceCell->Amount = static_cast<uint16>(
+					SourceCell->Amount - TransferAmount);
+				if (SourceCell->Amount == 0)
+				{
+					SourceCell->MaterialIndex = 0;
+					SourceCell->RemainingLifetime = 0;
+				}
+				DestinationCell.LastUpdatedTick = Tick;
+				SourceCell->LastUpdatedTick = Tick;
+				MarkDirtyNeighborhood(Source);
+				MarkDirtyNeighborhood(LowestDestination);
+				++Stats.MovedCells;
+				return true;
+			}
+
 			bool bFoundDestination = false;
 			int16 LowestSupport = MAX_int16;
 			FIntPoint BestDestination = Source;
@@ -1065,7 +1223,7 @@ namespace MatterFlux::Material
 			{
 				uint16 BaselineMaterialIndex = 0;
 				int16 BaselineSupportHeight = 0;
-				uint8 BaselineAmount = 0;
+				uint16 BaselineAmount = 0;
 				if (FindBaselineCell(
 						Source,
 						BaselineMaterialIndex,
@@ -1151,13 +1309,21 @@ namespace MatterFlux::Material
 							BestCapacity);
 						DestinationCell.Amount = static_cast<uint8>(
 							static_cast<int32>(DestinationCell.Amount)
-							+ TransferAmount);
+								+ TransferAmount);
+						if (DestinationCell.RemainingLifetime != 0
+							&& MutableSourceCell.RemainingLifetime != 0)
+						{
+							DestinationCell.RemainingLifetime = FMath::Min(
+								DestinationCell.RemainingLifetime,
+								MutableSourceCell.RemainingLifetime);
+						}
 						MutableSourceCell.Amount = static_cast<uint8>(
 							static_cast<int32>(MutableSourceCell.Amount)
 							- TransferAmount);
 						if (MutableSourceCell.Amount == 0)
 						{
 							MutableSourceCell.MaterialIndex = 0;
+							MutableSourceCell.RemainingLifetime = 0;
 						}
 						DestinationCell.LastUpdatedTick = Tick;
 						MutableSourceCell.LastUpdatedTick = Tick;
@@ -1209,8 +1375,16 @@ namespace MatterFlux::Material
 					NeighborCell.Amount = static_cast<uint8>(
 						static_cast<int32>(NeighborCell.Amount)
 						+ static_cast<int32>(MutableSourceCell.Amount));
+					if (NeighborCell.RemainingLifetime != 0
+						&& MutableSourceCell.RemainingLifetime != 0)
+					{
+						NeighborCell.RemainingLifetime = FMath::Min(
+							NeighborCell.RemainingLifetime,
+							MutableSourceCell.RemainingLifetime);
+					}
 					MutableSourceCell.MaterialIndex = 0;
 					MutableSourceCell.Amount = 0;
+					MutableSourceCell.RemainingLifetime = 0;
 					NeighborCell.LastUpdatedTick = Tick;
 					MutableSourceCell.LastUpdatedTick = Tick;
 					MarkDirtyNeighborhood(Source);
@@ -1436,6 +1610,7 @@ namespace MatterFlux::Material
 			}
 
 			const uint16 SourceMaterialIndex = SourceCell->MaterialIndex;
+			WakeSurfaceFlow(LateralDestination);
 			FCell& DestinationCell = FindOrAddCell(LateralDestination);
 			FCell& MutableSourceCell = FindOrAddCell(Source);
 			int32 TransferMinimumRetainedAmount = MinimumRetainedAmount;
@@ -1443,7 +1618,7 @@ namespace MatterFlux::Material
 			{
 				uint16 BaselineMaterialIndex = 0;
 				int16 BaselineSupportHeight = 0;
-				uint8 BaselineAmount = 0;
+				uint16 BaselineAmount = 0;
 				if (FindBaselineCell(
 						Source,
 						BaselineMaterialIndex,
@@ -1470,7 +1645,20 @@ namespace MatterFlux::Material
 			{
 				return false;
 			}
+			const bool bDestinationWasEmpty = DestinationCell.MaterialIndex == 0;
 			DestinationCell.MaterialIndex = SourceMaterialIndex;
+			if (bDestinationWasEmpty)
+			{
+				DestinationCell.RemainingLifetime =
+					MutableSourceCell.RemainingLifetime;
+			}
+			else if (DestinationCell.RemainingLifetime != 0
+				&& MutableSourceCell.RemainingLifetime != 0)
+			{
+				DestinationCell.RemainingLifetime = FMath::Min(
+					DestinationCell.RemainingLifetime,
+					MutableSourceCell.RemainingLifetime);
+			}
 			DestinationCell.Amount = static_cast<uint8>(
 				FMath::Min(
 					static_cast<int32>(FullCellAmount),
@@ -1482,6 +1670,7 @@ namespace MatterFlux::Material
 			if (MutableSourceCell.Amount == 0)
 			{
 				MutableSourceCell.MaterialIndex = 0;
+				MutableSourceCell.RemainingLifetime = 0;
 			}
 			DestinationCell.LastUpdatedTick = Tick;
 			MutableSourceCell.LastUpdatedTick = Tick;
@@ -1508,6 +1697,7 @@ namespace MatterFlux::Material
 				FCell& SourceCell = FindOrAddCell(Source);
 				SourceCell.MaterialIndex = 0;
 				SourceCell.Amount = 0;
+				SourceCell.RemainingLifetime = 0;
 				SourceCell.LastUpdatedTick = Tick;
 				MarkDirtyNeighborhood(Source);
 				++Stats.CulledCells;
@@ -1516,7 +1706,11 @@ namespace MatterFlux::Material
 
 			if (!IsChunkActive(ToChunkCoordinate(Destination)))
 			{
-				return false;
+				if (!Settings.bUseSurfaceTopology)
+				{
+					return false;
+				}
+				WakeSurfaceFlow(Destination);
 			}
 
 			FCell& DestinationCell = FindOrAddCell(Destination);
@@ -1539,6 +1733,7 @@ namespace MatterFlux::Material
 				}
 				Swap(SourceCell.MaterialIndex, DestinationCell.MaterialIndex);
 				Swap(SourceCell.Amount, DestinationCell.Amount);
+				Swap(SourceCell.RemainingLifetime, DestinationCell.RemainingLifetime);
 				SourceCell.LastUpdatedTick = Tick;
 				DestinationCell.LastUpdatedTick = Tick;
 			}
@@ -1547,9 +1742,11 @@ namespace MatterFlux::Material
 				DestinationCell.MaterialIndex =
 					SourceCell.MaterialIndex;
 				DestinationCell.Amount = SourceCell.Amount;
+				DestinationCell.RemainingLifetime = SourceCell.RemainingLifetime;
 				DestinationCell.LastUpdatedTick = Tick;
 				SourceCell.MaterialIndex = 0;
 				SourceCell.Amount = 0;
+				SourceCell.RemainingLifetime = 0;
 				SourceCell.LastUpdatedTick = Tick;
 			}
 
@@ -1609,6 +1806,12 @@ namespace MatterFlux::Material
 					ContactResult.FirstMaterial);
 				SecondCell->MaterialIndex = ResolveResult(
 					ContactResult.SecondMaterial);
+				FirstCell->RemainingLifetime = FirstCell->MaterialIndex == 0
+					? 0
+					: Materials[FirstCell->MaterialIndex].LifetimeSteps;
+				SecondCell->RemainingLifetime = SecondCell->MaterialIndex == 0
+					? 0
+					: Materials[SecondCell->MaterialIndex].LifetimeSteps;
 				if (FirstCell->MaterialIndex == 0)
 				{
 					FirstCell->Amount = 0;
@@ -1710,6 +1913,7 @@ namespace MatterFlux::Material
 				FMath::RoundToInt(ScaledDensity));
 			Material.Mobility = Definition.Mobility;
 			Material.Dispersion = Definition.Dispersion;
+			Material.LifetimeSteps = Definition.LifetimeSteps;
 			Impl->MaterialIndices.Add(
 				MaterialId,
 				static_cast<uint16>(Impl->Materials.Num() - 1));
@@ -1822,6 +2026,54 @@ namespace MatterFlux::Material
 		FImpl::FCell& Cell = Impl->FindOrAddCell(WorldCell);
 		Cell.MaterialIndex = MaterialIndex;
 		Cell.Amount = MaterialIndex == 0 ? 0 : FullCellAmount;
+		Cell.RemainingLifetime = MaterialIndex == 0
+			? 0
+			: Impl->Materials[MaterialIndex].LifetimeSteps;
+		Cell.LastUpdatedTick = 0;
+		Cell.BodyDisplacedTick = 0;
+		Cell.BodyDisplacedMaterialIndex = 0;
+		Cell.BodyDisplacedReferenceAmount = 0;
+		Cell.bHasBodyDisplacementVacancy = false;
+		Impl->BodyDisplacementVacancies.Remove(WorldCell);
+		Impl->MarkDirtyNeighborhood(WorldCell);
+		const FIntPoint ChunkCoordinate =
+			Impl->ToChunkCoordinate(WorldCell);
+		if (!Impl->IsChunkActive(ChunkCoordinate))
+		{
+			Impl->ArchiveChunk(ChunkCoordinate);
+		}
+		return true;
+	}
+
+	bool FChunkedMaterialWorld::SetCellAmount(
+		const FIntPoint& WorldCell,
+		const FName MaterialId,
+		const uint16 Amount)
+	{
+		if (!Impl->bInitialized
+			|| MaterialId.IsNone()
+			|| Amount == 0
+			|| (Impl->Settings.bUseSurfaceTopology
+				? Impl->Settings.bCullOutsideSurfaceBounds
+					&& !Impl->IsInsideSurfaceBounds(WorldCell)
+				: Impl->Settings.bCullOutsideVerticalBounds
+					&& !Impl->IsInsideVerticalBounds(WorldCell.Y)))
+		{
+			return false;
+		}
+
+		const uint16* MaterialIndex =
+			Impl->MaterialIndices.Find(MaterialId);
+		if (!MaterialIndex)
+		{
+			return false;
+		}
+
+		FImpl::FCell& Cell = Impl->FindOrAddCell(WorldCell);
+		Cell.MaterialIndex = *MaterialIndex;
+		Cell.Amount = Amount;
+		Cell.RemainingLifetime =
+			Impl->Materials[*MaterialIndex].LifetimeSteps;
 		Cell.LastUpdatedTick = 0;
 		Cell.BodyDisplacedTick = 0;
 		Cell.BodyDisplacedMaterialIndex = 0;
@@ -1909,6 +2161,9 @@ namespace MatterFlux::Material
 			Cell.Amount = Cell.MaterialIndex == 0
 				? 0
 				: SeedCell.Amount;
+			Cell.RemainingLifetime = Cell.MaterialIndex == 0
+				? 0
+				: Impl->Materials[Cell.MaterialIndex].LifetimeSteps;
 			Cell.LastUpdatedTick = 0;
 			Cell.BodyDisplacedTick = 0;
 			Cell.BodyDisplacedMaterialIndex = 0;
@@ -1927,22 +2182,33 @@ namespace MatterFlux::Material
 				Impl->ArchiveChunk(ChunkCoordinate);
 			}
 		}
-		Impl->BaselineChunks = Impl->ArchivedChunks;
-		for (const TPair<FIntPoint, TUniquePtr<FImpl::FChunk>>& Pair
-			: Impl->Chunks)
+		// Streaming adds one surface chunk at a time. Preserve every untouched
+		// baseline fact and refresh only this transaction's chunks instead of
+		// copying and serializing the entire explored material world after every
+		// addition. The initial full-map seed still touches every chunk and thus
+		// produces the same complete baseline.
+		for (const FIntPoint& ChunkCoordinate : TouchedChunks)
 		{
-			if (Pair.Value)
+			if (const FImpl::FArchivedChunk* Archive =
+				Impl->ArchivedChunks.Find(ChunkCoordinate))
+			{
+				Impl->BaselineChunks.Add(ChunkCoordinate, *Archive);
+			}
+			else if (const TUniquePtr<FImpl::FChunk>* Chunk =
+				Impl->Chunks.Find(ChunkCoordinate);
+				Chunk && Chunk->IsValid())
 			{
 				Impl->BaselineChunks.Add(
-					Pair.Key, Impl->EncodeChunk(*Pair.Value));
+					ChunkCoordinate,
+					Impl->EncodeChunk(**Chunk));
 			}
-		}
-		for (const TPair<FIntPoint, TUniquePtr<FImpl::FChunk>>& Pair
-			: Impl->Chunks)
-		{
-			if (Impl->IsChunkActive(Pair.Key))
+			else
 			{
-				Impl->MarkChunkForBaselineResume(Pair.Key);
+				Impl->BaselineChunks.Remove(ChunkCoordinate);
+			}
+			if (Impl->IsChunkActive(ChunkCoordinate))
+			{
+				Impl->MarkChunkForBaselineResume(ChunkCoordinate);
 			}
 		}
 		return true;
@@ -2051,6 +2317,7 @@ namespace MatterFlux::Material
 			FIntPoint WorldCell = FIntPoint::ZeroValue;
 			int32 AmountToMove = 0;
 			uint8 BodyDisplacedReferenceAmount = 0;
+			uint8 RemainingLifetime = 0;
 		};
 		struct FPressureDestination
 		{
@@ -2117,7 +2384,7 @@ namespace MatterFlux::Material
 						: SourceCell->Amount;
 				uint16 BaselineMaterialIndex = 0;
 				int16 BaselineSupportHeight = 0;
-				uint8 BaselineAmount = 0;
+				uint16 BaselineAmount = 0;
 				if (Impl->FindBaselineCell(
 						Source,
 						BaselineMaterialIndex,
@@ -2132,7 +2399,8 @@ namespace MatterFlux::Material
 				SourcesByMaterial.FindOrAdd(SourceCell->MaterialIndex).Add({
 					Source,
 					AmountToMove,
-					ReferenceAmount });
+					ReferenceAmount,
+					SourceCell->RemainingLifetime });
 				++Impl->LastLiquidDisplacementStats.SourceCells;
 			}
 
@@ -2151,6 +2419,7 @@ namespace MatterFlux::Material
 				});
 
 				int64 RemainingToMove = 0;
+				uint8 TransferLifetime = 0;
 				int32 SourceMinX = MAX_int32;
 				int32 SourceMaxX = MIN_int32;
 				int32 SourceMinY = MAX_int32;
@@ -2158,6 +2427,14 @@ namespace MatterFlux::Material
 				for (const FSourceState& Source : Sources)
 				{
 					RemainingToMove += Source.AmountToMove;
+					if (Source.RemainingLifetime != 0)
+					{
+						TransferLifetime = TransferLifetime == 0
+							? Source.RemainingLifetime
+							: FMath::Min(
+								TransferLifetime,
+								Source.RemainingLifetime);
+					}
 					SourceMinX = FMath::Min(SourceMinX, Source.WorldCell.X);
 					SourceMaxX = FMath::Max(SourceMaxX, Source.WorldCell.X);
 					SourceMinY = FMath::Min(SourceMinY, Source.WorldCell.Y);
@@ -2470,7 +2747,18 @@ namespace MatterFlux::Material
 					}
 					FImpl::FCell& DestinationCell =
 						Impl->FindOrAddCell(Destination.WorldCell);
+					const bool bDestinationWasEmpty =
+						DestinationCell.MaterialIndex == 0;
 					DestinationCell.MaterialIndex = MaterialIndex;
+					if (TransferLifetime != 0)
+					{
+						DestinationCell.RemainingLifetime = bDestinationWasEmpty
+							|| DestinationCell.RemainingLifetime == 0
+							? TransferLifetime
+							: FMath::Min(
+								DestinationCell.RemainingLifetime,
+								TransferLifetime);
+					}
 					DestinationCell.Amount = static_cast<uint8>(
 						static_cast<int32>(DestinationCell.Amount)
 							+ Destination.TransferAmount);
@@ -2491,6 +2779,7 @@ namespace MatterFlux::Material
 					FImpl::FCell& DestinationCell =
 						Impl->FindOrAddCell(Destination.WorldCell);
 					DestinationCell.MaterialIndex = MaterialIndex;
+					DestinationCell.RemainingLifetime = TransferLifetime;
 					DestinationCell.Amount =
 						static_cast<uint8>(Destination.TransferAmount);
 					DestinationCell.LastUpdatedTick = Impl->Tick;
@@ -2530,6 +2819,7 @@ namespace MatterFlux::Material
 					if (SourceCell->Amount == 0)
 					{
 						SourceCell->MaterialIndex = 0;
+						SourceCell->RemainingLifetime = 0;
 					}
 					SourceCell->LastUpdatedTick = Impl->Tick;
 					SourceCell->BodyDisplacedTick = Impl->Tick;
@@ -2611,6 +2901,9 @@ namespace MatterFlux::Material
 		OutSnapshot.Amount = Cell
 			? Cell->Amount
 			: Impl->FindArchivedAmount(WorldCell);
+		OutSnapshot.RemainingLifetime = Cell
+			? Cell->RemainingLifetime
+			: 0;
 		return true;
 	}
 
@@ -2736,6 +3029,8 @@ namespace MatterFlux::Material
 				Snapshot.SupportHeight =
 					Pair.Value->Cells[CellIndex].SupportHeight;
 				Snapshot.Amount = Pair.Value->Cells[CellIndex].Amount;
+				Snapshot.RemainingLifetime =
+					Pair.Value->Cells[CellIndex].RemainingLifetime;
 			}
 		}
 		OutCells.Sort([](
@@ -2782,6 +3077,7 @@ namespace MatterFlux::Material
 				Snapshot.MaterialId = Impl->Materials[Cell.MaterialIndex].Id;
 				Snapshot.SupportHeight = Cell.SupportHeight;
 				Snapshot.Amount = Cell.Amount;
+				Snapshot.RemainingLifetime = Cell.RemainingLifetime;
 			}
 		}
 
@@ -2809,6 +3105,7 @@ namespace MatterFlux::Material
 					Snapshot.MaterialId = Impl->Materials[Run.MaterialIndex].Id;
 					Snapshot.SupportHeight = Run.SupportHeight;
 					Snapshot.Amount = Run.Amount;
+					Snapshot.RemainingLifetime = 0;
 				}
 			}
 		}
@@ -2861,7 +3158,8 @@ namespace MatterFlux::Material
 			uint16 MaterialIndex = 0;
 			int16 SupportHeight = 0;
 			int16 BaselineSupportHeight = 0;
-			uint8 Amount = FullCellAmount;
+			uint16 Amount = FullCellAmount;
+			uint8 RemainingLifetime = 0;
 		};
 		struct FActiveChunk
 		{
@@ -2891,13 +3189,13 @@ namespace MatterFlux::Material
 						+ CellIndex / Impl->Settings.ChunkSize);
 				uint16 BaselineMaterialIndex = 0;
 				int16 BaselineSupportHeight = 0;
-				uint8 BaselineAmount = 0;
+				uint16 BaselineAmount = 0;
 				Impl->FindBaselineCell(
 					WorldCell,
 					BaselineMaterialIndex,
 					BaselineSupportHeight,
 					BaselineAmount);
-				const uint8 CurrentAmount = Cell.MaterialIndex == 0
+				const uint16 CurrentAmount = Cell.MaterialIndex == 0
 					? 0
 					: Cell.Amount;
 				BaselineAmount = BaselineMaterialIndex == 0
@@ -2905,7 +3203,8 @@ namespace MatterFlux::Material
 					: BaselineAmount;
 				if (Cell.MaterialIndex == BaselineMaterialIndex
 					&& Cell.SupportHeight == BaselineSupportHeight
-					&& CurrentAmount == BaselineAmount)
+					&& CurrentAmount == BaselineAmount
+					&& Cell.RemainingLifetime == 0)
 				{
 					continue;
 				}
@@ -2914,7 +3213,8 @@ namespace MatterFlux::Material
 					Cell.MaterialIndex,
 					Cell.SupportHeight,
 					BaselineSupportHeight,
-					CurrentAmount });
+					CurrentAmount,
+					Cell.RemainingLifetime });
 			}
 			if (!Chunk.Cells.IsEmpty())
 			{
@@ -3049,17 +3349,19 @@ namespace MatterFlux::Material
 			}
 			for (const FOccupiedCell& Cell : Chunk.Cells)
 			{
-				// Empty material unambiguously means zero amount in v5. Omitting
-				// that redundant byte matters for cuts, flowing liquid, and fire,
+				// Empty material unambiguously means zero amount. Omitting
+				// that redundant byte matters for cuts and moving/reactive materials,
 				// which can clear hundreds of baseline cells in one snapshot.
 				const bool bHasPartialAmount =
 					Cell.MaterialIndex != 0
 					&& Cell.Amount != FullCellAmount;
 				const bool bHasSupportDelta =
 					Cell.SupportHeight != Cell.BaselineSupportHeight;
+				const bool bHasLifetime = Cell.RemainingLifetime != 0;
 				AppendVarUint32(
 					OutState,
-					(static_cast<uint32>(Cell.MaterialIndex) << 2u)
+					(static_cast<uint32>(Cell.MaterialIndex) << 3u)
+						| (bHasLifetime ? 4u : 0u)
 						| (bHasSupportDelta ? 2u : 0u)
 						| (bHasPartialAmount ? 1u : 0u));
 				if (bHasSupportDelta)
@@ -3072,7 +3374,11 @@ namespace MatterFlux::Material
 				}
 				if (bHasPartialAmount)
 				{
-					AppendUint8(OutState, Cell.Amount);
+					AppendVarUint32(OutState, Cell.Amount);
+				}
+				if (bHasLifetime)
+				{
+					AppendUint8(OutState, Cell.RemainingLifetime);
 				}
 			}
 			if (OutState.Num() > MaximumActiveStateBytes)
@@ -3110,7 +3416,8 @@ namespace MatterFlux::Material
 			uint32 CellIndex = 0;
 			uint16 MaterialIndex = 0;
 			int16 SupportHeight = 0;
-			uint8 Amount = FullCellAmount;
+			uint16 Amount = FullCellAmount;
+			uint8 RemainingLifetime = 0;
 		};
 		struct FImportedChunk
 		{
@@ -3136,11 +3443,7 @@ namespace MatterFlux::Material
 			|| !ReadInt32(State, Offset, LogicalStep)
 			|| !ReadUint32(State, Offset, SimulationTick)
 			|| Magic != ActiveStateMagic
-			|| (Version != LegacyActiveStateVersion
-				&& Version != PreviousActiveStateVersion
-				&& Version != CompactActiveStateVersion
-				&& Version != BaselineDeltaActiveStateVersion
-				&& Version != ActiveStateVersion)
+			|| Version != ActiveStateVersion
 			|| ChunkSize != Impl->Settings.ChunkSize
 			|| ActiveRadius
 				!= Impl->Settings.ActiveChunkRadius
@@ -3441,7 +3744,7 @@ namespace MatterFlux::Material
 									/ Impl->Settings.ChunkSize);
 						uint16 BaselineMaterial = 0;
 						int16 BaselineSupport = 0;
-						uint8 BaselineAmount = 0;
+						uint16 BaselineAmount = 0;
 						Impl->FindBaselineCell(
 							WorldCell,
 							BaselineMaterial,
@@ -3507,16 +3810,32 @@ namespace MatterFlux::Material
 					&& Version >= CompactActiveStateVersion
 					&& (PackedMaterialCode & 1u) != 0)
 				{
-					bCellEncodingValid = ReadUint8(
+					uint32 EncodedAmount = 0;
+					bCellEncodingValid = ReadVarUint32(
 						State,
 						Offset,
-						Cell.Amount);
+						EncodedAmount)
+						&& EncodedAmount <= MAX_uint16;
+					if (bCellEncodingValid)
+					{
+						Cell.Amount = static_cast<uint16>(EncodedAmount);
+					}
 				}
 				else if (bCellEncodingValid
 					&& Version == ActiveStateVersion
-					&& (PackedMaterialCode >> 2u) == 0)
+					&& (PackedMaterialCode >> 3u) == 0)
 				{
 					Cell.Amount = 0;
+				}
+				if (bCellEncodingValid
+					&& Version == ActiveStateVersion
+					&& (PackedMaterialCode & 4u) != 0)
+				{
+					bCellEncodingValid = ReadUint8(
+						State,
+						Offset,
+						Cell.RemainingLifetime)
+						&& Cell.RemainingLifetime != 0;
 				}
 				if (!bCellEncodingValid
 					|| Cell.CellIndex >= static_cast<uint32>(CellCount)
@@ -3528,7 +3847,9 @@ namespace MatterFlux::Material
 					return false;
 				}
 				const uint32 DecodedMaterialIndex =
-					Version >= BaselineDeltaActiveStateVersion
+					Version == ActiveStateVersion
+						? PackedMaterialCode >> 3u
+						: Version >= BaselineDeltaActiveStateVersion
 						? PackedMaterialCode >> 2u
 						: Version == CompactActiveStateVersion
 						? PackedMaterialCode >> 1u
@@ -3554,6 +3875,17 @@ namespace MatterFlux::Material
 						Cell.Amount,
 						Impl->Materials.Num());
 					return false;
+				}
+				if (Cell.MaterialIndex != 0)
+				{
+					const uint8 DefinedLifetime =
+						Impl->Materials[Cell.MaterialIndex].LifetimeSteps;
+					if ((DefinedLifetime == 0) != (Cell.RemainingLifetime == 0)
+						|| Cell.RemainingLifetime > DefinedLifetime)
+					{
+						OutError = TEXT("Active material state contains an invalid material lifetime");
+						return false;
+					}
 				}
 				PreviousCellIndex = Cell.CellIndex;
 				PreviousSupportHeight = Cell.SupportHeight;
@@ -3585,6 +3917,7 @@ namespace MatterFlux::Material
 					Cell.SupportHeight = 0;
 				}
 				Cell.Amount = 0;
+				Cell.RemainingLifetime = 0;
 				Cell.LastUpdatedTick = 0;
 				Cell.BodyDisplacedTick = 0;
 				Cell.BodyDisplacedMaterialIndex = 0;
@@ -3624,6 +3957,7 @@ namespace MatterFlux::Material
 				Cell.SupportHeight =
 					ImportedCell.SupportHeight;
 				Cell.Amount = ImportedCell.Amount;
+				Cell.RemainingLifetime = ImportedCell.RemainingLifetime;
 				Cell.LastUpdatedTick = 0;
 				Cell.BodyDisplacedTick = 0;
 				Cell.BodyDisplacedMaterialIndex = 0;
@@ -3653,6 +3987,7 @@ namespace MatterFlux::Material
 	void FChunkedMaterialWorld::SetSimulationFocuses(
 		const TConstArrayView<FIntPoint> WorldCells)
 	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(MatterFlux_MaterialWorld_SetFocuses);
 		if (!Impl->bInitialized)
 		{
 			return;
@@ -3677,93 +4012,105 @@ namespace MatterFlux::Material
 			return;
 		}
 
-		TArray<FIntPoint> ChunksToArchive;
-		for (const TPair<FIntPoint, TUniquePtr<FImpl::FChunk>>& Pair
-			: Impl->Chunks)
 		{
-			if (!Impl->IsChunkActive(Pair.Key))
+			TRACE_CPUPROFILER_EVENT_SCOPE(
+				MatterFlux_MaterialWorld_ArchiveDepartedChunks);
+			TArray<FIntPoint> ChunksToArchive;
+			for (const TPair<FIntPoint, TUniquePtr<FImpl::FChunk>>& Pair
+				: Impl->Chunks)
 			{
-				ChunksToArchive.Add(Pair.Key);
-			}
-		}
-		for (const FIntPoint& ChunkCoordinate : ChunksToArchive)
-		{
-			Impl->ArchiveChunk(ChunkCoordinate);
-		}
-
-		TArray<FIntPoint> ChunksToRestore;
-		for (const TPair<FIntPoint, FImpl::FArchivedChunk>& Pair
-			: Impl->ArchivedChunks)
-		{
-			if (Impl->IsChunkActive(Pair.Key))
-			{
-				ChunksToRestore.Add(Pair.Key);
-			}
-		}
-		for (const FIntPoint& ChunkCoordinate : ChunksToRestore)
-		{
-			Impl->FindOrAddChunk(ChunkCoordinate);
-			Impl->MarkChunkForBaselineResume(ChunkCoordinate);
-		}
-
-		for (const TPair<FIntPoint, TUniquePtr<FImpl::FChunk>>& Pair
-			: Impl->Chunks)
-		{
-			if (!Impl->IsChunkActive(Pair.Key)
-				|| !PreviousActiveChunks.Contains(Pair.Key))
-			{
-				continue;
-			}
-
-			// Retained chunks only need to retry cells along a seam whose
-			// neighbor has just entered the active window. Newly restored
-			// chunks above are already marked fully dirty.
-			for (int32 NeighborY = -1; NeighborY <= 1; ++NeighborY)
-			{
-				for (int32 NeighborX = -1;
-					NeighborX <= 1;
-					++NeighborX)
+				if (!Impl->IsChunkSimulated(Pair.Key))
 				{
-					if (NeighborX == 0 && NeighborY == 0)
-					{
-						continue;
-					}
-					const FIntPoint NeighborChunk =
-						Pair.Key + FIntPoint(
-							NeighborX,
-							NeighborY);
-					if (!Impl->IsChunkActive(NeighborChunk)
-						|| PreviousActiveChunks.Contains(NeighborChunk))
-					{
-						continue;
-					}
+					ChunksToArchive.Add(Pair.Key);
+				}
+			}
+			for (const FIntPoint& ChunkCoordinate : ChunksToArchive)
+			{
+				Impl->ArchiveChunk(ChunkCoordinate);
+			}
+		}
 
-					const int32 MinX = NeighborX < 0
-						? 0
-						: NeighborX > 0
-							? Impl->Settings.ChunkSize - 1
-							: 0;
-					const int32 MaxX = NeighborX == 0
-						? Impl->Settings.ChunkSize - 1
-						: MinX;
-					const int32 MinY = NeighborY < 0
-						? 0
-						: NeighborY > 0
-							? Impl->Settings.ChunkSize - 1
-							: 0;
-					const int32 MaxY = NeighborY == 0
-						? Impl->Settings.ChunkSize - 1
-						: MinY;
-					for (int32 LocalY = MinY;
-						LocalY <= MaxY;
-						++LocalY)
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE(
+				MatterFlux_MaterialWorld_RestoreArrivingChunks);
+			TArray<FIntPoint> ChunksToRestore;
+			for (const TPair<FIntPoint, FImpl::FArchivedChunk>& Pair
+				: Impl->ArchivedChunks)
+			{
+				if (Impl->IsChunkSimulated(Pair.Key))
+				{
+					ChunksToRestore.Add(Pair.Key);
+				}
+			}
+			for (const FIntPoint& ChunkCoordinate : ChunksToRestore)
+			{
+				Impl->FindOrAddChunk(ChunkCoordinate);
+				Impl->MarkChunkForBaselineResume(ChunkCoordinate);
+			}
+		}
+
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE(
+				MatterFlux_MaterialWorld_WakeArrivingSeams);
+			for (const TPair<FIntPoint, TUniquePtr<FImpl::FChunk>>& Pair
+				: Impl->Chunks)
+			{
+				if (!Impl->IsChunkActive(Pair.Key)
+					|| !PreviousActiveChunks.Contains(Pair.Key))
+				{
+					continue;
+				}
+
+				// Retained chunks only need to retry cells along a seam whose
+				// neighbor has just entered the active window. Newly restored
+				// chunks above are already marked fully dirty.
+				for (int32 NeighborY = -1; NeighborY <= 1; ++NeighborY)
+				{
+					for (int32 NeighborX = -1;
+						NeighborX <= 1;
+						++NeighborX)
 					{
-						for (int32 LocalX = MinX;
-							LocalX <= MaxX;
-							++LocalX)
+						if (NeighborX == 0 && NeighborY == 0)
 						{
-							Pair.Value->MarkDirty(
-								FIntPoint(LocalX, LocalY));
+							continue;
+						}
+						const FIntPoint NeighborChunk =
+							Pair.Key + FIntPoint(
+								NeighborX,
+								NeighborY);
+						if (!Impl->IsChunkActive(NeighborChunk)
+							|| PreviousActiveChunks.Contains(NeighborChunk))
+						{
+							continue;
+						}
+
+						const int32 MinX = NeighborX < 0
+							? 0
+							: NeighborX > 0
+								? Impl->Settings.ChunkSize - 1
+								: 0;
+						const int32 MaxX = NeighborX == 0
+							? Impl->Settings.ChunkSize - 1
+							: MinX;
+						const int32 MinY = NeighborY < 0
+							? 0
+							: NeighborY > 0
+								? Impl->Settings.ChunkSize - 1
+								: 0;
+						const int32 MaxY = NeighborY == 0
+							? Impl->Settings.ChunkSize - 1
+							: MinY;
+						for (int32 LocalY = MinY;
+							LocalY <= MaxY;
+							++LocalY)
+						{
+							for (int32 LocalX = MinX;
+								LocalX <= MaxX;
+								++LocalX)
+							{
+								Pair.Value->MarkDirty(
+									FIntPoint(LocalX, LocalY));
+							}
 						}
 					}
 				}
@@ -3785,40 +4132,70 @@ namespace MatterFlux::Material
 		}
 
 		TArray<FIntPoint> CellsToVisit;
-		for (const TPair<FIntPoint, TUniquePtr<FImpl::FChunk>>& Pair
-			: Impl->Chunks)
 		{
-			FImpl::FChunk& Chunk = *Pair.Value;
-			if (!Impl->IsChunkActive(Pair.Key) || !Chunk.bHasDirtyCells)
+			TRACE_CPUPROFILER_EVENT_SCOPE(
+				MatterFlux_MaterialStep_GatherDirtyCells);
+			for (const TPair<FIntPoint, TUniquePtr<FImpl::FChunk>>& Pair
+				: Impl->Chunks)
+			{
+				FImpl::FChunk& Chunk = *Pair.Value;
+				if (!Impl->IsChunkSimulated(Pair.Key) || !Chunk.bHasDirtyCells)
+				{
+					continue;
+				}
+
+				const FIntPoint DirtyMin = Chunk.DirtyMin;
+				const FIntPoint DirtyMax = Chunk.DirtyMax;
+				Chunk.bHasDirtyCells = false;
+				Chunk.DirtyMin = FIntPoint(MAX_int32, MAX_int32);
+				Chunk.DirtyMax = FIntPoint(MIN_int32, MIN_int32);
+				for (int32 LocalY = DirtyMin.Y; LocalY <= DirtyMax.Y; ++LocalY)
+				{
+					for (int32 LocalX = DirtyMin.X; LocalX <= DirtyMax.X; ++LocalX)
+					{
+						CellsToVisit.Add(FIntPoint(
+							Pair.Key.X * Impl->Settings.ChunkSize + LocalX,
+							Pair.Key.Y * Impl->Settings.ChunkSize + LocalY));
+					}
+				}
+			}
+			CellsToVisit.Sort([Tick = Impl->Tick](
+				const FIntPoint& A,
+				const FIntPoint& B)
+			{
+				if (A.Y != B.Y)
+				{
+					return A.Y < B.Y;
+				}
+				return (Tick & 1u) == 0 ? A.X < B.X : A.X > B.X;
+			});
+		}
+
+		// Lifetime is a material property, independent of phase and reaction kind.
+		// Age each cell once at the start of a fixed step so movement cannot extend
+		// its lifetime by crossing a chunk or changing traversal order.
+		for (const FIntPoint& WorldCell : CellsToVisit)
+		{
+			FImpl::FCell* Cell = Impl->FindCell(WorldCell);
+			if (!Cell
+				|| Cell->MaterialIndex == 0
+				|| Cell->RemainingLifetime == 0)
 			{
 				continue;
 			}
-
-			const FIntPoint DirtyMin = Chunk.DirtyMin;
-			const FIntPoint DirtyMax = Chunk.DirtyMax;
-			Chunk.bHasDirtyCells = false;
-			Chunk.DirtyMin = FIntPoint(MAX_int32, MAX_int32);
-			Chunk.DirtyMax = FIntPoint(MIN_int32, MIN_int32);
-			for (int32 LocalY = DirtyMin.Y; LocalY <= DirtyMax.Y; ++LocalY)
+			--Cell->RemainingLifetime;
+			if (Cell->RemainingLifetime == 0)
 			{
-				for (int32 LocalX = DirtyMin.X; LocalX <= DirtyMax.X; ++LocalX)
-				{
-					CellsToVisit.Add(FIntPoint(
-						Pair.Key.X * Impl->Settings.ChunkSize + LocalX,
-						Pair.Key.Y * Impl->Settings.ChunkSize + LocalY));
-				}
+				Cell->MaterialIndex = 0;
+				Cell->Amount = 0;
+				Impl->MarkDirtyNeighborhood(WorldCell);
+				++Stats.CulledCells;
+			}
+			else
+			{
+				Impl->MarkDirty(WorldCell);
 			}
 		}
-		CellsToVisit.Sort([Tick = Impl->Tick](
-			const FIntPoint& A,
-			const FIntPoint& B)
-		{
-			if (A.Y != B.Y)
-			{
-				return A.Y < B.Y;
-			}
-			return (Tick & 1u) == 0 ? A.X < B.X : A.X > B.X;
-		});
 
 		for (const FIntPoint& WorldCell : CellsToVisit)
 		{
@@ -3860,6 +4237,8 @@ namespace MatterFlux::Material
 		if (Impl->Settings.bUseSurfaceTopology
 			&& !Impl->BodyDisplacementVacancies.IsEmpty())
 		{
+			TRACE_CPUPROFILER_EVENT_SCOPE(
+				MatterFlux_MaterialStep_RestoreBodyDisplacement);
 			static const FIntPoint RefillDirections[] =
 			{
 				FIntPoint(1, 0), FIntPoint(0, 1),
@@ -3974,6 +4353,15 @@ namespace MatterFlux::Material
 						continue;
 					}
 					DestinationCell->MaterialIndex = DisplacedMaterialIndex;
+					if (SourceCell->RemainingLifetime != 0)
+					{
+						DestinationCell->RemainingLifetime =
+							DestinationCell->RemainingLifetime == 0
+							? SourceCell->RemainingLifetime
+							: FMath::Min(
+								DestinationCell->RemainingLifetime,
+								SourceCell->RemainingLifetime);
+					}
 					DestinationCell->Amount = static_cast<uint8>(
 						static_cast<int32>(DestinationCell->Amount) + TransferAmount);
 					SourceCell->Amount = static_cast<uint8>(
@@ -3981,6 +4369,7 @@ namespace MatterFlux::Material
 					if (SourceCell->Amount == 0)
 					{
 						SourceCell->MaterialIndex = 0;
+						SourceCell->RemainingLifetime = 0;
 					}
 					DestinationCell->LastUpdatedTick = Impl->Tick;
 					SourceCell->LastUpdatedTick = Impl->Tick;
@@ -4129,7 +4518,7 @@ namespace MatterFlux::Material
 						{
 							uint16 BaselineMaterialIndex = 0;
 							int16 BaselineSupportHeight = 0;
-							uint8 BaselineAmount = 0;
+							uint16 BaselineAmount = 0;
 							if (Impl->FindBaselineCell(
 									Candidate,
 									BaselineMaterialIndex,
@@ -4214,6 +4603,15 @@ namespace MatterFlux::Material
 							continue;
 						}
 						DestinationCell->MaterialIndex = RestitutionMaterialIndex;
+						if (SourceCell->RemainingLifetime != 0)
+						{
+							DestinationCell->RemainingLifetime =
+								DestinationCell->RemainingLifetime == 0
+								? SourceCell->RemainingLifetime
+								: FMath::Min(
+									DestinationCell->RemainingLifetime,
+									SourceCell->RemainingLifetime);
+						}
 						DestinationCell->Amount = static_cast<uint8>(
 							static_cast<int32>(DestinationCell->Amount)
 								+ TransferAmount);
@@ -4223,6 +4621,7 @@ namespace MatterFlux::Material
 						if (SourceCell->Amount == 0)
 						{
 							SourceCell->MaterialIndex = 0;
+							SourceCell->RemainingLifetime = 0;
 						}
 						Destination.RemainingTransfer -= TransferAmount;
 						Donor.AvailableAmount -= TransferAmount;
@@ -4240,6 +4639,8 @@ namespace MatterFlux::Material
 		TMap<FIntPoint, FImpl::FSurfacePuddleShape> SurfaceLiquidShapes;
 		if (Impl->Settings.bUseSurfaceTopology)
 		{
+			TRACE_CPUPROFILER_EVENT_SCOPE(
+				MatterFlux_MaterialStep_ClassifySurfaceLiquids);
 			static const FIntPoint NeighborDirections[] =
 			{
 				FIntPoint(1, 0),
@@ -4338,44 +4739,46 @@ namespace MatterFlux::Material
 			}
 		}
 
-		for (const FIntPoint& WorldCell : CellsToVisit)
 		{
-			FImpl::FCell* Cell = Impl->FindCell(WorldCell);
-			if (!Cell
-				|| Cell->MaterialIndex == 0
-				|| Cell->LastUpdatedTick == Impl->Tick)
+			TRACE_CPUPROFILER_EVENT_SCOPE(MatterFlux_MaterialStep_MoveCells);
+			for (const FIntPoint& WorldCell : CellsToVisit)
 			{
-				continue;
-			}
-			++Stats.VisitedCells;
-			const FImpl::FResolvedMaterial Material =
-				Impl->Materials[Cell->MaterialIndex];
-			const bool bIsLiquid =
-				Material.Phase == EMatterFluxMaterialPhase::Liquid;
-			const bool bIsPowder =
-				Material.Phase == EMatterFluxMaterialPhase::Powder;
-			const bool bIsGas =
-				Material.Phase == EMatterFluxMaterialPhase::Gas;
-			if (!bIsLiquid && !bIsPowder && !bIsGas)
-			{
-				continue;
-			}
-			if (!Impl->PassesMobilityCheck(WorldCell, Material))
-			{
-				Impl->MarkDirty(WorldCell);
-				continue;
-			}
-			if (Impl->Settings.bUseSurfaceTopology)
-			{
-				Impl->TryMoveSurfaceCell(
-					WorldCell,
-					Material,
-					Stats,
-					SurfaceLiquidShapes.Find(WorldCell));
-				continue;
-			}
+				FImpl::FCell* Cell = Impl->FindCell(WorldCell);
+				if (!Cell
+					|| Cell->MaterialIndex == 0
+					|| Cell->LastUpdatedTick == Impl->Tick)
+				{
+					continue;
+				}
+				++Stats.VisitedCells;
+				const FImpl::FResolvedMaterial Material =
+					Impl->Materials[Cell->MaterialIndex];
+				const bool bIsLiquid =
+					Material.Phase == EMatterFluxMaterialPhase::Liquid;
+				const bool bIsPowder =
+					Material.Phase == EMatterFluxMaterialPhase::Powder;
+				const bool bIsGas =
+					Material.Phase == EMatterFluxMaterialPhase::Gas;
+				if (!bIsLiquid && !bIsPowder && !bIsGas)
+				{
+					continue;
+				}
+				if (!Impl->PassesMobilityCheck(WorldCell, Material))
+				{
+					Impl->MarkDirty(WorldCell);
+					continue;
+				}
+				if (Impl->Settings.bUseSurfaceTopology)
+				{
+					Impl->TryMoveSurfaceCell(
+						WorldCell,
+						Material,
+						Stats,
+						SurfaceLiquidShapes.Find(WorldCell));
+					continue;
+				}
 
-			const uint32 DirectionHash = MixBits(
+				const uint32 DirectionHash = MixBits(
 				Impl->Seed
 				^ static_cast<uint32>(WorldCell.X)
 				^ (static_cast<uint32>(WorldCell.Y) << 16u)
@@ -4456,8 +4859,33 @@ namespace MatterFlux::Material
 			{
 				continue;
 			}
-			TryMoveOffset(
-				FIntPoint(-FirstDirection, 0));
+				TryMoveOffset(
+					FIntPoint(-FirstDirection, 0));
+			}
+		}
+		if (Impl->Settings.bUseSurfaceTopology
+			&& !Impl->SurfaceFlowChunks.IsEmpty())
+		{
+			TArray<FIntPoint> SettledFlowChunks;
+			for (const FIntPoint ChunkCoordinate : Impl->SurfaceFlowChunks)
+			{
+				if (Impl->IsChunkActive(ChunkCoordinate))
+				{
+					continue;
+				}
+				const TUniquePtr<FImpl::FChunk>* Chunk =
+					Impl->Chunks.Find(ChunkCoordinate);
+				if (!Chunk || !Chunk->IsValid()
+					|| !(**Chunk).bHasDirtyCells)
+				{
+					SettledFlowChunks.Add(ChunkCoordinate);
+				}
+			}
+			for (const FIntPoint ChunkCoordinate : SettledFlowChunks)
+			{
+				Impl->SurfaceFlowChunks.Remove(ChunkCoordinate);
+				Impl->ArchiveChunk(ChunkCoordinate);
+			}
 		}
 		return Stats;
 	}

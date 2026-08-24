@@ -1,10 +1,10 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Material/MatterFluxCombustion.h"
+#include "Material/MatterFluxReaction.h"
 #include "Material/MatterFluxGroundStateChunk.h"
 
-namespace MatterFlux::Combustion
+namespace MatterFlux::Reaction
 {
 	struct MATTERFLUX_API FGroundRuntimeSettings
 	{
@@ -26,7 +26,7 @@ namespace MatterFlux::Combustion
 
 	struct MATTERFLUX_API FGroundRuntimeSnapshot
 	{
-		FStateSnapshot CombustionState;
+		FStateSnapshot ReactionState;
 		float StepAccumulator = 0.0f;
 		int32 Revision = 0;
 	};
@@ -39,18 +39,18 @@ namespace MatterFlux::Combustion
 	};
 
 	/**
-	 * Owns deterministic ground-combustion stepping and its chunk replication
+	 * Owns deterministic ground-reaction stepping and its chunk replication
 	 * transaction. UE Actors only transport the completed chunk payloads.
 	 */
-	class MATTERFLUX_API FGroundCombustionRuntime
+	class MATTERFLUX_API FGroundReactionRuntime
 	{
 	public:
-		FGroundCombustionRuntime();
-		~FGroundCombustionRuntime();
+		FGroundReactionRuntime();
+		~FGroundReactionRuntime();
 
-		FGroundCombustionRuntime(const FGroundCombustionRuntime&) = delete;
-		FGroundCombustionRuntime& operator=(
-			const FGroundCombustionRuntime&) = delete;
+		FGroundReactionRuntime(const FGroundReactionRuntime&) = delete;
+		FGroundReactionRuntime& operator=(
+			const FGroundReactionRuntime&) = delete;
 
 		bool Initialize(
 			const FGroundRuntimeSettings& Settings,
@@ -61,7 +61,7 @@ namespace MatterFlux::Combustion
 		void Reset();
 		bool IsInitialized() const { return Simulation.IsValid(); }
 
-		bool Ignite(FIntPoint Cell, FName IgnitionMaterial);
+		bool Activate(FIntPoint Cell, FName StimulusMaterial);
 		FGroundAdvanceResult AdvanceAuthority(float DeltaSeconds);
 		bool BuildInitialReplication(
 			TArray<FMatterFluxGroundStateChunk>& OutChunks,
@@ -83,22 +83,22 @@ namespace MatterFlux::Combustion
 		{
 			return !DirtyChunks.IsEmpty();
 		}
-		bool IsBurning() const
+		bool IsActive() const
 		{
-			return Simulation && Simulation->IsBurning();
+			return Simulation && Simulation->IsActive();
 		}
-		int32 CountResidueCells() const;
-		void GatherBurningCellIndices(TArray<int32>& OutCellIndices) const;
-		void GatherResidueCellIndices(TArray<int32>& OutCellIndices) const;
-		void GatherBurningChunkCoordinates(
+		int32 CountOutputCells() const;
+		void GatherActiveCellIndices(TArray<int32>& OutCellIndices) const;
+		void GatherOutputCellIndices(TArray<int32>& OutCellIndices) const;
+		void GatherActiveChunkCoordinates(
 			TArray<FIntPoint>& OutChunkCoordinates) const;
 		void GatherVisibleCellIndicesForChunks(
 			TConstArrayView<FIntPoint> ChunkCoordinates,
-			TArray<int32>& OutResidueCellIndices,
-			TArray<int32>& OutBurningCellIndices) const;
+			TArray<int32>& OutOutputCellIndices,
+			TArray<int32>& OutActiveCellIndices) const;
 		int32 GetRevision() const { return Revision; }
-		const TArray<uint8>& GetResidueMask() const { return VisibleResidueMask; }
-		const TArray<uint8>& GetBurningMask() const { return VisibleBurningMask; }
+		const TArray<uint8>& GetOutputMask() const { return VisibleOutputMask; }
+		const TArray<uint8>& GetActiveMask() const { return VisibleActiveMask; }
 		const FMatterFluxReactionDefinition* GetRule() const
 		{
 			return Simulation ? &Simulation->GetRule() : nullptr;
@@ -111,17 +111,17 @@ namespace MatterFlux::Combustion
 			TArray<FMatterFluxGroundStateChunk>& OutChunks,
 			FString& OutError) const;
 		void MarkCellDirty(int32 CellIndex);
-		void SetBurningCellIndexState(int32 CellIndex, bool bBurning);
-		void SetResidueCellIndexState(int32 CellIndex, bool bResidue);
+		void SetActiveCellIndexState(int32 CellIndex, bool bActive);
+		void SetOutputCellIndexState(int32 CellIndex, bool bOutput);
 		void RefreshVisibleCellIndicesForChunk(FIntPoint ChunkCoordinate);
 		void RebuildVisibleCellIndices();
 
-		TUniquePtr<FMaskCombustion> Simulation;
+		TUniquePtr<FMaskReaction> Simulation;
 		FGroundRuntimeSettings RuntimeSettings;
-		TArray<uint8> VisibleResidueMask;
-		TArray<uint8> VisibleBurningMask;
-		TMap<FIntPoint, TSet<int32>> BurningCellIndicesByChunk;
-		TMap<FIntPoint, TSet<int32>> ResidueCellIndicesByChunk;
+		TArray<uint8> VisibleOutputMask;
+		TArray<uint8> VisibleActiveMask;
+		TMap<FIntPoint, TSet<int32>> ActiveCellIndicesByChunk;
+		TMap<FIntPoint, TSet<int32>> OutputCellIndicesByChunk;
 		TSet<FIntPoint> DirtyChunks;
 		TMap<FIntPoint, int32> AppliedChunkRevisions;
 		float StepAccumulator = 0.0f;

@@ -2,6 +2,7 @@
 
 #if WITH_DEV_AUTOMATION_TESTS
 
+#include "Camera/CameraComponent.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/BoxComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
@@ -41,6 +42,61 @@ namespace
 		const UCapsuleComponent* Capsule = Character.GetCapsuleComponent();
 		return Character.GetActorLocation().Z
 			- (Capsule ? Capsule->GetScaledCapsuleHalfHeight() : 0.0f);
+	}
+
+	TSet<uint32> CollectProjectionTriangleKeysInsideBounds(
+		UProceduralMeshComponent& Projection,
+		const FBox& WorldBounds)
+	{
+		TSet<uint32> TriangleKeys;
+		for (int32 SectionIndex = 0;
+			SectionIndex < Projection.GetNumSections(); ++SectionIndex)
+		{
+			const FProcMeshSection* Section =
+				Projection.GetProcMeshSection(SectionIndex);
+			if (!Section)
+			{
+				continue;
+			}
+			for (int32 TriangleIndex = 0;
+				TriangleIndex + 2 < Section->ProcIndexBuffer.Num();
+				TriangleIndex += 3)
+			{
+				const int32 A = Section->ProcIndexBuffer[TriangleIndex];
+				const int32 B = Section->ProcIndexBuffer[TriangleIndex + 1];
+				const int32 C = Section->ProcIndexBuffer[TriangleIndex + 2];
+				if (!Section->ProcVertexBuffer.IsValidIndex(A)
+					|| !Section->ProcVertexBuffer.IsValidIndex(B)
+					|| !Section->ProcVertexBuffer.IsValidIndex(C))
+				{
+					continue;
+				}
+				const FVector WorldA = Projection.GetComponentTransform()
+					.TransformPosition(Section->ProcVertexBuffer[A].Position);
+				const FVector WorldB = Projection.GetComponentTransform()
+					.TransformPosition(Section->ProcVertexBuffer[B].Position);
+				const FVector WorldC = Projection.GetComponentTransform()
+					.TransformPosition(Section->ProcVertexBuffer[C].Position);
+				const FVector WorldCentroid = (WorldA + WorldB + WorldC) / 3.0f;
+				if (WorldBounds.IsInsideOrOn(WorldCentroid))
+				{
+					const FVector WorldNormal = FVector::CrossProduct(
+						WorldB - WorldA, WorldC - WorldA).GetSafeNormal();
+					const FIntVector QuantizedCentroid(
+						FMath::RoundToInt(WorldCentroid.X * 10.0f),
+						FMath::RoundToInt(WorldCentroid.Y * 10.0f),
+						FMath::RoundToInt(WorldCentroid.Z * 10.0f));
+					const FIntVector QuantizedNormal(
+						FMath::RoundToInt(WorldNormal.X * 1000.0f),
+						FMath::RoundToInt(WorldNormal.Y * 1000.0f),
+						FMath::RoundToInt(WorldNormal.Z * 1000.0f));
+					TriangleKeys.Add(HashCombineFast(
+						GetTypeHash(QuantizedCentroid),
+						GetTypeHash(QuantizedNormal)));
+				}
+			}
+		}
+		return TriangleKeys;
 	}
 
 	template <typename TActor>
@@ -295,8 +351,8 @@ bool FMatterFluxHouseStructureCutTest::RunTest(const FString& Parameters)
 			static_cast<uint8>(0));
 	}
 	const FBox StairClearanceLocal(
-		FVector(-380.0f, 120.0f, 34.0f),
-		FVector(380.0f, 365.0f,
+		FVector(-380.0f, -365.0f, 34.0f),
+		FVector(380.0f, -120.0f,
 			AMatterFluxTwoStoreyHouseActor::StoreyHeight + 14.0f));
 	const FBox StairClearanceWorld = StairClearanceLocal.TransformBy(
 		House->GetActorTransform().ToMatrixWithScale());
@@ -308,11 +364,15 @@ bool FMatterFluxHouseStructureCutTest::RunTest(const FString& Parameters)
 			*Source->GetName(),
 			*Bounds.GetSize().ToString()),
 			Bounds.GetSize().GetMax() <= 1250.0f);
-		TestFalse(*FString::Printf(
-			TEXT("House source %s stays outside stair clearance; bounds=%s"),
-			*Source->GetName(),
-			*Bounds.ToString()),
-			Bounds.Intersect(StairClearanceWorld));
+		if (Source->StructuralRole
+			!= EMatterFluxMaterialStructuralRole::Floor)
+		{
+			TestFalse(*FString::Printf(
+				TEXT("Non-floor house source %s stays outside stair clearance; bounds=%s"),
+				*Source->GetName(),
+				*Bounds.ToString()),
+				Bounds.Intersect(StairClearanceWorld));
+		}
 	}
 
 	AFragment2DSourceActor* Target = HouseSources[0];
@@ -484,7 +544,7 @@ bool FMatterFluxHouseFurnitureCutTest::RunTest(const FString& Parameters)
 
 	AFragment2DSourceActor* Target = FurnitureSources[0];
 	double BestTableDistanceSquared = TNumericLimits<double>::Max();
-	const FVector TableTopLocal(-115.0f, -120.0f, 118.0f);
+	const FVector TableTopLocal(-115.0f, 120.0f, 118.0f);
 	for (AFragment2DSourceActor* Source : FurnitureSources)
 	{
 		TestTrue(TEXT("Furniture keeps a semantic wood or fabric material fact"),
@@ -636,14 +696,18 @@ bool FMatterFluxHouseCutawayTest::RunTest(const FString& Parameters)
 		return false;
 	}
 	StartTestWorld(*World);
+	if (!House->HasActorBegunPlay())
+	{
+		House->DispatchBeginPlay();
+	}
 
 	const float GroundZ = House->GetFloorSurfaceWorldZ(0);
 	const float UpperZ = House->GetFloorSurfaceWorldZ(1);
 	AMatterFluxCharacter* Viewer = SpawnAlways<AMatterFluxCharacter>(
-		*World, FVector(-180.0f, -120.0f, GroundZ + 88.0f));
+		*World, FVector(-180.0f, 0.0f, GroundZ + 88.0f));
 	AMatterFluxCreatureActor* Creature =
 		SpawnAlways<AMatterFluxCreatureActor>(
-			*World, FVector(210.0f, -120.0f, UpperZ + 80.0f));
+			*World, FVector(210.0f, 0.0f, UpperZ + 80.0f));
 	if (!TestNotNull(TEXT("Viewer character spawns indoors"), Viewer)
 		|| !TestNotNull(TEXT("Creature spawns on the upper floor"), Creature))
 	{
@@ -656,22 +720,20 @@ bool FMatterFluxHouseCutawayTest::RunTest(const FString& Parameters)
 		House->GetCurrentCutawayFloor(), 0);
 	TestEqual(TEXT("Furniture on the viewer's floor remains fully visible"),
 		House->GetFurnitureOpacity(0), 1.0f);
-	TestTrue(TEXT("Furniture above the viewer is hidden with the upper storey"),
-		House->GetFurnitureOpacity(1) > 0.0f
-			&& House->GetFurnitureOpacity(1) < 0.30f);
-	TestTrue(TEXT("Walls, furniture and upper structure use ghost opacity"),
-		House->GetCurrentStructureOpacity() > 0.0f
-			&& House->GetCurrentStructureOpacity() < 0.10f);
-	TestTrue(TEXT("Upper floor fades while viewed from the ground floor"),
-		House->GetFloorSurfaceOpacity(1) > 0.10f
-			&& House->GetFloorSurfaceOpacity(1) < 0.25f);
-	TestTrue(TEXT("Stacked roof and walls fade more strongly than one floor"),
-		House->GetCurrentStructureOpacity()
-			< House->GetFloorSurfaceOpacity(1));
-	TestEqual(TEXT("Upper-floor creature is included in the local cutaway"),
-		House->GetTrackedInteriorActorCount(), 1);
+	TestEqual(TEXT("Furniture above the viewer is not wall material"),
+		House->GetFurnitureOpacity(1), 1.0f);
+	TestEqual(TEXT("Cutaway starts from the current solid opacity"),
+		House->GetCurrentStructureOpacity(), 1.0f);
+	House->Tick(0.05f);
+	TestTrue(TEXT("Connected wall material begins fading without a snap"),
+		House->GetCurrentStructureOpacity() < 1.0f
+			&& House->GetCurrentStructureOpacity() > 0.24f);
+	TestEqual(TEXT("Upper floor remains a solid floor projection"),
+		House->GetFloorSurfaceOpacity(1), 1.0f);
+	TestEqual(TEXT("Upper-floor creature is not wall material"),
+		House->GetTrackedInteriorActorCount(), 0);
 
-	Viewer->SetActorLocation(FVector(-180.0f, -120.0f, UpperZ + 88.0f));
+	Viewer->SetActorLocation(FVector(-180.0f, 0.0f, UpperZ + 88.0f));
 	House->RefreshCutawayImmediately();
 	TestEqual(TEXT("Viewer feet select the upper floor cutaway"),
 		House->GetCurrentCutawayFloor(), 1);
@@ -679,17 +741,250 @@ bool FMatterFluxHouseCutawayTest::RunTest(const FString& Parameters)
 		House->GetFloorSurfaceOpacity(1), 1.0f);
 	TestEqual(TEXT("Upper-floor furniture remains visible beside the viewer"),
 		House->GetFurnitureOpacity(1), 1.0f);
-	TestEqual(TEXT("Same-floor creature remains a cutaway participant"),
-		House->GetTrackedInteriorActorCount(), 1);
+	TestEqual(TEXT("Same-floor creature remains fully visible"),
+		House->GetTrackedInteriorActorCount(), 0);
+	House->Tick(0.05f);
 
 	Viewer->SetActorLocation(FVector(1400.0f, 0.0f, GroundZ + 88.0f));
 	House->RefreshCutawayImmediately();
 	TestEqual(TEXT("Leaving the house restores the full facade"),
 		House->GetCurrentCutawayFloor(), INDEX_NONE);
-	TestEqual(TEXT("Restored house returns to opaque material"),
-		House->GetCurrentStructureOpacity(), 1.0f);
+	const float ExitStartOpacity = House->GetCurrentStructureOpacity();
+	TestTrue(TEXT("Restored house does not jump directly to opaque"),
+		ExitStartOpacity < 1.0f);
+	House->Tick(0.05f);
+	TestTrue(TEXT("Restored house fades toward opaque"),
+		House->GetCurrentStructureOpacity() > ExitStartOpacity
+			&& House->GetCurrentStructureOpacity() < 1.0f);
 	TestEqual(TEXT("Creature materials are restored after leaving"),
 		House->GetTrackedInteriorActorCount(), 0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxHouseCutawayWallDemolitionTest,
+	"MatterFlux.Playable.House.IndoorCutawaySurvivesWallDemolition",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxHouseCutawayWallDemolitionTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxTwoStoreyHouseActor* House = World
+		? SpawnAlways<AMatterFluxTwoStoreyHouseActor>(*World, FVector::ZeroVector)
+		: nullptr;
+	if (!TestNotNull(TEXT("House spawns for demolition cutaway"), House))
+	{
+		return false;
+	}
+	StartTestWorld(*World);
+	if (!House->HasActorBegunPlay())
+	{
+		House->DispatchBeginPlay();
+	}
+
+	const float GroundZ = House->GetFloorSurfaceWorldZ(0);
+	AMatterFluxCharacter* Viewer = SpawnAlways<AMatterFluxCharacter>(
+		*World, FVector(-180.0f, 0.0f, GroundZ + 88.0f));
+	if (!TestNotNull(TEXT("Indoor viewer spawns"), Viewer))
+	{
+		return false;
+	}
+
+	TArray<AFragment2DSourceActor*> LiveWalls;
+	TArray<AFragment2DSourceActor*> StructureSources;
+	AFragment2DSourceActor* WallToDemolish = nullptr;
+	for (TActorIterator<AFragment2DSourceActor> It(World); It; ++It)
+	{
+		AFragment2DSourceActor* Source = *It;
+		if (Source->GetOwner() != House)
+		{
+			continue;
+		}
+		StructureSources.Add(Source);
+		if (Source->StructuralRole
+				!= EMatterFluxMaterialStructuralRole::Wall
+			|| Source->bBroken)
+		{
+			continue;
+		}
+		LiveWalls.Add(Source);
+		if (!WallToDemolish
+			&& Source->ActorHasTag(TEXT("MatterFluxHouseGroup.LowerWalls")))
+		{
+			WallToDemolish = Source;
+		}
+	}
+	if (!TestTrue(TEXT("House owns live wall sources"), !LiveWalls.IsEmpty())
+		|| !TestNotNull(TEXT("A lower wall can be demolished"), WallToDemolish))
+	{
+		return false;
+	}
+
+	House->SetCutawayViewerOverride(Viewer);
+	House->RefreshCutawayImmediately();
+	constexpr float FadeTickSeconds = 0.05f;
+	for (int32 FadeTick = 0; FadeTick < 20; ++FadeTick)
+	{
+		House->Tick(FadeTickSeconds);
+	}
+
+	MatterFlux::MaterialCutaway::FResult InitialCutaway;
+	TestTrue(TEXT("Canonical indoor cutaway resolves before demolition"),
+		MatterFlux::MaterialCutaway::Resolve(
+			FVector(Viewer->GetActorLocation().X,
+				Viewer->GetActorLocation().Y,
+				CharacterFeetZ(*Viewer)),
+			StructureSources,
+			FGuid(),
+			InitialCutaway));
+	int32 GhostedWallCount = 0;
+	for (const AFragment2DSourceActor* Wall : LiveWalls)
+	{
+		GhostedWallCount += InitialCutaway.GhostSourceIds.Contains(Wall->SourceId)
+			? 1 : 0;
+	}
+	TestEqual(TEXT("Every live wall belongs to the indoor cutaway"),
+		GhostedWallCount, LiveWalls.Num());
+	TestTrue(TEXT("Indoor wall presentation preserves the authored house cutaway"),
+		House->GetCurrentStructureOpacity() <= 0.06f);
+
+	const FGuid DemolishedSourceId = WallToDemolish->SourceId;
+	UProceduralMeshComponent* WholeObjectProjection =
+		House->FindComponentByClass<UProceduralMeshComponent>();
+	if (!TestNotNull(TEXT("House owns a merged cuttable projection"),
+		WholeObjectProjection))
+	{
+		return false;
+	}
+	const FBox DemolishedWallBounds =
+		WallToDemolish->GetComponentsBoundingBox(true);
+	const TSet<uint32> ProjectedTrianglesBeforeDemolition =
+		CollectProjectionTriangleKeysInsideBounds(
+			*WholeObjectProjection, DemolishedWallBounds);
+	TestTrue(TEXT("Wall selected for demolition owns visible projection geometry"),
+		!ProjectedTrianglesBeforeDemolition.IsEmpty());
+	WallToDemolish->MarkBroken();
+	for (int32 FadeTick = 0; FadeTick < 20; ++FadeTick)
+	{
+		House->Tick(FadeTickSeconds);
+	}
+	TestEqual(TEXT("Demolished wall source collision is disabled"),
+		WallToDemolish->MeshComponent->GetCollisionEnabled(),
+		ECollisionEnabled::NoCollision);
+	const TSet<uint32> ProjectedTrianglesAfterDemolition =
+		CollectProjectionTriangleKeysInsideBounds(
+			*WholeObjectProjection, DemolishedWallBounds);
+	int32 RemovedTriangleCount = 0;
+	for (const uint32 TriangleKey : ProjectedTrianglesBeforeDemolition)
+	{
+		RemovedTriangleCount +=
+			ProjectedTrianglesAfterDemolition.Contains(TriangleKey) ? 0 : 1;
+	}
+	TestTrue(TEXT("Demolished wall is removed from the merged projection"),
+		RemovedTriangleCount > 0);
+
+	MatterFlux::MaterialCutaway::FResult RebuiltCutaway;
+	TestTrue(TEXT("Canonical indoor cutaway resolves after demolition"),
+		MatterFlux::MaterialCutaway::Resolve(
+			FVector(Viewer->GetActorLocation().X,
+				Viewer->GetActorLocation().Y,
+				CharacterFeetZ(*Viewer)),
+			StructureSources,
+			FGuid(),
+			RebuiltCutaway));
+	TestFalse(TEXT("Demolished wall leaves the active ghost set"),
+		RebuiltCutaway.GhostSourceIds.Contains(DemolishedSourceId));
+
+	int32 RemainingWallCount = 0;
+	int32 RemainingGhostedCount = 0;
+	for (const AFragment2DSourceActor* Wall : LiveWalls)
+	{
+		if (Wall->bBroken)
+		{
+			continue;
+		}
+		++RemainingWallCount;
+		RemainingGhostedCount +=
+			RebuiltCutaway.GhostSourceIds.Contains(Wall->SourceId) ? 1 : 0;
+	}
+	TestEqual(TEXT("All remaining walls still belong to the cutaway"),
+		RemainingGhostedCount, RemainingWallCount);
+	TestTrue(TEXT("Remaining wall presentation returns to the authored target"),
+		House->GetCurrentStructureOpacity() <= 0.06f);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxHouseExteriorOcclusionTest,
+	"MatterFlux.Playable.House.ExteriorViewerOccludedByHouseFadesStructure",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxHouseExteriorOcclusionTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxTwoStoreyHouseActor* House = World
+		? SpawnAlways<AMatterFluxTwoStoreyHouseActor>(*World, FVector::ZeroVector)
+		: nullptr;
+	if (!TestNotNull(TEXT("House spawns for exterior occlusion"), House))
+	{
+		return false;
+	}
+	StartTestWorld(*World);
+	if (!House->HasActorBegunPlay())
+	{
+		House->DispatchBeginPlay();
+	}
+
+	const float GroundZ = House->GetFloorSurfaceWorldZ(0);
+	AMatterFluxCharacter* Viewer = SpawnAlways<AMatterFluxCharacter>(
+		*World, FVector(900.0f, 0.0f, GroundZ + 88.0f));
+	if (!TestNotNull(TEXT("Exterior viewer spawns"), Viewer)
+		|| !TestNotNull(
+			TEXT("Viewer has a follow camera"), Viewer->FollowCamera.Get()))
+	{
+		return false;
+	}
+
+	Viewer->FollowCamera->SetWorldLocation(FVector(
+		700.0f, 0.0f, Viewer->GetActorLocation().Z));
+	const FVector SameSideCameraLocation =
+		Viewer->FollowCamera->GetComponentLocation();
+	TestTrue(TEXT("Viewer is outside the east wall"),
+		Viewer->GetActorLocation().X > AMatterFluxTwoStoreyHouseActor::HalfSizeX);
+	TestTrue(TEXT("Same-side camera is outside the east wall"),
+		SameSideCameraLocation.X > AMatterFluxTwoStoreyHouseActor::HalfSizeX);
+	House->SetCutawayViewerOverride(Viewer);
+	House->RefreshCutawayImmediately();
+	House->Tick(0.05f);
+	TestEqual(TEXT("An exterior house that does not block the viewer stays solid"),
+		House->GetCurrentStructureOpacity(), 1.0f);
+	TestEqual(TEXT("The ground floor stays solid when the house does not occlude the viewer"),
+		House->GetFloorSurfaceOpacity(0), 1.0f);
+	TestEqual(TEXT("The upper floor stays solid when the house does not occlude the viewer"),
+		House->GetFloorSurfaceOpacity(1), 1.0f);
+
+	Viewer->FollowCamera->SetWorldLocation(FVector(
+		-1200.0f, 0.0f, Viewer->GetActorLocation().Z));
+	const FVector CameraLocation = Viewer->FollowCamera->GetComponentLocation();
+	TestTrue(TEXT("Camera is outside the west wall"),
+		CameraLocation.X < -AMatterFluxTwoStoreyHouseActor::HalfSizeX);
+	TestTrue(TEXT("Camera-to-viewer line crosses the house footprint"),
+		FMath::Abs(CameraLocation.Y) < AMatterFluxTwoStoreyHouseActor::HalfSizeY
+			&& FMath::Abs(Viewer->GetActorLocation().Y)
+				< AMatterFluxTwoStoreyHouseActor::HalfSizeY);
+
+	House->RefreshCutawayImmediately();
+	TestEqual(TEXT("Exterior occlusion does not pretend the viewer is indoors"),
+		House->GetCurrentCutawayFloor(), INDEX_NONE);
+	House->Tick(0.05f);
+	TestTrue(TEXT("A house between camera and exterior viewer begins fading"),
+		House->GetCurrentStructureOpacity() < 1.0f);
+	TestTrue(TEXT("The ground floor fades with an exterior-occluding house"),
+		House->GetFloorSurfaceOpacity(0) < 1.0f);
+	TestTrue(TEXT("The upper floor fades with an exterior-occluding house"),
+		House->GetFloorSurfaceOpacity(1) < 1.0f);
 	return true;
 }
 
@@ -710,6 +1005,10 @@ bool FMatterFluxHouseCutawayBoundaryJitterTest::RunTest(
 		return false;
 	}
 	StartTestWorld(*World);
+	if (!House->HasActorBegunPlay())
+	{
+		House->DispatchBeginPlay();
+	}
 
 	const float UpperZ = House->GetFloorSurfaceWorldZ(1);
 	AMatterFluxCharacter* Viewer = SpawnAlways<AMatterFluxCharacter>(
@@ -723,8 +1022,12 @@ bool FMatterFluxHouseCutawayBoundaryJitterTest::RunTest(
 	House->RefreshCutawayImmediately();
 	TestEqual(TEXT("Upper-floor cutaway starts active"),
 		House->GetCurrentCutawayFloor(), 1);
-	const float StableOpacity = House->GetCurrentStructureOpacity();
 	constexpr float HouseTickSeconds = 0.05f;
+	for (int32 FadeTick = 0; FadeTick < 8; ++FadeTick)
+	{
+		House->Tick(HouseTickSeconds);
+	}
+	const float StableOpacity = House->GetCurrentStructureOpacity();
 
 	// CharacterMovement can produce a one-frame depenetration / floor-edge
 	// correction close to an exterior wall.  A single ambiguous sample must not
@@ -733,8 +1036,8 @@ bool FMatterFluxHouseCutawayBoundaryJitterTest::RunTest(
 	House->Tick(HouseTickSeconds);
 	TestEqual(TEXT("One boundary sample preserves the last stable floor"),
 		House->GetCurrentCutawayFloor(), 1);
-	TestEqual(TEXT("One boundary sample does not brighten the facade"),
-		House->GetCurrentStructureOpacity(), StableOpacity);
+	TestTrue(TEXT("One boundary sample does not brighten the facade"),
+		House->GetCurrentStructureOpacity() <= StableOpacity);
 
 	Viewer->SetActorLocation(FVector(480.0f, 0.0f, UpperZ + 88.0f));
 	House->Tick(HouseTickSeconds);
@@ -780,6 +1083,11 @@ bool FMatterFluxHouseStairTraversalTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("Stair ramp blocks pawns and physics queries"),
 		House->StairRampCollision->GetCollisionEnabled(),
 		ECollisionEnabled::QueryAndPhysics);
+	const float StairY = House->StairRampCollision->GetRelativeLocation().Y;
+	TestTrue(TEXT("The staircase occupies the rear half of the house"),
+		StairY < 0.0f);
+	const float GroundZ = House->GetFloorSurfaceWorldZ(0);
+	const float UpperZ = House->GetFloorSurfaceWorldZ(1);
 
 	// 三条竖直射线必须依次命中越来越高的连续坡面；可见台阶本身不
 	// 承担碰撞，所以这里同时防止日后重新引入逐级抖动。
@@ -789,8 +1097,8 @@ bool FMatterFluxHouseStairTraversalTest::RunTest(const FString& Parameters)
 		FHitResult Hit;
 		const bool bHit = World->LineTraceSingleByChannel(
 			Hit,
-			FVector(X, 245.0f, 620.0f),
-			FVector(X, 245.0f, -80.0f),
+			FVector(X, StairY, 620.0f),
+			FVector(X, StairY, -80.0f),
 			ECC_Visibility);
 		TestTrue(TEXT("A stair sample hits walkable collision"), bHit);
 		if (bHit)
@@ -800,9 +1108,20 @@ bool FMatterFluxHouseStairTraversalTest::RunTest(const FString& Parameters)
 			PreviousHitZ = Hit.ImpactPoint.Z;
 		}
 	}
+	FHitResult UpperLandingHit;
+	const bool bUpperLandingHit = World->LineTraceSingleByChannel(
+		UpperLandingHit,
+		FVector(330.0f, StairY, UpperZ + 80.0f),
+		FVector(330.0f, StairY, UpperZ - 100.0f),
+		ECC_Visibility);
+	TestTrue(TEXT("The stair ramp reaches its upper landing"),
+		bUpperLandingHit);
+	if (bUpperLandingHit)
+	{
+		TestTrue(TEXT("The last stair is within walking tolerance of the upper floor"),
+			UpperLandingHit.ImpactPoint.Z >= UpperZ - 12.0f);
+	}
 
-	const float GroundZ = House->GetFloorSurfaceWorldZ(0);
-	const float UpperZ = House->GetFloorSurfaceWorldZ(1);
 	const FCollisionShape PlayerCapsule = FCollisionShape::MakeCapsule(
 		42.0f, 88.0f);
 	const FCollisionShape CreatureCapsule = FCollisionShape::MakeCapsule(
@@ -820,8 +1139,8 @@ bool FMatterFluxHouseStairTraversalTest::RunTest(const FString& Parameters)
 		FHitResult FloorHit;
 		const bool bHasFloor = World->LineTraceSingleByChannel(
 			FloorHit,
-			FVector(X, 245.0f, 620.0f),
-			FVector(X, 245.0f, -80.0f),
+			FVector(X, StairY, 620.0f),
+			FVector(X, StairY, -80.0f),
 			ECC_Visibility,
 			QueryParams);
 		if (!TestTrue(TEXT("Every traversal sample has a floor"), bHasFloor))
@@ -832,9 +1151,9 @@ bool FMatterFluxHouseStairTraversalTest::RunTest(const FString& Parameters)
 			FloorHit.ImpactPoint.Z + 2.0f >= LastSurfaceZ);
 		LastSurfaceZ = FloorHit.ImpactPoint.Z;
 		const FVector PlayerCenter(
-			X, 245.0f, FloorHit.ImpactPoint.Z + 100.0f);
+			X, StairY, FloorHit.ImpactPoint.Z + 100.0f);
 		const FVector CreatureCenter(
-			X, 245.0f, FloorHit.ImpactPoint.Z + 86.0f);
+			X, StairY, FloorHit.ImpactPoint.Z + 86.0f);
 		TestFalse(TEXT("Player capsule has clearance along the entire stair"),
 			World->OverlapBlockingTestByChannel(
 				PlayerCenter, FQuat::Identity, ECC_Pawn,
