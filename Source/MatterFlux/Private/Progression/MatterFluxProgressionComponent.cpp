@@ -410,6 +410,32 @@ bool FMatterFluxProgressionRules::BuildStarterState(
 	return true;
 }
 
+bool FMatterFluxProgressionRules::BuildFreeModeState(
+	const FMatterFluxContentRegistry& Registry,
+	const FMatterFluxProgressionEvaluationContext& Context,
+	TArray<FMatterFluxItemStack>& Items,
+	TArray<FMatterFluxQuestState>& Quests,
+	FName& SelectedQuest,
+	FMatterFluxProgressionEffects& OutEffects,
+	FString& OutError)
+{
+	if (!BuildStarterState(
+		Registry,
+		Context,
+		Items,
+		Quests,
+		SelectedQuest,
+		OutEffects,
+		OutError))
+	{
+		return false;
+	}
+	Quests.Reset();
+	SelectedQuest = NAME_None;
+	OutEffects.Reset();
+	return true;
+}
+
 bool FMatterFluxProgressionRules::AddItem(
 	const FMatterFluxContentRegistry& Registry,
 	TArray<FMatterFluxItemStack>& Items,
@@ -1124,6 +1150,122 @@ bool UMatterFluxProgressionComponent::ResetToStarterStateAuthority(
 	GetOwner()->ForceNetUpdate();
 	return true;
 }
+
+bool UMatterFluxProgressionComponent::ResetToStoryStateAuthority(
+	FString& OutError)
+{
+	OutError.Reset();
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		OutError = TEXT("story progression reset requires authority");
+		return false;
+	}
+	if (bApplyingEffects)
+	{
+		OutError = TEXT("story progression reset cannot re-enter progression effects");
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry =
+		IMatterFluxScriptRuntime::Get().GetActiveRegistry();
+	if (!Registry.IsValid())
+	{
+		OutError = TEXT("progression content registry is unavailable");
+		return false;
+	}
+	TArray<FMatterFluxItemStack> NextItems;
+	TArray<FMatterFluxQuestState> NextQuests;
+	FName NextSelection;
+	FMatterFluxProgressionEffects Effects;
+	if (!FMatterFluxProgressionRules::BuildStarterState(
+		*Registry, BuildEvaluationContext(), NextItems, NextQuests,
+		NextSelection, Effects, OutError))
+	{
+		return false;
+	}
+	// The story tutorial deliberately begins before the player owns any
+	// ordinary item. Quest activation can still grant its authored magic kit.
+	NextItems.Reset();
+	if (!ApplyEffectsAuthority(Effects, OutError))
+	{
+		return false;
+	}
+	ItemStacks.Items = MoveTemp(NextItems);
+	QuestStates.Items = MoveTemp(NextQuests);
+	SelectedQuest = NextSelection;
+	ShopPurchaseCounts.Reset();
+	Revision = FMath::Max(Revision + 1, 1);
+	MarkAllDirty();
+	ProgressionChanged.Broadcast();
+	GetOwner()->ForceNetUpdate();
+	return true;
+}
+
+bool UMatterFluxProgressionComponent::ResetToFreeModeStateAuthority(
+	FString& OutError)
+{
+	OutError.Reset();
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		OutError = TEXT("progression reset requires authority");
+		return false;
+	}
+	if (bApplyingEffects)
+	{
+		OutError = TEXT("progression reset cannot re-enter progression effects");
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry =
+		IMatterFluxScriptRuntime::Get().GetActiveRegistry();
+	if (!Registry.IsValid())
+	{
+		OutError = TEXT("progression content registry is unavailable");
+		return false;
+	}
+	TArray<FMatterFluxItemStack> NextItems;
+	TArray<FMatterFluxQuestState> NextQuests;
+	FName NextSelection;
+	FMatterFluxProgressionEffects Effects;
+	if (!FMatterFluxProgressionRules::BuildFreeModeState(
+		*Registry,
+		BuildEvaluationContext(),
+		NextItems,
+		NextQuests,
+		NextSelection,
+		Effects,
+		OutError))
+	{
+		return false;
+	}
+	ItemStacks.Items = MoveTemp(NextItems);
+	QuestStates.Items = MoveTemp(NextQuests);
+	SelectedQuest = NAME_None;
+	ShopPurchaseCounts.Reset();
+	Revision = FMath::Max(Revision + 1, 1);
+	MarkAllDirty();
+	ProgressionChanged.Broadcast();
+	GetOwner()->ForceNetUpdate();
+	return true;
+}
+
+bool UMatterFluxProgressionComponent::ClearStoryQuestsAuthority(
+	FString& OutError)
+{
+	OutError.Reset();
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		OutError = TEXT("clearing story quests requires authority");
+		return false;
+	}
+	QuestStates.Items.Reset();
+	SelectedQuest = NAME_None;
+	ShopPurchaseCounts.Reset();
+	Revision = FMath::Max(Revision + 1, 1);
+	MarkAllDirty();
+	ProgressionChanged.Broadcast();
+	GetOwner()->ForceNetUpdate();
+	return true;
+}
+
 bool UMatterFluxProgressionComponent::CaptureSaveState(
 	FMatterFluxProgressionSaveState& OutState, FString& OutError) const
 {

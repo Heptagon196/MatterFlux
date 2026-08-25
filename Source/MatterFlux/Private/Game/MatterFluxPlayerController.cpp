@@ -1,10 +1,14 @@
 #include "Game/MatterFluxPlayerController.h"
 
 #include "AbilitySystemComponent.h"
+#include "Containers/Ticker.h"
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
 #include "Engine/Engine.h"
+#include "Engine/GameInstance.h"
+#include "Engine/GameViewportClient.h"
 #include "EngineUtils.h"
+#include "Framework/Application/SlateApplication.h"
 #include "Creatures/MatterFluxCreatureActor.h"
 #include "Game/MatterFluxPlayerState.h"
 #include "GAS/GA_FragmentDebugDamage.h"
@@ -79,11 +83,144 @@ void AMatterFluxPlayerController::BeginPlay()
 	}
 
 	GrantDebugAbilityIfEnabled();
+	if (IsLocalController() && !IsShellMenuOpen())
+	{
+		ApplyGameplayMouseInputMode();
+	}
 	if (bEnableDebugControls && IsLocalController())
 	{
-		SetInputMode(FInputModeGameOnly());
 		AddDebugMappingContext();
 	}
+}
+
+void AMatterFluxPlayerController::ApplyGameplayMouseInputMode()
+{
+	if (!IsLocalController())
+	{
+		return;
+	}
+	FInputModeGameAndUI InputMode;
+	InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+	InputMode.SetHideCursorDuringCapture(false);
+	SetInputMode(InputMode);
+	bShowMouseCursor = true;
+
+	UGameViewportClient* GameViewport = GetWorld()
+		? GetWorld()->GetGameViewport()
+		: nullptr;
+	const TSharedPtr<SWidget> GameplayViewport = GameViewport
+		? GameViewport->GetGameViewportWidget()
+		: nullptr;
+	RestoreGameplayViewportFocus(GameplayViewport);
+
+	const TWeakObjectPtr<AMatterFluxPlayerController> WeakThis(this);
+	RestoreGameplayViewportFocusAfterSlateEvent(
+		GameplayViewport,
+		[WeakThis]()
+		{
+			const AMatterFluxPlayerController* Controller = WeakThis.Get();
+			return Controller
+				&& Controller->IsLocalController()
+				&& !Controller->IsShellMenuOpen()
+				&& !Controller->IsMagicWorkbenchOpen()
+				&& (!Controller->InteractionWidget
+					|| !Controller->InteractionWidget->IsInteractionOpen());
+		});
+}
+
+void AMatterFluxPlayerController::RestoreGameplayViewportFocus(
+	const TSharedPtr<SWidget>& GameplayViewport)
+{
+	if (FSlateApplication::IsInitialized() && GameplayViewport.IsValid())
+	{
+		FSlateApplication::Get().SetAllUserFocus(
+			GameplayViewport,
+			EFocusCause::SetDirectly);
+	}
+}
+
+void AMatterFluxPlayerController::RestoreGameplayViewportFocusAfterSlateEvent(
+	const TSharedPtr<SWidget>& GameplayViewport,
+	TFunction<bool()> ShouldRestoreFocus)
+{
+	const TWeakPtr<SWidget> WeakGameplayViewport(GameplayViewport);
+	FTSTicker::GetCoreTicker().AddTicker(
+		FTickerDelegate::CreateLambda(
+			[WeakGameplayViewport,
+			 ShouldRestoreFocus = MoveTemp(ShouldRestoreFocus)](float) mutable
+			{
+				if ((!ShouldRestoreFocus || ShouldRestoreFocus())
+					&& WeakGameplayViewport.IsValid())
+				{
+					RestoreGameplayViewportFocus(
+						WeakGameplayViewport.Pin());
+				}
+				return false;
+			}));
+}
+
+bool AMatterFluxPlayerController::MakeHorizontalAimDirection(
+	const FVector& AimOrigin,
+	const FVector& TargetWorldLocation,
+	FVector& OutDirection)
+{
+	if (AimOrigin.ContainsNaN() || TargetWorldLocation.ContainsNaN())
+	{
+		return false;
+	}
+	OutDirection = TargetWorldLocation - AimOrigin;
+	OutDirection.Z = 0.0f;
+	return OutDirection.Normalize();
+}
+
+bool AMatterFluxPlayerController::TryGetHorizontalMouseAimDirection(
+	const FVector& AimOrigin,
+	FVector& OutDirection) const
+{
+	if (!IsLocalController())
+	{
+		return false;
+	}
+	FVector RayOrigin;
+	FVector RayDirection;
+	if (!DeprojectMousePositionToWorld(RayOrigin, RayDirection)
+		|| !RayDirection.Normalize())
+	{
+		return false;
+	}
+
+	FVector TargetWorldLocation = FVector::ZeroVector;
+	bool bHasTarget = false;
+	if (const UWorld* World = GetWorld())
+	{
+		FHitResult Hit;
+		FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(MouseSpellAim), true);
+		QueryParams.AddIgnoredActor(GetPawn());
+		const FVector RayEnd = RayOrigin + RayDirection * 1000000.0f;
+		if (World->LineTraceSingleByChannel(
+			Hit,
+			RayOrigin,
+			RayEnd,
+			ECC_Visibility,
+			QueryParams))
+		{
+			TargetWorldLocation = Hit.ImpactPoint;
+			bHasTarget = true;
+		}
+	}
+	if (!bHasTarget && !FMath::IsNearlyZero(RayDirection.Z))
+	{
+		const float Distance = (AimOrigin.Z - RayOrigin.Z) / RayDirection.Z;
+		if (Distance >= 0.0f && FMath::IsFinite(Distance))
+		{
+			TargetWorldLocation = RayOrigin + RayDirection * Distance;
+			bHasTarget = true;
+		}
+	}
+	return bHasTarget && MakeHorizontalAimDirection(
+		AimOrigin,
+		TargetWorldLocation,
+		OutDirection);
 }
 
 void AMatterFluxPlayerController::EndPlay(
@@ -149,6 +286,10 @@ void AMatterFluxPlayerController::OnPossess(APawn* InPawn)
 	{
 		PlayerStatusHud->RefreshStatus();
 	}
+	if (ShellWidget)
+	{
+		ShellWidget->RefreshShell();
+	}
 }
 
 void AMatterFluxPlayerController::OnRep_PlayerState()
@@ -165,6 +306,10 @@ void AMatterFluxPlayerController::OnRep_PlayerState()
 	if (PlayerStatusHud)
 	{
 		PlayerStatusHud->RefreshStatus();
+	}
+	if (ShellWidget)
+	{
+		ShellWidget->RefreshShell();
 	}
 }
 
@@ -240,6 +385,18 @@ void AMatterFluxPlayerController::SetupInputComponent()
 	}
 
 	EnhancedInputComponent->BindAction(InputAction, ETriggerEvent::Started, this, &AMatterFluxPlayerController::HandleDebugDamageInput);
+}
+
+void AMatterFluxPlayerController::PlayerTick(const float DeltaTime)
+{
+	Super::PlayerTick(DeltaTime);
+	if (!IsLocalController()) return;
+	InteractionPromptRefreshRemaining -= DeltaTime;
+	if (InteractionPromptRefreshRemaining <= 0.0f)
+	{
+		InteractionPromptRefreshRemaining = 0.15f;
+		RefreshInteractionPrompt();
+	}
 }
 
 void AMatterFluxPlayerController::CreateMagicWorkbench()
@@ -329,21 +486,19 @@ void AMatterFluxPlayerController::CreateInteractionWidget()
 	}
 	InteractionWidget->InitializeForPlayer(this);
 	InteractionWidget->AddToPlayerScreen(30);
-	InteractionWidget->SetVisibility(ESlateVisibility::Collapsed);
+	InteractionWidget->SetVisibility(ESlateVisibility::HitTestInvisible);
+	InteractionWidget->SetInteractionPromptVisible(false);
 }
 
-void AMatterFluxPlayerController::TryInteract()
+AMatterFluxCreatureActor*
+AMatterFluxPlayerController::FindNearestInteractableCreature() const
 {
-	if (!IsLocalController() || IsShellMenuOpen() || IsMagicWorkbenchOpen()
-		|| (InteractionWidget && InteractionWidget->IsInteractionOpen()))
-	{
-		return;
-	}
 	APawn* Interactor = GetPawn();
-	if (!Interactor || !GetWorld()) return;
+	UWorld* World = GetWorld();
+	if (!Interactor || !World) return nullptr;
 	AMatterFluxCreatureActor* Nearest = nullptr;
 	float NearestDistanceSquared = FMath::Square(360.0f);
-	for (TActorIterator<AMatterFluxCreatureActor> It(GetWorld()); It; ++It)
+	for (TActorIterator<AMatterFluxCreatureActor> It(World); It; ++It)
 	{
 		AMatterFluxCreatureActor* Candidate = *It;
 		if (!Candidate || !Candidate->CanInteract(*Interactor)) continue;
@@ -355,6 +510,26 @@ void AMatterFluxPlayerController::TryInteract()
 			NearestDistanceSquared = DistanceSquared;
 		}
 	}
+	return Nearest;
+}
+
+void AMatterFluxPlayerController::RefreshInteractionPrompt()
+{
+	if (!InteractionWidget) CreateInteractionWidget();
+	if (!InteractionWidget || InteractionWidget->IsInteractionOpen()) return;
+	const bool bCanShow = !IsShellMenuOpen() && !IsMagicWorkbenchOpen()
+		&& FindNearestInteractableCreature() != nullptr;
+	InteractionWidget->SetInteractionPromptVisible(bCanShow);
+}
+
+void AMatterFluxPlayerController::TryInteract()
+{
+	if (!IsLocalController() || IsShellMenuOpen() || IsMagicWorkbenchOpen()
+		|| (InteractionWidget && InteractionWidget->IsInteractionOpen()))
+	{
+		return;
+	}
+	AMatterFluxCreatureActor* Nearest = FindNearestInteractableCreature();
 	if (Nearest) ServerInteract(Nearest);
 }
 
@@ -387,6 +562,25 @@ void AMatterFluxPlayerController::ClientOpenCreatureInteraction_Implementation(
 	InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
 	SetInputMode(InputMode);
 	bShowMouseCursor = true;
+}
+
+bool AMatterFluxPlayerController::OpenCreatureShopForVisualCapture(
+	AMatterFluxCreatureActor* Creature,
+	const FName DialogueId,
+	const FName ShopId)
+{
+	if (!IsLocalController() || !Creature || ShopId.IsNone()) return false;
+	if (!InteractionWidget) CreateInteractionWidget();
+	if (!InteractionWidget) return false;
+	if (ShellWidget && ShellWidget->IsMenuOpen()) ShellWidget->CloseMenus();
+	if (IsMagicWorkbenchOpen()) CloseMagicWorkbench();
+	InteractionWidget->OpenShop(Creature, DialogueId, ShopId);
+	FInputModeUIOnly InputMode;
+	InputMode.SetWidgetToFocus(InteractionWidget->TakeWidget());
+	InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+	SetInputMode(InputMode);
+	bShowMouseCursor = true;
+	return true;
 }
 
 void AMatterFluxPlayerController::RequestCreaturePurchase(
@@ -447,10 +641,9 @@ void AMatterFluxPlayerController::CloseCreatureInteraction()
 {
 	if (InteractionWidget)
 	{
-		InteractionWidget->SetVisibility(ESlateVisibility::Collapsed);
+		InteractionWidget->CloseInteraction();
 	}
-	SetInputMode(FInputModeGameOnly());
-	bShowMouseCursor = false;
+	ApplyGameplayMouseInputMode();
 }
 
 bool AMatterFluxPlayerController::IsMagicWorkbenchOpen() const
@@ -607,8 +800,7 @@ void AMatterFluxPlayerController::CloseMagicWorkbench()
 	{
 		MagicWorkbench->SetVisibility(ESlateVisibility::Collapsed);
 	}
-	SetInputMode(FInputModeGameOnly());
-	bShowMouseCursor = false;
+	ApplyGameplayMouseInputMode();
 }
 
 bool AMatterFluxPlayerController::IsShellMenuOpen() const
@@ -928,8 +1120,7 @@ void AMatterFluxPlayerController::HandleShellStateChanged(
 	}
 	else
 	{
-		SetInputMode(FInputModeGameOnly());
-		bShowMouseCursor = false;
+		ApplyGameplayMouseInputMode();
 	}
 }
 

@@ -75,6 +75,43 @@ namespace
 			WorldTransform.ToMatrixWithScale());
 	}
 
+	double ComputeClosestSolidCellDistanceSquared(
+		const FFragmentSourceMask& Mask,
+		const FTransform& WorldTransform,
+		const FVector& WorldLocation)
+	{
+		if (!Mask.IsValid()
+			|| !WorldTransform.IsValid()
+			|| WorldLocation.ContainsNaN())
+		{
+			return TNumericLimits<double>::Max();
+		}
+		double BestDistanceSquared = TNumericLimits<double>::Max();
+		for (int32 Index = 0; Index < Mask.SolidMask.Num(); ++Index)
+		{
+			if (Mask.SolidMask[Index] == 0)
+			{
+				continue;
+			}
+			const int32 X = Index % Mask.Width;
+			const int32 Z = Index / Mask.Width;
+			const FVector LocalCellCenter(
+				(static_cast<float>(X) + 0.5f
+					- static_cast<float>(Mask.Width) * 0.5f)
+					* Mask.CellSize,
+				0.0f,
+				(static_cast<float>(Z) + 0.5f
+					- static_cast<float>(Mask.Height) * 0.5f)
+					* Mask.CellSize);
+			BestDistanceSquared = FMath::Min(
+				BestDistanceSquared,
+				FVector::DistSquared(
+					WorldTransform.TransformPosition(LocalCellCenter),
+					WorldLocation));
+		}
+		return BestDistanceSquared;
+	}
+
 	const FMatterFluxReactionDefinition* FindReactionRule(
 		const FMatterFluxContentRegistry& Registry,
 		const FName InputMaterial,
@@ -580,19 +617,150 @@ bool AFragment2DActor::TryAcceptWorldCut(
 	if ((GetWorld() && GetWorld()->IsGameWorld() && !HasAuthority())
 		|| IsActorBeingDestroyed()
 		|| IsCutFadeActive()
-		|| CutsBeforeFade <= 0
-		|| !FMath::IsFinite(CutExhaustionFadeDuration)
-		|| CutExhaustionFadeDuration <= 0.0f
 		|| !DoesCutShapeIntersect(CutShape))
 	{
 		return false;
 	}
 
-	AcceptedCutCount = FMath::Min(AcceptedCutCount + 1, CutsBeforeFade);
-	if (AcceptedCutCount >= CutsBeforeFade)
+	const bool bWasSimulating = MeshComponent->IsSimulatingPhysics();
+	const FTransform PreservedBodyTransform =
+		MeshComponent->GetComponentTransform();
+	const FVector PreservedLinearVelocity = bWasSimulating
+		? MeshComponent->GetPhysicsLinearVelocity()
+		: SpawnPayload.InitialLinearVelocity;
+	const FVector PreservedAngularVelocity = bWasSimulating
+		? MeshComponent->GetPhysicsAngularVelocityInDegrees()
+		: SpawnPayload.InitialAngularVelocity;
+
+	const FFragmentAggregateSourceState PreviousRootState =
+		RootReactionState;
+	const TArray<FFragmentAggregateSourceState> PreviousAggregateSources =
+		AggregateSources;
+	const FFragmentSourceMask PreviousDetachedMask =
+		SpawnPayload.DetachedVoxelMask;
+
+	const auto ApplyCutToMask = [&CutShape](
+		FFragmentSourceMask& Mask,
+		const FTransform& MaskWorldTransform)
 	{
-		ActiveCutFadeDuration = CutExhaustionFadeDuration;
-		SynchronizeCutFadeState();
+		if (!Mask.IsValid() || !MaskWorldTransform.IsValid())
+		{
+			return false;
+		}
+		FFragmentDamageShape LocalShape = CutShape;
+		LocalShape.WorldTransform = CutShape.WorldTransform.GetRelativeTransform(
+			MaskWorldTransform);
+		return MatterFlux::FragmentGeometry::ApplyDamageShape(
+			Mask.SolidMask,
+			Mask.Width,
+			Mask.Height,
+			Mask.CellSize,
+			LocalShape);
+	};
+	const auto ApplyCutToState = [&ApplyCutToMask](
+		FFragmentAggregateSourceState& State,
+		const FTransform& StateWorldTransform)
+	{
+		if (!State.IsValid()
+			|| !ApplyCutToMask(State.SourceMask, StateWorldTransform))
+		{
+			return false;
+		}
+		ApplyCutToMask(State.OutputMask, StateWorldTransform);
+		ApplyCutToMask(State.ActiveMask, StateWorldTransform);
+		++State.Revision;
+		return true;
+	};
+
+	bool bChanged = false;
+	if (RootReactionState.IsValid())
+	{
+		bChanged |= ApplyCutToState(
+			RootReactionState,
+			GetActorTransform());
+	}
+	else if (SpawnPayload.DetachedVoxelMask.IsValid())
+	{
+		bChanged |= ApplyCutToMask(
+			SpawnPayload.DetachedVoxelMask,
+			GetActorTransform());
+	}
+	for (FFragmentAggregateSourceState& Source : AggregateSources)
+	{
+		bChanged |= ApplyCutToState(
+			Source,
+			Source.LocalTransform * GetActorTransform());
+	}
+	if (!bChanged)
+	{
+		// Legacy triangulated debris has no retained material mask to edit.
+		// It must still react on the first exact hit instead of silently
+		// accumulating invisible durability counters.
+		if (!RootReactionState.SourceMask.HasValidLayout()
+			&& !SpawnPayload.DetachedVoxelMask.HasValidLayout()
+			&& AggregateSources.IsEmpty())
+		{
+			AcceptedCutCount = FMath::Min(AcceptedCutCount + 1, MAX_int32);
+			ActiveCutFadeDuration = FMath::Max(
+				CutExhaustionFadeDuration,
+				0.05f);
+			SynchronizeCutFadeState();
+			ForceNetUpdate();
+			return true;
+		}
+		return false;
+	}
+
+	const auto StateHasMaterial = [](
+		const FFragmentAggregateSourceState& State)
+	{
+		return State.SourceMask.SolidMask.Contains(1)
+			|| (State.bHasReactionState
+				&& State.OutputMask.SolidMask.Contains(1));
+	};
+	const bool bHasRemainingMaterial =
+		StateHasMaterial(RootReactionState)
+		|| AggregateSources.ContainsByPredicate(StateHasMaterial)
+		|| (!RootReactionState.SourceMask.HasValidLayout()
+			&& SpawnPayload.DetachedVoxelMask.SolidMask.Contains(1));
+	if (!bHasRemainingMaterial)
+	{
+		AcceptedCutCount = FMath::Min(AcceptedCutCount + 1, MAX_int32);
+		MeshComponent->SetSimulatePhysics(false);
+		MeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		ForceNetUpdate();
+		Destroy();
+		return true;
+	}
+
+	RefreshBuoyancyDensity();
+	if (!RebuildMeshFromPayload())
+	{
+		RootReactionState = PreviousRootState;
+		AggregateSources = PreviousAggregateSources;
+		SpawnPayload.DetachedVoxelMask = PreviousDetachedMask;
+		RefreshBuoyancyDensity();
+		RebuildMeshFromPayload();
+		return false;
+	}
+
+	AcceptedCutCount = FMath::Min(AcceptedCutCount + 1, MAX_int32);
+	if (bWasSimulating
+		&& MeshComponent->GetCollisionEnabled()
+			!= ECollisionEnabled::NoCollision)
+	{
+		MeshComponent->SetWorldTransform(
+			PreservedBodyTransform,
+			false,
+			nullptr,
+			ETeleportType::TeleportPhysics);
+		if (!MeshComponent->IsSimulatingPhysics())
+		{
+			MeshComponent->SetSimulatePhysics(true);
+		}
+		MeshComponent->SetPhysicsLinearVelocity(PreservedLinearVelocity);
+		MeshComponent->SetPhysicsAngularVelocityInDegrees(
+			PreservedAngularVelocity);
 	}
 	ForceNetUpdate();
 	return true;
@@ -854,14 +1022,16 @@ bool AFragment2DActor::ApplyMaterialStimulusAtWorldLocation(
 		&& RootReactionState.SourceMask.SolidMask.Contains(1)
 		&& !IsRootReacting())
 	{
-		const FBox Bounds = BuildMaskWorldBounds(
-			RootReactionState.SourceMask,
-			GetActorTransform());
-		if (Bounds.IsValid)
+		const double DistanceSquared =
+			ComputeClosestSolidCellDistanceSquared(
+				RootReactionState.SourceMask,
+				GetActorTransform(),
+				WorldLocation);
+		if (FMath::IsFinite(DistanceSquared))
 		{
 			Candidates.Add({
 				RootReactionState.SourceId,
-				Bounds.ComputeSquaredDistanceToPoint(WorldLocation),
+				DistanceSquared,
 				true});
 		}
 	}
@@ -873,14 +1043,16 @@ bool AFragment2DActor::ApplyMaterialStimulusAtWorldLocation(
 		{
 			continue;
 		}
-		const FBox Bounds = BuildMaskWorldBounds(
-			Source.SourceMask,
-			Source.LocalTransform * GetActorTransform());
-		if (Bounds.IsValid)
+		const double DistanceSquared =
+			ComputeClosestSolidCellDistanceSquared(
+				Source.SourceMask,
+				Source.LocalTransform * GetActorTransform(),
+				WorldLocation);
+		if (FMath::IsFinite(DistanceSquared))
 		{
 			Candidates.Add({
 				Source.SourceId,
-				Bounds.ComputeSquaredDistanceToPoint(WorldLocation),
+				DistanceSquared,
 				false});
 		}
 	}
@@ -2485,7 +2657,7 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 		&& !SpawnPayload.MaterialId.IsNone();
 	const bool bUseRootReactionState = bIncludeRootVoxel
 		&& RootReactionState.SourceId == SpawnPayload.FragmentId
-		&& RootReactionState.IsValid();
+		&& RootReactionState.SourceMask.HasValidLayout();
 	const FFragmentSourceMask& RootRenderMask = bUseRootReactionState
 		? RootReactionState.SourceMask
 		: SpawnPayload.DetachedVoxelMask;
@@ -3018,14 +3190,65 @@ bool AFragment2DActor::RebuildSimpleCollision()
 
 	if (SpawnPayload.bEnableCollision)
 	{
-		for (const FFragmentContour& Contour : SpawnPayload.CollisionContours)
+		const bool bUseCutRootMask =
+			RootReactionState.SourceMask.HasValidLayout()
+			&& SpawnPayload.DetachedVoxelMask.GeometryStyle
+				== EFragmentSourceGeometryStyle::VoxelBlocks;
+		if (bUseCutRootMask)
 		{
-			AddContour(Contour, SpawnPayload.Thickness, FTransform::Identity);
+			TArray<uint8> CollisionMask =
+				RootReactionState.SourceMask.SolidMask;
+			if (RootReactionState.bHasReactionState
+				&& RootReactionState.OutputMask.SolidMask.Num()
+					== CollisionMask.Num())
+			{
+				for (int32 Index = 0; Index < CollisionMask.Num(); ++Index)
+				{
+					CollisionMask[Index] = CollisionMask[Index] != 0
+						|| RootReactionState.OutputMask.SolidMask[Index] != 0
+						? 1
+						: 0;
+				}
+			}
+			if (CollisionMask.Contains(1))
+			{
+				MatterFlux::FragmentGeometry::FFragmentGeometry2D Geometry;
+				if (!MatterFlux::FragmentGeometry::BuildFragmentGeometryFromMask(
+					CollisionMask,
+					RootReactionState.SourceMask.Width,
+					RootReactionState.SourceMask.Height,
+					RootReactionState.SourceMask.CellSize,
+					Geometry))
+				{
+					MeshComponent->SetCollisionEnabled(
+						ECollisionEnabled::NoCollision);
+					return false;
+				}
+				for (const FFragmentContour& Contour : Geometry.CollisionContours)
+				{
+					AddContour(
+						Contour,
+						RootReactionState.SourceMask.CellSize,
+						FTransform::Identity);
+				}
+			}
+		}
+		else
+		{
+			for (const FFragmentContour& Contour : SpawnPayload.CollisionContours)
+			{
+				AddContour(
+					Contour,
+					SpawnPayload.Thickness,
+					FTransform::Identity);
+			}
 		}
 	}
 	for (const FFragmentAggregateSourceState& Source : AggregateSources)
 	{
-		if (!Source.bEnableCollision)
+		if (!Source.bEnableCollision
+			|| !Source.SourceMask.HasValidLayout()
+			|| !Source.SourceMask.SolidMask.Contains(1))
 		{
 			continue;
 		}
@@ -3042,8 +3265,7 @@ bool AFragment2DActor::RebuildSimpleCollision()
 			}
 		}
 		MatterFlux::FragmentGeometry::FFragmentGeometry2D Geometry;
-		if (!Source.IsValid()
-			|| !MatterFlux::FragmentGeometry::BuildFragmentGeometryFromMask(
+		if (!MatterFlux::FragmentGeometry::BuildFragmentGeometryFromMask(
 				CollisionMask,
 				Source.SourceMask.Width,
 				Source.SourceMask.Height,

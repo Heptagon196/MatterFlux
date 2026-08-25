@@ -553,17 +553,62 @@ bool FMatterFluxLiquidSurfaceSeparatesAbruptCurrentStepTest::RunTest(
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FMatterFluxLiquidSurfaceBoundsTransitiveHeightBandsTest,
-	"MatterFlux.Playable.Liquid.SurfaceProjectionBoundsTransitiveHeightBands",
+	FMatterFluxLiquidSurfaceKeepsGradualRiverContinuousTest,
+	"MatterFlux.Playable.Liquid.SurfaceProjectionKeepsGradualRiverContinuous",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 
-bool FMatterFluxLiquidSurfaceBoundsTransitiveHeightBandsTest::RunTest(
+bool FMatterFluxLiquidSurfaceKeepsGradualRiverContinuousTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	using MatterFlux::Material::FCellSnapshot;
+	TArray<FCellSnapshot> Cells;
+	for (int32 X = 0; X < 12; ++X)
+	{
+		Cells.Add({ FIntPoint(X, 0), TEXT("water"),
+			static_cast<int16>(X * 8), 255 });
+	}
+
+	MatterFlux::Rendering::FLiquidSurfaceProjection Projection;
+	MatterFlux::Rendering::BuildLiquidSurfaceProjection(
+		Cells,
+		16.0f,
+		128.0f,
+		Projection);
+
+	TestEqual(
+		TEXT("A river whose local steps are gentle remains one continuous surface"),
+		Projection.SurfacePatchCount,
+		1);
+	for (int32 TriangleIndex = 0;
+		TriangleIndex + 2 < Projection.TopTriangleIndexCount;
+		TriangleIndex += 3)
+	{
+		const float Height0 = Projection.Vertices[
+			Projection.Triangles[TriangleIndex]].Z;
+		const float Height1 = Projection.Vertices[
+			Projection.Triangles[TriangleIndex + 1]].Z;
+		const float Height2 = Projection.Vertices[
+			Projection.Triangles[TriangleIndex + 2]].Z;
+		TestTrue(TEXT("Every river triangle follows only its local gentle slope"),
+			FMath::Max3(Height0, Height1, Height2)
+				- FMath::Min3(Height0, Height1, Height2) <= 8.01f);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxLiquidSurfacePreservesTransitiveGentleSlopeTest,
+	"MatterFlux.Playable.Liquid.SurfaceProjectionPreservesTransitiveGentleSlope",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxLiquidSurfacePreservesTransitiveGentleSlopeTest::RunTest(
 	const FString& Parameters)
 {
 	using MatterFlux::Material::FCellSnapshot;
-	// Every link around this 2x2 loop differs by at most 16cm, but the complete
-	// transitive component spans 48cm. Pairwise flood filling merges all four
-	// and makes the shared center corner 24cm above the lowest cell.
+	// Every traversable link around this 2x2 loop differs by at most 16cm. The
+	// complete component spans 48cm, but the water surface is still one locally
+	// gentle slope rather than several bands with artificial internal walls.
 	TArray<FCellSnapshot> Cells;
 	Cells.Add({ FIntPoint(0, 0), TEXT("water"), 0, 255 });
 	Cells.Add({ FIntPoint(1, 0), TEXT("water"), 16, 255 });
@@ -577,8 +622,8 @@ bool FMatterFluxLiquidSurfaceBoundsTransitiveHeightBandsTest::RunTest(
 		128.0f,
 		Projection);
 
-	TestTrue(TEXT("Transitive staircase is split into bounded height bands"),
-		Projection.SurfacePatchCount >= 2);
+	TestEqual(TEXT("Transitive locally gentle staircase stays connected"),
+		Projection.SurfacePatchCount, 1);
 	for (int32 TriangleIndex = 0;
 		TriangleIndex + 2 < Projection.TopTriangleIndexCount;
 		TriangleIndex += 3)
@@ -589,7 +634,7 @@ bool FMatterFluxLiquidSurfaceBoundsTransitiveHeightBandsTest::RunTest(
 			Projection.Triangles[TriangleIndex + 1]].Z;
 		const float Height2 = Projection.Vertices[
 			Projection.Triangles[TriangleIndex + 2]].Z;
-		TestTrue(TEXT("No triangle exceeds one continuous height band"),
+		TestTrue(TEXT("No triangle exceeds one local continuous step"),
 			FMath::Max3(Height0, Height1, Height2)
 				- FMath::Min3(Height0, Height1, Height2) <= 32.01f);
 	}

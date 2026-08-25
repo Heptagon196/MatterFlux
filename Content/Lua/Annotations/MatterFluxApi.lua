@@ -23,6 +23,7 @@
 ---@field phase? MatterFluxMaterialPhase 物态，默认 static。
 ---@field mobility? integer 每步移动意愿，范围 0～255。
 ---@field dispersion? integer 横向扩散意愿，范围 0～255。
+---@field movement_resistance? number 浸入该物质后的移动阻力倍率，范围 0～8；液体和粉末使用。
 ---@field lifetime_steps? integer 存在的固定模拟步数，范围 0～255；0 表示不会自行消散。
 ---@field shallow_opacity? number 浅水不透明度，范围 0～1。
 ---@field deep_opacity? number 深水不透明度，范围 0～1，且不小于 shallow_opacity。
@@ -101,8 +102,11 @@
 ---@field radius? number 投射物碰撞半径，单位为 UE 单位。
 ---@field gravity_scale? number 飞行阶段承受的世界重力比例；命中并转入材质世界后不再生效。
 ---@field body_material? MatterFluxContentId 飞行中组成投射物体素球的材质 ID；留空使用普通投射物外观。
----@field material_amount? integer 投射物携带、并在碰撞或寿命结束时交给物质模拟的材质格数量，范围 1～64，默认 1。
+---@field material_amount? integer 投射物携带、并在碰撞或寿命结束时交给物质模拟的材质格数量，范围 1～4096，默认 1。
 ---@field visual_shape? MatterFluxProjectileVisualShape 投射物外形；默认 orb。
+---@field spawn_forward_offset? number 沿本次施法方向追加的生成距离，单位为 UE 单位。
+---@field spawn_height_offset? number 相对施法者向上追加的生成高度，单位为 UE 单位。
+---@field spawn_stationary? boolean 生成时不带水平初速度，仅由重力等后续运动驱动。
 ---@field cast_delay? number 对当前轮施法间隔的增量，单位为秒。
 ---@field recharge_time? number 对法杖充能时间的增量，单位为秒。
 
@@ -207,6 +211,7 @@
 ---@field kill_enemies fun(parameters?: MatterFluxQuestObjectiveParameters) 追踪击杀指定敌人或等级敌人的数量。
 ---@field spend_item fun(parameters?: MatterFluxQuestObjectiveParameters) 追踪消费指定物品的数量，例如商店付款。
 ---@field never fun() 当前任务不靠事件直接完成，通常作为纯容器父任务。
+---@field spawn_creature fun(creature_id: MatterFluxContentId, marker_id: MatterFluxContentId) 任务激活时在当前地图的指定稳定 marker 生成一个生物。
 ---@field activation_reward fun(kind: MatterFluxRewardKind, id: MatterFluxContentId, quantity?: integer, equipment_slot?: integer) 任务激活时由服务器发放奖励。
 ---@field reward fun(kind: MatterFluxRewardKind, id: MatterFluxContentId, quantity?: integer, equipment_slot?: integer) 任务完成时由服务器发放奖励。
 
@@ -222,6 +227,7 @@
 ---@field width? number 碰撞和占位宽度，单位为 UE 单位。
 ---@field height? number 碰撞和占位高度，单位为 UE 单位。
 ---@field density? number 生物体积密度；低于所在液体材质密度时上浮，高于时下沉。
+---@field wait_for_first_sight? boolean 为 true 时，在首次看到玩家前保持静止；首次看到后永久按行为树运行。
 ---@field color_r? number 基础显示颜色的红色分量，通常为 0～1。
 ---@field color_g? number 基础显示颜色的绿色分量，通常为 0～1。
 ---@field color_b? number 基础显示颜色的蓝色分量，通常为 0～1。
@@ -276,7 +282,6 @@
 ---@field action fun(name: MatterFluxCreatureBehaviorAction, parameters?: MatterFluxCreaturePatrolAction|MatterFluxCreatureCastAction): MatterFluxCreatureBehaviorNode 创建服务器权威动作，动作参数与使用位置保持在一起。
 ---@field tree fun(definition: MatterFluxCreatureBehaviorTree) 提交完整行为树；树在内容包加载时编译，运行时不再调用 Lua。
 ---@field drop fun(item_id: MatterFluxContentId, count?: integer) 设置死亡时掉落的物品 ID 和数量。
----@field spawn_on_quest fun(quest_id: MatterFluxContentId?, count?: integer, distance?: number) 设置任务激活后生成的数量和距玩家的生成距离；quest_id 为空表示常驻生成。
 
 ---@class MatterFluxCreatureNamespace
 ---@field define fun(metadata: MatterFluxCreatureMetadata, build_ai: fun(api: MatterFluxCreatureBuilder)) 注册生物数据并把受限 AI 描述编译为 C++ 可解释程序。
@@ -310,6 +315,10 @@
 ---@field id MatterFluxContentId 商店配置的稳定唯一 ID。
 ---@field name string UI 标题中显示的商店名称。
 
+---@class MatterFluxShopCategory
+---@field id MatterFluxContentId 页签在该商店内使用的稳定唯一 ID。
+---@field name string 页签上显示的名称。
+
 ---@class MatterFluxShopOffer
 ---@field kind MatterFluxShopProductKind 商品是物品、法术卡还是法杖。
 ---@field product_id MatterFluxContentId 售出内容的 ID。
@@ -317,8 +326,10 @@
 ---@field cost_item MatterFluxContentId 用作货币的物品 ID。
 ---@field cost_count? integer 每次购买消耗的货币数量。
 ---@field limit? integer 每名玩家可购买次数；负数表示不限次数。
+---@field category? MatterFluxContentId 报价所属的自定义页签；省略时仅出现在“全部”。
 
 ---@class MatterFluxShopBuilder
+---@field category fun(parameters: MatterFluxShopCategory) 追加一个有序的自定义分类页签。
 ---@field offer fun(parameters: MatterFluxShopOffer) 向商店商品列表中追加一个报价。
 
 ---@class MatterFluxShopNamespace
@@ -338,6 +349,7 @@
 ---@field fill_rectangle fun(material_id: MatterFluxContentId, min_x: integer, min_y: integer, max_x: integer, max_y: integer) 用材质填充闭区间矩形；后声明的填充覆盖先声明的填充。
 ---@field fill_circle fun(material_id: MatterFluxContentId, center_x: integer, center_y: integer, radius: integer) 用材质填充圆形截面；半径范围为 1～128 格。
 ---@field marker fun(id: MatterFluxContentId, x: integer, y: integer) 添加稳定命名位置，供出生点、镜头和自动化断言查询。
+---@field spawn_creature fun(creature_id: MatterFluxContentId, marker_id: MatterFluxContentId) 地图开始时在指定稳定 marker 生成一个常驻生物；任务波次应由 Quest Builder 声明。
 ---@field scene_box fun(id: MatterFluxContentId, material_id: MatterFluxContentId, center_x: number, center_y: number, center_z: number, size_x: number, size_y: number, size_z: number, collision?: boolean) 添加水平游戏场景中的静态盒；中心和尺寸均以地图格为单位，可选择启用碰撞。
 ---@field camera fun(id: MatterFluxContentId, location_x: number, location_y: number, location_z: number, target_x: number, target_y: number, target_z: number, field_of_view: number) 添加透视验收相机；位置和目标以地图格为单位。
 ---@field tilting_container fun(definition: MatterFluxTiltingContainerDefinition) 添加一个装满液体、按固定步数倾斜的三维容器；测试与游戏表现共用同一配置。

@@ -1,5 +1,6 @@
 #include "Material/MatterFluxReaction.h"
 #include "Material/MatterFluxGroundReactionRuntime.h"
+#include "Material/MatterFluxMaterialContactGeometry.h"
 #include "Material/MatterFluxSourceReactionRuntime.h"
 #include "Fragment/Fragment2DActor.h"
 #include "Fragment/Fragment2DSourceActor.h"
@@ -21,6 +22,95 @@
 #include "Tests/AutomationEditorCommon.h"
 
 #include <limits>
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxMaterialContactGeometryPhaseTest,
+	"MatterFlux.Reaction.MaterialContactGeometrySeparatesGasFromLiquid",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxMaterialContactGeometryPhaseTest::RunTest(
+	const FString& Parameters)
+{
+	constexpr float CellSize = 8.0f;
+	constexpr float LiquidColumnHeight = 128.0f;
+	const MatterFlux::Material::FMaterialContactGeometry Fire =
+		MatterFlux::Material::BuildMaterialContactGeometry(
+			EMatterFluxMaterialPhase::Gas,
+			CellSize,
+			LiquidColumnHeight);
+	const MatterFlux::Material::FMaterialContactGeometry Acid =
+		MatterFlux::Material::BuildMaterialContactGeometry(
+			EMatterFluxMaterialPhase::Liquid,
+			CellSize,
+			LiquidColumnHeight);
+
+	TestTrue(TEXT("Gas and liquid contact geometries are valid"),
+		Fire.IsValid() && Acid.IsValid());
+	TestEqual(TEXT("A fire cell uses one material-cell height"),
+		Fire.ColumnHeight, CellSize);
+	TestEqual(TEXT("A fire cell contact radius stays local"),
+		Fire.RadialContactRadius, CellSize * 0.52f);
+	TestEqual(TEXT("Fire cannot reach ground through liquid-column tolerance"),
+		Fire.GroundVerticalTolerance, CellSize);
+	TestEqual(TEXT("Acid retains the authored liquid column height"),
+		Acid.ColumnHeight, LiquidColumnHeight);
+	TestEqual(TEXT("Acid retains liquid-column contact radius"),
+		Acid.RadialContactRadius, LiquidColumnHeight * 0.5f);
+	TestEqual(TEXT("Acid retains liquid ground-contact tolerance"),
+		Acid.GroundVerticalTolerance, LiquidColumnHeight);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxGroundRepeatedStimulusTest,
+	"MatterFlux.Reaction.GroundRuntimeRepeatedContactDoesNotJumpToNeighbor",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxGroundRepeatedStimulusTest::RunTest(
+	const FString& Parameters)
+{
+	FFragmentSourceMask Mask;
+	Mask.Width = 64;
+	Mask.Height = 64;
+	Mask.CellSize = 8.0f;
+	Mask.SolidMask.Init(1, Mask.Width * Mask.Height);
+	FMatterFluxReactionDefinition Rule;
+	Rule.Id = TEXT("ground_repeated_fire_contact");
+	Rule.InputA = TEXT("grassland");
+	Rule.InputB = TEXT("fire");
+	Rule.OutputA = TEXT("ash");
+	Rule.ChancePermille = 1000;
+	Rule.PropagationChancePermille = 0;
+	Rule.DurationSteps = 8;
+
+	MatterFlux::Reaction::FGroundRuntimeSettings Settings;
+	Settings.Width = Mask.Width;
+	Settings.Height = Mask.Height;
+	MatterFlux::Reaction::FGroundReactionRuntime Runtime;
+	FString Error;
+	if (!TestTrue(TEXT("Ground runtime initializes"),
+		Runtime.Initialize(Settings, Mask, Rule, 1337, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	const FIntPoint Contact(32, 32);
+	FIntPoint ActivatedCell = FIntPoint::ZeroValue;
+	TestTrue(TEXT("First fire contact activates its requested ground cell"),
+		Runtime.ActivateNearestInput(Contact, TEXT("fire"), 5, ActivatedCell));
+	TestEqual(TEXT("The requested cell is selected first"),
+		ActivatedCell, Contact);
+	TestFalse(TEXT("Repeated contact does not select a neighboring fuel cell"),
+		Runtime.ActivateNearestInput(Contact, TEXT("fire"), 5, ActivatedCell));
+	TArray<int32> ActiveCells;
+	Runtime.GatherActiveCellIndices(ActiveCells);
+	TestEqual(TEXT("Only one ground cell remains active"),
+		ActiveCells.Num(), 1);
+	return true;
+}
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxUnifiedSmokeVisualPoolTest,
@@ -211,6 +301,62 @@ bool FMatterFluxSourceReactionFrontBudgetTest::RunTest(
 	TestEqual(TEXT("The bounded front still performs one deterministic step"),
 		Result.Steps,
 		1);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxSourceReactionBudgetCompletesConnectedMaskTest,
+	"MatterFlux.Reaction.SourceRuntimeBudgetDoesNotOrphanConnectedCells",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxSourceReactionBudgetCompletesConnectedMaskTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	FFragmentSourceMask Mask;
+	Mask.Width = 5;
+	Mask.Height = 5;
+	Mask.CellSize = 4.0f;
+	Mask.SolidMask.Init(1, Mask.Width * Mask.Height);
+
+	FMatterFluxReactionDefinition Rule;
+	Rule.Id = TEXT("budgeted_connected_reaction");
+	Rule.InputA = TEXT("leaf");
+	Rule.InputB = TEXT("fire");
+	Rule.OutputA = TEXT("ash");
+	Rule.OutputB = TEXT("fire");
+	Rule.EmissionMaterial = TEXT("smoke");
+	Rule.ChancePermille = 1000;
+	Rule.PropagationChancePermille = 1000;
+	Rule.EmissionChancePermille = 0;
+	Rule.DurationSteps = 3;
+
+	MatterFlux::Reaction::FSourceRuntimeSettings Settings;
+	Settings.MaxActivationsPerStep = 1;
+	MatterFlux::Reaction::FSourceReactionRuntime Runtime;
+	FString Error;
+	if (!TestTrue(TEXT("Budgeted connected mask initializes"),
+		Runtime.Initialize(Settings, Mask, Rule, 551, Error))
+		|| !TestTrue(TEXT("Center cell accepts the generic stimulus"),
+			Runtime.ActivateNearest(FIntPoint(2, 2), TEXT("fire"))))
+	{
+		AddError(Error);
+		return false;
+	}
+	for (int32 Step = 0; Step < 256 && Runtime.IsActive(); ++Step)
+	{
+		Runtime.AdvanceAuthority(Settings.StepSeconds);
+	}
+	int32 RemainingInputCells = 0;
+	for (const uint8 Cell : Runtime.GetInputMask())
+	{
+		RemainingInputCells += Cell != 0 ? 1 : 0;
+	}
+	TestFalse(TEXT("A finite connected reaction eventually completes"),
+		Runtime.IsActive());
+	TestEqual(TEXT("The front budget leaves no connected input island"),
+		RemainingInputCells, 0);
 	return true;
 }
 
@@ -1231,6 +1377,161 @@ bool FMatterFluxPlayableTreeReactionTest::RunTest(
 		WorldActor->GetReactedGroundCellCount()
 			< MatterFlux::PlayableLevel::TerrainCellsX
 				* MatterFlux::PlayableLevel::TerrainCellsY / 4);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxPlayableTreeTopCanopyReactionTest,
+	"MatterFlux.Reaction.PlayableTreeConsumesTopCanopy",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxPlayableTreeTopCanopyReactionTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* WorldActor =
+		World ? World->SpawnActor<AMatterFluxPlayableWorldActor>() : nullptr;
+	if (!TestNotNull(TEXT("Playable world spawns"), WorldActor))
+	{
+		return false;
+	}
+
+	const FMatterFluxContentRegistryPtr Registry =
+		IMatterFluxScriptRuntime::Get().GetActiveRegistry();
+	MatterFlux::PlayableLevel::FLevelLayout Layout;
+	if (!TestTrue(TEXT("Reference forest layout builds"),
+		MatterFlux::PlayableLevel::BuildLevelLayout(
+			1337,
+			Layout,
+			Registry.Get())))
+	{
+		return false;
+	}
+
+	const MatterFlux::PlayableLevel::FLevelFragmentSource* NearestWood =
+		nullptr;
+	double BestDistanceSquared = TNumericLimits<double>::Max();
+	FString BestId;
+	for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
+		: Layout.FragmentSources)
+	{
+		if (Source.MaterialId != TEXT("wood") || !Source.Mask.IsValid())
+		{
+			continue;
+		}
+		const double DistanceSquared = FVector::DistSquared(
+			Source.Transform.GetLocation(),
+			FVector::ZeroVector);
+		const FString CandidateId =
+			Source.SourceId.ToString(EGuidFormats::Digits);
+		if (!NearestWood || DistanceSquared < BestDistanceSquared
+			|| (DistanceSquared == BestDistanceSquared
+				&& CandidateId < BestId))
+		{
+			NearestWood = &Source;
+			BestDistanceSquared = DistanceSquared;
+			BestId = CandidateId;
+		}
+	}
+	if (!TestNotNull(TEXT("Nearest generated tree wood exists"), NearestWood))
+	{
+		return false;
+	}
+
+	TArray<const MatterFlux::PlayableLevel::FLevelFragmentSource*>
+		TopLeafSources;
+	double HighestLeafZ = -TNumericLimits<double>::Max();
+	for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
+		: Layout.FragmentSources)
+	{
+		if (Source.AggregateId != NearestWood->AggregateId
+			|| Source.MaterialId != TEXT("leaf")
+			|| !Source.Mask.IsValid())
+		{
+			continue;
+		}
+		const FVector HalfExtent(
+			Source.Mask.Width * Source.Mask.CellSize * 0.5f,
+			Source.Mask.CellSize,
+			Source.Mask.Height * Source.Mask.CellSize * 0.5f);
+		const FBox WorldBounds = FBox(-HalfExtent, HalfExtent).TransformBy(
+			Source.Transform.ToMatrixWithScale());
+		if (WorldBounds.Max.Z > HighestLeafZ + KINDA_SMALL_NUMBER)
+		{
+			HighestLeafZ = WorldBounds.Max.Z;
+			TopLeafSources.Reset();
+		}
+		if (FMath::IsNearlyEqual(WorldBounds.Max.Z, HighestLeafZ))
+		{
+			TopLeafSources.Add(&Source);
+		}
+	}
+	if (!TestTrue(TEXT("The nearest tree has a highest leaf layer"),
+		!TopLeafSources.IsEmpty()))
+	{
+		return false;
+	}
+
+	bool bEveryTopLeafBurned = true;
+	constexpr int32 EventSeeds[] = { 1, 7, 19, 73 };
+	for (const int32 EventSeed : EventSeeds)
+	{
+		WorldActor->Regenerate(1337);
+		if (!TestTrue(TEXT("The generated tree accepts fire stimulus"),
+			WorldActor->ApplyMaterialStimulusToFirstGeneratedTree(EventSeed)))
+		{
+			return false;
+		}
+		for (int32 Step = 0; Step < 60; ++Step)
+		{
+			WorldActor->Tick(0.1f);
+		}
+
+		for (const MatterFlux::PlayableLevel::FLevelFragmentSource* Source
+			: TopLeafSources)
+		{
+			int32 Revision = INDEX_NONE;
+			TArray<uint8> RuntimeMask;
+			if (!Source)
+			{
+				return false;
+			}
+			if (!WorldActor->GetFragmentSourceRuntimeState(
+				Source->SourceId,
+				Revision,
+				RuntimeMask))
+			{
+				continue;
+			}
+			int32 RemainingCells = 0;
+			FString RemainingCoordinates;
+			for (int32 CellIndex = 0; CellIndex < RuntimeMask.Num(); ++CellIndex)
+			{
+				if (RuntimeMask[CellIndex] == 0)
+				{
+					continue;
+				}
+				++RemainingCells;
+				RemainingCoordinates += FString::Printf(
+					TEXT(" (%d,%d)"),
+					CellIndex % Source->Mask.Width,
+					CellIndex / Source->Mask.Width);
+			}
+			if (RemainingCells > 0)
+			{
+				bEveryTopLeafBurned = false;
+				AddError(FString::Printf(
+					TEXT("Fire seed %d left %d cells%s in top leaf source %s at %s"),
+					EventSeed,
+					RemainingCells,
+					*RemainingCoordinates,
+					*Source->SourceId.ToString(EGuidFormats::Digits),
+					*Source->Transform.GetLocation().ToCompactString()));
+			}
+		}
+	}
+	TestTrue(TEXT("Fire consumes every top-canopy leaf cell"),
+		bEveryTopLeafBurned);
 	return true;
 }
 

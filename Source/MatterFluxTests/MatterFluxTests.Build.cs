@@ -29,6 +29,8 @@ public class MatterFluxTests : ModuleRules
 			"EnhancedInput",
 			"InputCore",
 			"PhysicsCore",
+			"Slate",
+			"SlateCore",
 			"UMG",
 			"ProceduralMeshComponent"
 		});

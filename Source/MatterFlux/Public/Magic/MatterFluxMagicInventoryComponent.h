@@ -237,6 +237,8 @@ public:
 		const FMatterFluxMagicInventorySaveState& State,
 		FString& OutError);
 	bool ResetToStarterLoadoutAuthority(FString& OutError);
+	/** Clears every owned/equipped spell and wand while retaining valid slots. */
+	bool ResetToEmptyLoadoutAuthority(FString& OutError);
 	bool ApplyQuestRewardsAuthority(
 		const TArray<FMatterFluxQuestRewardDefinition>& Rewards,
 		FString& OutError);

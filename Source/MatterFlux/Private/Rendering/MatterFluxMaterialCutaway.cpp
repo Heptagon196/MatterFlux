@@ -104,7 +104,7 @@ namespace
 				B.WorldBounds.Min.Z, B.WorldBounds.Max.Z) <= ContactTolerance;
 	}
 
-	bool SegmentIntersectsBox(
+	bool CutawaySegmentIntersectsBox(
 		const FVector& Start,
 		const FVector& End,
 		const FBox& Box)
@@ -147,7 +147,7 @@ namespace
 			|| Role == EMatterFluxMaterialStructuralRole::Floor;
 	}
 
-	void BuildViewerProbePoints(
+	void BuildCutawayViewerProbePoints(
 		const FVector& CameraLocation,
 		const FBox& ViewerBounds,
 		TArray<FVector, TInlineAllocator<5>>& OutPoints)
@@ -346,7 +346,7 @@ namespace MatterFlux::MaterialCutaway
 		}
 
 		TArray<FVector, TInlineAllocator<5>> ProbePoints;
-		BuildViewerProbePoints(CameraLocation, ViewerBounds, ProbePoints);
+		BuildCutawayViewerProbePoints(CameraLocation, ViewerBounds, ProbePoints);
 		TArray<int32, TInlineAllocator<32>> ConnectedNodeIndices;
 		for (int32 NodeIndex = 0; NodeIndex < Nodes.Num(); ++NodeIndex)
 		{
@@ -361,7 +361,7 @@ namespace MatterFlux::MaterialCutaway
 			const bool bBlocksViewer = ProbePoints.ContainsByPredicate(
 				[&CameraLocation, &ProbeBounds](const FVector& ProbePoint)
 				{
-					return SegmentIntersectsBox(
+					return CutawaySegmentIntersectsBox(
 						CameraLocation, ProbePoint, ProbeBounds);
 				});
 			if (bBlocksViewer)

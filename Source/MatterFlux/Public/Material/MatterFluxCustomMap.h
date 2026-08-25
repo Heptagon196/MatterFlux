@@ -7,6 +7,7 @@ struct FMatterFluxContentRegistry;
 namespace MatterFlux::Material
 {
 	class FChunkedMaterialWorld;
+	class FSimulationRuntime;
 
 	struct FCustomMapSceneBox
 	{
@@ -62,6 +63,20 @@ namespace MatterFlux::Material
 		const FMatterFluxContentRegistry& Registry,
 		int32 Seed,
 		FChunkedMaterialWorld& OutWorld,
+		FCustomMapScene& OutScene,
+		FString& OutError);
+
+	/**
+	 * Uses BuildCustomMap as the canonical compiler, then adopts its deterministic
+	 * state into the fixed-step runtime used by the playable world actor.
+	 */
+	MATTERFLUX_API bool BuildPlayableCustomMap(
+		FName MapId,
+		const FMatterFluxContentRegistry& Registry,
+		int32 Seed,
+		float StepSeconds,
+		int32 MaxStepsPerAdvance,
+		FSimulationRuntime& OutRuntime,
 		FCustomMapScene& OutScene,
 		FString& OutError);
 }

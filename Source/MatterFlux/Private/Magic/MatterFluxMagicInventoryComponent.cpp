@@ -8,7 +8,8 @@
 
 namespace MatterFluxMagicInventory
 {
-	constexpr int32 EquipmentSlotCount = 4;
+	constexpr int32 EquipmentSlotCount =
+		MatterFlux::Magic::EquipmentSlotCount;
 
 	FName ResolveRetiredSpellId(const FName SpellId)
 	{
@@ -105,7 +106,7 @@ namespace MatterFluxMagicInventory
 		if (CurrentEquippedWands.Num() != EquipmentSlotCount
 			|| !IsValidEquipmentSlot(ActiveEquipmentSlot))
 		{
-			OutError = TEXT("equipment state must contain exactly four valid wand slots");
+			OutError = TEXT("equipment state must contain exactly five valid wand slots");
 			return false;
 		}
 		if (!FMath::IsFinite(WandManaRestoreAmount)
@@ -190,6 +191,12 @@ namespace MatterFluxMagicInventory
 					PlayerSeed);
 				Wand.DefinitionId = Reward.ContentId;
 				Wand.SpellSlots.Init(NAME_None, Definition->Capacity);
+				for (int32 DeckIndex = 0;
+					DeckIndex < Definition->StarterDeck.Num(); ++DeckIndex)
+				{
+					Wand.SpellSlots[DeckIndex] =
+						Definition->StarterDeck[DeckIndex];
+				}
 				Wand.Mana = Definition->ManaMax;
 				Wand.LastManaUpdateServerTime = Now;
 				if (CopyIndex == 0 && Reward.EquipmentSlot != INDEX_NONE)
@@ -271,7 +278,7 @@ bool FMatterFluxMagicInventoryRules::ApplyEdit(
 	OutError.Reset();
 	if (EquippedWands.Num() != EquipmentSlotCount)
 	{
-		OutError = TEXT("equipment state must contain exactly four wand slots");
+		OutError = TEXT("equipment state must contain exactly five wand slots");
 		return false;
 	}
 
@@ -892,6 +899,28 @@ bool UMatterFluxMagicInventoryComponent::ResetToStarterLoadoutAuthority(
 		OutError = TEXT("starter loadout could not be initialized");
 		return false;
 	}
+	return true;
+}
+
+bool UMatterFluxMagicInventoryComponent::ResetToEmptyLoadoutAuthority(
+	FString& OutError)
+{
+	OutError.Reset();
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		OutError = TEXT("empty loadout reset requires authority");
+		return false;
+	}
+	OwnedSpells.Items.Reset();
+	OwnedWands.Items.Reset();
+	EquippedWands.Init(FGuid(), MatterFluxMagicInventory::EquipmentSlotCount);
+	ActiveEquipmentSlot = 0;
+	InventoryRevision = FMath::Max(InventoryRevision + 1, 1);
+	OwnedSpells.Owner = this;
+	OwnedWands.Owner = this;
+	MarkAllInventoryDirty();
+	InventoryChanged.Broadcast();
+	GetOwner()->ForceNetUpdate();
 	return true;
 }
 

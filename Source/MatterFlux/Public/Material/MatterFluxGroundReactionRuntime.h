@@ -62,6 +62,11 @@ namespace MatterFlux::Reaction
 		bool IsInitialized() const { return Simulation.IsValid(); }
 
 		bool Activate(FIntPoint Cell, FName StimulusMaterial);
+		bool ActivateNearestInput(
+			FIntPoint RequestedCell,
+			FName StimulusMaterial,
+			int32 MaximumSearchRadius,
+			FIntPoint& OutActivatedCell);
 		FGroundAdvanceResult AdvanceAuthority(float DeltaSeconds);
 		bool BuildInitialReplication(
 			TArray<FMatterFluxGroundStateChunk>& OutChunks,

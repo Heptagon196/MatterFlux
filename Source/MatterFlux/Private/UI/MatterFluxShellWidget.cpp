@@ -1,11 +1,14 @@
 #include "UI/MatterFluxShellWidget.h"
 #include "UI/MatterFluxShellSlate.h"
 
+#include "Game/MatterFluxPlayableWorldActor.h"
 #include "Game/MatterFluxPlayerController.h"
+#include "Game/MatterFluxPlayerState.h"
 #include "Engine/Engine.h"
 #include "InputCoreTypes.h"
 #include "Kismet/KismetSystemLibrary.h"
 #include "MatterFluxLog.h"
+#include "Progression/MatterFluxProgressionComponent.h"
 #include "Save/MatterFluxSaveSubsystem.h"
 #include "Save/MatterFluxSaveGame.h"
 
@@ -18,6 +21,24 @@ void UMatterFluxShellWidget::InitializeForPlayer(
 		&& GetWorld()->URL.HasOption(TEXT("MatterFluxHostSlot="));
 	SetIsFocusable(true);
 	RefreshShell();
+}
+
+int32 UMatterFluxShellWidget::ResolveOwnedCoinQuantity(
+	const AMatterFluxPlayerState* PlayerState)
+{
+	const UMatterFluxProgressionComponent* Progression = PlayerState
+		? PlayerState->GetProgression()
+		: nullptr;
+	return Progression
+		? FMath::Max(0, Progression->GetItemQuantity(TEXT("std.coin")))
+		: 0;
+}
+
+int32 UMatterFluxShellWidget::GetOwnedCoinQuantity() const
+{
+	return ResolveOwnedCoinQuantity(OwnerController
+		? OwnerController->GetPlayerState<AMatterFluxPlayerState>()
+		: nullptr);
 }
 
 AMatterFluxPlayerController* UMatterFluxShellWidget::GetMatterFluxController() const
@@ -220,6 +241,29 @@ void UMatterFluxShellWidget::RequestNewGame()
 	{
 		bCloseAfterSuccessfulOperation = true;
 		const bool bStarted = Save->RequestNewGame(OwnerController);
+		if (!bStarted
+			&& Save->GetOperation() == EMatterFluxSaveOperation::Failed)
+		{
+			TransientNotice = Save->GetLastResultMessage();
+			Save->AcknowledgeResult();
+			bCloseAfterSuccessfulOperation = false;
+		}
+		LastObservedOperation = Save->GetOperation();
+		RefreshShell();
+		NotifyControllerState(Save->IsBusy());
+	}
+}
+
+void UMatterFluxShellWidget::RequestStoryMode()
+{
+	CancelPendingJoinForSinglePlayer();
+	if (UMatterFluxSaveSubsystem* Save = GetSaveSubsystem())
+	{
+		bCloseAfterSuccessfulOperation = true;
+		const bool bStarted = Save->RequestStoryGame(
+			OwnerController,
+			GetStoryMapId(),
+			AMatterFluxPlayableWorldActor::PaperMagicStorySeed);
 		if (!bStarted
 			&& Save->GetOperation() == EMatterFluxSaveOperation::Failed)
 		{
@@ -442,6 +486,19 @@ void UMatterFluxShellWidget::RequestMagicWorkbench()
 	}
 }
 
+void UMatterFluxShellWidget::NativeConstruct()
+{
+	Super::NativeConstruct();
+	BindProgression();
+	RefreshShell();
+}
+
+void UMatterFluxShellWidget::NativeDestruct()
+{
+	UnbindProgression();
+	Super::NativeDestruct();
+}
+
 void UMatterFluxShellWidget::NativeTick(
 	const FGeometry& MyGeometry,
 	const float InDeltaTime)
@@ -520,7 +577,46 @@ void UMatterFluxShellWidget::ReleaseSlateResources(
 
 void UMatterFluxShellWidget::RefreshShell()
 {
+	BindProgression();
 	MatterFluxShellUI::RefreshShell(Shell);
+}
+
+UMatterFluxProgressionComponent*
+UMatterFluxShellWidget::ResolveProgression() const
+{
+	const AMatterFluxPlayerState* PlayerState = OwnerController
+		? OwnerController->GetPlayerState<AMatterFluxPlayerState>()
+		: nullptr;
+	return PlayerState ? PlayerState->GetProgression() : nullptr;
+}
+
+void UMatterFluxShellWidget::BindProgression()
+{
+	UMatterFluxProgressionComponent* Progression = ResolveProgression();
+	if (BoundProgression.Get() == Progression)
+	{
+		return;
+	}
+	UnbindProgression();
+	BoundProgression = Progression;
+	if (Progression)
+	{
+		ProgressionChangedHandle =
+			Progression->OnProgressionChanged().AddUObject(
+				this,
+				&UMatterFluxShellWidget::RefreshShell);
+	}
+}
+
+void UMatterFluxShellWidget::UnbindProgression()
+{
+	if (BoundProgression.IsValid() && ProgressionChangedHandle.IsValid())
+	{
+		BoundProgression->OnProgressionChanged().Remove(
+			ProgressionChangedHandle);
+	}
+	ProgressionChangedHandle.Reset();
+	BoundProgression.Reset();
 }
 
 void UMatterFluxShellWidget::NotifyControllerState(

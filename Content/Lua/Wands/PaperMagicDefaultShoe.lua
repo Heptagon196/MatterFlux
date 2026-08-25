@@ -1,5 +1,5 @@
--- The original foot-slot jump caster remains content-compatible while using
--- MatterFlux's uniform target-key binding model instead of a hard-coded slot.
+-- Space is a regular equipment key. Its starter caster uses the same generic
+-- wand program and GAS execution path as every other bound slot.
 content.register_wand({
 	id = "std.default_shoe",
 	name = "默认鞋型施法器",
@@ -13,5 +13,7 @@ content.register_wand({
 	mana_max = 100,
 	mana_recharge = 50,
 	spread = 0,
-	starter_count = 1
+	starter_count = 1,
+	starter_slot = 4,
+	starter_deck = { "std.jump" }
 })

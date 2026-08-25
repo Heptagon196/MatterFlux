@@ -37,10 +37,18 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Fragment")
 	int32 RequestWorldCut(const FFragmentWorldCutRequest& Request);
 
-	static bool ExecuteFragmentDamage(AFragment2DSourceActor* SourceActor, const FFragmentDamageEvent& DamageEvent);
+	static bool ExecuteFragmentDamage(
+		AFragment2DSourceActor* SourceActor,
+		const FFragmentDamageEvent& DamageEvent);
+	static bool ExecuteFragmentDamage(
+		AFragment2DSourceActor* SourceActor,
+		const FFragmentDamageEvent& DamageEvent,
+		AFragment2DActor** OutPrimaryCarrier);
 	static int32 ExecuteWorldCut(UWorld* World, const FFragmentWorldCutRequest& Request);
+	/** Runtime switch used by cut-path diagnostics. Toggle with mf.Fragment.CutLog 0|1. */
+	static bool IsCutLoggingEnabled();
 
-	void RegisterSourceActor(AFragment2DSourceActor& SourceActor);
+	bool RegisterSourceActor(AFragment2DSourceActor& SourceActor);
 	void UnregisterSourceActor(AFragment2DSourceActor& SourceActor);
 	void GatherSourcesInBounds(
 		const FBox& WorldBounds,

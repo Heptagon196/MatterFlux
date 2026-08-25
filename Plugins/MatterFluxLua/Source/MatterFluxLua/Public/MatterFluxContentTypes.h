@@ -2,6 +2,12 @@
 
 #include "CoreMinimal.h"
 
+namespace MatterFlux::Magic
+{
+	/** Physical equipment keys: left, right, Q, E, and Space. */
+	inline constexpr int32 EquipmentSlotCount = 5;
+}
+
 enum class EMatterFluxMaterialPhase : uint8
 {
 	StaticSolid,
@@ -35,6 +41,8 @@ struct FMatterFluxMaterialDefinition
 	EMatterFluxMaterialPhase Phase = EMatterFluxMaterialPhase::StaticSolid;
 	uint8 Mobility = 255;
 	uint8 Dispersion = 128;
+	/** 对浸入其中的角色/刚体施加的相对移动阻力倍率。 */
+	float MovementResistance = 1.0f;
 	/** 物质格存在的固定模拟步数；0 表示不会自行消散。 */
 	uint8 LifetimeSteps = 0;
 	/** 浅水处的透明度；0 完全透明，1 完全不透明。 */
@@ -207,6 +215,8 @@ struct FMatterFluxCreatureDefinition
 	float AttackRange = 650.0f;
 	float RetreatRange = 180.0f;
 	float TargetMemorySeconds = 5.0f;
+	/** Keep this creature idle until it sees a player for the first time. */
+	bool bWaitForFirstSight = false;
 	float PatrolTurnSeconds = 3.0f;
 	float PatrolPauseSeconds = 0.5f;
 	float AttackCooldown = 2.0f;
@@ -217,9 +227,6 @@ struct FMatterFluxCreatureDefinition
 	FName ShopId;
 	FName DropItemId;
 	int32 DropItemCount = 0;
-	FName SpawnQuestId;
-	int32 SpawnCount = 0;
-	float SpawnDistance = 600.0f;
 	FLinearColor Color = FLinearColor::White;
 };
 
@@ -257,6 +264,13 @@ enum class EMatterFluxShopProductKind : uint8
 	Wand
 };
 
+/** One author-defined, ordered filtering tab in a shop. */
+struct FMatterFluxShopCategoryDefinition
+{
+	FName Id;
+	FString DisplayName;
+};
+
 struct FMatterFluxShopOfferDefinition
 {
 	EMatterFluxShopProductKind ProductKind = EMatterFluxShopProductKind::Item;
@@ -265,12 +279,15 @@ struct FMatterFluxShopOfferDefinition
 	FName CostItemId;
 	int32 CostCount = 1;
 	int32 PurchaseLimit = INDEX_NONE;
+	/** Empty keeps the offer visible in the unfiltered catalog. */
+	FName CategoryId;
 };
 
 struct FMatterFluxShopDefinition
 {
 	FName Id;
 	FString DisplayName;
+	TArray<FMatterFluxShopCategoryDefinition> Categories;
 	TArray<FMatterFluxShopOfferDefinition> Offers;
 };
 
@@ -329,6 +346,12 @@ struct FMatterFluxSpellDefinition
 	FName BodyMaterial;
 	/** Number of body-material cells released into the simulation on impact. */
 	int32 MaterialAmount = 1;
+	/** Extra spawn distance along the current cast aim direction. */
+	float SpawnForwardOffset = 0.0f;
+	/** Extra world-up offset applied at spawn. */
+	float SpawnHeightOffset = 0.0f;
+	/** Suppresses the authored forward launch speed after placement. */
+	bool bSpawnStationary = false;
 	/** Uses a thin plane instead of the default compact projectile body. */
 	bool bUsePlaneVisual = false;
 	/** Plane visual is vertical and extends along travel; false keeps it horizontal. */
@@ -419,6 +442,13 @@ struct FMatterFluxQuestRewardDefinition
 	int32 EquipmentSlot = INDEX_NONE;
 };
 
+/** One explicit creature/marker instruction owned by a quest or custom map. */
+struct FMatterFluxCreatureSpawnDefinition
+{
+	FName CreatureId;
+	FName MarkerId;
+};
+
 /**
  * Immutable quest graph node compiled from Lua. Lua describes objectives and
  * rewards; authoritative C++ owns progress, ordering, replication and save IO.
@@ -442,6 +472,8 @@ struct FMatterFluxQuestDefinition
 	int32 EquipmentSlot = INDEX_NONE;
 	TArray<FName> Prerequisites;
 	TArray<FName> Subquests;
+	/** Spawned once when this quest becomes active. */
+	TArray<FMatterFluxCreatureSpawnDefinition> ActivationCreatureSpawns;
 	TArray<FMatterFluxQuestRewardDefinition> ActivationRewards;
 	TArray<FMatterFluxQuestRewardDefinition> CompletionRewards;
 };
@@ -541,6 +573,8 @@ struct FMatterFluxCustomMapDefinition
 	float MaterialDepthCells = 3.0f;
 	TArray<FMatterFluxCustomMapStampDefinition> Stamps;
 	TArray<FMatterFluxCustomMapMarkerDefinition> Markers;
+	/** Non-quest occupants created when this map becomes playable. */
+	TArray<FMatterFluxCreatureSpawnDefinition> InitialCreatureSpawns;
 	TArray<FMatterFluxCustomMapSceneBoxDefinition> SceneBoxes;
 	TArray<FMatterFluxCustomMapCameraDefinition> Cameras;
 	TArray<FMatterFluxCustomMapPourContainerDefinition> PourContainers;

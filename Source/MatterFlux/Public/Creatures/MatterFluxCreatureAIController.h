@@ -10,6 +10,12 @@ class AMatterFluxTwoStoreyHouseActor;
 
 namespace MatterFlux::Creatures
 {
+	/** True while an authored creature has never acquired its first target. */
+	MATTERFLUX_API bool ShouldWaitForFirstSight(
+		bool bWaitForFirstSight,
+		bool bHasEverSeenTarget,
+		bool bHasVisibleTarget);
+
 	/** True when chase input should pause inside the configured combat band. */
 	MATTERFLUX_API bool ShouldHoldCombatPosition(
 		EMatterFluxCreatureRuntimeState State,
@@ -45,6 +51,7 @@ private:
 		float DeltaSeconds);
 
 	TWeakObjectPtr<AActor> RememberedTarget;
+	bool bHasEverSeenTarget = false;
 	double LastSeenTime = -DBL_MAX;
 	double LastAttackTime = -DBL_MAX;
 	double LastSkillTime = -DBL_MAX;

@@ -1,14 +1,10 @@
 quest.define({
 	id = "std.init_quest.equip_spell",
-	description = "在已装备法杖上安装一个攻击法术。",
-	completed_description = "已装备法术。",
+	description = "把圆形子弹装入左键法杖，然后关闭背包准备战斗。",
+	completed_description = "攻击法术已就绪；关闭背包后敌人出现。",
 	category = "objective",
 	sort = 20,
 	prerequisites = { "std.init_quest.equip_wand" },
 }, function(q)
-	q.equip_spell({})
-	q.activation_reward("spell", "std.default", 5)
-	q.activation_reward("spell", "std.set_color_red", 1)
-	q.activation_reward("spell", "std.double_cast", 2)
-	q.activation_reward("spell", "std.circle_trail", 1)
+	q.equip_spell({ target_id = "std.default", equipment_slot = 0 })
 end)

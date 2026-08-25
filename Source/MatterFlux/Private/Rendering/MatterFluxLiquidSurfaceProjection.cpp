@@ -160,12 +160,12 @@ namespace MatterFlux::Rendering
 				}
 				const int32 Patch = NextPatch++;
 				TArray<FIntPoint> ShapeCells{ Root };
-				float PatchMinimumHeight = CurrentHeights.FindChecked(Root);
-				float PatchMaximumHeight = PatchMinimumHeight;
 				Visited.Add(Root);
 				for (int32 QueueIndex = 0; QueueIndex < ShapeCells.Num(); ++QueueIndex)
 				{
 					const FIntPoint Current = ShapeCells[QueueIndex];
+					const float CurrentHeight =
+						CurrentHeights.FindChecked(Current);
 					for (const FIntPoint Offset : ShapeNeighbors)
 					{
 						const FIntPoint Neighbor = Current + Offset;
@@ -174,15 +174,14 @@ namespace MatterFlux::Rendering
 						{
 							continue;
 						}
-						const float ExpandedMinimum = FMath::Min(
-							PatchMinimumHeight, *NeighborHeight);
-						const float ExpandedMaximum = FMath::Max(
-							PatchMaximumHeight, *NeighborHeight);
-						if (ExpandedMaximum - ExpandedMinimum
+						// Continuity is a local edge fact. A long river may lose far
+						// more height than one column while every neighboring pair is
+						// still a gentle slope. Bounding the total component range cut
+						// those rivers into arbitrary bands and emitted vertical walls
+						// at each band boundary.
+						if (FMath::Abs(*NeighborHeight - CurrentHeight)
 							<= MaximumContinuousSurfaceStep)
 						{
-							PatchMinimumHeight = ExpandedMinimum;
-							PatchMaximumHeight = ExpandedMaximum;
 							Visited.Add(Neighbor);
 							ShapeCells.Add(Neighbor);
 						}

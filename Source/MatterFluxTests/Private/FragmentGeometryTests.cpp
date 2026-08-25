@@ -152,6 +152,76 @@ bool FMatterFluxLineSplitTest::RunTest(const FString& Parameters)
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxSingleCellLineRasterTest,
+	"MatterFlux.Fragment.Damage.SingleCellLineUsesTargetSourceResolution",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxSingleCellLineRasterTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	constexpr int32 Side = 31;
+	for (const float CellSize : {8.0f, 10.0f, 17.0f, 18.0f})
+	{
+		for (const bool bVertical : {false, true})
+		{
+			TArray<uint8> Mask;
+			Mask.Init(1, Side * Side);
+			FFragmentDamageShape Shape;
+			Shape.Type = EFragmentDamageShapeType::Line;
+			Shape.WorldTransform = FTransform(
+				bVertical
+					? FQuat(FVector::YAxisVector, UE_HALF_PI)
+					: FQuat::Identity,
+				FVector(2.1f, 0.0f, 3.2f));
+			Shape.Extents.X = 120.0f;
+			Shape.Thickness = 10.0f;
+			Shape.bSingleCellLine = true;
+			if (!TestTrue(
+				*FString::Printf(
+					TEXT("%.0f cm %s line changes the mask"),
+					CellSize,
+					bVertical ? TEXT("vertical") : TEXT("horizontal")),
+				MatterFlux::FragmentGeometry::ApplyDamageShape(
+					Mask,
+					Side,
+					Side,
+					CellSize,
+					Shape)))
+			{
+				continue;
+			}
+
+			TSet<int32> RemovedColumns;
+			TSet<int32> RemovedRows;
+			int32 RemovedCells = 0;
+			for (int32 Y = 0; Y < Side; ++Y)
+			{
+				for (int32 X = 0; X < Side; ++X)
+				{
+					if (Mask[Y * Side + X] != 0)
+					{
+						continue;
+					}
+					RemovedColumns.Add(X);
+					RemovedRows.Add(Y);
+					++RemovedCells;
+				}
+			}
+			TestTrue(TEXT("Single-cell line has visible length"),
+				RemovedCells > 1);
+			TestEqual(
+				*FString::Printf(
+					TEXT("%.0f cm %s cut occupies exactly one cell across"),
+					CellSize,
+					bVertical ? TEXT("vertical") : TEXT("horizontal")),
+				bVertical ? RemovedColumns.Num() : RemovedRows.Num(),
+				1);
+		}
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxHorizontalWorldLineOrientationTest,
 	"MatterFlux.Fragment.Damage.HorizontalWorldLineNeverTransposesTreeCut",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)

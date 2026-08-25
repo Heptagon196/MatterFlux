@@ -10,6 +10,7 @@
 #include "Engine/StaticMesh.h"
 #include "EngineUtils.h"
 #include "Fragment/Fragment2DSourceActor.h"
+#include "Fragment/FragmentSimulationSubsystem.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/PlayerController.h"
 #include "Materials/MaterialInstanceDynamic.h"
@@ -29,7 +30,9 @@ namespace
 		+ AMatterFluxTwoStoreyHouseActor::StoreyHeight;
 	constexpr float WallThickness = 34.0f;
 	constexpr float WallHeight = 326.0f;
+	constexpr float StructureCellSize = 17.0f;
 	constexpr float InteriorMargin = 46.0f;
+	constexpr float FloorGhostOpacity = 0.16f;
 	// Entering a floor is precise, but leaving uses a Schmitt-trigger envelope.
 	// CharacterMovement may briefly depenetrate a capsule beyond the strict
 	// interior bounds at walls, stair lips and low-FPS floor corrections.
@@ -132,7 +135,10 @@ AMatterFluxTwoStoreyHouseActor::AMatterFluxTwoStoreyHouseActor()
 	PrimaryActorTick.TickInterval = 0.05f;
 
 	SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));
-	SceneRoot->SetMobility(EComponentMobility::Static);
+	// Streamed houses are pooled and teleported between chunk locations. A
+	// static root rejects SetActorTransform in game worlds, leaving the visible
+	// whole-house projection behind while its logical cuttable Sources move.
+	SceneRoot->SetMobility(EComponentMobility::Movable);
 	SetRootComponent(SceneRoot);
 
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> CubeFinder(
@@ -148,13 +154,28 @@ AMatterFluxTwoStoreyHouseActor::AMatterFluxTwoStoreyHouseActor()
 	StairRampCollision = CreateDefaultSubobject<UBoxComponent>(
 		TEXT("StairRampCollision"));
 	StairRampCollision->SetupAttachment(SceneRoot);
-	StairRampCollision->SetMobility(EComponentMobility::Static);
+	StairRampCollision->SetMobility(EComponentMobility::Movable);
 	StairRampCollision->SetCollisionObjectType(ECC_WorldStatic);
 	StairRampCollision->SetCollisionEnabled(
 		ECollisionEnabled::QueryAndPhysics);
 	StairRampCollision->SetCollisionResponseToAllChannels(ECR_Block);
 	StairRampCollision->SetHiddenInGame(true);
 	StairRampCollision->SetCanEverAffectNavigation(true);
+
+	ExteriorGroundCollision = CreateDefaultSubobject<UBoxComponent>(
+		TEXT("ExteriorGroundCollision"));
+	ExteriorGroundCollision->SetupAttachment(SceneRoot);
+	ExteriorGroundCollision->SetMobility(EComponentMobility::Movable);
+	ExteriorGroundCollision->SetBoxExtent(FVector(760.0f, 760.0f, 8.0f));
+	// Generated houses are placed at FoundationTop + 4. The collision pad's
+	// top therefore sits exactly on the flattened terrain at local Z=-4.
+	ExteriorGroundCollision->SetRelativeLocation(FVector(0.0f, 0.0f, -12.0f));
+	ExteriorGroundCollision->SetCollisionObjectType(ECC_WorldStatic);
+	ExteriorGroundCollision->SetCollisionEnabled(
+		ECollisionEnabled::QueryAndPhysics);
+	ExteriorGroundCollision->SetCollisionResponseToAllChannels(ECR_Block);
+	ExteriorGroundCollision->SetHiddenInGame(true);
+	ExteriorGroundCollision->SetCanEverAffectNavigation(true);
 
 	CuttableWholeObjectMesh = CreateDefaultSubobject<UProceduralMeshComponent>(
 		TEXT("CuttableWholeObjectMesh"));
@@ -168,6 +189,7 @@ AMatterFluxTwoStoreyHouseActor::AMatterFluxTwoStoreyHouseActor()
 	LowerFloorLight = CreateDefaultSubobject<UPointLightComponent>(
 		TEXT("LowerFloorLight"));
 	LowerFloorLight->SetupAttachment(SceneRoot);
+	LowerFloorLight->SetMobility(EComponentMobility::Movable);
 	LowerFloorLight->SetRelativeLocation(FVector(-120.0f, -60.0f, 250.0f));
 	LowerFloorLight->Intensity = 950.0f;
 	LowerFloorLight->AttenuationRadius = 720.0f;
@@ -177,6 +199,7 @@ AMatterFluxTwoStoreyHouseActor::AMatterFluxTwoStoreyHouseActor()
 	UpperFloorLight = CreateDefaultSubobject<UPointLightComponent>(
 		TEXT("UpperFloorLight"));
 	UpperFloorLight->SetupAttachment(SceneRoot);
+	UpperFloorLight->SetMobility(EComponentMobility::Movable);
 	UpperFloorLight->SetRelativeLocation(FVector(120.0f, 20.0f, 610.0f));
 	UpperFloorLight->Intensity = 820.0f;
 	UpperFloorLight->AttenuationRadius = 680.0f;
@@ -343,6 +366,13 @@ void AMatterFluxTwoStoreyHouseActor::MoveHouseAndCuttableSources(
 				false,
 				nullptr,
 				ETeleportType::TeleportPhysics);
+			if (UFragmentSimulationSubsystem* FragmentSubsystem =
+				GetWorld()
+					? GetWorld()->GetSubsystem<UFragmentSimulationSubsystem>()
+					: nullptr)
+			{
+				FragmentSubsystem->RegisterSourceActor(*Source);
+			}
 		}
 	}
 }
@@ -393,7 +423,11 @@ AMatterFluxTwoStoreyHouseActor::CreateVoxelGroup(
 	UInstancedStaticMeshComponent* Group =
 		CreateDefaultSubobject<UInstancedStaticMeshComponent>(Name);
 	Group->SetupAttachment(SceneRoot);
-	Group->SetMobility(EComponentMobility::Static);
+	// The entire generated house is pooled between streamed chunks. Every
+	// attached projection must accept the same teleport as the movable root;
+	// otherwise static HISM groups (most visibly the stairs) stay behind at the
+	// previous chunk while the cuttable whole-object projection moves.
+	Group->SetMobility(EComponentMobility::Movable);
 	Group->SetStaticMesh(CubeMesh);
 	Group->SetCollisionObjectType(ECC_WorldStatic);
 	Group->SetCollisionEnabled(
@@ -454,7 +488,7 @@ void AMatterFluxTwoStoreyHouseActor::BuildFoundationAndFloors()
 
 	UInstancedStaticMeshComponent* UpperFloor = CreateVoxelGroup(
 		TEXT("UpperFloor"), true, 1,
-		FLinearColor(0.54f, 0.30f, 0.12f), false, true, 0.16f,
+		FLinearColor(0.54f, 0.30f, 0.12f), false, true, FloorGhostOpacity,
 		true, false, TEXT("wood"));
 	// 二楼地板围绕楼梯井分成四块，避免视觉地板和坡面碰撞互相穿插。
 	AddBox(*UpperFloor, FVector(-410.0f, 0.0f,
@@ -487,26 +521,53 @@ void AMatterFluxTwoStoreyHouseActor::BuildWallsAndRoof()
 		const float Height)
 	{
 		const float CenterZ = BaseZ + Height * 0.5f;
+		constexpr float WestLowerCenterY = -275.0f;
+		constexpr float WestLowerLength = 255.0f;
+		constexpr float WestUpperCenterY = 315.0f;
+		constexpr float WestUpperLength = 210.0f;
+		constexpr float NorthLeftCenterX = -320.0f;
+		constexpr float NorthLeftLength = 430.0f;
+		constexpr float NorthRightCenterX = 405.0f;
+		constexpr float NorthRightLength = 310.0f;
+		// Independent source masks snap to the shared structure grid. Give each
+		// lintel one cell of bearing on both side walls so grid rounding cannot
+		// reopen a visible joint in the merged WholeObject projection.
+		const float WestLintelMinY =
+			WestLowerCenterY + WestLowerLength * 0.5f - StructureCellSize;
+		const float WestLintelMaxY =
+			WestUpperCenterY - WestUpperLength * 0.5f + StructureCellSize;
+		const float NorthLintelMinX =
+			NorthLeftCenterX + NorthLeftLength * 0.5f - StructureCellSize;
+		const float NorthLintelMaxX =
+			NorthRightCenterX - NorthRightLength * 0.5f + StructureCellSize;
 		// 背向镜头的两面完整承重墙。
 		AddBox(Group, FVector(HalfSizeX - WallThickness * 0.5f, 0.0f, CenterZ),
 			FVector(WallThickness, HalfSizeY * 2.0f, Height));
 		AddBox(Group, FVector(0.0f, -HalfSizeY + WallThickness * 0.5f, CenterZ),
 			FVector(HalfSizeX * 2.0f, WallThickness, Height));
 		// 朝镜头的两面保留门洞和大窗，形成可读的娃娃屋切面。
-		AddBox(Group, FVector(-HalfSizeX + WallThickness * 0.5f, -275.0f, CenterZ),
-			FVector(WallThickness, 255.0f, Height));
-		AddBox(Group, FVector(-HalfSizeX + WallThickness * 0.5f, 315.0f, CenterZ),
-			FVector(WallThickness, 210.0f, Height));
-		AddBox(Group, FVector(-HalfSizeX + WallThickness * 0.5f, 20.0f,
+		AddBox(Group, FVector(-HalfSizeX + WallThickness * 0.5f,
+			WestLowerCenterY, CenterZ),
+			FVector(WallThickness, WestLowerLength, Height));
+		AddBox(Group, FVector(-HalfSizeX + WallThickness * 0.5f,
+			WestUpperCenterY, CenterZ),
+			FVector(WallThickness, WestUpperLength, Height));
+		AddBox(Group, FVector(-HalfSizeX + WallThickness * 0.5f,
+			(WestLintelMinY + WestLintelMaxY) * 0.5f,
 			BaseZ + Height - 38.0f),
-			FVector(WallThickness, 335.0f, 76.0f));
-		AddBox(Group, FVector(-320.0f, HalfSizeY - WallThickness * 0.5f, CenterZ),
-			FVector(430.0f, WallThickness, Height));
-		AddBox(Group, FVector(405.0f, HalfSizeY - WallThickness * 0.5f, CenterZ),
-			FVector(310.0f, WallThickness, Height));
-		AddBox(Group, FVector(45.0f, HalfSizeY - WallThickness * 0.5f,
+			FVector(WallThickness, WestLintelMaxY - WestLintelMinY, 76.0f));
+		AddBox(Group, FVector(NorthLeftCenterX,
+			HalfSizeY - WallThickness * 0.5f, CenterZ),
+			FVector(NorthLeftLength, WallThickness, Height));
+		AddBox(Group, FVector(NorthRightCenterX,
+			HalfSizeY - WallThickness * 0.5f, CenterZ),
+			FVector(NorthRightLength, WallThickness, Height));
+		AddBox(Group, FVector(
+			(NorthLintelMinX + NorthLintelMaxX) * 0.5f,
+			HalfSizeY - WallThickness * 0.5f,
 			BaseZ + Height - 38.0f),
-			FVector(300.0f, WallThickness, 76.0f));
+			FVector(NorthLintelMaxX - NorthLintelMinX,
+				WallThickness, 76.0f));
 		// 角柱让开放切面仍然清楚表现为完整建筑。
 		for (const FVector2D Corner : {
 			FVector2D(-HalfSizeX + 26.0f, -HalfSizeY + 26.0f),
@@ -527,7 +588,7 @@ void AMatterFluxTwoStoreyHouseActor::BuildWallsAndRoof()
 	// 屋顶是两片一格厚的阶梯瓦壳，不是逐层填满的实心山墙。
 	// 每一级左右各一条贯穿长轴的瓦梁，最高一级合并成屋脊。
 	UInstancedStaticMeshComponent* Roof = CreateVoxelGroup(
-		TEXT("Roof"), false, 2,
+		TEXT("Roof"), true, 2,
 		// 旧值接近纯黑，背光坡面会完全丢失体素层级。颜色仍保持
 		// 深红陶瓦，但给真实光照和顶点 AO 留出足够动态范围。
 		FLinearColor(0.34f, 0.085f, 0.035f), false, false, 0.025f,
@@ -595,19 +656,19 @@ void AMatterFluxTwoStoreyHouseActor::BuildStairs()
 void AMatterFluxTwoStoreyHouseActor::BuildFurniture()
 {
 	UInstancedStaticMeshComponent* LowerWood = CreateVoxelGroup(
-		TEXT("LowerFurnitureWood"), false, 0,
+		TEXT("LowerFurnitureWood"), true, 0,
 		FLinearColor(0.36f, 0.15f, 0.045f), false, false, 0.22f,
 		true, true, TEXT("wood"));
 	UInstancedStaticMeshComponent* LowerAccent = CreateVoxelGroup(
-		TEXT("LowerFurnitureAccent"), false, 0,
+		TEXT("LowerFurnitureAccent"), true, 0,
 		FLinearColor(0.12f, 0.38f, 0.36f), false, false, 0.22f,
 		true, true, TEXT("fabric"));
 	UInstancedStaticMeshComponent* UpperWood = CreateVoxelGroup(
-		TEXT("UpperFurnitureWood"), false, 1,
+		TEXT("UpperFurnitureWood"), true, 1,
 		FLinearColor(0.40f, 0.19f, 0.07f), false, false, 0.22f,
 		true, true, TEXT("wood"));
 	UInstancedStaticMeshComponent* UpperAccent = CreateVoxelGroup(
-		TEXT("UpperFurnitureAccent"), false, 1,
+		TEXT("UpperFurnitureAccent"), true, 1,
 		FLinearColor(0.64f, 0.16f, 0.24f), false, false, 0.22f,
 		true, true, TEXT("fabric"));
 
@@ -870,7 +931,6 @@ void AMatterFluxTwoStoreyHouseActor::SpawnCuttableStructureSources()
 			const FQuat LocalRotation =
 				BoxTransform.GetRotation() * PlaneRotation;
 
-			constexpr float StructureCellSize = 17.0f;
 			FFragmentSourceMask Mask;
 			// 每个独立盒体都向共同体素格的外侧取整。向最近格收缩会在
 			// 相邻墙段、墙与楼板包边之间留下至多一格的可见裂缝。
@@ -1194,7 +1254,11 @@ void AMatterFluxTwoStoreyHouseActor::RebuildCuttableWholeObjectMesh(
 				== EMatterFluxMaterialStructuralRole::Furniture;
 			Fade.MaterialId = Info.MaterialId;
 			Fade.GhostOpacity = Info.MaterialId == TEXT("roof")
-				? RoofGhostOpacity : WallGhostOpacity;
+				? RoofGhostOpacity
+				: Info.StructuralRole
+					== EMatterFluxMaterialStructuralRole::Floor
+						? FloorGhostOpacity
+						: WallGhostOpacity;
 			Fade.MaterialSlots.Add(SectionIndex);
 			Fade.SolidMaterials.Add(Solid);
 			if (GhostMaterialTemplate)
@@ -1491,12 +1555,15 @@ void AMatterFluxTwoStoreyHouseActor::UpdateCutawayFloor(
 		{
 			CutawaySourceView.Add(Source);
 		}
-		bResolved = MatterFlux::MaterialCutaway::Resolve(
-			ViewerFeet,
-			CutawaySourceView,
-			CurrentFloorSourceId,
-			CutawayPolicy,
-			Result);
+		if (IsInsideHouse(Viewer->GetActorLocation()))
+		{
+			bResolved = MatterFlux::MaterialCutaway::Resolve(
+				ViewerFeet,
+				CutawaySourceView,
+				CurrentFloorSourceId,
+				CutawayPolicy,
+				Result);
+		}
 	}
 	if (bResolved)
 	{
@@ -1599,14 +1666,20 @@ void AMatterFluxTwoStoreyHouseActor::UpdateStructureFade(
 		{
 			continue;
 		}
+		const bool bInteriorUpperFloor = !bExteriorOcclusionActive
+			&& CurrentCutawayFloor != INDEX_NONE
+			&& Group.StructuralRole
+				== EMatterFluxMaterialStructuralRole::Floor
+			&& Group.FloorTier > CurrentCutawayFloor;
 		const bool bCanGhost = Group.StructuralRole
 				== EMatterFluxMaterialStructuralRole::Wall
 			|| (bExteriorOcclusionActive
 				&& Group.StructuralRole
 					== EMatterFluxMaterialStructuralRole::Floor);
-		const bool bGhost = bCanGhost
-			&& Group.SourceId.IsValid()
-			&& CurrentGhostSourceIds.Contains(Group.SourceId);
+		const bool bGhost = bInteriorUpperFloor
+			|| (bCanGhost
+				&& Group.SourceId.IsValid()
+				&& CurrentGhostSourceIds.Contains(Group.SourceId));
 		if (Group.bNeverFade && !bGhost)
 		{
 			continue;

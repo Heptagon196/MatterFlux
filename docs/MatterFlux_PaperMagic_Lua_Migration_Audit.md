@@ -40,7 +40,6 @@ PaperMagic Demo 的内容逻辑已经按 MatterFlux 架构完成等价迁移：9
 | ID | 关键语义 |
 |---|---|
 | `std.default` | 10 伤害、10 法力、1500 cm/s、3 秒寿命 |
-| `std.add_damage` | 子投射物伤害 `+7`，消耗 10 |
 | `std.circle_trail` | 圆轨半径 300 cm，寿命乘 2 |
 | `std.double_cast` | 两个子节点，目标散射范围 `±10°` |
 | `std.triple_cast` | 三个子节点，目标散射范围 `±10°` |

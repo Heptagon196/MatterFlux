@@ -18,9 +18,21 @@ class MATTERFLUX_API UMatterFluxCharacterMovementComponent final
 	GENERATED_BODY()
 
 public:
+	/** Weighted liquid/powder resistance sampled before this movement tick. */
+	void SetMaterialMovementResistance(float NewResistance);
+	float GetMaterialMovementResistance() const
+	{
+		return MaterialMovementResistance;
+	}
+
+	virtual float GetMaxSpeed() const override;
+	virtual float GetMaxAcceleration() const override;
 	virtual void ApplyImpactPhysicsForces(
 		const FHitResult& Impact,
 		const FVector& ImpactAcceleration,
 		const FVector& ImpactVelocity) override;
 	virtual void UpdateBasedMovement(float DeltaSeconds) override;
+
+private:
+	float MaterialMovementResistance = 0.0f;
 };

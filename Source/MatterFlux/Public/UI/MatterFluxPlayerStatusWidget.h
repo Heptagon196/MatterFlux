@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
+#include "MatterFluxContentTypes.h"
 #include "MatterFluxPlayerStatusWidget.generated.h"
 
 class APlayerController;
@@ -45,13 +46,14 @@ class MATTERFLUX_API UMatterFluxPlayerStatusWidget : public UUserWidget
 	GENERATED_BODY()
 
 public:
-	static constexpr int32 WandSlotCount = 4;
+	static constexpr int32 WandSlotCount =
+		MatterFlux::Magic::EquipmentSlotCount;
 
 	void InitializeForPlayer(APlayerController* InPlayerController);
 	void SetSuppressedByFrontEnd(bool bSuppressed);
 	void RefreshStatus();
 
-	/** 可测试的纯读取边界：把 PlayerState 投影成固定五行 HUD 数据。 */
+	/** 可测试的纯读取边界：把 PlayerState 投影成生命加五个法杖槽。 */
 	static FMatterFluxPlayerStatusSnapshot BuildStatusSnapshot(
 		const AMatterFluxPlayerState* PlayerState);
 

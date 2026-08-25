@@ -88,8 +88,8 @@ namespace
 		CorrodeWood.Id = TEXT("acid_wood_corrosion");
 		CorrodeWood.InputA = TEXT("acid");
 		CorrodeWood.InputB = TEXT("wood");
-		CorrodeWood.OutputA = TEXT("acid");
-		CorrodeWood.OutputB = TEXT("acid_gas");
+		CorrodeWood.OutputA = TEXT("empty");
+		CorrodeWood.OutputB = TEXT("empty");
 		CorrodeWood.ChancePermille = 1000;
 		Registry.Reactions.Add(CorrodeWood.Id, CorrodeWood);
 
@@ -97,8 +97,8 @@ namespace
 		CorrodeGrassland.Id = TEXT("acid_grassland_corrosion");
 		CorrodeGrassland.InputA = TEXT("acid");
 		CorrodeGrassland.InputB = TEXT("grassland");
-		CorrodeGrassland.OutputA = TEXT("acid");
-		CorrodeGrassland.OutputB = TEXT("acid_gas");
+		CorrodeGrassland.OutputA = TEXT("empty");
+		CorrodeGrassland.OutputB = TEXT("empty");
 		CorrodeGrassland.ChancePermille = 1000;
 		Registry.Reactions.Add(CorrodeGrassland.Id, CorrodeGrassland);
 		return Registry;
@@ -745,6 +745,114 @@ bool FMatterFluxSurfaceLiquidSpreadsByAmountTest::RunTest(
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxRepeatedWaterSprayFlatPuddleTest,
+	"MatterFlux.Material.RepeatedWaterSprayRelaxesIntoShallowFlatPuddle",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxRepeatedWaterSprayFlatPuddleTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 16;
+	Settings.ActiveChunkRadius = 1;
+	Settings.MaxActiveChunks = 9;
+	Settings.bUseSurfaceTopology = true;
+	Settings.MinSurfaceCell = FIntPoint(-16, -16);
+	Settings.MaxSurfaceCellExclusive = FIntPoint(17, 17);
+	Settings.LiquidFullColumnHeight = 128;
+
+	FMatterFluxContentRegistry Registry = MakeLiquidRegistry();
+	Registry.Materials.FindChecked(TEXT("water")).Dispersion = 220;
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(TEXT("Repeated-spray world initializes"),
+		World.Initialize(Settings, Registry, 20260825, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	for (int32 Y = -16; Y <= 16; ++Y)
+	{
+		for (int32 X = -16; X <= 16; ++X)
+		{
+			World.SetSupportHeight(FIntPoint(X, Y), 0);
+		}
+	}
+
+	// Eight WaterSpray impacts contain 8 * 5 one-voxel liquid payloads.
+	// A voxel is 16/255 of the configured 128 cm full column. Start from a
+	// compact impact volume so the hydraulic solver, not a deposition disk,
+	// determines the settled footprint.
+	TestTrue(TEXT("First compact spray column is seeded"),
+		World.SetCellAmount(FIntPoint(0, 0), TEXT("water"), 255));
+	TestTrue(TEXT("Second compact spray column is seeded"),
+		World.SetCellAmount(FIntPoint(1, 0), TEXT("water"), 255));
+	TestTrue(TEXT("Remaining compact spray volume is seeded"),
+		World.SetCellAmount(FIntPoint(0, 1), TEXT("water"), 130));
+	constexpr int64 SprayAmount = 8 * 5 * 16;
+	TestEqual(TEXT("Compact input matches eight authored spray payloads"),
+		World.SumMaterialAmount(TEXT("water")), SprayAmount);
+
+	for (int32 Step = 0; Step < 128; ++Step)
+	{
+		World.Step();
+	}
+
+	TArray<MatterFlux::Material::FCellSnapshot> Cells;
+	World.GetActiveCells(Cells);
+	int64 FinalAmount = 0;
+	int32 WaterCellCount = 0;
+	int32 MaximumColumnAmount = 0;
+	FIntPoint Minimum(MAX_int32, MAX_int32);
+	FIntPoint Maximum(MIN_int32, MIN_int32);
+	TArray<FString> SettledCells;
+	for (const MatterFlux::Material::FCellSnapshot& Cell : Cells)
+	{
+		if (Cell.MaterialId != TEXT("water") || Cell.Amount == 0)
+		{
+			continue;
+		}
+		FinalAmount += Cell.Amount;
+		++WaterCellCount;
+		MaximumColumnAmount = FMath::Max(
+			MaximumColumnAmount,
+			static_cast<int32>(Cell.Amount));
+		Minimum.X = FMath::Min(Minimum.X, Cell.WorldCell.X);
+		Minimum.Y = FMath::Min(Minimum.Y, Cell.WorldCell.Y);
+		Maximum.X = FMath::Max(Maximum.X, Cell.WorldCell.X);
+		Maximum.Y = FMath::Max(Maximum.Y, Cell.WorldCell.Y);
+		SettledCells.Add(FString::Printf(
+			TEXT("(%d,%d)=%d"),
+			Cell.WorldCell.X,
+			Cell.WorldCell.Y,
+			static_cast<int32>(Cell.Amount)));
+	}
+	SettledCells.Sort();
+	const int32 Width = Maximum.X - Minimum.X + 1;
+	const int32 Height = Maximum.Y - Minimum.Y + 1;
+	AddInfo(FString::Printf(
+		TEXT("Repeated WaterSpray settled footprint: cells=%d bounds=%dx%d maxAmount=%d total=%lld"),
+		WaterCellCount,
+		Width,
+		Height,
+		MaximumColumnAmount,
+		FinalAmount));
+	AddInfo(FString::Printf(
+		TEXT("Repeated WaterSpray settled cells: %s"),
+		*FString::Join(SettledCells, TEXT(" "))));
+	TestEqual(TEXT("Repeated spray conserves exact water amount"),
+		FinalAmount, SprayAmount);
+	TestTrue(TEXT("Repeated spray covers at least twenty flat-ground cells"),
+		WaterCellCount >= 20);
+	TestTrue(TEXT("Repeated spray spreads in both horizontal axes"),
+		Width >= 5 && Height >= 5);
+	TestTrue(TEXT("Settled water has no tall pillar column"),
+		MaximumColumnAmount <= 64);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxSurfaceLiquidRefillsAcrossUnevenSupportTest,
 	"MatterFlux.Material.SurfaceLiquidRefillsDisplacementAcrossUnevenSupport",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
@@ -904,6 +1012,110 @@ bool FMatterFluxBodyWakeRefillConsumesOnlyDisplacedSurplusTest::RunTest(
 	TestEqual(TEXT("Displaced center recovers its conserved baseline volume"),
 		Restored.Amount, static_cast<uint8>(120));
 	TestEqual(TEXT("Wake restitution conserves the exact lake volume"),
+		World.SumMaterialAmount(TEXT("water")), AmountBefore);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxWalkingBodyDoesNotPressurePumpItsWakeTest,
+	"MatterFlux.Material.WalkingBodyDoesNotPressurePumpItsWake",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxWalkingBodyDoesNotPressurePumpItsWakeTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 32;
+	Settings.ActiveChunkRadius = 1;
+	Settings.MaxActiveChunks = 9;
+	Settings.bUseSurfaceTopology = true;
+	Settings.MinSurfaceCell = FIntPoint(-8, -8);
+	Settings.MaxSurfaceCellExclusive = FIntPoint(9, 9);
+	Settings.LiquidFullColumnHeight = 255;
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(TEXT("Walking-wake world initializes"),
+		World.Initialize(Settings, MakeLiquidRegistry(), 20260825, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	TArray<MatterFlux::Material::FSeedCell> Seeds;
+	for (int32 Y = -8; Y <= 8; ++Y)
+	{
+		for (int32 X = -8; X <= 8; ++X)
+		{
+			Seeds.Add({ FIntPoint(X, Y), TEXT("water"), 0, 120 });
+		}
+	}
+	TestTrue(TEXT("Flat walking lake is seeded"), World.SeedSurface(Seeds));
+	const int64 AmountBefore = World.SumMaterialAmount(TEXT("water"));
+	TArray<MatterFlux::Material::FLiquidDisplacementConstraint> FirstFootprint;
+	TArray<MatterFlux::Material::FLiquidDisplacementConstraint> NextFootprint;
+	for (int32 Y = -1; Y <= 1; ++Y)
+	{
+		for (int32 X = -1; X <= 1; ++X)
+		{
+			FirstFootprint.Add({ FIntPoint(X, Y), 0 });
+			NextFootprint.Add({ FIntPoint(X + 1, Y), 0 });
+		}
+	}
+
+	// Mirror the live playable-world order: constrain before a fixed step, then
+	// reassert the still-submerged body after the step so render frames never
+	// show water inside its current footprint.
+	TestEqual(TEXT("Standing body displaces its first footprint"),
+		World.DisplaceLiquids(FirstFootprint, 4), FirstFootprint.Num());
+	World.Step();
+	World.DisplaceLiquids(FirstFootprint, 4);
+
+	TestEqual(TEXT("Walking body displaces only its new leading edge"),
+		World.DisplaceLiquids(NextFootprint, 4), 3);
+	World.Step();
+	for (int32 Y = -1; Y <= 1; ++Y)
+	{
+		MatterFlux::Material::FCellSnapshot WakeBeforeReassert;
+		TestTrue(TEXT("Released trailing edge begins a partial hydraulic refill"),
+			World.TryGetCellSnapshot(FIntPoint(-1, Y), WakeBeforeReassert));
+		TestTrue(TEXT("One fixed step leaves an observable partial wake"),
+			WakeBeforeReassert.Amount > 0 && WakeBeforeReassert.Amount <= 24);
+	}
+
+	World.DisplaceLiquids(NextFootprint, 4);
+	TArray<uint16> PreviousWakeAmounts;
+	PreviousWakeAmounts.Reserve(3);
+	for (int32 Y = -1; Y <= 1; ++Y)
+	{
+		MatterFlux::Material::FCellSnapshot WakeAfterReassert;
+		TestTrue(TEXT("Released trailing edge remains liquid after body reassertion"),
+			World.TryGetCellSnapshot(FIntPoint(-1, Y), WakeAfterReassert));
+		TestTrue(TEXT("Reasserting the current footprint cannot pressure-pump the wake"),
+			WakeAfterReassert.Amount <= 24);
+		PreviousWakeAmounts.Add(WakeAfterReassert.Amount);
+	}
+
+	// Keep the body submerged on its new footprint. Its trailing edge must gain
+	// conserved particles over several material steps rather than snapping back
+	// as a side effect of reasserting the current occupied columns.
+	for (int32 StepIndex = 0; StepIndex < 3; ++StepIndex)
+	{
+		World.Step();
+		for (int32 Y = -1; Y <= 1; ++Y)
+		{
+			MatterFlux::Material::FCellSnapshot CurrentWake;
+			TestTrue(TEXT("Walking wake remains material while progressively refilling"),
+				World.TryGetCellSnapshot(FIntPoint(-1, Y), CurrentWake));
+			TestTrue(TEXT("Walking wake never loses already returned particles"),
+				CurrentWake.Amount >= PreviousWakeAmounts[Y + 1]);
+			TestTrue(TEXT("Walking wake accepts at most one bounded refill per step"),
+				CurrentWake.Amount
+					<= FMath::Min<int32>(PreviousWakeAmounts[Y + 1] + 24, 120));
+			PreviousWakeAmounts[Y + 1] = CurrentWake.Amount;
+		}
+		World.DisplaceLiquids(NextFootprint, 4);
+	}
+	TestEqual(TEXT("Walking displacement conserves exact lake volume"),
 		World.SumMaterialAmount(TEXT("water")), AmountBefore);
 	return true;
 }
@@ -1083,7 +1295,7 @@ bool FMatterFluxSurfaceLiquidRelaxesIntoOrganicPuddleTest::RunTest(
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxAcidCorrosionTest,
-	"MatterFlux.Material.AcidCorrodesSolidsIntoGasWithoutBeingConsumed",
+	"MatterFlux.Material.AcidCorrosionConsumesAcidWithoutIncreasingAcidFamily",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 
 bool FMatterFluxAcidCorrosionTest::RunTest(const FString& Parameters)
@@ -1105,10 +1317,14 @@ bool FMatterFluxAcidCorrosionTest::RunTest(const FString& Parameters)
 		World.SetCell(FIntPoint(0, 0), TEXT("acid"));
 		World.SetCell(FIntPoint(1, 0), SolidMaterial);
 		const MatterFlux::Material::FStepStats Stats = World.Step();
-		TestEqual(TEXT("Acid remains after corrosion"),
-			World.GetMaterialAt(FIntPoint(0, 0)), FName(TEXT("acid")));
-		TestEqual(TEXT("Corroded material becomes acid gas"),
-			World.GetMaterialAt(FIntPoint(1, 0)), FName(TEXT("acid_gas")));
+		TestTrue(TEXT("Acid is consumed after one corrosion reaction"),
+			World.GetMaterialAt(FIntPoint(0, 0)).IsNone());
+		TestTrue(TEXT("Corroded material leaves no acid-family residue"),
+			World.GetMaterialAt(FIntPoint(1, 0)).IsNone());
+		TestEqual(TEXT("Corrosion consumes rather than reproduces acid"),
+			World.CountMaterial(TEXT("acid"))
+				+ World.CountMaterial(TEXT("acid_gas")),
+			0);
 		TestEqual(TEXT("Exactly one corrosion pair reacts"),
 			Stats.ReactedPairs, 1);
 		return true;
@@ -1851,6 +2067,59 @@ bool FMatterFluxSurfacePowderBuildsPileTest::RunTest(
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxDynamicBodyPowderDisplacementTest,
+	"MatterFlux.Material.DynamicBodyDisplacesTallPowderAndConservesAmount",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxDynamicBodyPowderDisplacementTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 16;
+	Settings.ActiveChunkRadius = 1;
+	Settings.MaxActiveChunks = 9;
+	Settings.bUseSurfaceTopology = true;
+	Settings.MinSurfaceCell = FIntPoint(-6, -6);
+	Settings.MaxSurfaceCellExclusive = FIntPoint(7, 7);
+
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(TEXT("Powder-displacement world initializes"),
+		World.Initialize(Settings, MakeLiquidRegistry(), 20260825, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	TArray<MatterFlux::Material::FSeedCell> Surface;
+	for (int32 Y = -6; Y <= 6; ++Y)
+	{
+		for (int32 X = -6; X <= 6; ++X)
+		{
+			Surface.Add({ FIntPoint(X, Y), NAME_None, 0, 0 });
+		}
+	}
+	TestTrue(TEXT("Flat powder support is seeded"), World.SeedSurface(Surface));
+	World.SetSimulationFocus(FIntPoint::ZeroValue);
+	constexpr uint16 TallSandAmount = 4 * 255;
+	TestTrue(TEXT("A body test starts in a multi-layer sand column"),
+		World.SetCellAmount(FIntPoint::ZeroValue, TEXT("sand"), TallSandAmount));
+	const int64 AmountBefore = World.SumMaterialAmount(TEXT("sand"));
+	const MatterFlux::Material::FLiquidDisplacementConstraint Constraint = {
+		FIntPoint::ZeroValue, 0 };
+	TestEqual(TEXT("The occupied tall sand column is displaced"),
+		World.DisplacePowders(MakeArrayView(&Constraint, 1), 4), 1);
+	TestEqual(TEXT("No sand remains inside the submitted body footprint"),
+		World.GetMaterialAt(FIntPoint::ZeroValue), NAME_None);
+	TestEqual(TEXT("Powder displacement conserves every stacked particle"),
+		World.SumMaterialAmount(TEXT("sand")), AmountBefore);
+	TestEqual(TEXT("Repeating the same body constraint is idempotent"),
+		World.DisplacePowders(MakeArrayView(&Constraint, 1), 4), 0);
+	TestEqual(TEXT("Repeated occupancy still preserves exact powder volume"),
+		World.SumMaterialAmount(TEXT("sand")), AmountBefore);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxActiveChunkBoundaryTest,
 	"MatterFlux.Material.ActiveChunksExchangeCellsAcrossBoundaries",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
@@ -1966,6 +2235,49 @@ bool FMatterFluxActivatedChunkBoundaryRetryTest::RunTest(
 		TEXT("Activation retry conserves liquid"),
 		World.CountMaterial(TEXT("water")),
 		1);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxVisibleTransientSurfaceWakeTest,
+	"MatterFlux.Material.VisibleTransientSurfaceWakeSimulatesOutsidePlayerFocus",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxVisibleTransientSurfaceWakeTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 8;
+	Settings.ActiveChunkRadius = 0;
+	Settings.MaxActiveChunks = 1;
+	Settings.bUseSurfaceTopology = true;
+	Settings.MinSurfaceCell = FIntPoint(-64, -64);
+	Settings.MaxSurfaceCellExclusive = FIntPoint(64, 64);
+
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(TEXT("Surface material world initializes"),
+		World.Initialize(Settings, MakeLiquidRegistry(), 30, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	World.SetSimulationFocus(FIntPoint::ZeroValue);
+	const FIntPoint VisibleCell(24, 24);
+	World.WakeSurfaceCells(MakeArrayView(&VisibleCell, 1));
+	TestTrue(TEXT("A visible impact can author outside the player-focus chunk"),
+		World.SetCellAmount(VisibleCell, TEXT("sand"), 255));
+	TestEqual(TEXT("The explicitly visible chunk stays resident for its solve"),
+		World.GetResidentChunkCount(),
+		1);
+	TestEqual(TEXT("The explicitly visible chunk is not immediately archived"),
+		World.GetArchivedChunkCount(),
+		0);
+
+	const MatterFlux::Material::FStepStats Stats = World.Step();
+	TestTrue(TEXT("The visible out-of-focus particle receives a simulation step"),
+		Stats.VisitedCells > 0);
 	return true;
 }
 
@@ -2127,6 +2439,76 @@ bool FMatterFluxSurfaceLiquidDownhillTest::RunTest(
 		Water && Water->SupportHeight == 0);
 	TestTrue(TEXT("Downhill flow transfers a bounded particle amount"),
 		Water && Water->Amount > 0 && Water->Amount < 255);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxShallowSurfaceLiquidsFollowDownhillGradientTest,
+	"MatterFlux.Material.ShallowSurfaceLiquidsFollowDownhillGradient",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxShallowSurfaceLiquidsFollowDownhillGradientTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	for (const FName MaterialId : { FName(TEXT("water")), FName(TEXT("acid")) })
+	{
+		MatterFlux::Material::FWorldSettings Settings;
+		Settings.ChunkSize = 8;
+		Settings.ActiveChunkRadius = 1;
+		Settings.MaxActiveChunks = 9;
+		Settings.bUseSurfaceTopology = true;
+		Settings.MinSurfaceCell = FIntPoint(-2, -2);
+		Settings.MaxSurfaceCellExclusive = FIntPoint(3, 3);
+		Settings.LiquidFullColumnHeight = 128;
+
+		MatterFlux::Material::FChunkedMaterialWorld World;
+		FString Error;
+		if (!TestTrue(
+				*FString::Printf(TEXT("%s slope world initializes"),
+					*MaterialId.ToString()),
+				World.Initialize(Settings, MakeLiquidRegistry(), 1, Error)))
+		{
+			AddError(Error);
+			continue;
+		}
+
+		for (int32 Y = -2; Y <= 2; ++Y)
+		{
+			for (int32 X = -2; X <= 2; ++X)
+			{
+				World.SetSupportHeight(FIntPoint(X, Y), 40);
+			}
+		}
+		const FIntPoint Source(0, 0);
+		const FIntPoint Downhill(1, 0);
+		World.SetSupportHeight(Source, 20);
+		World.SetSupportHeight(Downhill, 16);
+		TestTrue(
+			*FString::Printf(TEXT("A shallow %s splash is deposited"),
+				*MaterialId.ToString()),
+			World.SetCellAmount(Source, MaterialId, 16));
+		const int64 AmountBefore = World.SumMaterialAmount(MaterialId);
+
+		const MatterFlux::Material::FStepStats Stats = World.Step();
+		MatterFlux::Material::FCellSnapshot DownhillSnapshot;
+		TestTrue(
+			*FString::Printf(
+				TEXT("Shallow %s enters the uniquely lower dry neighbor"),
+				*MaterialId.ToString()),
+			World.TryGetCellSnapshot(Downhill, DownhillSnapshot)
+				&& DownhillSnapshot.MaterialId == MaterialId
+				&& DownhillSnapshot.Amount > 0);
+		TestEqual(
+			*FString::Printf(TEXT("Downhill %s flow conserves exact amount"),
+				*MaterialId.ToString()),
+			World.SumMaterialAmount(MaterialId),
+			AmountBefore);
+		TestTrue(
+			*FString::Printf(TEXT("Downhill %s flow reports movement"),
+				*MaterialId.ToString()),
+			Stats.MovedCells > 0);
+	}
 	return true;
 }
 

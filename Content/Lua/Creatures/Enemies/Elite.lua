@@ -3,7 +3,7 @@ creature.define({
 	name = "巡逻精英",
 	faction = "hostile",
 	level = "elite",
-	health = 50,
+	health = 25,
 	width = 75,
 	height = 170,
 	density = 0.90, -- 精英只能在较深水域接近中性浮力。
@@ -30,5 +30,4 @@ creature.define({
 		}),
 	})
 	ai.drop("std.coin", 5000)
-	ai.spawn_on_quest("std.init_quest.kill_enemy", 1, 850)
 end)

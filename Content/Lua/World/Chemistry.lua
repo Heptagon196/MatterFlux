@@ -6,26 +6,25 @@ reaction.define {
     chance = 1.0,
 }
 
--- 接触腐蚀与燃烧共用同一个反应 DSL。酸本身保留，被腐蚀格转成会扩散的酸雾；
--- 这里故意不声明 acid+water，二者只按密度分层，不发生化学反应。
+reaction.define {
+    id = "fire_water_extinguish",
+    trigger = "contact",
+    inputs = { "fire", "water" },
+    outputs = { "empty", "water" },
+    chance = 1.0,
+}
+
+-- 腐蚀是守恒的一次接触反应，不是像燃烧一样的自传播过程。一个酸液格在
+-- 溶解一个固体格后被消耗，不产生新的酸性材料格；反应不会复制酸，也不会
+-- 沿 Source mask 自行蔓延。这里故意不声明 acid+water，二者只按密度分层。
 local function corrodible(id, target)
     reaction.define {
         id = id,
         trigger = "contact",
         inputs = { "acid", target },
-        outputs = { "acid", "acid_gas" },
+        outputs = { "empty", "empty" },
         chance = 1.0,
     }
-	reaction.define {
-		id = target .. "_corrosion_acid",
-		trigger = "propagating",
-		inputs = { target, "acid" },
-		outputs = { "empty", "acid" },
-		chance = 1.0,
-		duration_steps = 3,
-		propagation = { chance = 0.78 },
-		emission = { material = "acid_gas", chance = 0.86 },
-	}
 end
 
 corrodible("acid_wood_corrosion", "wood")

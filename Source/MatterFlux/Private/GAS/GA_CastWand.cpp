@@ -2,6 +2,7 @@
 
 #include "AbilitySystemComponent.h"
 #include "Components/PrimitiveComponent.h"
+#include "Components/SphereComponent.h"
 #include "Game/MatterFluxPlayerState.h"
 #include "Game/MatterFluxCharacter.h"
 #include "GameFramework/CharacterMovementComponent.h"
@@ -37,7 +38,7 @@ namespace MatterFluxCastWand
 			|| !FMath::IsFinite(Projectile.Color.B)
 			|| !FMath::IsFinite(Projectile.Color.A)
 			|| Projectile.Damage < 0.0f
-			|| Projectile.Speed <= 0.0f
+			|| Projectile.Speed < 0.0f
 			|| Projectile.Lifetime <= 0.0f
 			|| Projectile.Lifetime > 30.0f
 			|| Projectile.Radius <= 0.0f
@@ -45,9 +46,13 @@ namespace MatterFluxCastWand
 			|| Projectile.GravityScale < 0.0f
 			|| Projectile.GravityScale > 4.0f
 			|| Projectile.MaterialAmount < 1
-			|| Projectile.MaterialAmount > 64
+			|| Projectile.MaterialAmount > 4096
 			|| Projectile.OrbitRadius < 0.0f
-			|| Projectile.OrbitRadius > 10000.0f)
+			|| Projectile.OrbitRadius > 10000.0f
+			|| !FMath::IsFinite(Projectile.SpawnForwardOffset)
+			|| !FMath::IsFinite(Projectile.SpawnHeightOffset)
+			|| FMath::Abs(Projectile.SpawnForwardOffset) > 5000.0f
+			|| FMath::Abs(Projectile.SpawnHeightOffset) > 5000.0f)
 		{
 			return false;
 		}
@@ -130,15 +135,26 @@ void UGA_CastWand::ActivateAbility(
 		HashCombineFast(
 			GetTypeHash(EquipmentSlot),
 			GetTypeHash(ActivationSerial++))));
+	FVector CastDirection = Avatar->GetActorForwardVector();
+	if (const AMatterFluxCharacter* Character =
+		Cast<AMatterFluxCharacter>(Avatar))
+	{
+		CastDirection = Character->GetCurrentWandCastAimDirection();
+	}
 	FMatterFluxWandCastPlan Plan;
 	FGuid WandId;
 	FString Error;
 	const bool bExecuted = Inventory->ExecuteCastAuthority(
 		EquipmentSlot,
 		EventSeed,
-		[Avatar, EventSeed](const FMatterFluxWandCastPlan& Candidate)
+		[Avatar, EventSeed, CastDirection](
+			const FMatterFluxWandCastPlan& Candidate)
 		{
-			return SpawnCastPlan(*Avatar, Candidate, EventSeed);
+			return SpawnCastPlan(
+				*Avatar,
+				Candidate,
+				EventSeed,
+				CastDirection);
 		},
 		Plan,
 		WandId,
@@ -166,14 +182,13 @@ void UGA_CastWand::ActivateAbility(
 bool UGA_CastWand::SpawnCastPlan(
 	AActor& Avatar,
 	const FMatterFluxWandCastPlan& Plan,
-	const int32 EventSeed)
+	const int32 EventSeed,
+	const FVector& AimDirection)
 {
 	UWorld* World = Avatar.GetWorld();
-	if (!World
-		|| !Avatar.HasAuthority()
+	if (!World || !Avatar.HasAuthority()
 		|| (Plan.Projectiles.IsEmpty() && Plan.CasterEffects.IsEmpty())
-		|| Plan.Projectiles.Num() > 32
-		|| Plan.CasterEffects.Num() > 32)
+		|| Plan.Projectiles.Num() > 32 || Plan.CasterEffects.Num() > 32)
 	{
 		return false;
 	}
@@ -188,7 +203,9 @@ bool UGA_CastWand::SpawnCastPlan(
 			return false;
 		}
 	}
-	FVector Forward = Avatar.GetActorForwardVector();
+	FVector Forward = AimDirection.IsNearlyZero()
+		? Avatar.GetActorForwardVector()
+		: AimDirection;
 	Forward.Z = 0.0f;
 	if (!Forward.Normalize())
 	{
@@ -250,7 +267,9 @@ bool UGA_CastWand::SpawnCastPlan(
 			Direction.Rotation(),
 			CasterBoundsOrigin
 				+ FVector(0.0f, 0.0f, 25.0f)
-				+ Direction * SpawnDistance);
+				+ Direction
+					* (SpawnDistance + Projectile.SpawnForwardOffset)
+				+ FVector::UpVector * Projectile.SpawnHeightOffset);
 		AMatterFluxMagicProjectile* Spawned =
 			World->SpawnActorDeferred<AMatterFluxMagicProjectile>(
 				AMatterFluxMagicProjectile::StaticClass(),
@@ -275,6 +294,24 @@ bool UGA_CastWand::SpawnCastPlan(
 		FDeferredProjectile& Entry = Deferred.AddDefaulted_GetRef();
 		Entry.Actor = Spawned;
 		Entry.Transform = Transform;
+	}
+	// Multicast projectiles intentionally share a launch point. Prevent the
+	// siblings from treating that initial overlap as an immediate impact while
+	// preserving their collision with the caster's world and other casts.
+	for (int32 FirstIndex = 0; FirstIndex < Deferred.Num(); ++FirstIndex)
+	{
+		for (int32 SecondIndex = FirstIndex + 1;
+			SecondIndex < Deferred.Num();
+			++SecondIndex)
+		{
+			AMatterFluxMagicProjectile* First = Deferred[FirstIndex].Actor;
+			AMatterFluxMagicProjectile* Second = Deferred[SecondIndex].Actor;
+			if (First && Second && First->Collision && Second->Collision)
+			{
+				First->Collision->IgnoreActorWhenMoving(Second, true);
+				Second->Collision->IgnoreActorWhenMoving(First, true);
+			}
+		}
 	}
 	for (FDeferredProjectile& Entry : Deferred)
 	{

@@ -1,7 +1,7 @@
 quest.define({
 	id = "std.init_quest_buy",
 	name = "进入营地",
-	description = "进入营地，用击败敌人获得的金币购买任意商品。",
+	description = "用跳跃法术越过左侧高石排，靠近营地商人按 E 交互并购买任意商品。",
 	completed_description = "已完成第一次交易。",
 	category = "main",
 	sort = 100,

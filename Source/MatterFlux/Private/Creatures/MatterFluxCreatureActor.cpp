@@ -8,6 +8,7 @@
 #include "Game/MatterFluxCharacterMovementComponent.h"
 #include "Game/MatterFluxPlayerState.h"
 #include "GameFramework/CharacterMovementComponent.h"
+#include "GameFramework/GameStateBase.h"
 #include "IMatterFluxScriptRuntime.h"
 #include "Magic/MatterFluxMagicProjectile.h"
 #include "Material/MatterFluxBuoyancyComponent.h"
@@ -98,9 +99,14 @@ void AMatterFluxCreatureActor::InitializeCreature(const FName InDefinitionId)
 {
 	check(HasAuthority());
 	DefinitionId = InDefinitionId;
-	if (const FMatterFluxCreatureDefinition* Definition = ResolveDefinition())
+	const FMatterFluxCreatureDefinition* Definition = ResolveDefinition();
+	if (Definition)
 	{
 		CurrentHealth = Definition->MaxHealth;
+		// Deferred creatures must use their authored capsule before
+		// FinishSpawning places them on terrain. Waiting for BeginPlay leaves the
+		// constructor's 80 cm half-height capsule embedded for short creatures.
+		ApplyDefinitionRuntimeProperties(*Definition);
 		FMatterFluxCreatureAIDecisionContext InitialContext;
 		FString BehaviorError;
 		if (!FMatterFluxCreatureBehaviorTreeEvaluator::Evaluate(
@@ -108,6 +114,10 @@ void AMatterFluxCreatureActor::InitializeCreature(const FName InDefinitionId)
 			InitialContext,
 			RuntimeState,
 			BehaviorError))
+		{
+			RuntimeState = EMatterFluxCreatureRuntimeState::Passive;
+		}
+		if (Definition->bWaitForFirstSight)
 		{
 			RuntimeState = EMatterFluxCreatureRuntimeState::Passive;
 		}
@@ -372,11 +382,7 @@ void AMatterFluxCreatureActor::ApplyDefinitionPresentation()
 {
 	const FMatterFluxCreatureDefinition* Definition = ResolveDefinition();
 	if (!Definition) return;
-	GetCapsuleComponent()->SetCapsuleSize(
-		Definition->Width * 0.5f,
-		Definition->Height * 0.5f);
-	GetCharacterMovement()->MaxWalkSpeed = Definition->MoveSpeed;
-	BuoyancyComponent->SetBodyDensity(Definition->Density);
+	ApplyDefinitionRuntimeProperties(*Definition);
 	const float WidthScale = Definition->Width / 100.0f;
 	const float HeightScale = Definition->Height / 100.0f;
 	BodyVisual->SetRelativeScale3D(FVector(
@@ -409,6 +415,16 @@ void AMatterFluxCreatureActor::ApplyDefinitionPresentation()
 	}
 }
 
+void AMatterFluxCreatureActor::ApplyDefinitionRuntimeProperties(
+	const FMatterFluxCreatureDefinition& Definition)
+{
+	GetCapsuleComponent()->SetCapsuleSize(
+		Definition.Width * 0.5f,
+		Definition.Height * 0.5f);
+	GetCharacterMovement()->MaxWalkSpeed = Definition.MoveSpeed;
+	BuoyancyComponent->SetBodyDensity(Definition.Density);
+}
+
 AMatterFluxPlayerState* AMatterFluxCreatureActor::ResolveKillerPlayerState(
 	AActor* DamageSource) const
 {
@@ -435,11 +451,12 @@ void AMatterFluxCreatureActor::HandleDeathAuthority(AActor* DamageSource)
 		AI->StopMovement();
 	}
 
-	if (AMatterFluxPlayerState* Killer = ResolveKillerPlayerState(DamageSource))
+	const FMatterFluxCreatureDefinition* Definition = ResolveDefinition();
+	AMatterFluxPlayerState* Killer = ResolveKillerPlayerState(DamageSource);
+	if (Killer)
 	{
 		if (UMatterFluxProgressionComponent* Progression = Killer->GetProgression())
 		{
-			const FMatterFluxCreatureDefinition* Definition = ResolveDefinition();
 			FString Error;
 			if (Definition && !Definition->DropItemId.IsNone()
 				&& Definition->DropItemCount > 0)
@@ -447,13 +464,44 @@ void AMatterFluxCreatureActor::HandleDeathAuthority(AActor* DamageSource)
 				Progression->AddItemAuthority(
 					Definition->DropItemId, Definition->DropItemCount, Error);
 			}
-			FMatterFluxQuestEvent Event;
-			Event.Type = EMatterFluxQuestEventType::EnemyKilled;
-			Event.SubjectId = DefinitionId;
-			Event.SubjectLevel = Definition
-				? static_cast<int32>(Definition->Level) : INDEX_NONE;
-			Progression->NotifyQuestEventAuthority(Event, Error);
 		}
+	}
+
+	// A kill objective describes a world fact: the target enemy died. It must
+	// not disappear merely because another hostile delivered the final hit.
+	// Loot ownership remains killer-specific above, while every participating
+	// player's active objective receives the authoritative death event once.
+	FMatterFluxQuestEvent Event;
+	Event.Type = EMatterFluxQuestEventType::EnemyKilled;
+	Event.SubjectId = DefinitionId;
+	Event.SubjectLevel = Definition
+		? static_cast<int32>(Definition->Level) : INDEX_NONE;
+	TSet<UMatterFluxProgressionComponent*> QuestRecipients;
+	if (const AGameStateBase* GameState = GetWorld()
+		? GetWorld()->GetGameState() : nullptr)
+	{
+		for (APlayerState* QuestPlayerState : GameState->PlayerArray)
+		{
+			if (AMatterFluxPlayerState* MatterFluxState =
+				Cast<AMatterFluxPlayerState>(QuestPlayerState))
+			{
+				if (UMatterFluxProgressionComponent* Progression =
+					MatterFluxState->GetProgression())
+				{
+					QuestRecipients.Add(Progression);
+				}
+			}
+		}
+	}
+	if (Killer && Killer->GetProgression())
+	{
+		// Preserve standalone/unit-test worlds which do not install a GameState.
+		QuestRecipients.Add(Killer->GetProgression());
+	}
+	for (UMatterFluxProgressionComponent* Progression : QuestRecipients)
+	{
+		FString Error;
+		Progression->NotifyQuestEventAuthority(Event, Error);
 	}
 	ForceNetUpdate();
 	SetLifeSpan(0.75f);

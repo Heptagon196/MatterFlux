@@ -194,6 +194,80 @@ namespace MatterFlux::PlayableLevel
 			return Clamped * Clamped * (3.0f - 2.0f * Clamped);
 		}
 
+		constexpr float HouseWalkablePlateauRadius = 900.0f;
+		constexpr float HouseTerrainBlendRadius = 1150.0f;
+		constexpr float HousePopulationReserveHalfExtent = 950.0f;
+
+		bool IsHouseWalkableSiteClearOfWater(
+			const FGenerationContext& Context,
+			const FVector2D& Candidate)
+		{
+			if (Context.IsInsideLake(
+				Candidate.X, Candidate.Y, HouseWalkablePlateauRadius))
+			{
+				return false;
+			}
+			const float StreamBankHalfWidth =
+				StreamBankHalfWidthCells * TerrainCellSize;
+			const int32 MinimumRow = Context.ToCellY(
+				Candidate.Y - HouseWalkablePlateauRadius);
+			const int32 MaximumRow = Context.ToCellY(
+				Candidate.Y + HouseWalkablePlateauRadius);
+			for (int32 Row = MinimumRow; Row <= MaximumRow; ++Row)
+			{
+				const float WorldY = TerrainOriginY + Row * TerrainCellSize;
+				const float DeltaY = WorldY - Candidate.Y;
+				const float RemainingRadiusSquared =
+					FMath::Square(HouseWalkablePlateauRadius)
+						- FMath::Square(DeltaY);
+				if (RemainingRadiusSquared < 0.0f)
+				{
+					continue;
+				}
+				const float RequiredHorizontalClearance =
+					FMath::Sqrt(RemainingRadiusSquared)
+						+ StreamBankHalfWidth;
+				if (FMath::Abs(Candidate.X - Context.StreamXAt(WorldY))
+					< RequiredHorizontalClearance)
+				{
+					return false;
+				}
+			}
+			return true;
+		}
+
+		void FlattenHouseWalkableSite(
+			FGenerationContext& Context,
+			const FVector2D& HouseCenter)
+		{
+			const float PlateauHeight = Context.SurfaceAt(
+				HouseCenter.X, HouseCenter.Y);
+			for (int32 Y = 0; Y < TerrainCellsY; ++Y)
+			{
+				const float WorldY = TerrainOriginY
+					+ static_cast<float>(Y) * TerrainCellSize;
+				for (int32 X = 0; X < TerrainCellsX; ++X)
+				{
+					const float WorldX = TerrainOriginX
+						+ static_cast<float>(X) * TerrainCellSize;
+					const float Distance = FVector2D::Distance(
+						FVector2D(WorldX, WorldY), HouseCenter);
+					if (Distance > HouseTerrainBlendRadius)
+					{
+						continue;
+					}
+					const int32 Index = Y * TerrainCellsX + X;
+					const float OriginalHeight = Context.SurfaceHeights[Index];
+					const float Blend = SmoothStep01(
+						(Distance - HouseWalkablePlateauRadius)
+						/ (HouseTerrainBlendRadius
+							- HouseWalkablePlateauRadius));
+					Context.SurfaceHeights[Index] = FMath::Lerp(
+						PlateauHeight, OriginalHeight, Blend);
+				}
+			}
+		}
+
 		constexpr int64 InfiniteRiverSpacingCells = 16 * 32;
 		constexpr int32 InfiniteRiverMeanderCells = 32;
 
@@ -798,6 +872,38 @@ namespace MatterFlux::PlayableLevel
 			FRandomStream LakeRandom = Context.MakeRuleStream(0x4c414b45u);
 			SelectLakeLowland(Context, LakeRandom);
 			ResolveLakeSurface(Context);
+
+			// Pick the deterministic dry site before carving water, then make the
+			// house and its exterior walking ring one continuous surface. Water is
+			// carved afterwards so the platform blend cannot fill a lake basin.
+			const FVector2D HouseCandidates[] = {
+				FVector2D(900.0f, 400.0f),
+				FVector2D(900.0f, -400.0f),
+				FVector2D(-900.0f, 400.0f),
+				FVector2D(-900.0f, -400.0f),
+				FVector2D(1000.0f, 0.0f),
+				FVector2D(-1000.0f, 0.0f),
+				FVector2D(-1100.0f, -650.0f),
+				FVector2D(1100.0f, -650.0f),
+				FVector2D(-1100.0f, 650.0f),
+				FVector2D(1100.0f, 650.0f),
+				FVector2D(650.0f, -720.0f),
+				FVector2D(920.0f, 260.0f),
+				FVector2D(-120.0f, 920.0f),
+				FVector2D(-1050.0f, 180.0f)
+			};
+			FVector2D HouseCenter = HouseCandidates[0];
+			for (const FVector2D Candidate : HouseCandidates)
+			{
+				if (IsHouseWalkableSiteClearOfWater(Context, Candidate))
+				{
+					HouseCenter = Candidate;
+					break;
+				}
+			}
+			Context.HouseCenter = HouseCenter;
+			Layout.HouseLocation = FVector(HouseCenter, 0.0f);
+			FlattenHouseWalkableSite(Context, HouseCenter);
 			CarveStreamChannel(Context);
 			CarveLakeBasin(Context);
 			Layout.Terrain.Heights = Context.SurfaceHeights;
@@ -862,29 +968,6 @@ namespace MatterFlux::PlayableLevel
 					Location.Y,
 					SafeTop - Scale.Z * 50.0f));
 			}
-
-			// 溪流形状由 seed 决定。按固定候选顺序挑选第一块远离溪流
-			// 的地面，使所有联机端可独立得到同一个房屋预留区。
-			const FVector2D HouseCandidates[] = {
-				FVector2D(650.0f, -720.0f),
-				FVector2D(920.0f, 260.0f),
-				FVector2D(-120.0f, 920.0f),
-				FVector2D(-1050.0f, 180.0f)
-			};
-			FVector2D HouseCenter = HouseCandidates[0];
-			for (const FVector2D Candidate : HouseCandidates)
-			{
-				if (!Context.IsNearStream(
-						Candidate.X, Candidate.Y, 760.0f)
-					&& !Context.IsInsideLake(
-						Candidate.X, Candidate.Y, 760.0f))
-				{
-					HouseCenter = Candidate;
-					break;
-				}
-			}
-			Context.HouseCenter = HouseCenter;
-			Layout.HouseLocation = FVector(HouseCenter, 0.0f);
 		}
 
 		void GenerateStream(FGenerationContext& Context, FLevelLayout& Layout)
@@ -1009,8 +1092,10 @@ namespace MatterFlux::PlayableLevel
 					&& (!bReserveCameraCorridor
 						|| !bInsideCameraCorridor);
 				const bool bClearOfHouse =
-					FMath::Abs(X - Context.HouseCenter.X) > 850.0f
-					|| FMath::Abs(Y - Context.HouseCenter.Y) > 710.0f;
+					FMath::Abs(X - Context.HouseCenter.X)
+						> HousePopulationReserveHalfExtent
+					|| FMath::Abs(Y - Context.HouseCenter.Y)
+						> HousePopulationReserveHalfExtent;
 				if (bClearOfDefaultSpawn
 					&& bClearOfHouse
 					&& !Context.IsInsideLake(X, Y, 90.0f)

@@ -1,6 +1,39 @@
 #include "Material/MatterFluxCustomMap.h"
 
+#include "Material/MatterFluxMaterialSimulationRuntime.h"
 #include "Material/MatterFluxMaterialWorld.h"
+
+namespace
+{
+	MatterFlux::Material::FWorldSettings MakeCustomMapWorldSettings(
+		const FMatterFluxCustomMapDefinition& Map)
+	{
+		constexpr int32 ChunkSize = 64;
+		const int32 Width = Map.MaximumCellExclusive.X - Map.MinimumCell.X;
+		const int32 Height = Map.MaximumCellExclusive.Y - Map.MinimumCell.Y;
+		const int32 ActiveRadius = FMath::Clamp(
+			FMath::DivideAndRoundUp(FMath::Max(Width, Height), ChunkSize) + 1,
+			1,
+			16);
+		MatterFlux::Material::FWorldSettings Settings;
+		Settings.ChunkSize = ChunkSize;
+		Settings.ActiveChunkRadius = ActiveRadius;
+		const int32 Diameter = ActiveRadius * 2 + 1;
+		Settings.MaxActiveChunks = Diameter * Diameter;
+		Settings.bUseSurfaceTopology = true;
+		Settings.MinSurfaceCell = Map.MinimumCell;
+		Settings.MaxSurfaceCellExclusive = Map.MaximumCellExclusive;
+		Settings.bCullOutsideSurfaceBounds = true;
+		return Settings;
+	}
+
+	FIntPoint GetCustomMapFocus(const FMatterFluxCustomMapDefinition& Map)
+	{
+		return FIntPoint(
+			(Map.MinimumCell.X + Map.MaximumCellExclusive.X - 1) / 2,
+			(Map.MinimumCell.Y + Map.MaximumCellExclusive.Y - 1) / 2);
+	}
+}
 
 namespace MatterFlux::Material
 {
@@ -24,29 +57,14 @@ namespace MatterFlux::Material
 			return false;
 		}
 
-		constexpr int32 ChunkSize = 64;
 		const int32 Width = Map->MaximumCellExclusive.X - Map->MinimumCell.X;
 		const int32 Height = Map->MaximumCellExclusive.Y - Map->MinimumCell.Y;
-		const int32 ActiveRadius = FMath::Clamp(
-			FMath::DivideAndRoundUp(FMath::Max(Width, Height), ChunkSize) + 1,
-			1,
-			16);
-		FWorldSettings Settings;
-		Settings.ChunkSize = ChunkSize;
-		Settings.ActiveChunkRadius = ActiveRadius;
-		const int32 Diameter = ActiveRadius * 2 + 1;
-		Settings.MaxActiveChunks = Diameter * Diameter;
-		Settings.bUseSurfaceTopology = true;
-		Settings.MinSurfaceCell = Map->MinimumCell;
-		Settings.MaxSurfaceCellExclusive = Map->MaximumCellExclusive;
-		Settings.bCullOutsideSurfaceBounds = true;
+		const FWorldSettings Settings = MakeCustomMapWorldSettings(*Map);
 		if (!OutWorld.Initialize(Settings, Registry, Seed, OutError))
 		{
 			return false;
 		}
-		OutWorld.SetSimulationFocus(FIntPoint(
-			(Map->MinimumCell.X + Map->MaximumCellExclusive.X - 1) / 2,
-			(Map->MinimumCell.Y + Map->MaximumCellExclusive.Y - 1) / 2));
+		OutWorld.SetSimulationFocus(GetCustomMapFocus(*Map));
 
 		TArray<FSeedCell> SurfaceCells;
 		SurfaceCells.Reserve(Width * Height);
@@ -188,6 +206,69 @@ namespace MatterFlux::Material
 			Container.TiltDurationSteps = SourceContainer.TiltDurationSteps;
 			Container.TiltDegrees = SourceContainer.TiltDegrees;
 			Container.PourCellsPerStep = SourceContainer.PourCellsPerStep;
+		}
+		return true;
+	}
+
+	bool BuildPlayableCustomMap(
+		const FName MapId,
+		const FMatterFluxContentRegistry& Registry,
+		const int32 Seed,
+		const float StepSeconds,
+		const int32 MaxStepsPerAdvance,
+		FSimulationRuntime& OutRuntime,
+		FCustomMapScene& OutScene,
+		FString& OutError)
+	{
+		FChunkedMaterialWorld StagingWorld;
+		if (!BuildCustomMap(
+			MapId,
+			Registry,
+			Seed,
+			StagingWorld,
+			OutScene,
+			OutError))
+		{
+			return false;
+		}
+		const FMatterFluxCustomMapDefinition* Map =
+			Registry.CustomMaps.Find(MapId);
+		if (!Map)
+		{
+			OutError = TEXT("Custom map disappeared during runtime adoption");
+			return false;
+		}
+		TArray<uint8> InitialState;
+		if (!StagingWorld.ExportActiveState(0, InitialState, OutError))
+		{
+			return false;
+		}
+
+		FRuntimeSettings RuntimeSettings;
+		RuntimeSettings.World = MakeCustomMapWorldSettings(*Map);
+		RuntimeSettings.StepSeconds = StepSeconds;
+		RuntimeSettings.MaxStepsPerAdvance = MaxStepsPerAdvance;
+		const FIntPoint InitialFocus = GetCustomMapFocus(*Map);
+		const TArray<FIntPoint> InitialFocuses = { InitialFocus };
+		if (!OutRuntime.Initialize(
+			RuntimeSettings,
+			Registry,
+			Seed,
+			InitialFocuses,
+			OutError))
+		{
+			return false;
+		}
+		int32 LogicalStep = 0;
+		FIntPoint ImportedFocus = FIntPoint::ZeroValue;
+		if (!OutRuntime.ImportActiveState(
+			InitialState,
+			LogicalStep,
+			ImportedFocus,
+			OutError))
+		{
+			OutRuntime.Reset();
+			return false;
 		}
 		return true;
 	}

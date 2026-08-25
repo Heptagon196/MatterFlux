@@ -2,11 +2,57 @@
 #include "Engine/Level.h"
 #include "Engine/World.h"
 #include "Game/MatterFluxCharacter.h"
+#include "Game/MatterFluxGameMode.h"
+#include "Game/MatterFluxPlayableWorldActor.h"
 #include "Game/MatterFluxPlayerOperation.h"
 #include "GameFramework/PlayerStart.h"
 #include "HAL/IConsoleManager.h"
 #include "Misc/AutomationTest.h"
+#include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
+#include "UI/MatterFluxShellWidget.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxTitleBackgroundSeedTest,
+	"MatterFlux.Project.TitleBackgroundUsesFixedSeed",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxTitleBackgroundSeedTest::RunTest(const FString& Parameters)
+{
+	TestEqual(
+		TEXT("The title screen resolves to its stable map seed"),
+		AMatterFluxGameMode::ResolveInitialPlayableWorldSeed(true),
+		AMatterFluxGameMode::TitleBackgroundMapSeed);
+	TestEqual(
+		TEXT("Started gameplay leaves the world actor free to choose its runtime seed"),
+		AMatterFluxGameMode::ResolveInitialPlayableWorldSeed(false),
+		0);
+	TestTrue(
+		TEXT("The fixed title seed is a valid procedural map seed"),
+		AMatterFluxGameMode::TitleBackgroundMapSeed > 0);
+	TestTrue(
+		TEXT("The completed seed 1337 title capture is present"),
+		FPaths::FileExists(FPaths::Combine(
+			FPaths::ProjectContentDir(),
+			TEXT("UI/TitleBackgroundSeed1337.png"))));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxStorySeedTest,
+	"MatterFlux.Project.StoryModeUsesFixedSeed",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxStorySeedTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	TestTrue(TEXT("Story mode has a valid fixed procedural seed"),
+		AMatterFluxPlayableWorldActor::PaperMagicStorySeed > 0);
+	TestEqual(TEXT("Story mode keeps the PaperMagic map id"),
+		UMatterFluxShellWidget::GetStoryMapId(),
+		FName(TEXT("story.paper_magic")));
+	return true;
+}
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxProjectVersionTest,
@@ -86,6 +132,9 @@ bool FMatterFluxDeveloperCaptureModuleTest::RunTest(
 				Command),
 			Console.FindConsoleObject(Command));
 	}
+	TestNotNull(
+		TEXT("Fragment cut logging command is registered"),
+		Console.FindConsoleObject(TEXT("mf.Fragment.CutLog")));
 	return true;
 }
 

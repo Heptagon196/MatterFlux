@@ -31,6 +31,7 @@ namespace MatterFluxLua
 	constexpr int32 MaximumCreatureBehaviorNodes = 64;
 	constexpr int32 MaximumCreatureBehaviorDepth = 8;
 	constexpr int32 MaximumCreatureBehaviorChildren = 16;
+	constexpr int32 MaximumShopCategories = 16;
 	constexpr int32 MaximumCustomMapStamps = 256;
 	constexpr int32 MaximumCustomMapMarkers = 64;
 	constexpr int32 MaximumCustomMapSceneBoxes = 64;
@@ -623,6 +624,9 @@ namespace MatterFluxLua
 			|| Definition.DeepOpacity > 1.0f
 			|| !FMath::IsFinite(Definition.OpacityDepth)
 			|| Definition.OpacityDepth <= 0.0f
+			|| !FMath::IsFinite(Definition.MovementResistance)
+			|| Definition.MovementResistance < 0.0f
+			|| Definition.MovementResistance > 8.0f
 			|| !bValidPhase)
 		{
 			OutError = FString::Printf(
@@ -817,7 +821,6 @@ namespace MatterFluxLua
 			&& IsFiniteNonNegative(Definition.PatrolPauseSeconds)
 			&& IsFiniteNonNegative(Definition.AttackCooldown)
 			&& IsFiniteNonNegative(Definition.SkillCooldown)
-			&& IsFiniteNonNegative(Definition.SpawnDistance)
 			&& FMath::IsFinite(Definition.Color.R)
 			&& FMath::IsFinite(Definition.Color.G)
 			&& FMath::IsFinite(Definition.Color.B)
@@ -853,10 +856,7 @@ namespace MatterFluxLua
 			|| (bUsesRetreatRange
 				&& Definition.RetreatRange > Definition.PerceptionRange)
 			|| Definition.DropItemCount < 0
-			|| Definition.DropItemCount > 999999
-			|| Definition.SpawnCount < 0
-			|| Definition.SpawnCount > 64
-			|| Definition.SpawnDistance > 10000.0f)
+			|| Definition.DropItemCount > 999999)
 		{
 			OutError = FString::Printf(
 				TEXT("creature '%s' contains invalid data"), *Id);
@@ -936,12 +936,28 @@ namespace MatterFluxLua
 		if (!IsValidContentId(Id)
 			|| Definition.DisplayName.IsEmpty()
 			|| Definition.DisplayName.Len() > 96
+			|| Definition.Categories.Num() > MaximumShopCategories
 			|| Definition.Offers.IsEmpty()
 			|| Definition.Offers.Num() > 64)
 		{
 			OutError = FString::Printf(
 				TEXT("shop '%s' contains invalid data"), *Id);
 			return false;
+		}
+		TSet<FName> CategoryIds;
+		for (const FMatterFluxShopCategoryDefinition& Category
+			: Definition.Categories)
+		{
+			if (!IsValidContentId(Category.Id.ToString())
+				|| Category.DisplayName.IsEmpty()
+				|| Category.DisplayName.Len() > 48
+				|| CategoryIds.Contains(Category.Id))
+			{
+				OutError = FString::Printf(
+					TEXT("shop '%s' contains an invalid category"), *Id);
+				return false;
+			}
+			CategoryIds.Add(Category.Id);
 		}
 		for (const FMatterFluxShopOfferDefinition& Offer : Definition.Offers)
 		{
@@ -950,7 +966,9 @@ namespace MatterFluxLua
 				|| Offer.CostItemId.IsNone()
 				|| Offer.CostCount < 1 || Offer.CostCount > 999999
 				|| Offer.PurchaseLimit < INDEX_NONE
-				|| Offer.PurchaseLimit > 999999)
+				|| Offer.PurchaseLimit > 999999
+				|| (!Offer.CategoryId.IsNone()
+					&& !CategoryIds.Contains(Offer.CategoryId)))
 			{
 				OutError = FString::Printf(
 					TEXT("shop '%s' contains an invalid offer"), *Id);
@@ -992,7 +1010,9 @@ namespace MatterFluxLua
 			&& FMath::IsFinite(Definition.Color.A)
 			&& IsFiniteNonNegative(Definition.OrbitRadius)
 			&& IsFiniteNonNegative(Definition.CarrierLifetimeOverride)
-			&& IsFiniteNonNegative(Definition.VerticalImpulse);
+			&& IsFiniteNonNegative(Definition.VerticalImpulse)
+			&& FMath::IsFinite(Definition.SpawnForwardOffset)
+			&& FMath::IsFinite(Definition.SpawnHeightOffset);
 		const bool bValidKind =
 			Definition.Kind == EMatterFluxSpellKind::Projectile
 			|| Definition.Kind == EMatterFluxSpellKind::Modifier
@@ -1017,8 +1037,10 @@ namespace MatterFluxLua
 			|| Definition.OrbitRadius > 10000.0f
 			|| Definition.CarrierLifetimeOverride > 30.0f
 			|| Definition.VerticalImpulse > 5000.0f
+			|| FMath::Abs(Definition.SpawnForwardOffset) > 5000.0f
+			|| FMath::Abs(Definition.SpawnHeightOffset) > 5000.0f
 			|| Definition.MaterialAmount < 1
-			|| Definition.MaterialAmount > 64
+			|| Definition.MaterialAmount > 4096
 			|| Definition.DrawCount < 0
 			|| Definition.DrawCount > 16
 			|| Definition.TriggerDrawCount < 0
@@ -1033,12 +1055,12 @@ namespace MatterFluxLua
 		}
 		if ((Definition.Kind == EMatterFluxSpellKind::Projectile
 				|| Definition.Kind == EMatterFluxSpellKind::Trigger)
-			&& (Definition.Speed <= 0.0f
+			&& (Definition.Speed < 0.0f
 				|| Definition.Lifetime <= 0.0f
 				|| Definition.Radius <= 0.0f))
 		{
 			OutError = FString::Printf(
-				TEXT("projectile spell '%s' requires positive speed, lifetime, and radius"),
+				TEXT("projectile spell '%s' requires non-negative speed and positive lifetime and radius"),
 				*Id);
 			return false;
 		}
@@ -1117,7 +1139,8 @@ namespace MatterFluxLua
 			|| Definition.StarterCount < 0
 			|| Definition.StarterCount > 16
 			|| Definition.StarterEquipmentSlot < -1
-			|| Definition.StarterEquipmentSlot >= 4
+			|| Definition.StarterEquipmentSlot
+				>= MatterFlux::Magic::EquipmentSlotCount
 			|| Definition.StarterDeck.Num() > Definition.Capacity)
 		{
 			OutError = FString::Printf(
@@ -1203,9 +1226,11 @@ namespace MatterFluxLua
 			|| Definition.TargetLevel < INDEX_NONE
 			|| Definition.TargetLevel > 1000000
 			|| Definition.EquipmentSlot < INDEX_NONE
-			|| Definition.EquipmentSlot >= 4
+			|| Definition.EquipmentSlot
+				>= MatterFlux::Magic::EquipmentSlotCount
 			|| Definition.Prerequisites.Num() > 32
 			|| Definition.Subquests.Num() > 32
+			|| Definition.ActivationCreatureSpawns.Num() > 64
 			|| Definition.ActivationRewards.Num() > 32
 			|| Definition.CompletionRewards.Num() > 32
 			|| (Definition.Objective == EMatterFluxQuestObjectiveKind::CompleteChildren
@@ -1226,7 +1251,8 @@ namespace MatterFluxLua
 					|| Reward.Quantity < 1
 					|| Reward.Quantity > 999999
 					|| Reward.EquipmentSlot < INDEX_NONE
-					|| Reward.EquipmentSlot >= 4)
+					|| Reward.EquipmentSlot
+						>= MatterFlux::Magic::EquipmentSlotCount)
 				{
 					OutError = FString::Printf(
 						TEXT("quest '%s' contains an invalid reward"), *Id);
@@ -1239,6 +1265,20 @@ namespace MatterFluxLua
 			|| !ValidateRewards(Definition.CompletionRewards))
 		{
 			return false;
+		}
+		TSet<FName> SpawnMarkerIds;
+		for (const FMatterFluxCreatureSpawnDefinition& Spawn
+			: Definition.ActivationCreatureSpawns)
+		{
+			if (Spawn.CreatureId.IsNone()
+				|| Spawn.MarkerId.IsNone()
+				|| SpawnMarkerIds.Contains(Spawn.MarkerId))
+			{
+				OutError = FString::Printf(
+					TEXT("quest '%s' contains an invalid creature spawn"), *Id);
+				return false;
+			}
+			SpawnMarkerIds.Add(Spawn.MarkerId);
 		}
 		if (Registry.Quests.Contains(Definition.Id))
 		{
@@ -1276,6 +1316,7 @@ namespace MatterFluxLua
 				&& Definition.PourContainers.IsEmpty())
 			|| Definition.Stamps.Num() > MaximumCustomMapStamps
 			|| Definition.Markers.Num() > MaximumCustomMapMarkers
+			|| Definition.InitialCreatureSpawns.Num() > 64
 			|| Definition.SceneBoxes.Num() > MaximumCustomMapSceneBoxes
 			|| Definition.Cameras.Num() > MaximumCustomMapCameras
 			|| Definition.PourContainers.Num()
@@ -1334,6 +1375,22 @@ namespace MatterFluxLua
 				return false;
 			}
 			MarkerIds.Add(Marker.Id);
+		}
+		TSet<FName> SpawnMarkerIds;
+		for (const FMatterFluxCreatureSpawnDefinition& Spawn
+			: Definition.InitialCreatureSpawns)
+		{
+			if (Spawn.CreatureId.IsNone()
+				|| Spawn.MarkerId.IsNone()
+				|| !MarkerIds.Contains(Spawn.MarkerId)
+				|| SpawnMarkerIds.Contains(Spawn.MarkerId))
+			{
+				OutError = FString::Printf(
+					TEXT("custom map '%s' contains an invalid initial creature spawn"),
+					*Id);
+				return false;
+			}
+			SpawnMarkerIds.Add(Spawn.MarkerId);
 		}
 		const auto IsFiniteVector = [](const FVector& Value)
 		{
@@ -1515,6 +1572,17 @@ namespace MatterFluxLua
 		for (const TPair<FName, FMatterFluxCustomMapDefinition>& Pair
 			: Registry.CustomMaps)
 		{
+			for (const FMatterFluxCreatureSpawnDefinition& Spawn
+				: Pair.Value.InitialCreatureSpawns)
+			{
+				if (!Registry.Creatures.Contains(Spawn.CreatureId))
+				{
+					OutError = FString::Printf(
+						TEXT("custom map '%s' references missing creature '%s'"),
+						*Pair.Key.ToString(), *Spawn.CreatureId.ToString());
+					return false;
+				}
+			}
 			for (const FMatterFluxCustomMapStampDefinition& Stamp
 				: Pair.Value.Stamps)
 			{
@@ -1700,9 +1768,7 @@ namespace MatterFluxLua
 				|| (!Creature.ShopId.IsNone()
 					&& !Registry.Shops.Contains(Creature.ShopId))
 				|| (!Creature.DropItemId.IsNone()
-					&& !Registry.Items.Contains(Creature.DropItemId))
-				|| (!Creature.SpawnQuestId.IsNone()
-					&& !Registry.Quests.Contains(Creature.SpawnQuestId)))
+					&& !Registry.Items.Contains(Creature.DropItemId)))
 			{
 				OutError = FString::Printf(
 					TEXT("creature '%s' references missing content"),
@@ -1789,6 +1855,17 @@ namespace MatterFluxLua
 					Pair.Key, Quest.CompletionRewards))
 			{
 				return false;
+			}
+			for (const FMatterFluxCreatureSpawnDefinition& Spawn
+				: Quest.ActivationCreatureSpawns)
+			{
+				if (!Registry.Creatures.Contains(Spawn.CreatureId))
+				{
+					OutError = FString::Printf(
+						TEXT("quest '%s' spawn references missing creature '%s'"),
+						*Pair.Key.ToString(), *Spawn.CreatureId.ToString());
+					return false;
+				}
 			}
 		}
 		TSet<FName> Visiting;
@@ -2405,6 +2482,77 @@ namespace MatterFluxLua
 		return true;
 	}
 
+	static bool ReadTableCreatureSpawnArrayField(
+		lua_State* State,
+		const int32 TableIndex,
+		const char* Field,
+		TArray<FMatterFluxCreatureSpawnDefinition>& OutValues,
+		FString& OutError)
+	{
+		OutValues.Reset();
+		const int32 AbsoluteTableIndex = lua_absindex(State, TableIndex);
+		lua_getfield(State, AbsoluteTableIndex, Field);
+		if (lua_type(State, -1) == LUA_TNIL)
+		{
+			lua_pop(State, 1);
+			return true;
+		}
+		if (lua_type(State, -1) != LUA_TTABLE)
+		{
+			lua_pop(State, 1);
+			OutError = FString::Printf(
+				TEXT("field '%s' must be an array of creature spawns"),
+				UTF8_TO_TCHAR(Field));
+			return false;
+		}
+		const int32 SpawnArrayIndex = lua_absindex(State, -1);
+		const size_t Count = lua_rawlen(State, SpawnArrayIndex);
+		if (Count > 64)
+		{
+			lua_pop(State, 1);
+			OutError = FString::Printf(
+				TEXT("field '%s' may contain at most 64 creature spawns"),
+				UTF8_TO_TCHAR(Field));
+			return false;
+		}
+		OutValues.Reserve(static_cast<int32>(Count));
+		for (size_t Index = 1; Index <= Count; ++Index)
+		{
+			lua_rawgeti(State, SpawnArrayIndex, static_cast<lua_Integer>(Index));
+			if (lua_type(State, -1) != LUA_TTABLE)
+			{
+				lua_pop(State, 2);
+				OutError = FString::Printf(
+					TEXT("field '%s' creature spawn %d must be a table"),
+					UTF8_TO_TCHAR(Field), static_cast<int32>(Index));
+				return false;
+			}
+			const int32 SpawnIndex = lua_absindex(State, -1);
+			FString CreatureId;
+			FString MarkerId;
+			if (!ReadTableStringField(
+					State, SpawnIndex, "creature_id", CreatureId, true, OutError)
+				|| !ReadTableStringField(
+					State, SpawnIndex, "marker_id", MarkerId, true, OutError)
+				|| !IsValidContentId(CreatureId)
+				|| !IsValidContentId(MarkerId))
+			{
+				lua_pop(State, 2);
+				OutError = FString::Printf(
+					TEXT("field '%s' creature spawn %d is invalid: %s"),
+					UTF8_TO_TCHAR(Field), static_cast<int32>(Index), *OutError);
+				return false;
+			}
+			FMatterFluxCreatureSpawnDefinition Spawn;
+			Spawn.CreatureId = FName(*CreatureId);
+			Spawn.MarkerId = FName(*MarkerId);
+			OutValues.Add(MoveTemp(Spawn));
+			lua_pop(State, 1);
+		}
+		lua_pop(State, 1);
+		return true;
+	}
+
 	static int32 FailLuaCall(lua_State* State, const FString& Error)
 	{
 		GetExecutionContext(State).Error = Error;
@@ -2547,6 +2695,9 @@ namespace MatterFluxLua
 					State, TableIndex, "mobility", Mobility, Error)
 				|| !ReadTableIntegerField(
 					State, TableIndex, "dispersion", Dispersion, Error)
+				|| !ReadTableNumberField(
+					State, TableIndex, "movement_resistance",
+					Definition.MovementResistance, Error)
 				|| !ReadTableIntegerField(
 					State, TableIndex, "lifetime_steps", LifetimeSteps, Error)
 				|| !ReadTableNumberField(
@@ -3230,6 +3381,72 @@ namespace MatterFluxLua
 		return true;
 	}
 
+	static bool ReadShopCategories(
+		lua_State* State,
+		const int32 DefinitionIndex,
+		TArray<FMatterFluxShopCategoryDefinition>& OutCategories,
+		FString& OutError)
+	{
+		OutCategories.Reset();
+		lua_getfield(State, DefinitionIndex, "categories");
+		if (lua_type(State, -1) == LUA_TNIL)
+		{
+			lua_pop(State, 1);
+			return true;
+		}
+		if (lua_type(State, -1) != LUA_TTABLE)
+		{
+			lua_pop(State, 1);
+			OutError = TEXT("shop categories must be an array");
+			return false;
+		}
+		const int32 CategoriesIndex = lua_absindex(State, -1);
+		const size_t Count = lua_rawlen(State, CategoriesIndex);
+		if (Count > MaximumShopCategories)
+		{
+			lua_pop(State, 1);
+			OutError = FString::Printf(
+				TEXT("shop may contain at most %d categories"),
+				MaximumShopCategories);
+			return false;
+		}
+		for (size_t Index = 1; Index <= Count; ++Index)
+		{
+			lua_rawgeti(
+				State,
+				CategoriesIndex,
+				static_cast<lua_Integer>(Index));
+			if (lua_type(State, -1) != LUA_TTABLE)
+			{
+				lua_pop(State, 2);
+				OutError = TEXT("shop category must be a table");
+				return false;
+			}
+			const int32 CategoryIndex = lua_absindex(State, -1);
+			FString CategoryId;
+			FMatterFluxShopCategoryDefinition Category;
+			if (!ReadTableStringField(
+					State, CategoryIndex, "id", CategoryId, true, OutError)
+				|| !ReadTableStringField(
+					State,
+					CategoryIndex,
+					"name",
+					Category.DisplayName,
+					true,
+					OutError)
+				|| !IsValidContentId(CategoryId))
+			{
+				lua_pop(State, 2);
+				return false;
+			}
+			Category.Id = FName(*CategoryId);
+			OutCategories.Add(MoveTemp(Category));
+			lua_pop(State, 1);
+		}
+		lua_pop(State, 1);
+		return true;
+	}
+
 	static bool ReadShopOffers(
 		lua_State* State,
 		const int32 DefinitionIndex,
@@ -3266,21 +3483,27 @@ namespace MatterFluxLua
 			FString Kind;
 			FString ProductId;
 			FString CostItemId;
+			FString CategoryId;
 			if (!ReadTableStringField(State, OfferIndex, "kind", Kind, true, OutError)
 				|| !ReadTableStringField(State, OfferIndex, "product_id", ProductId, true, OutError)
 				|| !ReadTableIntegerField(State, OfferIndex, "product_count", Offer.ProductCount, OutError)
 				|| !ReadTableStringField(State, OfferIndex, "cost_item", CostItemId, true, OutError)
 				|| !ReadTableIntegerField(State, OfferIndex, "cost_count", Offer.CostCount, OutError)
 				|| !ReadTableIntegerField(State, OfferIndex, "limit", Offer.PurchaseLimit, OutError)
+				|| !ReadTableStringField(State, OfferIndex, "category", CategoryId, false, OutError)
 				|| !ParseShopProductKind(Kind, Offer.ProductKind, OutError)
 				|| !IsValidContentId(ProductId)
-				|| !IsValidContentId(CostItemId))
+				|| !IsValidContentId(CostItemId)
+				|| (!CategoryId.IsEmpty() && !IsValidContentId(CategoryId)))
 			{
 				lua_pop(State, 2);
 				return false;
 			}
 			Offer.ProductId = FName(*ProductId);
 			Offer.CostItemId = FName(*CostItemId);
+			Offer.CategoryId = CategoryId.IsEmpty()
+				? NAME_None
+				: FName(*CategoryId);
 			OutOffers.Add(MoveTemp(Offer));
 			lua_pop(State, 1);
 		}
@@ -3354,7 +3577,6 @@ namespace MatterFluxLua
 		FString DialogueId;
 		FString ShopId;
 		FString DropItemId;
-		FString SpawnQuestId;
 		if (!ReadTableStringField(State, 1, "id", Id, true, Error)
 			|| !ReadTableStringField(State, 1, "name", Definition.DisplayName, true, Error)
 			|| !ReadTableStringField(State, 1, "faction", Faction, true, Error)
@@ -3369,6 +3591,7 @@ namespace MatterFluxLua
 			|| !ReadTableNumberField(State, 1, "attack_range", Definition.AttackRange, Error)
 			|| !ReadTableNumberField(State, 1, "retreat_range", Definition.RetreatRange, Error)
 			|| !ReadTableNumberField(State, 1, "target_memory", Definition.TargetMemorySeconds, Error)
+			|| !ReadTableBooleanField(State, 1, "wait_for_first_sight", Definition.bWaitForFirstSight, Error)
 			|| !ReadTableNumberField(State, 1, "patrol_turn", Definition.PatrolTurnSeconds, Error)
 			|| !ReadTableNumberField(State, 1, "patrol_pause", Definition.PatrolPauseSeconds, Error)
 			|| !ReadTableNumberField(State, 1, "attack_cooldown", Definition.AttackCooldown, Error)
@@ -3403,9 +3626,6 @@ namespace MatterFluxLua
 			|| !ReadTableStringField(State, 1, "shop_id", ShopId, false, Error)
 			|| !ReadTableStringField(State, 1, "drop_item", DropItemId, false, Error)
 			|| !ReadTableIntegerField(State, 1, "drop_count", Definition.DropItemCount, Error)
-			|| !ReadTableStringField(State, 1, "spawn_quest", SpawnQuestId, false, Error)
-			|| !ReadTableIntegerField(State, 1, "spawn_count", Definition.SpawnCount, Error)
-			|| !ReadTableNumberField(State, 1, "spawn_distance", Definition.SpawnDistance, Error)
 			|| !ReadTableNumberField(State, 1, "color_r", Definition.Color.R, Error)
 			|| !ReadTableNumberField(State, 1, "color_g", Definition.Color.G, Error)
 			|| !ReadTableNumberField(State, 1, "color_b", Definition.Color.B, Error)
@@ -3441,7 +3661,6 @@ namespace MatterFluxLua
 			|| !ParseOptionalId(DialogueId, Definition.DialogueId)
 			|| !ParseOptionalId(ShopId, Definition.ShopId)
 			|| !ParseOptionalId(DropItemId, Definition.DropItemId)
-			|| !ParseOptionalId(SpawnQuestId, Definition.SpawnQuestId)
 			|| !Context.Builder->AddCreature(Definition, Error))
 		{
 			return FailLuaCall(State, Error);
@@ -3503,6 +3722,7 @@ namespace MatterFluxLua
 		FString Id;
 		if (!ReadTableStringField(State, 1, "id", Id, true, Error)
 			|| !ReadTableStringField(State, 1, "name", Definition.DisplayName, true, Error)
+			|| !ReadShopCategories(State, 1, Definition.Categories, Error)
 			|| !ReadShopOffers(State, 1, Definition.Offers, Error)
 			|| !IsValidContentId(Id))
 		{
@@ -3646,6 +3866,12 @@ namespace MatterFluxLua
 				State, 1, "body_material", BodyMaterial, false, Error)
 			|| !ReadTableIntegerField(
 				State, 1, "material_amount", Definition.MaterialAmount, Error)
+			|| !ReadTableNumberField(
+				State, 1, "spawn_forward_offset", Definition.SpawnForwardOffset, Error)
+			|| !ReadTableNumberField(
+				State, 1, "spawn_height_offset", Definition.SpawnHeightOffset, Error)
+			|| !ReadTableBooleanField(
+				State, 1, "spawn_stationary", Definition.bSpawnStationary, Error)
 			|| !ReadTableStringField(
 				State, 1, "visual_shape", VisualShape, false, Error)
 			|| !ReadTableIntegerField(
@@ -3932,6 +4158,9 @@ namespace MatterFluxLua
 			|| !ReadTableIntegerField(State, 1, "equipment_slot", Definition.EquipmentSlot, Error)
 			|| !ReadTableContentIdArrayField(State, 1, "prerequisites", Definition.Prerequisites, Error)
 			|| !ReadTableContentIdArrayField(State, 1, "children", Definition.Subquests, Error)
+			|| !ReadTableCreatureSpawnArrayField(
+				State, 1, "activation_creature_spawns",
+				Definition.ActivationCreatureSpawns, Error)
 			|| !ReadTableQuestRewardArrayField(State, 1, "activation_rewards", Definition.ActivationRewards, Error)
 			|| !ReadTableQuestRewardArrayField(State, 1, "completion_rewards", Definition.CompletionRewards, Error)
 			|| !ParseQuestCategory(Category, Definition.Category, Error)
@@ -4045,6 +4274,12 @@ namespace MatterFluxLua
 				Error.IsEmpty() ? TEXT("custom map id is invalid") : Error);
 		}
 		Definition.Id = FName(*Id);
+		if (!ReadTableCreatureSpawnArrayField(
+			State, 1, "initial_creature_spawns",
+			Definition.InitialCreatureSpawns, Error))
+		{
+			return FailLuaCall(State, Error);
+		}
 
 		lua_getfield(State, 1, "stamps");
 		if (lua_type(State, -1) != LUA_TTABLE)

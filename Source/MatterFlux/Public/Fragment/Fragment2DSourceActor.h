@@ -106,6 +106,8 @@ public:
 			+ ReplicatedReactionActiveMask.Num();
 	}
 	bool IsReacting() const;
+	/** Stable mask-derived bounds used by world simulation indexes. */
+	FBox GetCanonicalWorldBounds() const;
 	FBox GetActiveWorldBounds() const;
 	FName GetReactionStimulusMaterial() const;
 	void GatherReactionSmokeAnchors(
@@ -268,7 +270,10 @@ private:
 		TArray<FFragmentSpawnPayload> Payloads;
 	};
 
-	bool PrepareDamageEvent(const FFragmentDamageEvent& DamageEvent, FPreparedFragmentDamage& OutTransaction) const;
+	bool PrepareDamageEvent(
+		const FFragmentDamageEvent& DamageEvent,
+		FPreparedFragmentDamage& OutTransaction,
+		bool bForceDetachedPhysics = false) const;
 	bool CommitPreparedDamage(FPreparedFragmentDamage& Transaction);
 
 	TUniquePtr<MatterFlux::Reaction::FMaskReaction>

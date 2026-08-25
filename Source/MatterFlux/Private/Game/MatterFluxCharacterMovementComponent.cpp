@@ -2,6 +2,26 @@
 
 #include "Components/PrimitiveComponent.h"
 
+void UMatterFluxCharacterMovementComponent::SetMaterialMovementResistance(
+	const float NewResistance)
+{
+	MaterialMovementResistance = FMath::IsFinite(NewResistance)
+		? FMath::Clamp(NewResistance, 0.0f, 8.0f)
+		: 0.0f;
+}
+
+float UMatterFluxCharacterMovementComponent::GetMaxSpeed() const
+{
+	return Super::GetMaxSpeed()
+		/ (1.0f + 0.65f * MaterialMovementResistance);
+}
+
+float UMatterFluxCharacterMovementComponent::GetMaxAcceleration() const
+{
+	return Super::GetMaxAcceleration()
+		/ (1.0f + MaterialMovementResistance);
+}
+
 void UMatterFluxCharacterMovementComponent::ApplyImpactPhysicsForces(
 	const FHitResult& Impact,
 	const FVector& ImpactAcceleration,

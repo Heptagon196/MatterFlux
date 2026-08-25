@@ -14,6 +14,7 @@
 #include "Fragment/Fragment2DActor.h"
 #include "Fragment/Fragment2DSourceActor.h"
 #include "Game/MatterFluxPlayableWorldActor.h"
+#include "Game/MatterFluxPlayerController.h"
 #include "Game/MatterFluxTwoStoreyHouseActor.h"
 #include "Game/MatterFluxPlayerState.h"
 #include "Game/MatterFluxCharacterPhysicsInteraction.h"
@@ -626,7 +627,7 @@ void AMatterFluxCharacter::PawnClientRestart()
 			reinterpret_cast<uint64>(this),
 			12.0f,
 			FColor(120, 220, 255),
-			TEXT("MatterFlux 2.5D  |  WASD 移动  Space 跳跃  滚轮缩放  左键/右键/Q/E 施放法杖  I/Tab 魔法工坊"));
+			TEXT("MatterFlux 2.5D  |  WASD 移动  滚轮缩放  左键/右键/Q/E/Space 施放法杖  I/Tab 魔法工坊"));
 	}
 }
 
@@ -644,8 +645,6 @@ void AMatterFluxCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInpu
 
 	EnhancedInput->BindAction(MoveAction, ETriggerEvent::Triggered, this, &AMatterFluxCharacter::HandleMove);
 	EnhancedInput->BindAction(MoveAction, ETriggerEvent::Completed, this, &AMatterFluxCharacter::HandleMoveCompleted);
-	EnhancedInput->BindAction(JumpAction, ETriggerEvent::Started, this, &AMatterFluxCharacter::HandleJumpStarted);
-	EnhancedInput->BindAction(JumpAction, ETriggerEvent::Completed, this, &AMatterFluxCharacter::HandleJumpCompleted);
 	EnhancedInput->BindAction(CameraZoomAction, ETriggerEvent::Triggered, this, &AMatterFluxCharacter::HandleCameraZoom);
 	for (int32 Slot = 0; Slot < CastWandActions.Num(); ++Slot)
 	{
@@ -694,7 +693,6 @@ void AMatterFluxCharacter::EnsurePlayableInputAssets()
 
 	PlayableMappingContext = NewObject<UInputMappingContext>(this, TEXT("Runtime_IMC_Playable"));
 	MoveAction = NewObject<UInputAction>(this, TEXT("Runtime_IA_Move"));
-	JumpAction = NewObject<UInputAction>(this, TEXT("Runtime_IA_Jump"));
 	CameraZoomAction = NewObject<UInputAction>(this, TEXT("Runtime_IA_CameraZoom"));
 	CastWandActions.Reset(UGA_CastWand::EquipmentSlotCount);
 	for (int32 Slot = 0; Slot < UGA_CastWand::EquipmentSlotCount; ++Slot)
@@ -706,7 +704,6 @@ void AMatterFluxCharacter::EnsurePlayableInputAssets()
 	RegenerateAction = NewObject<UInputAction>(this, TEXT("Runtime_IA_Regenerate"));
 
 	MoveAction->ValueType = EInputActionValueType::Axis2D;
-	JumpAction->ValueType = EInputActionValueType::Boolean;
 	CameraZoomAction->ValueType = EInputActionValueType::Axis1D;
 	for (UInputAction* Action : CastWandActions)
 	{
@@ -744,9 +741,6 @@ void AMatterFluxCharacter::EnsurePlayableInputAssets()
 	MapYKey(EKeys::Down, true);
 	MapYKey(EKeys::Gamepad_LeftY, false);
 
-	PlayableMappingContext->MapKey(JumpAction, EKeys::SpaceBar);
-	PlayableMappingContext->MapKey(JumpAction, EKeys::Gamepad_FaceButton_Bottom);
-
 	PlayableMappingContext->MapKey(CameraZoomAction, EKeys::MouseWheelAxis);
 
 	PlayableMappingContext->MapKey(CastWandActions[0], EKeys::LeftMouseButton);
@@ -757,6 +751,10 @@ void AMatterFluxCharacter::EnsurePlayableInputAssets()
 	PlayableMappingContext->MapKey(CastWandActions[2], EKeys::Gamepad_LeftShoulder);
 	PlayableMappingContext->MapKey(CastWandActions[3], EKeys::E);
 	PlayableMappingContext->MapKey(CastWandActions[3], EKeys::Gamepad_LeftTrigger);
+	PlayableMappingContext->MapKey(CastWandActions[4], EKeys::SpaceBar);
+	PlayableMappingContext->MapKey(
+		CastWandActions[4],
+		EKeys::Gamepad_FaceButton_Bottom);
 	PlayableMappingContext->MapKey(RegenerateAction, EKeys::R);
 }
 
@@ -892,11 +890,47 @@ void AMatterFluxCharacter::HandleCastWandStopped(
 void AMatterFluxCharacter::HandleCastWandRequested(
 	const int32 EquipmentSlot)
 {
+	ExecuteCastWandRequest(EquipmentSlot, ResolveWandCastAimDirection());
+}
+
+FVector AMatterFluxCharacter::ResolveWandCastAimDirection() const
+{
+	FVector AimDirection;
+	const AMatterFluxPlayerController* PlayerController =
+		Cast<AMatterFluxPlayerController>(GetController());
+	if (PlayerController
+		&& PlayerController->TryGetHorizontalMouseAimDirection(
+			GetActorLocation(),
+			AimDirection))
+	{
+		return AimDirection;
+	}
+	AimDirection = GetActorForwardVector();
+	AimDirection.Z = 0.0f;
+	return AimDirection.GetSafeNormal();
+}
+
+void AMatterFluxCharacter::ExecuteCastWandRequest(
+	const int32 EquipmentSlot,
+	const FVector& AimDirection)
+{
+	FVector HorizontalAim = AimDirection;
+	HorizontalAim.Z = 0.0f;
+	if (!HorizontalAim.Normalize())
+	{
+		HorizontalAim = GetActorForwardVector();
+		HorizontalAim.Z = 0.0f;
+		if (!HorizontalAim.Normalize())
+		{
+			return;
+		}
+	}
+	CurrentWandCastAimDirection = HorizontalAim;
 	PublishPlayerOperation(
 		EMatterFluxPlayerOperation::CastWand,
-		FVector2D::ZeroVector,
+		FVector2D(HorizontalAim.X, HorizontalAim.Y),
 		EquipmentSlot);
-	TryActivateWandSlot(EquipmentSlot);
+	TryActivateWandSlot(EquipmentSlot, HorizontalAim);
 }
 
 void AMatterFluxCharacter::HandleRegenerateRequested()
@@ -931,16 +965,18 @@ void AMatterFluxCharacter::ApplyPlayerOperation(
 		HandleCameraZoom(FInputActionValue(static_cast<float>(Value.X)));
 		break;
 	case EMatterFluxPlayerOperation::Cut:
-		HandleCastWandRequested(0);
+		ExecuteCastWandRequest(0, FVector(Value.X, Value.Y, 0.0f));
 		break;
 	case EMatterFluxPlayerOperation::Flame:
-		HandleCastWandRequested(1);
+		ExecuteCastWandRequest(1, FVector(Value.X, Value.Y, 0.0f));
 		break;
 	case EMatterFluxPlayerOperation::Regenerate:
 		ExecuteRegenerateRequest(IntegerValue);
 		break;
 	case EMatterFluxPlayerOperation::CastWand:
-		HandleCastWandRequested(IntegerValue);
+		ExecuteCastWandRequest(
+			IntegerValue,
+			FVector(Value.X, Value.Y, 0.0f));
 		break;
 	default:
 		break;
@@ -1010,7 +1046,8 @@ void AMatterFluxCharacter::ServerRelayPlayerOperation_Implementation(
 }
 
 void AMatterFluxCharacter::TryActivateWandSlot(
-	const int32 EquipmentSlot)
+	const int32 EquipmentSlot,
+	const FVector& AimDirection)
 {
 	if (EquipmentSlot < 0
 		|| EquipmentSlot >= UGA_CastWand::EquipmentSlotCount)
@@ -1019,9 +1056,12 @@ void AMatterFluxCharacter::TryActivateWandSlot(
 	}
 	if (!HasAuthority())
 	{
-		ServerActivateWandSlot(EquipmentSlot);
+		ServerActivateWandSlot(
+			EquipmentSlot,
+			FVector_NetQuantizeNormal(AimDirection));
 		return;
 	}
+	CurrentWandCastAimDirection = AimDirection;
 
 	UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
 	if (!ASC)
@@ -1041,16 +1081,27 @@ void AMatterFluxCharacter::TryActivateWandSlot(
 }
 
 bool AMatterFluxCharacter::ServerActivateWandSlot_Validate(
-	const int32 EquipmentSlot)
+	const int32 EquipmentSlot,
+	const FVector_NetQuantizeNormal AimDirection)
 {
 	return EquipmentSlot >= 0
-		&& EquipmentSlot < UGA_CastWand::EquipmentSlotCount;
+		&& EquipmentSlot < UGA_CastWand::EquipmentSlotCount
+		&& !AimDirection.ContainsNaN()
+		&& FMath::Abs(AimDirection.Z) <= KINDA_SMALL_NUMBER
+		&& AimDirection.SizeSquared2D() >= 0.8f
+		&& AimDirection.SizeSquared2D() <= 1.2f;
 }
 
 void AMatterFluxCharacter::ServerActivateWandSlot_Implementation(
-	const int32 EquipmentSlot)
+	const int32 EquipmentSlot,
+	const FVector_NetQuantizeNormal AimDirection)
 {
-	TryActivateWandSlot(EquipmentSlot);
+	FVector HorizontalAim = AimDirection;
+	HorizontalAim.Z = 0.0f;
+	if (HorizontalAim.Normalize())
+	{
+		TryActivateWandSlot(EquipmentSlot, HorizontalAim);
+	}
 }
 
 void AMatterFluxCharacter::ServerRegenerateLevel_Implementation()

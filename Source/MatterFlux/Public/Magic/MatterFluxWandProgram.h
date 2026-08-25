@@ -32,6 +32,8 @@ struct MATTERFLUX_API FMatterFluxMagicProjectilePlan
 	float OrbitRadius = 0.0f;
 	FName BodyMaterial;
 	int32 MaterialAmount = 1;
+	float SpawnForwardOffset = 0.0f;
+	float SpawnHeightOffset = 0.0f;
 	bool bUsePlaneVisual = false;
 	bool bUseVerticalPlaneVisual = false;
 	TArray<FMatterFluxMagicProjectilePlan> OnImpactProjectiles;
@@ -54,6 +56,8 @@ struct MATTERFLUX_API FMatterFluxMagicProjectilePlan
 			&& OrbitRadius == Other.OrbitRadius
 			&& BodyMaterial == Other.BodyMaterial
 			&& MaterialAmount == Other.MaterialAmount
+			&& SpawnForwardOffset == Other.SpawnForwardOffset
+			&& SpawnHeightOffset == Other.SpawnHeightOffset
 			&& bUsePlaneVisual == Other.bUsePlaneVisual
 			&& bUseVerticalPlaneVisual == Other.bUseVerticalPlaneVisual
 			&& OnImpactProjectiles == Other.OnImpactProjectiles

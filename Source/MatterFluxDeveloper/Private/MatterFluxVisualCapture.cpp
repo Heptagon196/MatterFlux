@@ -1,9 +1,11 @@
 #include "CoreMinimal.h"
+#include "AbilitySystemComponent.h"
 #include "Camera/CameraComponent.h"
 #include "Camera/CameraActor.h"
 #include "Camera/PlayerCameraManager.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
+#include "Components/BoxComponent.h"
 #include "Components/SceneComponent.h"
 #include "Components/PrimitiveComponent.h"
 #include "Containers/Ticker.h"
@@ -36,6 +38,7 @@
 #include "MatterFluxLog.h"
 #include "IMatterFluxScriptRuntime.h"
 #include "Game/MatterFluxCharacter.h"
+#include "GAS/GA_CastWand.h"
 #include "Magic/MatterFluxMagicInventoryComponent.h"
 #include "Magic/MatterFluxMagicProjectile.h"
 #include "Materials/MaterialInstanceDynamic.h"
@@ -47,7 +50,9 @@
 #include "Material/MatterFluxCustomMapPour.h"
 #include "Misc/DateTime.h"
 #include "Misc/App.h"
+#include "Misc/CommandLine.h"
 #include "Misc/Paths.h"
+#include "ProceduralMeshComponent.h"
 #include "Save/MatterFluxSaveSubsystem.h"
 #include "UnrealClient.h"
 
@@ -58,6 +63,7 @@ namespace
 	bool GTreeCutCapturePending = false;
 	bool GTreeBatchCutCapturePending = false;
 	bool GShellCapturePending = false;
+	bool GFreeModePlayerCheckPending = false;
 	bool GStabilityCapturePending = false;
 	bool GTerrainCutCapturePending = false;
 	bool GLiquidPoolCapturePending = false;
@@ -65,6 +71,11 @@ namespace
 	bool GLiquidDropCapturePending = false;
 	bool GPhysicsPushCapturePending = false;
 	bool GAcidReactionCapturePending = false;
+	bool GWaterSandCapturePending = false;
+	bool GSandSphereTreeCapturePending = false;
+	bool GHouseFadeAuditPending = false;
+	bool GHouseProjectileCutCapturePending = false;
+	bool GShopGridCapturePending = false;
 
 	bool TryApplySpellTreeVisualPreset(
 		AMatterFluxPlayerController& PlayerController,
@@ -107,7 +118,7 @@ namespace
 			DesiredSlots = {
 				TEXT("std.default"),
 				TEXT("std.double_cast"),
-				TEXT("std.add_damage"),
+				TEXT("spell.add_damage"),
 				TEXT("std.default"),
 				TEXT("std.trigger_on_collision"),
 				TEXT("std.default"),
@@ -188,7 +199,9 @@ namespace
 		int32 EventSeed = 1337;
 		bool bQuitAfterCapture = true;
 		bool bBurnInspectionOnly = false;
+		bool bFlameSpellInspection = false;
 		bool bRepeatedItemCut = false;
+		bool bVerticalInitialCut = false;
 		bool bAccepted = false;
 		bool bRequestedTreeMaterialization = false;
 		FGuid PinnedSourceId;
@@ -206,7 +219,72 @@ namespace
 		FVector CameraRight = FVector::RightVector;
 		float CaptureDistance = 560.0f;
 		float CaptureOrthoWidth = 320.0f;
+		double CastAt = 0.0;
+		double ImpactAt = 0.0;
+		bool bSawPlayerProjectile = false;
 	};
+
+	bool ActivateEquippedWandForTreeCapture(
+		AMatterFluxCharacter& Character,
+		const int32 EquipmentSlot)
+	{
+		UAbilitySystemComponent* AbilitySystem =
+			Character.GetAbilitySystemComponent();
+		if (!Character.HasAuthority()
+			|| !AbilitySystem
+			|| EquipmentSlot < 0
+			|| EquipmentSlot >= UGA_CastWand::EquipmentSlotCount)
+		{
+			return false;
+		}
+		for (const FGameplayAbilitySpec& Spec
+			: AbilitySystem->GetActivatableAbilities())
+		{
+			if (Spec.InputID == EquipmentSlot
+				&& Spec.Ability
+				&& Spec.Ability->IsA<UGA_CastWand>())
+			{
+				return AbilitySystem->TryActivateAbility(Spec.Handle, true);
+			}
+		}
+		return false;
+	}
+
+	void LogFlameSpellSpreadAudit(
+		const FTreeCutCaptureState& State,
+		const AMatterFluxPlayableWorldActor& PlayableWorld,
+		const TCHAR* Phase)
+	{
+		int32 PlayerProjectiles = 0;
+		if (UWorld* World = State.World.Get())
+		{
+			for (TActorIterator<AMatterFluxMagicProjectile> It(World); It; ++It)
+			{
+				PlayerProjectiles += It->GetOwner() == State.Character.Get() ? 1 : 0;
+			}
+		}
+		UE_LOG(
+			LogMatterFlux,
+			Display,
+			TEXT("FlameSpellSpread phase=%s elapsed=%.2f fireCells=%d fireAmount=%lld reactingSources=%d activeWood=%d activeLeaf=%d activeGrass=%d activeGrassland=%d sourceOutput=%d sourceEmissions=%d sourceFlames=%d groundActive=%d groundOutput=%d projectiles=%d"),
+			Phase,
+			State.ImpactAt > 0.0
+				? FPlatformTime::Seconds() - State.ImpactAt
+				: -1.0,
+			PlayableWorld.GetSimulatedMaterialCount(TEXT("fire")),
+			PlayableWorld.GetSimulatedMaterialAmount(TEXT("fire")),
+			PlayableWorld.GetReactingSourceCount(),
+			PlayableWorld.GetLogicalReactionActiveCellCount(TEXT("wood")),
+			PlayableWorld.GetLogicalReactionActiveCellCount(TEXT("leaf")),
+			PlayableWorld.GetLogicalReactionActiveCellCount(TEXT("grass")),
+			PlayableWorld.GetLogicalReactionActiveCellCount(TEXT("grassland")),
+			PlayableWorld.GetReactionOutputCellCount(),
+			PlayableWorld.GetLogicalReactionMaterialEmissionCount(),
+			PlayableWorld.GetLogicalReactionFlameInstanceCount(),
+			PlayableWorld.GetActiveGroundReactionCellCount(),
+			PlayableWorld.GetReactedGroundCellCount(),
+			PlayerProjectiles);
+	}
 
 	void PositionTreeCaptureCamera(
 		const FTreeCutCaptureState& State,
@@ -549,7 +627,7 @@ namespace
 				RestoreTreeCutCamera(*State);
 				if (State->bQuitAfterCapture)
 				{
-					FPlatformMisc::RequestExit(false);
+					FPlatformMisc::RequestExitWithStatus(false, 6);
 				}
 				return false;
 			}
@@ -559,58 +637,63 @@ namespace
 			State->AggregateId = AggregateId;
 			State->OutputDirectory = FPaths::Combine(
 				FPaths::ScreenShotDir(),
-				State->bBurnInspectionOnly
+				State->bFlameSpellInspection
+					? TEXT("MatterFluxFlameSpellSpread")
+					: State->bBurnInspectionOnly
 					? TEXT("MatterFluxTreeBurn")
 					: State->bRepeatedItemCut
 						? TEXT("MatterFluxTreeItemCut")
+					: State->bVerticalInitialCut
+						? TEXT("MatterFluxTreeVerticalCut")
 					: TEXT("MatterFluxTreeCut"),
 				FDateTime::Now().ToString(TEXT("%Y%m%d-%H%M%S")));
 			IFileManager::Get().MakeDirectory(
 				*State->OutputDirectory,
 				true);
 
+			const FVector CameraFocus = Bounds.IsValid
+				? Bounds.GetCenter()
+				: RootWorldTransform.GetLocation();
+			State->CameraFocus = CameraFocus;
+			State->CameraFront =
+				RootWorldTransform.GetUnitAxis(EAxis::Y);
+			State->CameraRight =
+				RootWorldTransform.GetUnitAxis(EAxis::X);
+			State->CaptureDistance = Bounds.IsValid
+				? FMath::Clamp(
+					Bounds.GetExtent().Size() * 3.0f,
+					430.0f,
+					680.0f)
+				: 560.0f;
+			State->CaptureOrthoWidth = Bounds.IsValid
+				? FMath::Clamp(
+					Bounds.GetSize().Z * 1.65f,
+					260.0f,
+					420.0f)
+				: 320.0f;
+
 			if (APlayerController* PlayerController =
 				World->GetFirstPlayerController())
 			{
 				State->OriginalViewTarget = PlayerController->GetViewTarget();
+				const FVector CaptureLocation = CameraFocus
+					+ State->CameraFront * State->CaptureDistance
+					+ FVector::UpVector * State->CaptureDistance;
+				ACameraActor* CaptureCamera =
+					World->SpawnActor<ACameraActor>(
+						CaptureLocation,
+						(CameraFocus - CaptureLocation).Rotation());
+				if (CaptureCamera)
+				{
+					State->CaptureCamera = CaptureCamera;
+					PositionTreeCaptureCamera(
+						*State,
+						State->CameraFront);
+					PlayerController->SetViewTarget(CaptureCamera);
+				}
+
 				if (APawn* Pawn = PlayerController->GetPawn())
 				{
-					const FVector CameraFocus =
-						Bounds.IsValid
-							? Bounds.GetCenter()
-							: RootWorldTransform.GetLocation();
-					State->CameraFocus = CameraFocus;
-					State->CameraFront =
-						RootWorldTransform.GetUnitAxis(EAxis::Y);
-					State->CameraRight =
-						RootWorldTransform.GetUnitAxis(EAxis::X);
-					State->CaptureDistance = Bounds.IsValid
-						? FMath::Clamp(
-							Bounds.GetExtent().Size() * 3.0f,
-							430.0f,
-							680.0f)
-						: 560.0f;
-					State->CaptureOrthoWidth = Bounds.IsValid
-						? FMath::Clamp(
-							Bounds.GetSize().Z * 1.65f,
-							260.0f,
-							420.0f)
-						: 320.0f;
-					const FVector CaptureLocation = CameraFocus
-						+ State->CameraFront * State->CaptureDistance
-						+ FVector::UpVector * State->CaptureDistance;
-					ACameraActor* CaptureCamera =
-						World->SpawnActor<ACameraActor>(
-							CaptureLocation,
-							(CameraFocus - CaptureLocation).Rotation());
-					if (CaptureCamera)
-					{
-						State->CaptureCamera = CaptureCamera;
-						PositionTreeCaptureCamera(
-							*State,
-							State->CameraFront);
-						PlayerController->SetViewTarget(CaptureCamera);
-					}
 					FVector PawnLocation =
 						CameraFocus + FVector(-180.0f, -180.0f, 0.0f);
 					PawnLocation.Z =
@@ -674,6 +757,28 @@ namespace
 			State->Phase = 1;
 			State->NextActionAt = Now + 1.0;
 			return true;
+		}
+
+		AMatterFluxPlayableWorldActor* CapturePlayableWorld = nullptr;
+		if (State->bFlameSpellInspection)
+		{
+			for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
+			{
+				CapturePlayableWorld = *It;
+				break;
+			}
+			if (!CapturePlayableWorld)
+			{
+				UE_LOG(LogMatterFlux, Error,
+					TEXT("Flame spell spread capture lost the playable world."));
+				GTreeCutCapturePending = false;
+				RestoreTreeCutCamera(*State);
+				if (State->bQuitAfterCapture)
+				{
+					FPlatformMisc::RequestExitWithStatus(false, 5);
+				}
+				return false;
+			}
 		}
 
 		switch (State->Phase)
@@ -745,12 +850,59 @@ namespace
 				RestoreTreeCutCamera(*State);
 				if (State->bQuitAfterCapture)
 				{
-					FPlatformMisc::RequestExit(false);
+					FPlatformMisc::RequestExitWithStatus(false, 7);
 				}
 				return false;
 			}
 			if (State->bBurnInspectionOnly)
 			{
+				if (State->bFlameSpellInspection)
+				{
+					AMatterFluxCharacter* Character = State->Character.Get();
+					if (!Character)
+					{
+						UE_LOG(LogMatterFlux, Error,
+							TEXT("Flame spell spread capture lost the player character."));
+						GTreeCutCapturePending = false;
+						RestoreTreeCutCamera(*State);
+						if (State->bQuitAfterCapture)
+						{
+							FPlatformMisc::RequestExitWithStatus(false, 5);
+						}
+						return false;
+					}
+					FVector AimDirection = State->CameraFocus
+						- Character->GetActorLocation();
+					AimDirection.Z = 0.0f;
+					if (!AimDirection.Normalize())
+					{
+						AimDirection = FVector::ForwardVector;
+					}
+					Character->SetActorRotation(AimDirection.Rotation());
+					if (!ActivateEquippedWandForTreeCapture(*Character, 1))
+					{
+						UE_LOG(LogMatterFlux, Error,
+							TEXT("Flame spell spread capture could not activate equipped wand slot 1."));
+						GTreeCutCapturePending = false;
+						RestoreTreeCutCamera(*State);
+						if (State->bQuitAfterCapture)
+						{
+							FPlatformMisc::RequestExitWithStatus(false, 5);
+						}
+						return false;
+					}
+					State->CastAt = Now;
+					State->World = World;
+					LogFlameSpellSpreadAudit(
+						*State,
+						*CapturePlayableWorld,
+						TEXT("cast"));
+					PositionTreeCaptureCamera(
+						*State,
+						(State->CameraFront + State->CameraRight).GetSafeNormal());
+					State->NextActionAt = Now + 0.02;
+					break;
+				}
 				const FVector ViewDirection =
 					(State->CameraFront + State->CameraRight).GetSafeNormal();
 				const FVector StimulusPoint = State->CameraFocus
@@ -814,11 +966,13 @@ namespace
 				0.0f,
 				(-static_cast<float>(Tree->GetMaskHeight()) * 0.5f + 1.5f)
 					* Tree->GetCellSize());
-			const FVector WorldCutLocation = Tree->GetActorTransform()
-				.TransformPosition(RootLocalCut);
+			const FVector WorldCutLocation = State->bVerticalInitialCut
+				? State->CameraFocus
+				: Tree->GetActorTransform().TransformPosition(RootLocalCut);
 			FMatterFluxMagicProjectilePlan SpellPlan;
 			SpellPlan.Radius = 60.0f;
 			SpellPlan.bUsePlaneVisual = true;
+			SpellPlan.bUseVerticalPlaneVisual = State->bVerticalInitialCut;
 			FFragmentWorldCutRequest CutRequest;
 			CutRequest.CutShape =
 				AMatterFluxMagicProjectile::BuildImpactCutShape(
@@ -849,7 +1003,7 @@ namespace
 				RestoreTreeCutCamera(*State);
 				if (State->bQuitAfterCapture)
 				{
-					FPlatformMisc::RequestExit(false);
+					FPlatformMisc::RequestExitWithStatus(false, 8);
 				}
 				return false;
 			}
@@ -859,11 +1013,84 @@ namespace
 		case 10:
 			if (State->bBurnInspectionOnly)
 			{
+				if (State->bFlameSpellInspection)
+				{
+					bool bPlayerProjectilePresent = false;
+					for (TActorIterator<AMatterFluxMagicProjectile> It(World); It; ++It)
+					{
+						if (It->GetOwner() == State->Character.Get())
+						{
+							bPlayerProjectilePresent = true;
+							State->bSawPlayerProjectile = true;
+							break;
+						}
+					}
+					if (bPlayerProjectilePresent
+						|| (!State->bSawPlayerProjectile
+							&& Now - State->CastAt < 0.25))
+					{
+						return true;
+					}
+					State->ImpactAt = Now;
+					LogFlameSpellSpreadAudit(
+						*State,
+						*CapturePlayableWorld,
+						TEXT("impact"));
+					RequestTreeCutScreenshot(
+						*State,
+						TEXT("09_Impact_0p0s.png"));
+					State->NextActionAt = State->ImpactAt + 0.5;
+					break;
+				}
 				RequestTreeCutScreenshot(
 					*State,
 					TEXT("09_Active_0p2s_FrontRight45.png"));
 				State->NextActionAt = Now + 0.5;
 				break;
+			}
+			if (State->bVerticalInitialCut)
+			{
+				int32 PrematurelyFadingLeaves = 0;
+				int32 FloatingStaticLeaves = 0;
+				int32 PersistentFragmentBodies = 0;
+				for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+				{
+					if (It->SpawnPayload.MaterialId == TEXT("leaf"))
+					{
+						PrematurelyFadingLeaves +=
+							It->SpawnPayload.FadeOutDuration > 0.0f
+								|| It->IsCutFadeActive()
+							? 1
+							: 0;
+					}
+					PersistentFragmentBodies +=
+						It->SpawnPayload.FadeOutDuration <= 0.0f
+							&& !It->IsCutFadeActive()
+						? 1
+						: 0;
+				}
+				for (TActorIterator<AFragment2DSourceActor> It(World); It; ++It)
+				{
+					FloatingStaticLeaves +=
+						It->AggregateId == State->AggregateId
+							&& It->SourceMaterialId == TEXT("leaf")
+							&& !It->IsActorBeingDestroyed()
+							&& !It->bBroken
+							&& It->GetRuntimeMask().Contains(1)
+						? 1
+						: 0;
+				}
+				State->bAccepted = PrematurelyFadingLeaves == 0
+					&& FloatingStaticLeaves == 0
+					&& PersistentFragmentBodies > 0;
+				UE_LOG(
+					LogMatterFlux,
+					Display,
+					TEXT("Vertical tree-cut first-frame audit: accepted=%s fadingLeaves=%d staticLeaves=%d persistentBodies=%d"),
+					State->bAccepted ? TEXT("true") : TEXT("false"),
+					PrematurelyFadingLeaves,
+					FloatingStaticLeaves,
+					PersistentFragmentBodies);
 			}
 			LogTreeCarrierPhysics(*World, TEXT("just-detached"));
 			RequestTreeCutScreenshot(*State, TEXT("09_JustDetached45.png"));
@@ -872,6 +1099,16 @@ namespace
 		case 11:
 			if (State->bBurnInspectionOnly)
 			{
+				if (State->bFlameSpellInspection)
+				{
+					LogFlameSpellSpreadAudit(
+						*State,
+						*CapturePlayableWorld,
+						TEXT("0p5s"));
+					RequestTreeCutScreenshot(*State, TEXT("10_Active_0p5s.png"));
+					State->NextActionAt = State->ImpactAt + 1.5;
+					break;
+				}
 				RequestTreeCutScreenshot(
 					*State,
 					TEXT("10_Active_0p7s_FrontRight45.png"));
@@ -885,6 +1122,16 @@ namespace
 		case 12:
 			if (State->bBurnInspectionOnly)
 			{
+				if (State->bFlameSpellInspection)
+				{
+					LogFlameSpellSpreadAudit(
+						*State,
+						*CapturePlayableWorld,
+						TEXT("1p5s"));
+					RequestTreeCutScreenshot(*State, TEXT("11_Active_1p5s.png"));
+					State->NextActionAt = State->ImpactAt + 4.0;
+					break;
+				}
 				RequestTreeCutScreenshot(
 					*State,
 					TEXT("11_Active_1p8s_FrontRight45.png"));
@@ -898,6 +1145,16 @@ namespace
 		case 13:
 			if (State->bBurnInspectionOnly)
 			{
+				if (State->bFlameSpellInspection)
+				{
+					LogFlameSpellSpreadAudit(
+						*State,
+						*CapturePlayableWorld,
+						TEXT("4p0s"));
+					RequestTreeCutScreenshot(*State, TEXT("12_Active_4p0s.png"));
+					State->NextActionAt = State->ImpactAt + 8.0;
+					break;
+				}
 				RequestTreeCutScreenshot(
 					*State,
 					TEXT("12_Active_4p0s_FrontRight45.png"));
@@ -915,6 +1172,17 @@ namespace
 			break;
 		case 14:
 		{
+			if (State->bFlameSpellInspection)
+			{
+				LogFlameSpellSpreadAudit(
+					*State,
+					*CapturePlayableWorld,
+					TEXT("8p0s"));
+				RequestTreeCutScreenshot(*State, TEXT("13_Active_8p0s.png"));
+				State->NextActionAt = Now + 0.5;
+				State->Phase = 17;
+				break;
+			}
 			AFragment2DActor* Item = nullptr;
 			for (TActorIterator<AFragment2DActor> It(World); It; ++It)
 			{
@@ -1056,7 +1324,11 @@ namespace
 			{
 				FPlatformMisc::RequestExitWithStatus(
 					false,
-					!State->bRepeatedItemCut || State->bAccepted ? 0 : 5);
+					(!State->bRepeatedItemCut
+						&& !State->bVerticalInitialCut)
+						|| State->bAccepted
+						? 0
+						: 5);
 			}
 			return false;
 		}
@@ -1101,10 +1373,16 @@ namespace
 		const FString WorkbenchPage = Args.Num() > 8
 			? Args[8].TrimStartAndEnd().ToLower()
 			: (bOpenWandBackpack ? TEXT("wand") : TEXT("spell"));
+		const bool bBackgroundOnly =
+			Args.Num() > 9 && FCString::Atoi(*Args[9]) != 0;
+		const bool bFrameTitleHouse =
+			Args.Num() > 10 && FCString::Atoi(*Args[10]) != 0;
 
 		GVisualCapturePending = true;
 		const double QueuedAt = FPlatformTime::Seconds();
 		const TSharedRef<double> ViewportReadyAt =
+			MakeShared<double>(-1.0);
+		const TSharedRef<double> StreamingReadyAt =
 			MakeShared<double>(-1.0);
 		const TSharedRef<bool> bSeedApplied =
 			MakeShared<bool>(RequestedMapSeed == 0);
@@ -1112,6 +1390,10 @@ namespace
 			MakeShared<bool>(!bOpenMagicWorkbench);
 		const TSharedRef<bool> bSpellTreePresetApplied =
 			MakeShared<bool>(SpellTreePreset.IsEmpty());
+		const TSharedRef<bool> bBackgroundPrepared =
+			MakeShared<bool>(!bBackgroundOnly);
+		const TSharedRef<bool> bTitleHouseFramed =
+			MakeShared<bool>(!bFrameTitleHouse);
 		const TSharedRef<FString> SpellTreePresetError =
 			MakeShared<FString>();
 		FTSTicker::GetCoreTicker().AddTicker(
@@ -1126,10 +1408,14 @@ namespace
 					WorkbenchEquipmentSlot,
 					SpellTreePreset,
 					WorkbenchPage,
+					bBackgroundOnly,
 					ViewportReadyAt,
+					StreamingReadyAt,
 					bSeedApplied,
 					bWorkbenchOpened,
 					bSpellTreePresetApplied,
+					bBackgroundPrepared,
+					bTitleHouseFramed,
 					SpellTreePresetError,
 					QueuedAt](
 					float)
@@ -1278,6 +1564,118 @@ namespace
 						return true;
 					}
 
+					AMatterFluxPlayableWorldActor* CaptureWorld = nullptr;
+					for (TActorIterator<AMatterFluxPlayableWorldActor> It(World);
+						It;
+						++It)
+					{
+						CaptureWorld = *It;
+						break;
+					}
+					const bool bStreamingReady = CaptureWorld
+						&& CaptureWorld->IsInitialWorldEntryReady()
+						&& CaptureWorld->GetPendingFragmentSourceSpawnCount() == 0;
+					if (!bStreamingReady)
+					{
+						*StreamingReadyAt = -1.0;
+						return true;
+					}
+					if (*StreamingReadyAt < 0.0)
+					{
+						*StreamingReadyAt = Now;
+						return true;
+					}
+					// A zero-length queue can occur during the hand-off from seeded
+					// river particles to liquid projection. Require a stable ready
+					// window so a capture cannot expose that one-frame gap.
+					if (Now - *StreamingReadyAt < 2.0)
+					{
+						return true;
+					}
+
+					if (!*bTitleHouseFramed)
+					{
+						AMatterFluxTwoStoreyHouseActor* House =
+							CaptureWorld->GetGeneratedHouse();
+						APlayerController* PlayerController =
+							World->GetFirstPlayerController();
+						if (!House || !PlayerController)
+						{
+							return true;
+						}
+
+						const FTransform HouseTransform =
+							House->GetActorTransform();
+						const FVector CameraLocation =
+							HouseTransform.TransformPosition(
+								FVector(3600.0f, 3600.0f, 900.0f));
+						// Aim to the landscape left of the building so the title menu
+						// has a quiet center while the authored house remains visible
+						// on the right and the seeded river stays in the foreground.
+						const FVector Focus = HouseTransform.TransformPosition(
+							FVector(-1800.0f, 900.0f, 280.0f));
+						ACameraActor* CaptureCamera =
+							World->SpawnActor<ACameraActor>(
+								CameraLocation,
+								(Focus - CameraLocation).Rotation());
+						if (!CaptureCamera)
+						{
+							UE_LOG(LogMatterFlux, Error,
+								TEXT("Visual capture could not create the title house camera."));
+							GVisualCapturePending = false;
+							return false;
+						}
+						if (UCameraComponent* CameraComponent =
+							CaptureCamera->GetCameraComponent())
+						{
+							CameraComponent->SetFieldOfView(58.0f);
+							CameraComponent->bConstrainAspectRatio = false;
+						}
+						PlayerController->SetViewTarget(CaptureCamera);
+						*bTitleHouseFramed = true;
+						*StreamingReadyAt = Now;
+						return true;
+					}
+
+					if (!*bBackgroundPrepared)
+					{
+						TArray<UInstancedStaticMeshComponent*> MaterialComponents;
+						CaptureWorld->GetComponents(MaterialComponents);
+						for (UInstancedStaticMeshComponent* Component
+							: MaterialComponents)
+						{
+							if (!IsValid(Component))
+							{
+								continue;
+							}
+							const FString ComponentName = Component->GetName();
+							if (ComponentName.StartsWith(TEXT("MaterialCells_"))
+								&& !ComponentName.StartsWith(TEXT("MaterialCells_water")))
+							{
+								Component->SetVisibility(false, true);
+								Component->SetHiddenInGame(true, true);
+							}
+						}
+						for (TActorIterator<AMatterFluxCreatureActor> It(World);
+							It;
+							++It)
+						{
+							It->SetActorHiddenInGame(true);
+						}
+						if (APlayerController* PlayerController =
+							World->GetFirstPlayerController())
+						{
+							if (APawn* Pawn = PlayerController->GetPawn())
+							{
+								Pawn->SetActorHiddenInGame(true);
+							}
+						}
+						*bBackgroundPrepared = true;
+						// Let hidden component render states settle before capture.
+						*StreamingReadyAt = Now;
+						return true;
+					}
+
 					if (bOpenMagicWorkbench)
 					{
 						const FString ScreenshotPath = FPaths::Combine(
@@ -1370,7 +1768,7 @@ namespace
 
 	FAutoConsoleCommandWithWorldAndArgs GVisualCaptureCommand(
 		TEXT("mf.Visual.Capture"),
-		TEXT("Capture after the game viewport is ready: mf.Visual.Capture [delay=5] [multiplier=2] [quit=0] [map-seed=0] [open-workbench=0] [legacy-wand-page=0] [equipment-slot=0] [spell-tree-preset] [page=spell|wand|item|quest]"),
+			TEXT("Capture after the game viewport is ready: mf.Visual.Capture [delay=5] [multiplier=2] [quit=0] [map-seed=0] [open-workbench=0] [legacy-wand-page=0] [equipment-slot=0] [spell-tree-preset] [page=spell|wand|item|quest] [background-only=0] [frame-title-house=0]"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
 			&QueueVisualCapture));
 
@@ -1886,6 +2284,194 @@ namespace
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
 			&QueueShellCapture));
 
+	void QueueFreeModePlayerCheck(const TArray<FString>& Args, UWorld*)
+	{
+		if (GFreeModePlayerCheckPending)
+		{
+			return;
+		}
+		GFreeModePlayerCheckPending = true;
+		const double QueuedAt = FPlatformTime::Seconds();
+		const int32 RequestedEntryCount = Args.IsEmpty()
+			? 1
+			: FMath::Clamp(FCString::Atoi(*Args[0]), 1, 4);
+		const TSharedRef<int32> CompletedEntryCount = MakeShared<int32>(0);
+		const TSharedRef<double> EntryStartedAt = MakeShared<double>(QueuedAt);
+		const TSharedRef<bool> bStarted = MakeShared<bool>(false);
+		const TSharedRef<bool> bEnteredGameplay = MakeShared<bool>(false);
+		const TSharedRef<bool> bObservedPostGenerationLoading =
+			MakeShared<bool>(false);
+		const TSharedRef<float> FirstPostGenerationProgress =
+			MakeShared<float>(-1.0f);
+		const TSharedRef<float> LastPostGenerationProgress =
+			MakeShared<float>(-1.0f);
+		const TSharedRef<double> CompletionObservedAt = MakeShared<double>(-1.0);
+		FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateLambda([
+				QueuedAt,
+				RequestedEntryCount,
+				CompletedEntryCount,
+				EntryStartedAt,
+				bStarted,
+				bEnteredGameplay,
+				bObservedPostGenerationLoading,
+				FirstPostGenerationProgress,
+				LastPostGenerationProgress,
+				CompletionObservedAt](float)
+			{
+				UWorld* World = GEngine && GEngine->GameViewport
+					? GEngine->GameViewport->GetWorld()
+					: nullptr;
+				AMatterFluxPlayerController* Controller = World
+					? Cast<AMatterFluxPlayerController>(
+						World->GetFirstPlayerController())
+					: nullptr;
+				UMatterFluxSaveSubsystem* Save = World && World->GetGameInstance()
+					? World->GetGameInstance()->GetSubsystem<
+						UMatterFluxSaveSubsystem>()
+					: nullptr;
+				const double Now = FPlatformTime::Seconds();
+				if (!World || !World->IsGameWorld() || !Controller || !Save)
+				{
+					if (Now - QueuedAt < 30.0)
+					{
+						return true;
+					}
+					UE_LOG(LogMatterFlux, Error,
+						TEXT("Free-mode player check timed out waiting for the game world."));
+					GFreeModePlayerCheckPending = false;
+					FPlatformMisc::RequestExitWithStatus(false, 4);
+					return false;
+				}
+				if (!*bStarted)
+				{
+					const int32 EntrySeed = 20260825 + *CompletedEntryCount;
+					if (!Save->RequestNewGame(Controller, EntrySeed))
+					{
+						if (Now - *EntryStartedAt < 30.0)
+						{
+							return true;
+						}
+						UE_LOG(LogMatterFlux, Error,
+							TEXT("Free-mode player check could not start generation: %s"),
+							*Save->GetLastResultMessage());
+						GFreeModePlayerCheckPending = false;
+						FPlatformMisc::RequestExitWithStatus(false, 4);
+						return false;
+					}
+					Controller->HandleShellStateChanged(true, true);
+					*bStarted = true;
+					return true;
+				}
+				AMatterFluxPlayableWorldActor* PlayableWorld = nullptr;
+				for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
+				{
+					PlayableWorld = *It;
+					break;
+				}
+				if (PlayableWorld
+					&& !PlayableWorld->IsGenerationInProgress()
+					&& !PlayableWorld->IsInitialWorldEntryReady()
+					&& Save->IsBusy())
+				{
+					*bObservedPostGenerationLoading = true;
+					const float Progress = Save->GetOperationProgress();
+					if (*FirstPostGenerationProgress < 0.0f)
+					{
+						*FirstPostGenerationProgress = Progress;
+					}
+					*LastPostGenerationProgress = Progress;
+				}
+				if (Save->IsBusy())
+				{
+					if (Now - *EntryStartedAt < 180.0)
+					{
+						return true;
+					}
+					UE_LOG(LogMatterFlux, Error,
+						TEXT("Free-mode player check timed out during generation."));
+					GFreeModePlayerCheckPending = false;
+					FPlatformMisc::RequestExitWithStatus(false, 4);
+					return false;
+				}
+				if (!*bEnteredGameplay
+					&& Save->GetOperation()
+						!= EMatterFluxSaveOperation::Failed)
+				{
+					// Match the shell's successful-operation path: the title menu is
+					// closed and standalone play is unpaused before the asynchronous
+					// terrain-collision entry barrier is allowed to finish.
+					Controller->EnterGameplayForVisualCapture();
+					*bEnteredGameplay = true;
+				}
+
+				APawn* Pawn = Controller->GetPawn();
+				const bool bInitializationReady = PlayableWorld
+					&& PlayableWorld->IsInitialWorldEntryReady();
+				const bool bProgressAdvanced =
+					*FirstPostGenerationProgress >= 0.0f
+					&& *LastPostGenerationProgress
+						> *FirstPostGenerationProgress + KINDA_SMALL_NUMBER;
+				const bool bSuccess = IsValid(Pawn)
+					&& Cast<AMatterFluxCharacter>(Pawn) != nullptr
+					&& bInitializationReady
+					&& *bObservedPostGenerationLoading
+					&& bProgressAdvanced;
+				if (!bSuccess
+					&& Save->GetOperation() != EMatterFluxSaveOperation::Failed)
+				{
+					if (*CompletionObservedAt < 0.0)
+					{
+						*CompletionObservedAt = Now;
+					}
+					if (Now - *CompletionObservedAt < 30.0)
+					{
+						return true;
+					}
+				}
+				if (bSuccess
+					&& *CompletedEntryCount + 1 < RequestedEntryCount)
+				{
+					++*CompletedEntryCount;
+					UE_LOG(LogMatterFlux, Display,
+						TEXT("Free-mode player check entry %d/%d complete; returning to title for re-entry."),
+						*CompletedEntryCount,
+						RequestedEntryCount);
+					Controller->ShowStartMenu();
+					Save->AcknowledgeResult();
+					*bStarted = false;
+					*bEnteredGameplay = false;
+					*bObservedPostGenerationLoading = false;
+					*FirstPostGenerationProgress = -1.0f;
+					*LastPostGenerationProgress = -1.0f;
+					*CompletionObservedAt = -1.0;
+					*EntryStartedAt = Now;
+					return true;
+				}
+				UE_LOG(LogMatterFlux, Display,
+					TEXT("Free-mode player check complete: success=%s entries=%d/%d operation=%d pawn=%s view_target=%s initialization_ready=%s post_generation_loading=%s progress=%.3f->%.3f"),
+					bSuccess ? TEXT("true") : TEXT("false"),
+					*CompletedEntryCount + (bSuccess ? 1 : 0),
+					RequestedEntryCount,
+					static_cast<int32>(Save->GetOperation()),
+					*GetNameSafe(Pawn),
+					*GetNameSafe(Controller->GetViewTarget()),
+					bInitializationReady ? TEXT("true") : TEXT("false"),
+					*bObservedPostGenerationLoading ? TEXT("true") : TEXT("false"),
+					*FirstPostGenerationProgress,
+					*LastPostGenerationProgress);
+				GFreeModePlayerCheckPending = false;
+				FPlatformMisc::RequestExitWithStatus(false, bSuccess ? 0 : 5);
+				return false;
+			}));
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs GFreeModePlayerCheckCommand(
+		TEXT("mf.Test.FreeModePlayer"),
+		TEXT("Start free mode one or more times and fail unless every entry reaches a playable character: mf.Test.FreeModePlayer [entry-count=1]."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+			&QueueFreeModePlayerCheck));
+
 	void QueueTreeCutCapture(
 		const TArray<FString>& Args,
 		UWorld*)
@@ -1910,10 +2496,17 @@ namespace
 			Args.Num() <= 1 || FCString::Atoi(*Args[1]) != 0;
 		State->bBurnInspectionOnly =
 			Args.Num() > 2
-			&& Args[2].Equals(TEXT("burn"), ESearchCase::IgnoreCase);
+			&& (Args[2].Equals(TEXT("burn"), ESearchCase::IgnoreCase)
+				|| Args[2].Equals(TEXT("flame"), ESearchCase::IgnoreCase));
+		State->bFlameSpellInspection =
+			Args.Num() > 2
+			&& Args[2].Equals(TEXT("flame"), ESearchCase::IgnoreCase);
 		State->bRepeatedItemCut =
 			Args.Num() > 2
 			&& Args[2].Equals(TEXT("item"), ESearchCase::IgnoreCase);
+		State->bVerticalInitialCut =
+			Args.Num() > 2
+			&& Args[2].Equals(TEXT("vertical"), ESearchCase::IgnoreCase);
 		GTreeCutCapturePending = true;
 		FTSTicker::GetCoreTicker().AddTicker(
 			FTickerDelegate::CreateLambda(
@@ -1928,14 +2521,18 @@ namespace
 			TEXT("Queued tree inspection sequence: seed=%d quit=%s mode=%s"),
 			State->EventSeed,
 			State->bQuitAfterCapture ? TEXT("true") : TEXT("false"),
-			State->bBurnInspectionOnly
+			State->bFlameSpellInspection
+				? TEXT("flame")
+				: State->bBurnInspectionOnly
 				? TEXT("burn")
-				: State->bRepeatedItemCut ? TEXT("item") : TEXT("cut"));
+				: State->bRepeatedItemCut
+					? TEXT("item")
+					: State->bVerticalInitialCut ? TEXT("vertical") : TEXT("cut"));
 	}
 
 	FAutoConsoleCommandWithWorldAndArgs GTreeCutCaptureCommand(
 		TEXT("mf.Visual.TreeCutSequence"),
-		TEXT("Capture one isolated tree, then cut, repeatedly cut its detached item, or burn it: mf.Visual.TreeCutSequence [event-seed=1337] [quit-after=1] [cut|item|burn]"),
+		TEXT("Capture one isolated tree, then cut, vertically cut, repeatedly cut its detached item, burn it directly, or fire the equipped flame wand: mf.Visual.TreeCutSequence [event-seed=1337] [quit-after=1] [cut|vertical|item|burn|flame]"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
 			&QueueTreeCutCapture));
 
@@ -3299,6 +3896,7 @@ namespace
 
 		case 3:
 		{
+			House->SetCutawayViewerOverride(nullptr);
 			PlayerController->SetPause(false);
 			PlayerController->ResetIgnoreMoveInput();
 			if (UCharacterMovementComponent* Movement =
@@ -3308,11 +3906,14 @@ namespace
 				Movement->SetMovementMode(MOVE_Walking);
 			}
 			const float GroundZ = House->GetFloorSurfaceWorldZ(0);
-			const FVector Local(-350.0f, 245.0f,
+			const float StairY = House->StairRampCollision
+				? House->StairRampCollision->GetRelativeLocation().Y : -245.0f;
+			const FVector Local(-350.0f, StairY,
 				GroundZ - House->GetActorLocation().Z + 91.0f);
 			Character->SetActorLocation(
 				House->GetActorTransform().TransformPosition(Local),
 				false, nullptr, ETeleportType::TeleportPhysics);
+			House->RefreshCutawayImmediately();
 			State->MaximumPlayerFeetZ = GroundZ;
 			State->Phase = 4;
 			State->PhaseStartedAt = Now;
@@ -3399,10 +4000,15 @@ namespace
 			}
 			State->MinimumPlayerFeetZAfterUpper =
 				House->GetFloorSurfaceWorldZ(1);
-			if (House->GetCurrentCutawayFloor() != 1)
+			if (House->GetCurrentCutawayFloor() != 1
+				|| House->GetCurrentStructureOpacity() > 0.06f
+				|| House->GetFloorSurfaceOpacity(1) < 0.999f)
 			{
 				UE_LOG(LogMatterFlux, Error,
-					TEXT("Upper-floor screenshot lost its material cutaway state."));
+					TEXT("Upper-floor screenshot lost its cutaway: floor=%d structureOpacity=%.3f floorOpacity=%.3f."),
+					House->GetCurrentCutawayFloor(),
+					House->GetCurrentStructureOpacity(),
+					House->GetFloorSurfaceOpacity(1));
 				RestoreHouseCapture(*State);
 				if (State->bQuitAfterCapture)
 				{
@@ -3475,10 +4081,15 @@ namespace
 			{
 				return true;
 			}
-			if (House->GetCurrentCutawayFloor() != 0)
+			if (House->GetCurrentCutawayFloor() != 0
+				|| House->GetCurrentStructureOpacity() > 0.06f
+				|| House->GetFloorSurfaceOpacity(0) < 0.999f)
 			{
 				UE_LOG(LogMatterFlux, Error,
-					TEXT("Ground-floor screenshot lost its material cutaway state."));
+					TEXT("Ground-floor screenshot lost its cutaway: floor=%d structureOpacity=%.3f floorOpacity=%.3f."),
+					House->GetCurrentCutawayFloor(),
+					House->GetCurrentStructureOpacity(),
+					House->GetFloorSurfaceOpacity(0));
 				RestoreHouseCapture(*State);
 				if (State->bQuitAfterCapture)
 				{
@@ -3788,6 +4399,8 @@ namespace
 			? FMath::Max(FCString::Atoi(*Args[0]), 1) : 1337;
 		State->bQuitAfterCapture = Args.Num() <= 1
 			|| FCString::Atoi(*Args[1]) != 0;
+		State->Phase = Args.Num() > 2
+			? FMath::Clamp(FCString::Atoi(*Args[2]), 0, 17) : 0;
 		State->OutputDirectory = FPaths::Combine(
 			FPaths::ScreenShotDir(),
 			TEXT("MatterFluxHouse"),
@@ -3798,17 +4411,1321 @@ namespace
 				return TickHouseCapture(State);
 			}));
 		UE_LOG(LogMatterFlux, Display,
-			TEXT("Queued house capture: seed=%d quit=%s output=%s"),
+			TEXT("Queued house capture: seed=%d quit=%s startPhase=%d output=%s"),
 			State->MapSeed,
 			State->bQuitAfterCapture ? TEXT("true") : TEXT("false"),
+			State->Phase,
 			*State->OutputDirectory);
 	}
 
 	FAutoConsoleCommandWithWorldAndArgs GHouseCaptureCommand(
 		TEXT("mf.Visual.HouseSequence"),
-		TEXT("Capture exterior, floor cutaway, and live player/AI stair round trips: mf.Visual.HouseSequence [map-seed=1337] [quit=1]"),
+		TEXT("Capture exterior, floor cutaway, and live player/AI stair round trips: mf.Visual.HouseSequence [map-seed=1337] [quit=1] [start-phase=0]"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
 			&QueueHouseCapture));
+
+	struct FHouseProjectileCutCaptureState
+	{
+		double QueuedAt = 0.0;
+		double PhaseStartedAt = 0.0;
+		int32 Phase = 0;
+		int32 MapSeed = 1337;
+		int32 RevisionBeforeCut = INDEX_NONE;
+		bool bQuitAfterCapture = true;
+		bool bBaselineWarmupCaptured = false;
+		FString OutputDirectory;
+		TWeakObjectPtr<AMatterFluxCharacter> Character;
+		TWeakObjectPtr<AMatterFluxTwoStoreyHouseActor> House;
+		TWeakObjectPtr<AFragment2DSourceActor> TargetWall;
+		TArray<TWeakObjectPtr<AMatterFluxCharacter>> CutCasters;
+		FTransform OriginalCharacterTransform = FTransform::Identity;
+		float OriginalCameraArmLength = 0.0f;
+		FVector OriginalCameraTargetOffset = FVector::ZeroVector;
+		bool bOriginalCameraLagEnabled = true;
+	};
+
+	void RequestHouseProjectileCutScreenshot(
+		const FHouseProjectileCutCaptureState& State,
+		const TCHAR* Filename)
+	{
+		IFileManager::Get().MakeDirectory(*State.OutputDirectory, true);
+		const FString Path = FPaths::Combine(State.OutputDirectory, Filename);
+		FScreenshotRequest::RequestScreenshot(
+			Path, false, false, false, FIntRect(), true);
+		UE_LOG(LogMatterFlux, Display,
+			TEXT("House projectile-cut capture requested screenshot: %s"),
+			*Path);
+	}
+
+	void RestoreHouseProjectileCutCapture(
+		const FHouseProjectileCutCaptureState& State)
+	{
+		for (const TWeakObjectPtr<AMatterFluxCharacter>& Caster
+			: State.CutCasters)
+		{
+			if (Caster.IsValid())
+			{
+				Caster->Destroy();
+			}
+		}
+		if (AMatterFluxCharacter* Character = State.Character.Get())
+		{
+			Character->SetActorTransform(
+				State.OriginalCharacterTransform,
+				false,
+				nullptr,
+				ETeleportType::TeleportPhysics);
+			if (Character->CameraBoom)
+			{
+				Character->CameraBoom->TargetArmLength =
+					State.OriginalCameraArmLength;
+				Character->CameraBoom->TargetOffset =
+					State.OriginalCameraTargetOffset;
+				Character->CameraBoom->bEnableCameraLag =
+					State.bOriginalCameraLagEnabled;
+			}
+		}
+		if (AMatterFluxTwoStoreyHouseActor* House = State.House.Get())
+		{
+			House->SetCutawayViewerOverride(nullptr);
+			House->RefreshCutawayImmediately();
+		}
+	}
+
+	AFragment2DSourceActor* FindVisibleHouseProjectileCutWall(
+		UWorld& World,
+		const AMatterFluxTwoStoreyHouseActor& House,
+		APlayerController& PlayerController)
+	{
+		AFragment2DSourceActor* TargetWall = nullptr;
+		float BestScore = -TNumericLimits<float>::Max();
+		const FVector CameraLocation = PlayerController.PlayerCameraManager
+			? PlayerController.PlayerCameraManager->GetCameraLocation()
+			: House.GetActorLocation();
+		for (TActorIterator<AFragment2DSourceActor> It(&World); It; ++It)
+		{
+			AFragment2DSourceActor* Candidate = *It;
+			if (!IsValid(Candidate)
+				|| Candidate->GetOwner() != &House
+				|| Candidate->SourceMaterialId != TEXT("stone")
+				|| !Candidate->ActorHasTag(
+					TEXT("MatterFluxHouseGroup.LowerWalls")))
+			{
+				continue;
+			}
+			FVector2D ScreenPosition = FVector2D::ZeroVector;
+			const bool bOnScreen =
+				PlayerController.ProjectWorldLocationToScreen(
+					Candidate->GetActorLocation(),
+					ScreenPosition,
+					true);
+			FHitResult VisibilityHit;
+			FCollisionQueryParams VisibilityParams(
+				SCENE_QUERY_STAT(MatterFluxHouseProjectileCutCapture),
+				false);
+			VisibilityParams.AddIgnoredActor(&House);
+			const bool bDirectlyVisible = World.LineTraceSingleByChannel(
+				VisibilityHit,
+				CameraLocation,
+				Candidate->GetActorLocation(),
+				ECC_Visibility,
+				VisibilityParams)
+				&& VisibilityHit.GetActor() == Candidate;
+			const float Score =
+				(bDirectlyVisible ? 1000000.0f : 0.0f)
+				+ (bOnScreen ? 100000.0f : 0.0f)
+				+ static_cast<float>(Candidate->GetMaskWidth()
+					* Candidate->GetMaskHeight());
+			if (!TargetWall || Score > BestScore)
+			{
+				TargetWall = Candidate;
+				BestScore = Score;
+			}
+		}
+		return TargetWall;
+	}
+
+	bool SpawnHouseProjectileCut(
+		FHouseProjectileCutCaptureState& State,
+		UWorld& World,
+		AFragment2DSourceActor& TargetWall,
+		const bool bVertical)
+	{
+		const TArray<uint8>& Mask = TargetWall.GetRuntimeMask();
+		const int32 Width = TargetWall.GetMaskWidth();
+		const int32 Height = TargetWall.GetMaskHeight();
+		const int32 DesiredX = FMath::Clamp(
+			FMath::RoundToInt(static_cast<float>(Width)
+				* (bVertical ? 0.68f : 0.32f)),
+			0,
+			Width - 1);
+		const int32 DesiredY = FMath::Clamp(
+			FMath::RoundToInt(static_cast<float>(Height) * 0.52f),
+			0,
+			Height - 1);
+		FIntPoint ImpactCell(INDEX_NONE, INDEX_NONE);
+		int32 BestDistance = MAX_int32;
+		for (int32 Y = 0; Y < Height; ++Y)
+		{
+			for (int32 X = 0; X < Width; ++X)
+			{
+				if (!Mask.IsValidIndex(Y * Width + X)
+					|| Mask[Y * Width + X] == 0)
+				{
+					continue;
+				}
+				const int32 Distance = FMath::Abs(X - DesiredX)
+					+ FMath::Abs(Y - DesiredY);
+				if (Distance < BestDistance)
+				{
+					BestDistance = Distance;
+					ImpactCell = FIntPoint(X, Y);
+				}
+			}
+		}
+		if (ImpactCell.X == INDEX_NONE)
+		{
+			return false;
+		}
+
+		const float CellSize = TargetWall.GetCellSize();
+		const FVector LocalImpactCenter(
+			(static_cast<float>(ImpactCell.X) + 0.5f
+				- static_cast<float>(Width) * 0.5f) * CellSize,
+			0.0f,
+			(static_cast<float>(ImpactCell.Y) + 0.5f
+				- static_cast<float>(Height) * 0.5f) * CellSize);
+		const FVector TraceStart = TargetWall.GetActorTransform()
+			.TransformPosition(LocalImpactCenter - FVector(0.0f, 180.0f, 0.0f));
+		const FVector TraceEnd = TargetWall.GetActorTransform()
+			.TransformPosition(LocalImpactCenter + FVector(0.0f, 180.0f, 0.0f));
+		FHitResult SurfaceHit;
+		FCollisionQueryParams QueryParams(
+			SCENE_QUERY_STAT(MatterFluxHouseProjectileCutCast),
+			true);
+		if (!TargetWall.MeshComponent->LineTraceComponent(
+			SurfaceHit,
+			TraceStart,
+			TraceEnd,
+			QueryParams))
+		{
+			return false;
+		}
+
+		const FVector ProjectileForward =
+			(TraceEnd - TraceStart).GetSafeNormal();
+		FActorSpawnParameters SpawnParameters;
+		SpawnParameters.SpawnCollisionHandlingOverride =
+			ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+		AMatterFluxCharacter* Caster = World.SpawnActor<AMatterFluxCharacter>(
+			AMatterFluxCharacter::StaticClass(),
+			SurfaceHit.ImpactPoint
+				- ProjectileForward * 250.0f
+				- FVector(0.0f, 0.0f, 25.0f),
+			ProjectileForward.Rotation(),
+			SpawnParameters);
+		if (!Caster)
+		{
+			return false;
+		}
+		Caster->SetActorHiddenInGame(true);
+		Caster->SetActorEnableCollision(false);
+		State.CutCasters.Add(Caster);
+
+		FMatterFluxMagicProjectilePlan ProjectilePlan;
+		ProjectilePlan.SpellId = bVertical
+			? TEXT("spell.vertical_terrain_cut")
+			: TEXT("spell.terrain_cut");
+		ProjectilePlan.Damage = 12.0f;
+		ProjectilePlan.Speed = 1040.0f;
+		ProjectilePlan.Lifetime = 0.5f;
+		ProjectilePlan.Radius = 60.0f;
+		ProjectilePlan.bUsePlaneVisual = true;
+		ProjectilePlan.bUseVerticalPlaneVisual = bVertical;
+		FMatterFluxWandCastPlan CastPlan;
+		CastPlan.Projectiles.Add(ProjectilePlan);
+		State.RevisionBeforeCut = TargetWall.Revision;
+		const bool bSpawned = UGA_CastWand::SpawnCastPlan(
+			*Caster,
+			CastPlan,
+			bVertical ? 0x48564354 : 0x48484354,
+			ProjectileForward);
+		UE_LOG(LogMatterFlux, Display,
+			TEXT("House projectile-cut capture fired %s spell at cell=(%d,%d) revision=%d spawned=%s."),
+			bVertical ? TEXT("vertical") : TEXT("horizontal"),
+			ImpactCell.X,
+			ImpactCell.Y,
+			State.RevisionBeforeCut,
+			bSpawned ? TEXT("true") : TEXT("false"));
+		return bSpawned;
+	}
+
+	bool TickHouseProjectileCutCapture(
+		const TSharedRef<FHouseProjectileCutCaptureState>& State)
+	{
+		const double Now = FPlatformTime::Seconds();
+		UWorld* World = GEngine && GEngine->GameViewport
+			? GEngine->GameViewport->GetWorld()
+			: nullptr;
+		if (!World || !World->IsGameWorld())
+		{
+			if (Now - State->QueuedAt < 45.0)
+			{
+				return true;
+			}
+			UE_LOG(LogMatterFlux, Error,
+				TEXT("House projectile-cut capture timed out waiting for a game viewport."));
+			GHouseProjectileCutCapturePending = false;
+			if (State->bQuitAfterCapture)
+			{
+				FPlatformMisc::RequestExitWithStatus(false, 4);
+			}
+			return false;
+		}
+
+		AMatterFluxPlayableWorldActor* PlayableWorld = nullptr;
+		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
+		{
+			PlayableWorld = *It;
+			break;
+		}
+		APlayerController* PlayerController = World->GetFirstPlayerController();
+		AMatterFluxCharacter* Character = PlayerController
+			? Cast<AMatterFluxCharacter>(PlayerController->GetPawn())
+			: nullptr;
+		if (!PlayableWorld || !PlayerController || !Character)
+		{
+			return true;
+		}
+		if (PlayableWorld->GetMapSeed() != State->MapSeed)
+		{
+			PlayableWorld->Regenerate(State->MapSeed);
+			State->PhaseStartedAt = Now;
+			return true;
+		}
+		if (PlayableWorld->IsGenerationInProgress()
+			|| PlayableWorld->GetPendingFragmentSourceSpawnCount() > 0)
+		{
+			return true;
+		}
+		AMatterFluxTwoStoreyHouseActor* House =
+			PlayableWorld->GetGeneratedHouse();
+		if (!House)
+		{
+			return true;
+		}
+
+		if (!State->Character.IsValid())
+		{
+			State->Character = Character;
+			State->House = House;
+			State->OriginalCharacterTransform = Character->GetActorTransform();
+			State->OriginalCameraArmLength = Character->CameraBoom
+				? Character->CameraBoom->TargetArmLength : 1480.0f;
+			State->OriginalCameraTargetOffset = Character->CameraBoom
+				? Character->CameraBoom->TargetOffset : FVector::ZeroVector;
+			State->bOriginalCameraLagEnabled = Character->CameraBoom
+				? Character->CameraBoom->bEnableCameraLag : true;
+			if (AMatterFluxPlayerController* MatterFluxController =
+				Cast<AMatterFluxPlayerController>(PlayerController))
+			{
+				MatterFluxController->CloseShellMenu();
+				MatterFluxController->HandleShellStateChanged(false, false);
+			}
+			PlayerController->SetPause(false);
+			const float GroundZ = House->GetFloorSurfaceWorldZ(0);
+			const FVector ExteriorLocal(
+				2600.0f,
+				2600.0f,
+				GroundZ - House->GetActorLocation().Z + 91.0f);
+			Character->SetActorLocation(
+				House->GetActorTransform().TransformPosition(ExteriorLocal),
+				false,
+				nullptr,
+				ETeleportType::TeleportPhysics);
+			if (Character->CameraBoom)
+			{
+				Character->CameraBoom->bEnableCameraLag = false;
+			}
+			House->SetCutawayViewerOverride(nullptr);
+			House->RefreshCutawayImmediately();
+			FrameHouseForCapture(*Character, *House);
+			State->TargetWall = FindVisibleHouseProjectileCutWall(
+				*World,
+				*House,
+				*PlayerController);
+			State->OutputDirectory = FPaths::Combine(
+				FPaths::ScreenShotDir(),
+				TEXT("MatterFluxHouseProjectileCuts"),
+				FDateTime::Now().ToString(TEXT("%Y%m%d-%H%M%S")));
+			State->PhaseStartedAt = Now;
+			return true;
+		}
+
+		FrameHouseForCapture(*Character, *House);
+		if (FScreenshotRequest::IsScreenshotRequested())
+		{
+			return true;
+		}
+		if (Now - State->QueuedAt > 75.0)
+		{
+			UE_LOG(LogMatterFlux, Error,
+				TEXT("House projectile-cut capture timed out in phase %d."),
+				State->Phase);
+			RestoreHouseProjectileCutCapture(*State);
+			GHouseProjectileCutCapturePending = false;
+			if (State->bQuitAfterCapture)
+			{
+				FPlatformMisc::RequestExitWithStatus(false, 4);
+			}
+			return false;
+		}
+
+		AFragment2DSourceActor* TargetWall = State->TargetWall.Get();
+		if (!TargetWall)
+		{
+			UE_LOG(LogMatterFlux, Error,
+				TEXT("House projectile-cut capture could not find a visible wall."));
+			RestoreHouseProjectileCutCapture(*State);
+			GHouseProjectileCutCapturePending = false;
+			if (State->bQuitAfterCapture)
+			{
+				FPlatformMisc::RequestExitWithStatus(false, 4);
+			}
+			return false;
+		}
+
+		switch (State->Phase)
+		{
+		case 0:
+			if (Now - State->PhaseStartedAt < 2.0)
+			{
+				return true;
+			}
+			RequestHouseProjectileCutScreenshot(
+				*State,
+				State->bBaselineWarmupCaptured
+					? TEXT("00_WallBeforeCuts.png")
+					: TEXT("00_CameraWarmup.png"));
+			if (!State->bBaselineWarmupCaptured)
+			{
+				// The first viewport screenshot also flushes the player-camera
+				// manager after offscreen startup. Capture the same untouched
+				// wall again on the settled camera before firing either spell.
+				State->bBaselineWarmupCaptured = true;
+				State->PhaseStartedAt = Now - 1.5;
+				return true;
+			}
+			State->Phase = 1;
+			State->PhaseStartedAt = Now;
+			return true;
+
+		case 1:
+			if (!SpawnHouseProjectileCut(
+				*State,
+				*World,
+				*TargetWall,
+				false))
+			{
+				break;
+			}
+			State->Phase = 2;
+			State->PhaseStartedAt = Now;
+			return true;
+
+		case 2:
+			if (TargetWall->Revision <= State->RevisionBeforeCut
+				|| Now - State->PhaseStartedAt < 1.0)
+			{
+				return true;
+			}
+			RequestHouseProjectileCutScreenshot(
+				*State,
+				TEXT("01_WallAfterHorizontalCut.png"));
+			State->Phase = 3;
+			State->PhaseStartedAt = Now;
+			return true;
+
+		case 3:
+		{
+			// Screenshot requests are consumed by the renderer after this ticker.
+			// Keep the horizontally cut house alive for a few frames before the
+			// vertical-test reset, otherwise the captured frame can contain only
+			// the cleared streaming-pool location.
+			if (Now - State->PhaseStartedAt < 0.5)
+			{
+				return true;
+			}
+			const FTransform HouseTransform = House->GetActorTransform();
+			House->DeactivateForStreamingPool();
+			House->ReactivateFromStreamingPool(
+				HouseTransform,
+				TEXT("structure.house.two_storey"));
+			State->Phase = 4;
+			State->PhaseStartedAt = Now;
+			return true;
+		}
+
+		case 4:
+			if (Now - State->PhaseStartedAt < 0.5)
+			{
+				return true;
+			}
+			if (!SpawnHouseProjectileCut(
+				*State,
+				*World,
+				*TargetWall,
+				true))
+			{
+				break;
+			}
+			State->Phase = 5;
+			State->PhaseStartedAt = Now;
+			return true;
+
+		case 5:
+			if (TargetWall->Revision <= State->RevisionBeforeCut
+				|| Now - State->PhaseStartedAt < 1.0)
+			{
+				return true;
+			}
+			RequestHouseProjectileCutScreenshot(
+				*State,
+				TEXT("02_WallAfterVerticalCut.png"));
+			State->Phase = 6;
+			State->PhaseStartedAt = Now;
+			return true;
+
+		case 6:
+			if (Now - State->PhaseStartedAt < 0.75)
+			{
+				return true;
+			}
+			UE_LOG(LogMatterFlux, Display,
+				TEXT("House projectile-cut capture complete: output=%s"),
+				*State->OutputDirectory);
+			RestoreHouseProjectileCutCapture(*State);
+			GHouseProjectileCutCapturePending = false;
+			if (State->bQuitAfterCapture)
+			{
+				FTSTicker::GetCoreTicker().AddTicker(
+					FTickerDelegate::CreateLambda([](float)
+					{
+						FPlatformMisc::RequestExitWithStatus(false, 0);
+						return false;
+					}),
+					1.0f);
+			}
+			return false;
+		}
+
+		UE_LOG(LogMatterFlux, Error,
+			TEXT("House projectile-cut capture could not fire its phase-%d spell."),
+			State->Phase);
+		RestoreHouseProjectileCutCapture(*State);
+		GHouseProjectileCutCapturePending = false;
+		if (State->bQuitAfterCapture)
+		{
+			FPlatformMisc::RequestExitWithStatus(false, 5);
+		}
+		return false;
+	}
+
+	void QueueHouseProjectileCutCapture(
+		const TArray<FString>& Args,
+		UWorld*)
+	{
+		if (GHouseProjectileCutCapturePending)
+		{
+			return;
+		}
+		const TSharedRef<FHouseProjectileCutCaptureState> State =
+			MakeShared<FHouseProjectileCutCaptureState>();
+		State->QueuedAt = FPlatformTime::Seconds();
+		State->PhaseStartedAt = State->QueuedAt;
+		State->MapSeed = Args.Num() > 0
+			? FMath::Max(FCString::Atoi(*Args[0]), 1)
+			: 1337;
+		State->bQuitAfterCapture = Args.Num() <= 1
+			|| FCString::Atoi(*Args[1]) != 0;
+		GHouseProjectileCutCapturePending = true;
+		FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateLambda([State](float)
+			{
+				return TickHouseProjectileCutCapture(State);
+			}));
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs GHouseProjectileCutCaptureCommand(
+		TEXT("mf.Visual.HouseProjectileCuts"),
+		TEXT("Capture a generated house before and after real horizontal and vertical cutting projectiles: mf.Visual.HouseProjectileCuts [map-seed=1337] [quit=1]"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+			&QueueHouseProjectileCutCapture));
+
+	enum class EHouseFadeAuditExpectation : uint8
+	{
+		ExteriorSolid,
+		GroundGhost,
+		AnyInteriorGhost,
+		UpperGhost
+	};
+
+	struct FHouseFadeAuditState
+	{
+		double QueuedAt = 0.0;
+		double PhaseStartedAt = 0.0;
+		double LastLogAt = 0.0;
+		double LastMovementProgressAt = 0.0;
+		double DetourUntil = 0.0;
+		int32 Phase = 0;
+		int32 WaypointIndex = 0;
+		int32 MapSeed = 1337;
+		int32 SampleCount = 0;
+		int32 JumpSampleCount = 0;
+		int32 InvalidSampleCount = 0;
+		bool bQuitAfterCapture = true;
+		bool bInitialized = false;
+		bool bEntryMoveStarted = false;
+		bool bJumpIssued = false;
+		bool bSawFalling = false;
+		bool bLastSampleValid = true;
+		float DetourDirection = -1.0f;
+		FVector LastMovementProgressLocation = FVector::ZeroVector;
+		FString OutputDirectory;
+		TWeakObjectPtr<AMatterFluxCharacter> Character;
+		TWeakObjectPtr<AMatterFluxTwoStoreyHouseActor> House;
+		FTransform OriginalCharacterTransform = FTransform::Identity;
+		float OriginalMaxWalkSpeed = 0.0f;
+		float OriginalCameraArmLength = 0.0f;
+		FVector OriginalCameraTargetOffset = FVector::ZeroVector;
+		FRotator OriginalCameraRotation = FRotator::ZeroRotator;
+		bool bOriginalCameraLagEnabled = true;
+	};
+
+	void RequestHouseFadeAuditScreenshot(
+		const FHouseFadeAuditState& State,
+		const TCHAR* FileName)
+	{
+		IFileManager::Get().MakeDirectory(*State.OutputDirectory, true);
+		const FString Path = FPaths::Combine(State.OutputDirectory, FileName);
+		FScreenshotRequest::RequestScreenshot(
+			Path, false, false, false, FIntRect(), true);
+		UE_LOG(LogMatterFlux, Display,
+			TEXT("HouseFadeAudit screenshot=%s"), *Path);
+	}
+
+	void RestoreHouseFadeAudit(const FHouseFadeAuditState& State)
+	{
+		if (AMatterFluxCharacter* Character = State.Character.Get())
+		{
+			Character->StopJumping();
+			if (UCharacterMovementComponent* Movement =
+				Character->GetCharacterMovement())
+			{
+				Movement->StopMovementImmediately();
+				Movement->SetMovementMode(MOVE_Walking);
+				if (State.OriginalMaxWalkSpeed > 0.0f)
+				{
+					Movement->MaxWalkSpeed = State.OriginalMaxWalkSpeed;
+				}
+			}
+			Character->SetActorTransform(
+				State.OriginalCharacterTransform,
+				false,
+				nullptr,
+				ETeleportType::TeleportPhysics);
+			if (Character->CameraBoom)
+			{
+				Character->CameraBoom->TargetArmLength =
+					State.OriginalCameraArmLength;
+				Character->CameraBoom->TargetOffset =
+					State.OriginalCameraTargetOffset;
+				Character->CameraBoom->SetRelativeRotation(
+					State.OriginalCameraRotation);
+				Character->CameraBoom->bEnableCameraLag =
+					State.bOriginalCameraLagEnabled;
+			}
+		}
+		if (AMatterFluxTwoStoreyHouseActor* House = State.House.Get())
+		{
+			House->SetCutawayViewerOverride(nullptr);
+			House->RefreshCutawayImmediately();
+		}
+	}
+
+	bool MoveHouseFadeAuditCharacter(
+		AMatterFluxCharacter& Character,
+		const AMatterFluxTwoStoreyHouseActor& House,
+		const FVector2D& LocalTarget,
+		const float AcceptanceRadius = 46.0f,
+		const float LateralBias = 0.0f)
+	{
+		const FVector Target = House.GetActorTransform().TransformPosition(
+			FVector(LocalTarget, 0.0f));
+		FVector Direction = Target - Character.GetActorLocation();
+		Direction.Z = 0.0f;
+		if (Direction.SizeSquared2D()
+			<= FMath::Square(AcceptanceRadius))
+		{
+			if (UCharacterMovementComponent* Movement =
+				Character.GetCharacterMovement())
+			{
+				Movement->StopMovementImmediately();
+			}
+			return true;
+		}
+		FVector MovementDirection = Direction.GetSafeNormal();
+		if (!FMath::IsNearlyZero(LateralBias))
+		{
+			const FVector LateralDirection(
+				-MovementDirection.Y, MovementDirection.X, 0.0f);
+			MovementDirection = (MovementDirection
+				+ LateralDirection * LateralBias).GetSafeNormal();
+		}
+		Character.AddMovementInput(MovementDirection, 1.0f, true);
+		return false;
+	}
+
+	bool AuditHouseFadeSample(
+		FHouseFadeAuditState& State,
+		const double Now,
+		const TCHAR* Label,
+		const EHouseFadeAuditExpectation Expectation)
+	{
+		AMatterFluxCharacter* Character = State.Character.Get();
+		AMatterFluxTwoStoreyHouseActor* House = State.House.Get();
+		if (!Character || !House)
+		{
+			return false;
+		}
+
+		const UCharacterMovementComponent* Movement =
+			Character->GetCharacterMovement();
+		const UCapsuleComponent* Capsule = Character->GetCapsuleComponent();
+		const FVector Local = House->GetActorTransform()
+			.InverseTransformPosition(Character->GetActorLocation());
+		const float FeetZ = Character->GetActorLocation().Z
+			- (Capsule ? Capsule->GetScaledCapsuleHalfHeight() : 0.0f);
+		const int32 CutawayFloor = House->GetCurrentCutawayFloor();
+		const float StructureOpacity = House->GetCurrentStructureOpacity();
+		const float GroundOpacity = House->GetFloorSurfaceOpacity(0);
+		const float UpperOpacity = House->GetFloorSurfaceOpacity(1);
+		const bool bInside = House->IsInsideHouse(Character->GetActorLocation());
+		const bool bFalling = Movement && Movement->IsFalling();
+		const FString VelocityString = Movement
+			? Movement->Velocity.ToCompactString() : TEXT("none");
+		const bool bFinite = FMath::IsFinite(StructureOpacity)
+			&& FMath::IsFinite(GroundOpacity)
+			&& FMath::IsFinite(UpperOpacity);
+		const bool bOpacityRangeValid = StructureOpacity >= 0.02f
+			&& StructureOpacity <= 1.001f
+			&& GroundOpacity >= 0.02f && GroundOpacity <= 1.001f
+			&& UpperOpacity >= 0.02f && UpperOpacity <= 1.001f;
+		const bool bFloorSlabsSolid = GroundOpacity >= 0.999f
+			&& UpperOpacity >= 0.999f;
+		bool bValid = bFinite && bOpacityRangeValid;
+		const TCHAR* ExpectedLabel = TEXT("unknown");
+		switch (Expectation)
+		{
+		case EHouseFadeAuditExpectation::ExteriorSolid:
+			ExpectedLabel = TEXT("exterior-no-local-floor");
+			bValid = bValid && !bInside
+				&& CutawayFloor == INDEX_NONE;
+			break;
+		case EHouseFadeAuditExpectation::GroundGhost:
+			ExpectedLabel = TEXT("ground-ghost");
+			bValid = bValid && bFloorSlabsSolid
+				&& bInside && CutawayFloor == 0
+				&& StructureOpacity <= 0.065f;
+			break;
+		case EHouseFadeAuditExpectation::AnyInteriorGhost:
+			ExpectedLabel = TEXT("stair-ghost");
+			bValid = bValid && bFloorSlabsSolid
+				&& bInside && CutawayFloor != INDEX_NONE
+				&& StructureOpacity <= 0.065f;
+			break;
+		case EHouseFadeAuditExpectation::UpperGhost:
+			ExpectedLabel = TEXT("upper-ghost");
+			bValid = bValid && bFloorSlabsSolid
+				&& bInside && CutawayFloor == 1
+				&& StructureOpacity <= 0.065f;
+			break;
+		default:
+			break;
+		}
+
+		++State.SampleCount;
+		State.JumpSampleCount += bFalling ? 1 : 0;
+		State.InvalidSampleCount += bValid ? 0 : 1;
+		if (!bValid && State.bLastSampleValid)
+		{
+			UE_LOG(LogMatterFlux, Error,
+				TEXT("HouseFadeAudit violation sample=%d phase=%d label=%s expected=%s local=%s feetZ=%.2f mode=%d falling=%s inside=%s floor=%d structure=%.3f ground=%.3f upper=%.3f"),
+				State.SampleCount,
+				State.Phase,
+				Label,
+				ExpectedLabel,
+				*Local.ToCompactString(),
+				FeetZ,
+				Movement ? static_cast<int32>(Movement->MovementMode) : -1,
+				bFalling ? TEXT("true") : TEXT("false"),
+				bInside ? TEXT("true") : TEXT("false"),
+				CutawayFloor,
+				StructureOpacity,
+				GroundOpacity,
+				UpperOpacity);
+		}
+		State.bLastSampleValid = bValid;
+		if (Now - State.LastLogAt >= 0.10)
+		{
+			State.LastLogAt = Now;
+			UE_LOG(LogMatterFlux, Display,
+				TEXT("HouseFadeAudit sample=%d phase=%d label=%s expected=%s local=%s feetZ=%.2f velocity=%s mode=%d falling=%s inside=%s floor=%d structure=%.3f ground=%.3f upper=%.3f valid=%s"),
+				State.SampleCount,
+				State.Phase,
+				Label,
+				ExpectedLabel,
+				*Local.ToCompactString(),
+				FeetZ,
+				*VelocityString,
+				Movement ? static_cast<int32>(Movement->MovementMode) : -1,
+				bFalling ? TEXT("true") : TEXT("false"),
+				bInside ? TEXT("true") : TEXT("false"),
+				CutawayFloor,
+				StructureOpacity,
+				GroundOpacity,
+				UpperOpacity,
+				bValid ? TEXT("true") : TEXT("false"));
+		}
+		return bValid;
+	}
+
+	bool FinishHouseFadeAudit(
+		const TSharedRef<FHouseFadeAuditState>& State,
+		const bool bMovementCompleted,
+		const TCHAR* Reason)
+	{
+		const bool bAccepted = bMovementCompleted
+			&& State->SampleCount > 0
+			&& State->JumpSampleCount > 0
+			&& State->InvalidSampleCount == 0;
+		UE_LOG(LogMatterFlux, Display,
+			TEXT("HouseFadeAudit complete accepted=%s movementCompleted=%s samples=%d jumpSamples=%d invalidSamples=%d reason=%s output=%s"),
+			bAccepted ? TEXT("true") : TEXT("false"),
+			bMovementCompleted ? TEXT("true") : TEXT("false"),
+			State->SampleCount,
+			State->JumpSampleCount,
+			State->InvalidSampleCount,
+			Reason,
+			*State->OutputDirectory);
+		RestoreHouseFadeAudit(*State);
+		GHouseFadeAuditPending = false;
+		if (State->bQuitAfterCapture)
+		{
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([bAccepted](float)
+				{
+					FPlatformMisc::RequestExitWithStatus(
+						false, bAccepted ? 0 : 6);
+					return false;
+				}),
+				0.75f);
+		}
+		return false;
+	}
+
+	bool TickHouseFadeAudit(
+		const TSharedRef<FHouseFadeAuditState>& State)
+	{
+		const double Now = FPlatformTime::Seconds();
+		UWorld* World = GEngine && GEngine->GameViewport
+			? GEngine->GameViewport->GetWorld() : nullptr;
+		if (!World || !World->IsGameWorld())
+		{
+			if (Now - State->QueuedAt < 40.0)
+			{
+				return true;
+			}
+			return FinishHouseFadeAudit(State, false,
+				TEXT("game-world-timeout"));
+		}
+
+		AMatterFluxPlayableWorldActor* PlayableWorld = nullptr;
+		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
+		{
+			PlayableWorld = *It;
+			break;
+		}
+		APlayerController* PlayerController = World->GetFirstPlayerController();
+		AMatterFluxCharacter* Character = PlayerController
+			? Cast<AMatterFluxCharacter>(PlayerController->GetPawn()) : nullptr;
+		if (!PlayableWorld || !Character)
+		{
+			return true;
+		}
+		if (PlayableWorld->GetMapSeed() != State->MapSeed)
+		{
+			PlayableWorld->Regenerate(State->MapSeed);
+			State->PhaseStartedAt = Now;
+			return true;
+		}
+		if (PlayableWorld->IsGenerationInProgress()
+			|| PlayableWorld->GetPendingFragmentSourceSpawnCount() > 0)
+		{
+			return true;
+		}
+		AMatterFluxTwoStoreyHouseActor* House =
+			PlayableWorld->GetGeneratedHouse();
+		if (!House)
+		{
+			return true;
+		}
+
+		if (!State->bInitialized)
+		{
+			State->bInitialized = true;
+			State->Character = Character;
+			State->House = House;
+			State->OriginalCharacterTransform = Character->GetActorTransform();
+			State->OriginalCameraArmLength = Character->CameraBoom
+				? Character->CameraBoom->TargetArmLength : 1480.0f;
+			State->OriginalCameraTargetOffset = Character->CameraBoom
+				? Character->CameraBoom->TargetOffset : FVector::ZeroVector;
+			State->OriginalCameraRotation = Character->CameraBoom
+				? Character->CameraBoom->GetRelativeRotation()
+				: FRotator::ZeroRotator;
+			State->bOriginalCameraLagEnabled = Character->CameraBoom
+				? Character->CameraBoom->bEnableCameraLag : true;
+			if (AMatterFluxPlayerController* MatterFluxController =
+				Cast<AMatterFluxPlayerController>(PlayerController))
+			{
+				MatterFluxController->CloseShellMenu();
+				MatterFluxController->HandleShellStateChanged(false, false);
+			}
+			PlayerController->SetPause(false);
+			PlayerController->ResetIgnoreMoveInput();
+			Character->SetActorTickEnabled(true);
+			if (UCharacterMovementComponent* Movement =
+				Character->GetCharacterMovement())
+			{
+				State->OriginalMaxWalkSpeed = Movement->MaxWalkSpeed;
+				Movement->MaxWalkSpeed = 220.0f;
+				Movement->SetComponentTickEnabled(true);
+				Movement->StopMovementImmediately();
+				Movement->SetMovementMode(MOVE_Walking);
+			}
+			if (Character->CameraBoom)
+			{
+				Character->CameraBoom->TargetArmLength = 650.0f;
+				Character->CameraBoom->TargetOffset = FVector::ZeroVector;
+				Character->CameraBoom->SetRelativeRotation(
+					FRotator(-82.0f, 0.0f, 0.0f));
+				Character->CameraBoom->bEnableCameraLag = false;
+			}
+			House->SetCutawayViewerOverride(nullptr);
+			const float GroundZ = House->GetFloorSurfaceWorldZ(0);
+			const FVector LocalStart(0.0f, 650.0f,
+				GroundZ - House->GetActorLocation().Z + 91.0f);
+			Character->SetActorLocation(
+				House->GetActorTransform().TransformPosition(LocalStart),
+				false, nullptr, ETeleportType::TeleportPhysics);
+			State->LastMovementProgressLocation = Character->GetActorLocation();
+			State->LastMovementProgressAt = Now;
+			House->RefreshCutawayImmediately();
+			State->Phase = 0;
+			State->PhaseStartedAt = Now;
+			UE_LOG(LogMatterFlux, Display,
+				TEXT("HouseFadeAudit initialized house=%s start=%s"),
+				*House->GetName(), *LocalStart.ToCompactString());
+			return true;
+		}
+
+		House = State->House.Get();
+		Character = State->Character.Get();
+		if (!House || !Character)
+		{
+			return FinishHouseFadeAudit(State, false,
+				TEXT("audit-actors-lost"));
+		}
+		if (World->IsPaused())
+		{
+			PlayerController->SetPause(false);
+		}
+		if (FScreenshotRequest::IsScreenshotRequested())
+		{
+			return true;
+		}
+		if (Now - State->QueuedAt > 80.0)
+		{
+			return FinishHouseFadeAudit(State, false,
+				TEXT("global-timeout"));
+		}
+
+		switch (State->Phase)
+		{
+		case 0:
+			if (Now - State->PhaseStartedAt >= 0.75)
+			{
+				AuditHouseFadeSample(*State, Now, TEXT("outside-settle"),
+					EHouseFadeAuditExpectation::ExteriorSolid);
+			}
+			if (Now - State->PhaseStartedAt < 1.5)
+			{
+				return true;
+			}
+			State->Phase = 1;
+			State->WaypointIndex = 1;
+			State->PhaseStartedAt = Now;
+			return true;
+
+		case 1:
+		{
+			static const FVector2D ExteriorWaypoints[] = {
+				FVector2D(0.0f, 650.0f),
+				FVector2D(650.0f, 650.0f),
+				FVector2D(650.0f, 0.0f),
+				FVector2D(650.0f, -650.0f),
+				FVector2D(0.0f, -650.0f),
+				FVector2D(-650.0f, -650.0f),
+				FVector2D(-650.0f, 0.0f),
+				FVector2D(-650.0f, 650.0f),
+				FVector2D(0.0f, 650.0f)
+			};
+			AuditHouseFadeSample(*State, Now, TEXT("outside-walk"),
+				EHouseFadeAuditExpectation::ExteriorSolid);
+			const FVector CurrentLocation = Character->GetActorLocation();
+			if (FVector::DistSquared2D(
+					CurrentLocation, State->LastMovementProgressLocation)
+				>= FMath::Square(20.0f))
+			{
+				State->LastMovementProgressLocation = CurrentLocation;
+				State->LastMovementProgressAt = Now;
+			}
+			else if (Now - State->LastMovementProgressAt >= 0.5
+				&& Now >= State->DetourUntil)
+			{
+				State->DetourDirection *= -1.0f;
+				State->DetourUntil = Now + 0.85;
+				State->LastMovementProgressAt = Now;
+				const FVector Local = House->GetActorTransform()
+					.InverseTransformPosition(CurrentLocation);
+				UE_LOG(LogMatterFlux, Display,
+					TEXT("HouseFadeAudit detour waypoint=%d local=%s side=%.0f"),
+					State->WaypointIndex,
+					*Local.ToCompactString(),
+					State->DetourDirection);
+			}
+			const float LateralBias = Now < State->DetourUntil
+				? State->DetourDirection * 1.35f : 0.0f;
+			if (MoveHouseFadeAuditCharacter(
+					*Character, *House,
+					ExteriorWaypoints[State->WaypointIndex],
+					46.0f,
+					LateralBias))
+			{
+				++State->WaypointIndex;
+				State->PhaseStartedAt = Now;
+				State->LastMovementProgressLocation =
+					Character->GetActorLocation();
+				State->LastMovementProgressAt = Now;
+				State->DetourUntil = 0.0;
+				if (State->WaypointIndex >= UE_ARRAY_COUNT(ExteriorWaypoints))
+				{
+					RequestHouseFadeAuditScreenshot(
+						*State, TEXT("01_ExteriorLoopComplete.png"));
+					State->Phase = 2;
+					State->PhaseStartedAt = Now;
+				}
+				return true;
+			}
+			if (Now - State->PhaseStartedAt > 12.0)
+			{
+				return FinishHouseFadeAudit(State, false,
+					TEXT("exterior-waypoint-timeout"));
+			}
+			return true;
+		}
+
+		case 2:
+			if (!State->bEntryMoveStarted)
+			{
+				// Exterior screenshot encoding can block the game thread longer than
+				// the entry budget. Start this timer only after capture has cleared.
+				State->bEntryMoveStarted = true;
+				State->PhaseStartedAt = Now;
+			}
+			if (MoveHouseFadeAuditCharacter(
+					*Character, *House, FVector2D(150.0f, 250.0f)))
+			{
+				if (House->GetCurrentCutawayFloor() != 0)
+				{
+					return true;
+				}
+				State->Phase = 3;
+				State->PhaseStartedAt = Now;
+			}
+			if (Now - State->PhaseStartedAt > 7.0)
+			{
+				return FinishHouseFadeAudit(State, false,
+					TEXT("house-entry-timeout"));
+			}
+			return true;
+
+		case 3:
+			if (House->GetCurrentCutawayFloor() == 0
+				&& House->GetCurrentStructureOpacity() <= 0.065f)
+			{
+				State->Phase = 4;
+				State->WaypointIndex = 1;
+				State->PhaseStartedAt = Now;
+				return true;
+			}
+			if (Now - State->PhaseStartedAt > 1.5)
+			{
+				return FinishHouseFadeAudit(State, false,
+					TEXT("ground-ghost-settle-timeout"));
+			}
+			return true;
+
+		case 4:
+		{
+			static const FVector2D GroundWaypoints[] = {
+				FVector2D(150.0f, 250.0f),
+				FVector2D(320.0f, 250.0f),
+				FVector2D(320.0f, 20.0f),
+				FVector2D(120.0f, 20.0f),
+				FVector2D(150.0f, 250.0f)
+			};
+			AuditHouseFadeSample(*State, Now, TEXT("ground-walk"),
+				EHouseFadeAuditExpectation::GroundGhost);
+			if (MoveHouseFadeAuditCharacter(
+					*Character, *House,
+					GroundWaypoints[State->WaypointIndex]))
+			{
+				++State->WaypointIndex;
+				State->PhaseStartedAt = Now;
+				if (State->WaypointIndex >= UE_ARRAY_COUNT(GroundWaypoints))
+				{
+					State->Phase = 5;
+					State->bJumpIssued = false;
+					State->bSawFalling = false;
+					State->PhaseStartedAt = Now;
+				}
+			}
+			if (Now - State->PhaseStartedAt > 5.0)
+			{
+				return FinishHouseFadeAudit(State, false,
+					TEXT("ground-walk-timeout"));
+			}
+			return true;
+		}
+
+		case 5:
+		{
+			AuditHouseFadeSample(*State, Now, TEXT("ground-jump"),
+				EHouseFadeAuditExpectation::GroundGhost);
+			if (!State->bJumpIssued)
+			{
+				Character->Jump();
+				State->bJumpIssued = true;
+			}
+			Character->AddMovementInput(House->GetActorForwardVector(), 0.35f, true);
+			const UCharacterMovementComponent* Movement =
+				Character->GetCharacterMovement();
+			State->bSawFalling = State->bSawFalling
+				|| (Movement && Movement->IsFalling());
+			if (State->bSawFalling && Movement && !Movement->IsFalling()
+				&& Now - State->PhaseStartedAt > 0.25)
+			{
+				Character->StopJumping();
+				RequestHouseFadeAuditScreenshot(
+					*State, TEXT("02_GroundJumpComplete.png"));
+				State->Phase = 6;
+				State->PhaseStartedAt = Now;
+				return true;
+			}
+			if (Now - State->PhaseStartedAt > 4.0)
+			{
+				return FinishHouseFadeAudit(State, false,
+					TEXT("ground-jump-timeout"));
+			}
+			return true;
+		}
+
+		case 6:
+		{
+			const float GroundZ = House->GetFloorSurfaceWorldZ(0);
+			const float StairY = House->StairRampCollision
+				? House->StairRampCollision->GetRelativeLocation().Y : -245.0f;
+			const FVector Local(-350.0f, StairY,
+				GroundZ - House->GetActorLocation().Z + 91.0f);
+			Character->SetActorLocation(
+				House->GetActorTransform().TransformPosition(Local),
+				false, nullptr, ETeleportType::TeleportPhysics);
+			if (UCharacterMovementComponent* Movement =
+				Character->GetCharacterMovement())
+			{
+				Movement->StopMovementImmediately();
+				Movement->SetMovementMode(MOVE_Walking);
+			}
+			House->RefreshCutawayImmediately();
+			State->Phase = 7;
+			State->PhaseStartedAt = Now;
+			return true;
+		}
+
+		case 7:
+		{
+			AuditHouseFadeSample(*State, Now, TEXT("stair-climb"),
+				EHouseFadeAuditExpectation::AnyInteriorGhost);
+			Character->AddMovementInput(House->GetActorForwardVector(), 1.0f, true);
+			const UCapsuleComponent* Capsule = Character->GetCapsuleComponent();
+			const float FeetZ = Character->GetActorLocation().Z
+				- (Capsule ? Capsule->GetScaledCapsuleHalfHeight() : 0.0f);
+			const float UpperZ = House->GetFloorSurfaceWorldZ(1);
+			if (FeetZ >= UpperZ - 55.0f
+				&& House->GetCurrentCutawayFloor() == 1)
+			{
+				if (UCharacterMovementComponent* Movement =
+					Character->GetCharacterMovement())
+				{
+					Movement->StopMovementImmediately();
+				}
+				State->Phase = 8;
+				State->PhaseStartedAt = Now;
+				return true;
+			}
+			if (Now - State->PhaseStartedAt > 8.0)
+			{
+				return FinishHouseFadeAudit(State, false,
+					TEXT("stair-climb-timeout"));
+			}
+			return true;
+		}
+
+		case 8:
+			AuditHouseFadeSample(*State, Now, TEXT("upper-settle"),
+				EHouseFadeAuditExpectation::UpperGhost);
+			if (Now - State->PhaseStartedAt < 1.0)
+			{
+				return true;
+			}
+			State->Phase = 9;
+			State->WaypointIndex = 0;
+			State->PhaseStartedAt = Now;
+			return true;
+
+		case 9:
+		{
+			static const FVector2D UpperWaypoints[] = {
+				FVector2D(430.0f, -200.0f),
+				FVector2D(430.0f, 20.0f),
+				FVector2D(430.0f, -200.0f)
+			};
+			AuditHouseFadeSample(*State, Now, TEXT("upper-walk"),
+				EHouseFadeAuditExpectation::UpperGhost);
+			if (MoveHouseFadeAuditCharacter(
+					*Character, *House,
+					UpperWaypoints[State->WaypointIndex]))
+			{
+				++State->WaypointIndex;
+				State->PhaseStartedAt = Now;
+				if (State->WaypointIndex >= UE_ARRAY_COUNT(UpperWaypoints))
+				{
+					State->Phase = 10;
+					State->bJumpIssued = false;
+					State->bSawFalling = false;
+					State->PhaseStartedAt = Now;
+				}
+			}
+			if (Now - State->PhaseStartedAt > 5.0)
+			{
+				return FinishHouseFadeAudit(State, false,
+					TEXT("upper-walk-timeout"));
+			}
+			return true;
+		}
+
+		case 10:
+		{
+			AuditHouseFadeSample(*State, Now, TEXT("upper-jump"),
+				EHouseFadeAuditExpectation::UpperGhost);
+			if (!State->bJumpIssued)
+			{
+				Character->Jump();
+				State->bJumpIssued = true;
+			}
+			Character->AddMovementInput(House->GetActorRightVector(), 0.25f, true);
+			const UCharacterMovementComponent* Movement =
+				Character->GetCharacterMovement();
+			State->bSawFalling = State->bSawFalling
+				|| (Movement && Movement->IsFalling());
+			if (State->bSawFalling && Movement && !Movement->IsFalling()
+				&& Now - State->PhaseStartedAt > 0.25)
+			{
+				Character->StopJumping();
+				RequestHouseFadeAuditScreenshot(
+					*State, TEXT("03_UpperJumpComplete.png"));
+				State->Phase = 11;
+				State->PhaseStartedAt = Now;
+				return true;
+			}
+			if (Now - State->PhaseStartedAt > 4.0)
+			{
+				return FinishHouseFadeAudit(State, false,
+					TEXT("upper-jump-timeout"));
+			}
+			return true;
+		}
+
+		default:
+			AuditHouseFadeSample(*State, Now, TEXT("upper-finish"),
+				EHouseFadeAuditExpectation::UpperGhost);
+			if (Now - State->PhaseStartedAt < 0.75)
+			{
+				return true;
+			}
+			return FinishHouseFadeAudit(State, true, TEXT("completed"));
+		}
+	}
+
+	void QueueHouseFadeAudit(const TArray<FString>& Args, UWorld*)
+	{
+		if (GHouseFadeAuditPending)
+		{
+			return;
+		}
+		GHouseFadeAuditPending = true;
+		const TSharedRef<FHouseFadeAuditState> State =
+			MakeShared<FHouseFadeAuditState>();
+		State->QueuedAt = FPlatformTime::Seconds();
+		State->PhaseStartedAt = State->QueuedAt;
+		State->LastLogAt = State->QueuedAt;
+		State->MapSeed = Args.Num() > 0
+			? FMath::Max(FCString::Atoi(*Args[0]), 1) : 1337;
+		State->bQuitAfterCapture = Args.Num() <= 1
+			|| FCString::Atoi(*Args[1]) != 0;
+		State->OutputDirectory = FPaths::Combine(
+			FPaths::ScreenShotDir(),
+			TEXT("MatterFluxHouseFadeAudit"),
+			FDateTime::Now().ToString(TEXT("%Y%m%d-%H%M%S")));
+		FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateLambda([State](float)
+			{
+				return TickHouseFadeAudit(State);
+			}));
+		UE_LOG(LogMatterFlux, Display,
+			TEXT("Queued HouseFadeAudit seed=%d quit=%s output=%s"),
+			State->MapSeed,
+			State->bQuitAfterCapture ? TEXT("true") : TEXT("false"),
+			*State->OutputDirectory);
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs GHouseFadeAuditCommand(
+		TEXT("mf.Visual.HouseFadeAudit"),
+		TEXT("Walk around and inside the generated house, including real jumps, while logging every cutaway invariant: mf.Visual.HouseFadeAudit [map-seed=1337] [quit=1]"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+			&QueueHouseFadeAudit));
 
 	struct FLiquidPoolCaptureState
 	{
@@ -6117,14 +8034,24 @@ namespace
 				{
 					for (int32 LocalX = -7; LocalX <= 7; ++LocalX)
 					{
+						const FVector SampleLocation = Candidate + FVector(
+							LocalX * CellSize,
+							LocalY * CellSize,
+							0.0f);
 						float Height = 0.0f;
 						if (!PlayableWorld.TrySampleTerrainHeightAtWorldLocation(
-							Candidate + FVector(
-								LocalX * CellSize,
-								LocalY * CellSize,
-								0.0f),
+							SampleLocation,
 							Height))
 						{
+							bCompletePatch = false;
+							break;
+						}
+						MatterFlux::Liquid::FLiquidColumn ExistingLiquid;
+						if (PlayableWorld.TrySampleLiquidColumnAtWorldLocation(
+								SampleLocation, ExistingLiquid))
+						{
+							// Capture an isolated spell splash, never a generated river
+							// that happened to receive a little more water.
 							bCompletePatch = false;
 							break;
 						}
@@ -6488,4 +8415,1323 @@ namespace
 		TEXT("Capture acid/water contact and tree corrosion: mf.Visual.AcidReaction [map-seed=1337] [quit=1]"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
 			&QueueAcidReactionCapture));
+
+	struct FWaterSandCaptureState
+	{
+		double QueuedAt = 0.0;
+		double PhaseStartedAt = 0.0;
+		int32 Phase = 0;
+		int32 MapSeed = 1337;
+		bool bQuitAfterCapture = true;
+		bool bRegenerationRequested = false;
+		bool bSimulationFocusMoved = false;
+		bool bCapturePatchSelected = false;
+		bool bWaterBurstInitialized = false;
+		FVector StageSearchFocus = FVector::ZeroVector;
+		FVector Focus = FVector::ZeroVector;
+		FVector WaterCenter = FVector::ZeroVector;
+		FVector InitialWaterCenter = FVector::ZeroVector;
+		FVector SandCenter = FVector::ZeroVector;
+		float MaximumWaterTravelDistance = 0.0f;
+		int64 InitialWaterAmount = 0;
+		int64 InitialSandAmount = 0;
+		int64 DepositedWaterAmount = 0;
+		int64 DepositedSandAmount = 0;
+		int32 InitialWaterCount = 0;
+		int32 InitialSandCount = 0;
+		int32 WaterDepositWrites = 0;
+		int32 SandDepositWrites = 0;
+		int32 FocusRequestedMaterialStep = 0;
+		int32 DepositStartedMaterialStep = 0;
+		int32 WaterBurstDeposits = 0;
+		int32 FramesSinceDeposit = 0;
+		double FocusWaitDeadline = 0.0;
+		double NextWaterDepositAt = 0.0;
+		int64 BaselineWaterAmount = 0;
+		int64 BaselineSandAmount = 0;
+		FString OutputDirectory;
+		TWeakObjectPtr<AMatterFluxPlayableWorldActor> PlayableWorld;
+		TWeakObjectPtr<ACameraActor> Camera;
+	};
+
+	struct FWaterSpreadMetrics
+	{
+		int32 CellCount = 0;
+		int32 Width = 0;
+		int32 Height = 0;
+		float MaximumDepth = 0.0f;
+		float HorizontalAspect = 0.0f;
+	};
+
+	bool FindWaterSandCapturePatch(
+		const AMatterFluxPlayableWorldActor& PlayableWorld,
+		const FVector& SearchFocus,
+		const float CellSize,
+		const int32 MinimumX,
+		const int32 MaximumX,
+		const bool bPreferSlope,
+		FVector& OutCenter)
+	{
+		const FVector SnappedFocus(
+			FMath::GridSnap(SearchFocus.X, CellSize),
+			FMath::GridSnap(SearchFocus.Y, CellSize),
+			SearchFocus.Z);
+		float BestScore = bPreferSlope ? -MAX_flt : MAX_flt;
+		bool bFound = false;
+		for (int32 CandidateY = -4; CandidateY <= 4; CandidateY += 4)
+		{
+			for (int32 CandidateX = MinimumX;
+				CandidateX <= MaximumX;
+				CandidateX += 8)
+			{
+				const FVector Candidate = SnappedFocus + FVector(
+					CandidateX * CellSize,
+					CandidateY * CellSize,
+					0.0f);
+				float MinimumHeight = MAX_flt;
+				float MaximumHeight = -MAX_flt;
+				float CenterHeight = 0.0f;
+				bool bCompletePatch = true;
+				for (int32 LocalY = -2; LocalY <= 2 && bCompletePatch; ++LocalY)
+				{
+					for (int32 LocalX = -2; LocalX <= 2; ++LocalX)
+					{
+						const FVector SampleLocation = Candidate + FVector(
+							LocalX * CellSize,
+							LocalY * CellSize,
+							0.0f);
+						float Height = 0.0f;
+						if (!PlayableWorld.TrySampleTerrainHeightAtWorldLocation(
+							SampleLocation,
+							Height))
+						{
+							bCompletePatch = false;
+							break;
+						}
+						MatterFlux::Liquid::FLiquidColumn ExistingLiquid;
+						if (PlayableWorld.TrySampleLiquidColumnAtWorldLocation(
+								SampleLocation,
+								ExistingLiquid))
+						{
+							// The visual proof must start on dry terrain. Otherwise a
+							// generated river can be mistaken for spell-water spread.
+							bCompletePatch = false;
+							break;
+						}
+						MinimumHeight = FMath::Min(MinimumHeight, Height);
+						MaximumHeight = FMath::Max(MaximumHeight, Height);
+						if (LocalX == 0 && LocalY == 0)
+						{
+							CenterHeight = Height;
+						}
+					}
+				}
+				if (!bCompletePatch)
+				{
+					continue;
+				}
+
+				const float HeightRange = MaximumHeight - MinimumHeight;
+				const float Score = bPreferSlope
+					? -FMath::Abs(HeightRange - CellSize * 2.0f)
+						+ CenterHeight * 0.25f
+					: HeightRange;
+				if (!bFound
+					|| (bPreferSlope ? Score > BestScore : Score < BestScore))
+				{
+					bFound = true;
+					BestScore = Score;
+					OutCenter = FVector(Candidate.X, Candidate.Y, CenterHeight);
+				}
+			}
+		}
+		return bFound;
+	}
+
+	void RequestWaterSandScreenshot(
+		const FWaterSandCaptureState& State,
+		const TCHAR* FileName)
+	{
+		const FString Path = FPaths::Combine(State.OutputDirectory, FileName);
+		IFileManager::Get().MakeDirectory(*State.OutputDirectory, true);
+		FScreenshotRequest::RequestScreenshot(Path, true, false, false);
+		UE_LOG(LogMatterFlux, Display,
+			TEXT("Requested water/sand screenshot: %s"), *Path);
+	}
+
+	bool TryTrackWaterCenter(
+		const AMatterFluxPlayableWorldActor& PlayableWorld,
+		const FVector& SearchCenter,
+		const float CellSize,
+		FVector& OutCenter)
+	{
+		constexpr int32 Radius = 8;
+		constexpr int32 Diameter = Radius * 2 + 1;
+		constexpr int32 SampleCount = Diameter * Diameter;
+		auto ToIndex = [=](const int32 X, const int32 Y)
+		{
+			return (Y + Radius) * Diameter + X + Radius;
+		};
+		TArray<float> Weights;
+		Weights.Init(0.0f, SampleCount);
+		TArray<FVector> Positions;
+		Positions.SetNumUninitialized(SampleCount);
+		int32 SeedIndex = INDEX_NONE;
+		int32 BestOffsetDistanceSquared = MAX_int32;
+		for (int32 Y = -Radius; Y <= Radius; ++Y)
+		{
+			for (int32 X = -Radius; X <= Radius; ++X)
+			{
+				const int32 Index = ToIndex(X, Y);
+				const FVector Sample = SearchCenter + FVector(
+					X * CellSize,
+					Y * CellSize,
+					0.0f);
+				Positions[Index] = Sample;
+				MatterFlux::Liquid::FLiquidColumn Column;
+				if (!PlayableWorld.TrySampleLiquidColumnAtWorldLocation(
+						Sample, Column)
+					|| Column.MaterialId != TEXT("water"))
+				{
+					continue;
+				}
+				Weights[Index] = FMath::Max(
+					Column.SurfaceZ - Column.BottomZ,
+					1.0f);
+				Positions[Index] = FVector(
+					Sample.X,
+					Sample.Y,
+					Column.SurfaceZ);
+				const int32 OffsetDistanceSquared = X * X + Y * Y;
+				if (OffsetDistanceSquared < BestOffsetDistanceSquared)
+				{
+					BestOffsetDistanceSquared = OffsetDistanceSquared;
+					SeedIndex = Index;
+				}
+			}
+		}
+		if (SeedIndex == INDEX_NONE)
+		{
+			return false;
+		}
+
+		TArray<uint8> Visited;
+		Visited.Init(0, SampleCount);
+		TArray<int32> Queue;
+		Queue.Reserve(SampleCount);
+		Queue.Add(SeedIndex);
+		Visited[SeedIndex] = 1;
+		FVector WeightedCenter = FVector::ZeroVector;
+		float TotalWeight = 0.0f;
+		for (int32 Head = 0; Head < Queue.Num(); ++Head)
+		{
+			const int32 Index = Queue[Head];
+			const float Weight = Weights[Index];
+			WeightedCenter += Positions[Index] * Weight;
+			TotalWeight += Weight;
+			const int32 LocalX = Index % Diameter;
+			const int32 LocalY = Index / Diameter;
+			const int32 NeighborIndices[4] = {
+				LocalX > 0 ? Index - 1 : INDEX_NONE,
+				LocalX + 1 < Diameter ? Index + 1 : INDEX_NONE,
+				LocalY > 0 ? Index - Diameter : INDEX_NONE,
+				LocalY + 1 < Diameter ? Index + Diameter : INDEX_NONE};
+			for (const int32 NeighborIndex : NeighborIndices)
+			{
+				if (NeighborIndex != INDEX_NONE
+					&& !Visited[NeighborIndex]
+					&& Weights[NeighborIndex] > 0.0f)
+				{
+					Visited[NeighborIndex] = 1;
+					Queue.Add(NeighborIndex);
+				}
+			}
+		}
+		OutCenter = WeightedCenter / TotalWeight;
+		return true;
+	}
+
+	FWaterSpreadMetrics MeasureWaterSpread(
+		const AMatterFluxPlayableWorldActor& PlayableWorld,
+		const FVector& Center,
+		const float CellSize)
+	{
+		constexpr int32 Radius = 16;
+		FWaterSpreadMetrics Metrics;
+		FIntPoint Minimum(MAX_int32, MAX_int32);
+		FIntPoint Maximum(MIN_int32, MIN_int32);
+		for (int32 Y = -Radius; Y <= Radius; ++Y)
+		{
+			for (int32 X = -Radius; X <= Radius; ++X)
+			{
+				MatterFlux::Liquid::FLiquidColumn Column;
+				if (!PlayableWorld.TrySampleLiquidColumnAtWorldLocation(
+						Center + FVector(X * CellSize, Y * CellSize, 0.0f),
+						Column)
+					|| Column.MaterialId != TEXT("water"))
+				{
+					continue;
+				}
+				++Metrics.CellCount;
+				Metrics.MaximumDepth = FMath::Max(
+					Metrics.MaximumDepth,
+					Column.SurfaceZ - Column.BottomZ);
+				Minimum.X = FMath::Min(Minimum.X, X);
+				Minimum.Y = FMath::Min(Minimum.Y, Y);
+				Maximum.X = FMath::Max(Maximum.X, X);
+				Maximum.Y = FMath::Max(Maximum.Y, Y);
+			}
+		}
+		if (Metrics.CellCount > 0)
+		{
+			Metrics.Width = Maximum.X - Minimum.X + 1;
+			Metrics.Height = Maximum.Y - Minimum.Y + 1;
+			Metrics.HorizontalAspect =
+				FMath::Max(Metrics.Width, Metrics.Height) * CellSize
+					/ FMath::Max(Metrics.MaximumDepth, 1.0f);
+		}
+		return Metrics;
+	}
+
+	void PlaceWaterSandCamera(FWaterSandCaptureState& State)
+	{
+		ACameraActor* Camera = State.Camera.Get();
+		if (!Camera)
+		{
+			return;
+		}
+		// A grazing side view keeps horizontal footprint and physical depth on
+		// separate screen axes. A steeper view made the ground-plane extent count as
+		// apparent height, so even a correctly settled sheet still looked blocky in
+		// screenshots and could not distinguish a puddle from the old water column.
+		const FVector CameraLocation = State.Focus + FVector(0.0f, -320.0f, 12.0f);
+		Camera->SetActorLocationAndRotation(
+			CameraLocation,
+			(State.Focus - CameraLocation).Rotation());
+		if (UCameraComponent* CameraComponent = Camera->GetCameraComponent())
+		{
+			CameraComponent->ProjectionMode = ECameraProjectionMode::Perspective;
+			CameraComponent->FieldOfView = 30.0f;
+			CameraComponent->bConstrainAspectRatio = false;
+			CameraComponent->PostProcessBlendWeight = 1.0f;
+			CameraComponent->PostProcessSettings.bOverride_AutoExposureMethod = true;
+			CameraComponent->PostProcessSettings.AutoExposureMethod = AEM_Manual;
+			CameraComponent->PostProcessSettings
+				.bOverride_AutoExposureApplyPhysicalCameraExposure = true;
+			CameraComponent->PostProcessSettings
+				.AutoExposureApplyPhysicalCameraExposure = false;
+			CameraComponent->PostProcessSettings.bOverride_MotionBlurAmount = true;
+			CameraComponent->PostProcessSettings.MotionBlurAmount = 0.0f;
+			CameraComponent->PostProcessSettings.bOverride_VignetteIntensity = true;
+			CameraComponent->PostProcessSettings.VignetteIntensity = 0.0f;
+		}
+	}
+
+	bool TickWaterSandCapture(
+		const TSharedRef<FWaterSandCaptureState>& State)
+	{
+		UWorld* World = GEngine && GEngine->GameViewport
+			? GEngine->GameViewport->GetWorld()
+			: nullptr;
+		const double Now = FPlatformTime::Seconds();
+		if (!World || !World->IsGameWorld())
+		{
+			if (Now - State->QueuedAt > 30.0)
+			{
+				GWaterSandCapturePending = false;
+				if (State->bQuitAfterCapture)
+				{
+					FPlatformMisc::RequestExitWithStatus(false, 4);
+				}
+				return false;
+			}
+			return true;
+		}
+
+		AMatterFluxPlayerController* Controller =
+			Cast<AMatterFluxPlayerController>(World->GetFirstPlayerController());
+		if (State->Camera.IsValid() && Controller
+			&& Controller->GetViewTarget() != State->Camera.Get())
+		{
+			Controller->SetViewTarget(State->Camera.Get());
+		}
+		if (Now < State->PhaseStartedAt)
+		{
+			return true;
+		}
+		if (State->Phase > 0)
+		{
+			++State->FramesSinceDeposit;
+			// Decoration streaming continues for several frames after the test
+			// focus moves, so keep the inspection stage isolated until the last
+			// screenshot instead of hiding only the actors that already existed.
+			for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+			{
+				It->SetActorHiddenInGame(true);
+			}
+			for (TActorIterator<AFragment2DSourceActor> It(World); It; ++It)
+			{
+				It->SetActorHiddenInGame(true);
+			}
+			for (TActorIterator<AMatterFluxCreatureActor> It(World); It; ++It)
+			{
+				It->SetActorHiddenInGame(true);
+			}
+			for (TActorIterator<AMatterFluxCharacter> It(World); It; ++It)
+			{
+				It->SetActorHiddenInGame(true);
+			}
+			if (AMatterFluxPlayableWorldActor* PlayableWorld =
+				State->PlayableWorld.Get())
+			{
+				if (State->Phase <= 3)
+				{
+					FVector TrackedCenter;
+					if (TryTrackWaterCenter(
+							*PlayableWorld,
+							State->WaterCenter,
+							MatterFlux::PlayableLevel::TerrainCellSize,
+							TrackedCenter)
+						&& FVector::Dist2D(State->WaterCenter, TrackedCenter)
+							<= MatterFlux::PlayableLevel::TerrainCellSize * 2.0f)
+					{
+						State->WaterCenter = TrackedCenter;
+						State->Focus = TrackedCenter
+							+ FVector(0.0f, 0.0f, 24.0f);
+						State->MaximumWaterTravelDistance = FMath::Max(
+							State->MaximumWaterTravelDistance,
+							FVector::Dist2D(
+								State->InitialWaterCenter,
+								TrackedCenter));
+						if (Controller && Controller->GetPawn())
+						{
+							Controller->GetPawn()->SetActorLocation(
+								TrackedCenter,
+								false,
+								nullptr,
+								ETeleportType::TeleportPhysics);
+						}
+						PlayableWorld->SetWorldStreamingFocus(TrackedCenter);
+						PlaceWaterSandCamera(*State);
+					}
+				}
+				if (AMatterFluxTwoStoreyHouseActor* House =
+					PlayableWorld->GetGeneratedHouse())
+				{
+					House->SetActorHiddenInGame(true);
+				}
+			}
+		}
+
+		if (State->Phase == 0)
+		{
+			AMatterFluxPlayableWorldActor* PlayableWorld = nullptr;
+			for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
+			{
+				PlayableWorld = *It;
+				break;
+			}
+			if (!PlayableWorld || !Controller)
+			{
+				return true;
+			}
+			Controller->EnterGameplayForVisualCapture();
+			Controller->HideUIForVisualCapture();
+			if (GEngine)
+			{
+				GEngine->ClearOnScreenDebugMessages();
+			}
+			if (PlayableWorld->GetMapSeed() != State->MapSeed
+				&& !State->bRegenerationRequested)
+			{
+				State->bRegenerationRequested = true;
+				PlayableWorld->Regenerate(State->MapSeed);
+				return true;
+			}
+			if (PlayableWorld->IsGenerationInProgress()
+				|| PlayableWorld->GetCachedFragmentSourceCount() <= 0)
+			{
+				return true;
+			}
+
+			APawn* PlayerPawn = Controller->GetPawn();
+			if (!State->bSimulationFocusMoved)
+			{
+				const FVector PlayerFocus = PlayerPawn
+					? PlayerPawn->GetActorLocation()
+					: FVector::ZeroVector;
+				// The material solver follows player pawns, not the independent
+				// world-streaming focus. Move the hidden capture pawn with the stage
+				// before depositing so these cells actually receive solver steps.
+				State->StageSearchFocus =
+					PlayerFocus + FVector(800.0f, 800.0f, 0.0f);
+				if (PlayerPawn)
+				{
+					PlayerPawn->SetActorLocation(
+						State->StageSearchFocus,
+						false,
+						nullptr,
+						ETeleportType::TeleportPhysics);
+				}
+				PlayableWorld->SetWorldStreamingFocus(State->StageSearchFocus);
+				State->bSimulationFocusMoved = true;
+				State->PhaseStartedAt = Now + 0.25;
+				return true;
+			}
+			if (State->bCapturePatchSelected)
+			{
+				// SetWorldStreamingFocus changes the requested material focus
+				// immediately, but the hydraulic solver consumes it on later world
+				// ticks. Keep the hidden pawn pinned here and prove that this patch
+				// has received several real material steps before the first impact.
+				if (PlayerPawn)
+				{
+					PlayerPawn->SetActorLocation(
+						State->WaterCenter,
+						false,
+						nullptr,
+						ETeleportType::TeleportPhysics);
+				}
+				PlayableWorld->SetWorldStreamingFocus(State->WaterCenter);
+				const bool bStreamingWorkPending =
+					PlayableWorld->GetPendingProceduralPopulationUpdateCount() > 0
+						|| PlayableWorld->GetPendingTerrainChunkPrefetchCount() > 0;
+				const bool bFocusHasStepped =
+					PlayableWorld->GetMaterialSimulationStep()
+						>= State->FocusRequestedMaterialStep + 4;
+				if ((!bFocusHasStepped || bStreamingWorkPending)
+					&& Now < State->FocusWaitDeadline)
+				{
+					return true;
+				}
+
+				if (!State->bWaterBurstInitialized)
+				{
+					State->BaselineWaterAmount =
+						PlayableWorld->GetSimulatedMaterialAmount(TEXT("water"));
+					State->BaselineSandAmount =
+						PlayableWorld->GetSimulatedMaterialAmount(TEXT("sand"));
+					State->DepositStartedMaterialStep =
+						PlayableWorld->GetMaterialSimulationStep();
+					State->NextWaterDepositAt = Now;
+					State->bWaterBurstInitialized = true;
+					UE_LOG(LogMatterFlux, Display,
+						TEXT("Water/sand capture focus ready: requestedStep=%d readyStep=%d pendingStreaming=%s"),
+						State->FocusRequestedMaterialStep,
+						State->DepositStartedMaterialStep,
+						bStreamingWorkPending ? TEXT("true") : TEXT("false"));
+				}
+
+				// Match repeated WaterSpray casts instead of creating one oversized
+				// pile in a single frame. The solver advances between these impacts.
+				if (State->WaterBurstDeposits < 8)
+				{
+					if (Now < State->NextWaterDepositAt)
+					{
+						return true;
+					}
+					State->WaterDepositWrites +=
+						PlayableWorld->DepositSimulatedMaterialAtWorldLocation(
+							State->WaterCenter,
+							TEXT("water"),
+							5);
+					++State->WaterBurstDeposits;
+					State->NextWaterDepositAt = Now + 0.08;
+					return true;
+				}
+
+				for (int32 DepositIndex = 0; DepositIndex < 4; ++DepositIndex)
+				{
+					State->SandDepositWrites +=
+						PlayableWorld->DepositSimulatedMaterialAtWorldLocation(
+							State->SandCenter,
+							TEXT("sand"),
+							64);
+				}
+				State->InitialWaterAmount =
+					PlayableWorld->GetSimulatedMaterialAmount(TEXT("water"));
+				State->InitialSandAmount =
+					PlayableWorld->GetSimulatedMaterialAmount(TEXT("sand"));
+				State->DepositedWaterAmount =
+					State->InitialWaterAmount - State->BaselineWaterAmount;
+				State->DepositedSandAmount =
+					State->InitialSandAmount - State->BaselineSandAmount;
+				State->InitialWaterCount =
+					PlayableWorld->GetSimulatedMaterialCount(TEXT("water"));
+				State->InitialSandCount =
+					PlayableWorld->GetSimulatedMaterialCount(TEXT("sand"));
+
+				State->Camera = World->SpawnActor<ACameraActor>();
+				if (!State->Camera.IsValid())
+				{
+					return true;
+				}
+				Controller->SetViewTarget(State->Camera.Get());
+				PlaceWaterSandCamera(*State);
+				State->OutputDirectory = FPaths::Combine(
+					FPaths::ScreenShotDir(),
+					TEXT("MatterFluxWaterSand"),
+					FDateTime::Now().ToString(TEXT("%Y%m%d-%H%M%S")));
+				UE_LOG(LogMatterFlux, Display,
+					TEXT("Water/sand capture started: water=%s sand=%s waterWrites=%d waterAdded=%lld waterCells=%d waterAmount=%lld sandWrites=%d sandAdded=%lld sandCells=%d sandAmount=%lld materialSteps=%d->%d"),
+					*State->WaterCenter.ToCompactString(),
+					*State->SandCenter.ToCompactString(),
+					State->WaterDepositWrites,
+					State->DepositedWaterAmount,
+					State->InitialWaterCount,
+					State->InitialWaterAmount,
+					State->SandDepositWrites,
+					State->DepositedSandAmount,
+					State->InitialSandCount,
+					State->InitialSandAmount,
+					State->DepositStartedMaterialStep,
+					PlayableWorld->GetMaterialSimulationStep());
+				State->Phase = 1;
+				State->FramesSinceDeposit = 0;
+				State->PhaseStartedAt = Now;
+				return true;
+			}
+			const bool bStreamingWorkPending =
+				PlayableWorld->GetPendingProceduralPopulationUpdateCount() > 0
+				|| PlayableWorld->GetPendingTerrainChunkPrefetchCount() > 0;
+			if (bStreamingWorkPending
+				&& Now < State->PhaseStartedAt + 5.0)
+			{
+				return true;
+			}
+			const FVector SearchFocus = State->StageSearchFocus;
+			const float CellSize = MatterFlux::PlayableLevel::TerrainCellSize;
+			const FVector SnappedFocus(
+				FMath::GridSnap(SearchFocus.X, CellSize),
+				FMath::GridSnap(SearchFocus.Y, CellSize),
+				0.0f);
+			FVector WaterPatch;
+			FVector SandPatch;
+			if (!FindWaterSandCapturePatch(
+					*PlayableWorld,
+					SnappedFocus,
+					CellSize,
+					-24,
+					-6,
+					false,
+					WaterPatch)
+				|| !FindWaterSandCapturePatch(
+					*PlayableWorld,
+					SnappedFocus,
+					CellSize,
+					6,
+					24,
+					true,
+					SandPatch))
+			{
+				return true;
+			}
+			State->WaterCenter = WaterPatch + FVector(0.0f, 0.0f, 8.0f);
+			State->SandCenter = SandPatch + FVector(0.0f, 0.0f, 8.0f);
+
+			State->PlayableWorld = PlayableWorld;
+			State->InitialWaterCenter = State->WaterCenter;
+			// Keep the timed sequence centered on the water. The previous midpoint
+			// framing made a spell-sized splash too small to inspect.
+			State->Focus = State->WaterCenter + FVector(0.0f, 0.0f, 24.0f);
+			// Material activation follows the player pawn rather than the detached
+			// capture camera. Pin the hidden pawn to the chosen water patch so every
+			// timed frame receives real hydraulic solver steps.
+			if (PlayerPawn)
+			{
+				PlayerPawn->SetActorLocation(
+					State->WaterCenter,
+					false,
+					nullptr,
+					ETeleportType::TeleportPhysics);
+			}
+			PlayableWorld->SetWorldStreamingFocus(State->WaterCenter);
+			State->FocusRequestedMaterialStep =
+				PlayableWorld->GetMaterialSimulationStep();
+			State->FocusWaitDeadline = Now + 5.0;
+			State->bCapturePatchSelected = true;
+			for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+			{
+				It->SetActorHiddenInGame(true);
+			}
+			for (TActorIterator<AFragment2DSourceActor> It(World); It; ++It)
+			{
+				It->SetActorHiddenInGame(true);
+			}
+			for (TActorIterator<AMatterFluxCreatureActor> It(World); It; ++It)
+			{
+				It->SetActorHiddenInGame(true);
+			}
+			for (TActorIterator<AMatterFluxCharacter> It(World); It; ++It)
+			{
+				It->SetActorHiddenInGame(true);
+			}
+			if (AMatterFluxTwoStoreyHouseActor* House =
+				PlayableWorld->GetGeneratedHouse())
+			{
+				House->SetActorHiddenInGame(true);
+			}
+
+			// Return to phase zero on the following ticks: the focus-readiness
+			// branch above will wait for hydraulic steps and issue the burst.
+			State->PhaseStartedAt = Now + 0.25;
+			return true;
+		}
+
+		if (State->Phase == 1)
+		{
+			if (State->FramesSinceDeposit < 45)
+			{
+				return true;
+			}
+			RequestWaterSandScreenshot(
+				*State, TEXT("01_Water_EarlyFlow.png"));
+			State->Phase = 2;
+			return true;
+		}
+		if (State->Phase == 2)
+		{
+			if (State->FramesSinceDeposit < 150)
+			{
+				return true;
+			}
+			RequestWaterSandScreenshot(*State, TEXT("02_Water_MidFlow.png"));
+			State->Phase = 3;
+			return true;
+		}
+		if (State->Phase == 3)
+		{
+			if (State->FramesSinceDeposit < 360)
+			{
+				return true;
+			}
+			RequestWaterSandScreenshot(*State, TEXT("03_Water_SettledFlow.png"));
+			// Let the renderer consume the water screenshot before moving the
+			// same camera to the dedicated sand close-up.
+			State->Phase = 4;
+			State->PhaseStartedAt = Now + 0.10;
+			return true;
+		}
+		if (State->Phase == 4)
+		{
+			State->Focus = State->SandCenter + FVector(0.0f, 0.0f, 24.0f);
+			if (ACameraActor* Camera = State->Camera.Get())
+			{
+				const FVector CameraLocation =
+					State->Focus + FVector(0.0f, 280.0f, 240.0f);
+				Camera->SetActorLocationAndRotation(
+					CameraLocation,
+					(State->Focus - CameraLocation).Rotation());
+			}
+			State->Phase = 5;
+			State->PhaseStartedAt = Now + 0.25;
+			return true;
+		}
+
+		AMatterFluxPlayableWorldActor* PlayableWorld = State->PlayableWorld.Get();
+		if (!PlayableWorld)
+		{
+			return true;
+		}
+		if (Controller)
+		{
+			Controller->SetPause(true);
+		}
+		const int64 FinalWaterAmount =
+			PlayableWorld->GetSimulatedMaterialAmount(TEXT("water"));
+		const int64 FinalSandAmount =
+			PlayableWorld->GetSimulatedMaterialAmount(TEXT("sand"));
+		const int32 FinalWaterCount =
+			PlayableWorld->GetSimulatedMaterialCount(TEXT("water"));
+		const int32 FinalSandCount =
+			PlayableWorld->GetSimulatedMaterialCount(TEXT("sand"));
+		const bool bWaterConserved = FinalWaterAmount == State->InitialWaterAmount;
+		const bool bSandConserved = FinalSandAmount == State->InitialSandAmount;
+		const bool bWaterPresent = FinalWaterCount > 0;
+		const bool bSandPresent = FinalSandCount > 0;
+		const bool bPayloadsComplete =
+			State->DepositedWaterAmount == 8 * 5 * 16
+			&& State->DepositedSandAmount == 4 * 64 * 255;
+		const FWaterSpreadMetrics WaterSpread = MeasureWaterSpread(
+			*PlayableWorld,
+			State->InitialWaterCenter,
+			MatterFlux::PlayableLevel::TerrainCellSize);
+		const bool bWaterMoved = State->MaximumWaterTravelDistance
+			>= MatterFlux::PlayableLevel::TerrainCellSize;
+		const bool bWaterSpread = WaterSpread.CellCount >= 20
+			&& WaterSpread.Width >= 5
+			&& WaterSpread.Height >= 5
+			&& WaterSpread.MaximumDepth
+				<= MatterFlux::PlayableLevel::TerrainCellSize * 4.0f
+			&& WaterSpread.HorizontalAspect >= 2.5f;
+		const bool bAccepted = bWaterSpread
+			&& bWaterPresent && bSandPresent && bPayloadsComplete
+			&& bWaterConserved && bSandConserved;
+		FMatterFluxLiquidProjectionHeightAudit WaterAudit;
+		const bool bHasWaterAudit =
+			PlayableWorld->TryGetLiquidProjectionHeightAudit(
+				TEXT("water"), WaterAudit);
+		RequestWaterSandScreenshot(*State, TEXT("04_Sand_SettledPile.png"));
+		UE_LOG(LogMatterFlux, Display,
+			TEXT("Water/sand capture complete: accepted=%s waterSpread=%s waterMoved=%s maxTravel=%.2f localCells=%d localBounds=%dx%d maxDepth=%.2f horizontalAspect=%.2f waterGlobalStable=%s waterCells=%d->%d waterAmount=%lld->%lld waterAudit=%s canonicalMedianZ=%.2f renderedMedianZ=%.2f maxTriangleSpan=%.2f patches=%d sandGlobalStable=%s sandCells=%d->%d sandAmount=%lld->%lld output=%s"),
+			bAccepted ? TEXT("true") : TEXT("false"),
+			bWaterSpread ? TEXT("true") : TEXT("false"),
+			bWaterMoved ? TEXT("true") : TEXT("false"),
+			State->MaximumWaterTravelDistance,
+			WaterSpread.CellCount,
+			WaterSpread.Width,
+			WaterSpread.Height,
+			WaterSpread.MaximumDepth,
+			WaterSpread.HorizontalAspect,
+			bWaterConserved ? TEXT("true") : TEXT("false"),
+			State->InitialWaterCount,
+			FinalWaterCount,
+			State->InitialWaterAmount,
+			FinalWaterAmount,
+			bHasWaterAudit ? TEXT("true") : TEXT("false"),
+			WaterAudit.CanonicalMedianSurfaceZ,
+			WaterAudit.RenderedMedianSurfaceZ,
+			WaterAudit.MaximumTriangleHeightSpan,
+			WaterAudit.SurfacePatchCount,
+			bSandConserved ? TEXT("true") : TEXT("false"),
+			State->InitialSandCount,
+			FinalSandCount,
+			State->InitialSandAmount,
+			FinalSandAmount,
+			*State->OutputDirectory);
+		GWaterSandCapturePending = false;
+		if (State->bQuitAfterCapture)
+		{
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([bAccepted](float)
+				{
+					FPlatformMisc::RequestExitWithStatus(false, bAccepted ? 0 : 5);
+					return false;
+				}),
+				1.5f);
+		}
+		return false;
+	}
+
+	void QueueWaterSandCapture(const TArray<FString>& Args, UWorld*)
+	{
+		if (GWaterSandCapturePending)
+		{
+			return;
+		}
+		GWaterSandCapturePending = true;
+		const TSharedRef<FWaterSandCaptureState> State =
+			MakeShared<FWaterSandCaptureState>();
+		State->QueuedAt = FPlatformTime::Seconds();
+		State->PhaseStartedAt = State->QueuedAt;
+		State->MapSeed = Args.Num() > 0
+			? FMath::Max(FCString::Atoi(*Args[0]), 1)
+			: 1337;
+		State->bQuitAfterCapture = Args.Num() <= 1
+			|| FCString::Atoi(*Args[1]) != 0;
+		FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateLambda([State](float)
+			{
+				return TickWaterSandCapture(State);
+			}));
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs GWaterSandCaptureCommand(
+		TEXT("mf.Visual.WaterSand"),
+		TEXT("Capture a short real-payload WaterSpray burst over time and a sand pile: mf.Visual.WaterSand [map-seed=1337] [quit=1]"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+			&QueueWaterSandCapture));
+
+	struct FSandSphereTreeCaptureState
+	{
+		double QueuedAt = 0.0;
+		double PhaseStartedAt = 0.0;
+		double FirstSupportedAt = 0.0;
+		int32 Phase = 0;
+		int32 MapSeed = 1337;
+		bool bQuitAfterCapture = true;
+		bool bRegenerationRequested = false;
+		int32 BodyVoxelCount = 0;
+		int64 BaselineSandAmount = 0;
+		int64 PeakSupportedAmount = 0;
+		int64 MidSupportedAmount = 0;
+		int64 FinalSupportedAmount = 0;
+		bool bSawSupportedDecline = false;
+		FVector Focus = FVector::ZeroVector;
+		FString OutputDirectory;
+		TWeakObjectPtr<AMatterFluxPlayableWorldActor> PlayableWorld;
+		TWeakObjectPtr<AMatterFluxMagicProjectile> Projectile;
+		TWeakObjectPtr<ACameraActor> Camera;
+	};
+
+	void RequestSandSphereTreeScreenshot(
+		const FSandSphereTreeCaptureState& State,
+		const TCHAR* FileName)
+	{
+		IFileManager::Get().MakeDirectory(*State.OutputDirectory, true);
+		const FString Path = FPaths::Combine(State.OutputDirectory, FileName);
+		FScreenshotRequest::RequestScreenshot(Path, true, false, false);
+		UE_LOG(LogMatterFlux, Display,
+			TEXT("Requested sand-sphere tree screenshot: %s"), *Path);
+	}
+
+	bool FinishSandSphereTreeCapture(
+		const TSharedRef<FSandSphereTreeCaptureState>& State,
+		const bool bTimedOut)
+	{
+		AMatterFluxPlayableWorldActor* PlayableWorld = State->PlayableWorld.Get();
+		const int64 FinalSandAmount = PlayableWorld
+			? PlayableWorld->GetSimulatedMaterialAmount(TEXT("sand"))
+			: 0;
+		const int64 AddedSandAmount = FinalSandAmount - State->BaselineSandAmount;
+		const bool bAmountMatches = AddedSandAmount == 2048ll * 255ll;
+		const bool bBallMatchesPayload = State->BodyVoxelCount >= 20;
+		const bool bLandedOnTree = State->PeakSupportedAmount > 0;
+		const bool bSlidFromTree = State->bSawSupportedDecline
+			&& State->FinalSupportedAmount < State->PeakSupportedAmount;
+		const bool bAccepted = !bTimedOut && bAmountMatches
+			&& bBallMatchesPayload && bLandedOnTree && bSlidFromTree;
+		UE_LOG(LogMatterFlux, Display,
+			TEXT("Sand-sphere tree capture complete: accepted=%s timeout=%s visualVoxels=%d addedAmount=%lld expectedAmount=%lld peakTreeAmount=%lld midTreeAmount=%lld finalTreeAmount=%lld declined=%s output=%s"),
+			bAccepted ? TEXT("true") : TEXT("false"),
+			bTimedOut ? TEXT("true") : TEXT("false"),
+			State->BodyVoxelCount,
+			AddedSandAmount,
+			2048ll * 255ll,
+			State->PeakSupportedAmount,
+			State->MidSupportedAmount,
+			State->FinalSupportedAmount,
+			State->bSawSupportedDecline ? TEXT("true") : TEXT("false"),
+			*State->OutputDirectory);
+		if (PlayableWorld)
+		{
+			PlayableWorld->SetFragmentSourceDebugIsolatedAggregate(FGuid());
+		}
+		GSandSphereTreeCapturePending = false;
+		if (State->bQuitAfterCapture)
+		{
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([bAccepted](float)
+				{
+					FPlatformMisc::RequestExitWithStatus(false, bAccepted ? 0 : 5);
+					return false;
+				}),
+				1.5f);
+		}
+		return false;
+	}
+
+	bool TickSandSphereTreeCapture(
+		const TSharedRef<FSandSphereTreeCaptureState>& State)
+	{
+		UWorld* World = GEngine && GEngine->GameViewport
+			? GEngine->GameViewport->GetWorld()
+			: nullptr;
+		const double Now = FPlatformTime::Seconds();
+		if (!World || !World->IsGameWorld())
+		{
+			return Now - State->QueuedAt <= 30.0
+				? true
+				: FinishSandSphereTreeCapture(State, true);
+		}
+
+		AMatterFluxPlayerController* Controller =
+			Cast<AMatterFluxPlayerController>(World->GetFirstPlayerController());
+		if (State->Camera.IsValid() && Controller
+			&& Controller->GetViewTarget() != State->Camera.Get())
+		{
+			Controller->SetViewTarget(State->Camera.Get());
+		}
+		if (State->Phase == 0)
+		{
+			AMatterFluxPlayableWorldActor* PlayableWorld = nullptr;
+			for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
+			{
+				PlayableWorld = *It;
+				break;
+			}
+			if (!PlayableWorld || !Controller)
+			{
+				return true;
+			}
+			Controller->EnterGameplayForVisualCapture();
+			Controller->HideUIForVisualCapture();
+			if (GEngine)
+			{
+				GEngine->ClearOnScreenDebugMessages();
+			}
+			if (PlayableWorld->GetMapSeed() != State->MapSeed
+				&& !State->bRegenerationRequested)
+			{
+				State->bRegenerationRequested = true;
+				PlayableWorld->Regenerate(State->MapSeed);
+				return true;
+			}
+			if (PlayableWorld->IsGenerationInProgress()
+				|| PlayableWorld->GetCachedFragmentSourceCount() <= 0)
+			{
+				return true;
+			}
+
+			FGuid AggregateId;
+			FGuid RootSourceId;
+			FBox TreeBounds(ForceInit);
+			FTransform RootTransform;
+			const FVector SearchFocus = Controller->GetPawn()
+				? Controller->GetPawn()->GetActorLocation()
+				: FVector::ZeroVector;
+			if (!PlayableWorld->FindNearestTreeAggregateForVisualInspection(
+					SearchFocus, AggregateId, RootSourceId,
+					TreeBounds, RootTransform))
+			{
+				return Now - State->QueuedAt <= 30.0
+					? true
+					: FinishSandSphereTreeCapture(State, true);
+			}
+			PlayableWorld->SetFragmentSourceDebugIsolatedAggregate(AggregateId);
+			State->Focus = TreeBounds.GetCenter();
+			PlayableWorld->SetWorldStreamingFocus(State->Focus);
+			if (APawn* Pawn = Controller->GetPawn())
+			{
+				Pawn->SetActorLocation(
+					RootTransform.GetLocation(), false, nullptr,
+					ETeleportType::TeleportPhysics);
+				Pawn->SetActorHiddenInGame(true);
+			}
+			if (AMatterFluxTwoStoreyHouseActor* House =
+				PlayableWorld->GetGeneratedHouse())
+			{
+				House->SetActorHiddenInGame(true);
+			}
+
+			ACameraActor* Camera = World->SpawnActor<ACameraActor>();
+			if (!Camera)
+			{
+				return true;
+			}
+			const FVector CameraLocation = State->Focus
+				+ FVector(-650.0f, -780.0f, 400.0f);
+			Camera->SetActorLocationAndRotation(
+				CameraLocation,
+				(State->Focus + FVector(0.0f, 0.0f, 180.0f)
+					- CameraLocation).Rotation());
+			Camera->GetCameraComponent()->SetFieldOfView(55.0f);
+			Controller->SetViewTarget(Camera);
+			State->Camera = Camera;
+
+			FMatterFluxMagicProjectilePlan Plan;
+			Plan.SpellId = TEXT("spell.sand_sphere");
+			Plan.Speed = 1.0f;
+			Plan.Lifetime = 5.0f;
+			Plan.Radius = 100.0f;
+			Plan.GravityScale = 1.0f;
+			Plan.BodyMaterial = TEXT("sand");
+			Plan.MaterialAmount = 2048;
+			const FVector SpawnLocation(
+				State->Focus.X,
+				State->Focus.Y,
+				TreeBounds.Max.Z + 270.0f);
+			const FTransform SpawnTransform(FRotator::ZeroRotator, SpawnLocation);
+			AMatterFluxMagicProjectile* Projectile =
+				World->SpawnActorDeferred<AMatterFluxMagicProjectile>(
+					AMatterFluxMagicProjectile::StaticClass(),
+					SpawnTransform, nullptr, Controller->GetPawn(),
+					ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+			if (!Projectile)
+			{
+				return FinishSandSphereTreeCapture(State, true);
+			}
+			Projectile->InitializeProjectile(Plan, State->MapSeed ^ 0x53414e44);
+			Projectile->FinishSpawning(SpawnTransform);
+			State->Projectile = Projectile;
+			State->BodyVoxelCount = Projectile->GetMaterialBodyVoxelCount();
+			State->BaselineSandAmount =
+				PlayableWorld->GetSimulatedMaterialAmount(TEXT("sand"));
+			State->PlayableWorld = PlayableWorld;
+			State->OutputDirectory = FPaths::Combine(
+				FPaths::ScreenShotDir(), TEXT("MatterFluxSandSphereTree"),
+				FDateTime::Now().ToString(TEXT("%Y%m%d-%H%M%S")));
+			State->Phase = 1;
+			State->PhaseStartedAt = Now;
+			return true;
+		}
+
+		AMatterFluxPlayableWorldActor* PlayableWorld = State->PlayableWorld.Get();
+		if (!PlayableWorld)
+		{
+			return FinishSandSphereTreeCapture(State, true);
+		}
+		const int64 SupportedAmount =
+			PlayableWorld->GetExternalMaterialSupportedAmount(TEXT("sand"));
+		if (SupportedAmount > State->PeakSupportedAmount)
+		{
+			State->PeakSupportedAmount = SupportedAmount;
+		}
+		if (State->PeakSupportedAmount > 0
+			&& SupportedAmount < State->PeakSupportedAmount)
+		{
+			State->bSawSupportedDecline = true;
+		}
+		if (Now - State->QueuedAt > 45.0)
+		{
+			return FinishSandSphereTreeCapture(State, true);
+		}
+
+		if (State->Phase == 1 && Now - State->PhaseStartedAt >= 0.15
+			&& !FScreenshotRequest::IsScreenshotRequested())
+		{
+			RequestSandSphereTreeScreenshot(
+				*State, TEXT("01_LargeSandBall_AboveTree.png"));
+			State->Phase = 2;
+			State->PhaseStartedAt = Now;
+			return true;
+		}
+		if (State->Phase == 2 && SupportedAmount > 0
+			&& State->FirstSupportedAt <= 0.0)
+		{
+			State->FirstSupportedAt = Now;
+			return true;
+		}
+		if (State->Phase == 2 && State->FirstSupportedAt > 0.0
+			&& Now - State->FirstSupportedAt >= 0.08
+			&& !FScreenshotRequest::IsScreenshotRequested())
+		{
+			RequestSandSphereTreeScreenshot(
+				*State, TEXT("02_Sand_LandedOnTree.png"));
+			State->Phase = 3;
+			State->PhaseStartedAt = Now;
+			return true;
+		}
+		if (State->Phase == 3
+			&& Now - State->PhaseStartedAt >= 0.50
+			&& !FScreenshotRequest::IsScreenshotRequested())
+		{
+			State->MidSupportedAmount = SupportedAmount;
+			RequestSandSphereTreeScreenshot(
+				*State, TEXT("03_Sand_SlidingFromTree.png"));
+			State->Phase = 4;
+			State->PhaseStartedAt = Now;
+			return true;
+		}
+		if (State->Phase == 4 && Now - State->PhaseStartedAt >= 2.5
+			&& !FScreenshotRequest::IsScreenshotRequested())
+		{
+			State->FinalSupportedAmount = SupportedAmount;
+			RequestSandSphereTreeScreenshot(
+				*State, TEXT("04_Sand_AfterTreeSlide.png"));
+			State->Phase = 5;
+			State->PhaseStartedAt = Now;
+			return true;
+		}
+		if (State->Phase == 5 && Now - State->PhaseStartedAt >= 0.4
+			&& !FScreenshotRequest::IsScreenshotRequested())
+		{
+			return FinishSandSphereTreeCapture(State, false);
+		}
+		return true;
+	}
+
+	void QueueSandSphereTreeCapture(const TArray<FString>& Args, UWorld*)
+	{
+		if (GSandSphereTreeCapturePending)
+		{
+			return;
+		}
+		GSandSphereTreeCapturePending = true;
+		const TSharedRef<FSandSphereTreeCaptureState> State =
+			MakeShared<FSandSphereTreeCaptureState>();
+		State->QueuedAt = FPlatformTime::Seconds();
+		State->PhaseStartedAt = State->QueuedAt;
+		State->MapSeed = Args.Num() > 0
+			? FMath::Max(FCString::Atoi(*Args[0]), 1) : 1337;
+		State->bQuitAfterCapture = Args.Num() <= 1
+			|| FCString::Atoi(*Args[1]) != 0;
+		FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateLambda([State](float)
+			{
+				return TickSandSphereTreeCapture(State);
+			}));
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs GSandSphereTreeCaptureCommand(
+		TEXT("mf.Visual.SandSphereTree"),
+		TEXT("Capture a real sand sphere landing on and sliding from a generated tree: mf.Visual.SandSphereTree [map-seed=1337] [quit=1]"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+			&QueueSandSphereTreeCapture));
+
+	void QueueShopGridCapture(const TArray<FString>& Args, UWorld*)
+	{
+		if (GShopGridCapturePending)
+		{
+			return;
+		}
+
+		GShopGridCapturePending = true;
+		const bool bQuitAfterCapture = Args.Num() == 0
+			|| FCString::Atoi(*Args[0]) != 0;
+		const double QueuedAt = FPlatformTime::Seconds();
+		const TSharedRef<double> OpenedAt = MakeShared<double>(-1.0);
+		const TSharedRef<bool> bShopOpened = MakeShared<bool>(false);
+
+		FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateLambda(
+				[bQuitAfterCapture, QueuedAt, OpenedAt, bShopOpened](float)
+				{
+					const double Now = FPlatformTime::Seconds();
+					UWorld* World = GEngine && GEngine->GameViewport
+						? GEngine->GameViewport->GetWorld()
+						: nullptr;
+					if (!World || !World->IsGameWorld())
+					{
+						if (Now - QueuedAt < 30.0)
+						{
+							return true;
+						}
+						UE_LOG(LogMatterFlux, Error,
+							TEXT("Shop-grid capture timed out waiting for a game world."));
+						GShopGridCapturePending = false;
+						if (bQuitAfterCapture)
+						{
+							FPlatformMisc::RequestExitWithStatus(false, 4);
+						}
+						return false;
+					}
+
+					if (!*bShopOpened)
+					{
+						AMatterFluxPlayerController* PlayerController =
+							Cast<AMatterFluxPlayerController>(
+								World->GetFirstPlayerController());
+						AMatterFluxCreatureActor* Merchant = nullptr;
+						const FMatterFluxCreatureDefinition* MerchantDefinition = nullptr;
+						for (TActorIterator<AMatterFluxCreatureActor> It(World); It; ++It)
+						{
+							const FMatterFluxCreatureDefinition* Definition =
+								It->ResolveDefinition();
+							if (Definition && !Definition->ShopId.IsNone())
+							{
+								Merchant = *It;
+								MerchantDefinition = Definition;
+								break;
+							}
+						}
+						if (PlayerController
+							&& PlayerController->GetPawn()
+							&& !Merchant
+							&& Now - QueuedAt >= 3.0)
+						{
+							const APawn* PlayerPawn = PlayerController->GetPawn();
+							const FVector MerchantLocation =
+								PlayerPawn->GetActorLocation()
+								+ PlayerPawn->GetActorForwardVector() * 180.0f;
+							Merchant = World->SpawnActorDeferred<AMatterFluxCreatureActor>(
+								AMatterFluxCreatureActor::StaticClass(),
+								FTransform(FRotator::ZeroRotator, MerchantLocation),
+								nullptr,
+								nullptr,
+								ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+							if (Merchant)
+							{
+								Merchant->InitializeCreature(TEXT("std.merchant_base"));
+								Merchant->FinishSpawning(
+									FTransform(FRotator::ZeroRotator, MerchantLocation));
+								MerchantDefinition = Merchant->ResolveDefinition();
+							}
+						}
+						if (!PlayerController || !Merchant || !MerchantDefinition)
+						{
+							if (Now - QueuedAt < 30.0)
+							{
+								return true;
+							}
+							UE_LOG(LogMatterFlux, Error,
+								TEXT("Shop-grid capture timed out waiting for the player and merchant."));
+							GShopGridCapturePending = false;
+							if (bQuitAfterCapture)
+							{
+								FPlatformMisc::RequestExitWithStatus(false, 4);
+							}
+							return false;
+						}
+
+						if (!PlayerController->OpenCreatureShopForVisualCapture(
+							Merchant,
+							MerchantDefinition->DialogueId,
+							MerchantDefinition->ShopId))
+						{
+							UE_LOG(LogMatterFlux, Error,
+								TEXT("Shop-grid capture could not open the interaction widget."));
+							GShopGridCapturePending = false;
+							if (bQuitAfterCapture)
+							{
+								FPlatformMisc::RequestExitWithStatus(false, 4);
+							}
+							return false;
+						}
+
+						*bShopOpened = true;
+						*OpenedAt = Now;
+						return true;
+					}
+
+					if (Now - *OpenedAt < 1.0
+						|| FScreenshotRequest::IsScreenshotRequested())
+					{
+						return true;
+					}
+
+					const FString OutputDirectory = FPaths::Combine(
+						FPaths::ScreenShotDir(),
+						TEXT("MatterFluxShopGrid"),
+						FDateTime::Now().ToString(TEXT("%Y%m%d-%H%M%S")));
+					IFileManager::Get().MakeDirectory(*OutputDirectory, true);
+					const FString ScreenshotPath = FPaths::Combine(
+						OutputDirectory,
+						TEXT("01_ShopGrid.png"));
+					FScreenshotRequest::RequestScreenshot(
+						ScreenshotPath,
+						true,
+						false,
+						false);
+					UE_LOG(LogMatterFlux, Display,
+						TEXT("Shop-grid capture requested screenshot: %s"),
+						*ScreenshotPath);
+					GShopGridCapturePending = false;
+					if (bQuitAfterCapture)
+					{
+						FTSTicker::GetCoreTicker().AddTicker(
+							FTickerDelegate::CreateLambda([](float)
+							{
+								FPlatformMisc::RequestExitWithStatus(false, 0);
+								return false;
+							}),
+							1.5f);
+					}
+					return false;
+				}),
+			0.1f);
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs GShopGridCaptureCommand(
+		TEXT("mf.Visual.ShopGrid"),
+		TEXT("Open and capture the merchant grid: mf.Visual.ShopGrid [quit=1]"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+			&QueueShopGridCapture));
+
+	struct FShopGridCaptureBootstrap
+	{
+		FShopGridCaptureBootstrap()
+		{
+			if (!FParse::Param(
+				FCommandLine::Get(), TEXT("MatterFluxCaptureShopGrid")))
+			{
+				return;
+			}
+			TArray<FString> Args;
+			Args.Add(TEXT("1"));
+			QueueShopGridCapture(Args, nullptr);
+		}
+	};
+
+	FShopGridCaptureBootstrap GShopGridCaptureBootstrap;
 }

@@ -27,9 +27,9 @@ bool FMatterFluxCreatureContentRegistrationTest::RunTest(
 content.set_manifest("creature.test", 1, 2)
 content.register_item({ id="std.coin", name="金币", max_stack=999999, use_action="none", consume_count=0 })
 content.register_spell({ id="std.default", name="火花弹", kind="projectile", mana_cost=1, damage=4, speed=600, lifetime=2, radius=8 })
-content.register_quest({ id="std.init_quest.kill_enemy", description="击败敌人", category="objective", objective="never", target_count=1 })
+content.register_quest({ id="std.init_quest.kill_enemy", description="击败敌人", category="objective", objective="never", target_count=1, activation_creature_spawns={ { creature_id="std.slime", marker_id="test.slime.0" }, { creature_id="std.slime", marker_id="test.slime.1" } } })
 content.register_creature({ id="std.merchant_base", name="商人", faction="friendly", level="normal", ai="passive", health=100, width=70, height=160, move_speed=0, dialogue_id="dialogue.merchant", shop_id="std.template_merchant", color_r=0.2, color_g=0.8, color_b=0.3, color_a=1 })
-content.register_creature({ id="std.slime", name="史莱姆", faction="hostile", level="elite", ai="skirmisher", health=15, width=80, height=90, density=0.35, move_speed=200, perception_range=700, attack_range=300, retreat_range=0, target_memory=5, patrol_turn=3, patrol_pause=1, attack_cooldown=2, attack_spell="std.default", attack_projectiles=2, attack_spread=10, drop_item="std.coin", drop_count=5000, spawn_quest="std.init_quest.kill_enemy", spawn_count=2, spawn_distance=500, color_r=0.4, color_g=0.9, color_b=0.2, color_a=1 })
+content.register_creature({ id="std.slime", name="史莱姆", faction="hostile", level="elite", ai="skirmisher", health=15, width=80, height=90, density=0.35, move_speed=200, perception_range=700, attack_range=300, retreat_range=0, target_memory=5, patrol_turn=3, patrol_pause=1, attack_cooldown=2, attack_spell="std.default", attack_projectiles=2, attack_spread=10, drop_item="std.coin", drop_count=5000, color_r=0.4, color_g=0.9, color_b=0.2, color_a=1 })
 content.register_dialogue({ id="dialogue.merchant", name="商人", start="hello", nodes={ { id="hello", text="这是一个商店。", options={ { text="看看商品", shop_id="std.template_merchant" }, { text="再见", close=true } } } } })
 content.register_shop({ id="std.template_merchant", name="营地商店", offers={ { kind="item", product_id="std.coin", product_count=1, cost_item="std.coin", cost_count=100, limit=10 } } })
 )LUA");
@@ -54,7 +54,19 @@ content.register_shop({ id="std.template_merchant", name="营地商店", offers=
 			Slime.AiMode == EMatterFluxCreatureAiMode::Skirmisher);
 		TestFalse(TEXT("Legacy raw creature receives a compiled behavior tree"),
 			Slime.BehaviorProgram.IsEmpty());
-		TestEqual(TEXT("Lua preserves quest spawn count"), Slime.SpawnCount, 2);
+		const FMatterFluxQuestDefinition& Quest =
+			Registry->Quests.FindChecked(TEXT("std.init_quest.kill_enemy"));
+		TestEqual(TEXT("Lua preserves task-owned creature spawn count"),
+			Quest.ActivationCreatureSpawns.Num(), 2);
+		if (Quest.ActivationCreatureSpawns.Num() == 2)
+		{
+			TestEqual(TEXT("Quest spawn preserves creature id"),
+				Quest.ActivationCreatureSpawns[0].CreatureId,
+				FName(TEXT("std.slime")));
+			TestEqual(TEXT("Quest spawn preserves marker id"),
+				Quest.ActivationCreatureSpawns[1].MarkerId,
+				FName(TEXT("test.slime.1")));
+		}
 		TestEqual(TEXT("Lua preserves drop count"), Slime.DropItemCount, 5000);
 		TestEqual(TEXT("Lua preserves buoyancy density"),
 			Slime.Density, 0.35f);
@@ -74,6 +86,70 @@ content.register_shop({ id="std.template_merchant", name="营地商店", offers=
 	{
 		Runtime.ReloadDefaultContentPack(Error);
 	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxShopCategoryDslTest,
+	"MatterFlux.Creatures.LuaShopCustomCategoryTabsCompile",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxShopCategoryDslTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString EngineSource;
+	if (!TestTrue(TEXT("Shop DSL source is readable"),
+		FFileHelper::LoadFileToString(
+			EngineSource,
+			*Runtime.GetDefaultEngineConfigPath())))
+	{
+		return false;
+	}
+	const FString Source = EngineSource + TEXT(R"LUA(
+content.set_manifest("shop.category.test", 1, 2)
+item.define({ id="std.coin", name="金币", max_stack=999999 })
+spell.define({ id="spell.test", name="测试飞弹", icon="paper/default", mana_cost=1 }, function(api)
+	api.projectile({ damage=1, speed=100, lifetime=1, radius=4 })
+end)
+shop.define({ id="shop.category", name="分类商店" }, function(s)
+	s.category({ id="projectile", name="投射物" })
+	s.category({ id="utility", name="功能" })
+	s.offer({ kind="spell", product_id="spell.test", product_count=1,
+		cost_item="std.coin", cost_count=10, limit=3, category="projectile" })
+end)
+)LUA");
+
+	FString Error;
+	if (!TestTrue(TEXT("Shop category DSL compiles"),
+		Runtime.LoadContentPackFromSource(Source, TEXT("ShopCategoryDsl"), Error)))
+	{
+		AddError(Error);
+		Runtime.ReloadDefaultContentPack(Error);
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry = Runtime.GetActiveRegistry();
+	const FMatterFluxShopDefinition* Shop = Registry.IsValid()
+		? Registry->Shops.Find(TEXT("shop.category"))
+		: nullptr;
+	if (TestNotNull(TEXT("Custom category shop exists"), Shop))
+	{
+		TestEqual(TEXT("Authored category order is preserved"),
+			Shop->Categories.Num(), 2);
+		if (Shop->Categories.Num() == 2)
+		{
+			TestEqual(TEXT("First category id reaches the registry"),
+				Shop->Categories[0].Id, FName(TEXT("projectile")));
+			TestEqual(TEXT("Second category label reaches the registry"),
+				Shop->Categories[1].DisplayName, FString(TEXT("功能")));
+		}
+		if (Shop->Offers.Num() == 1)
+		{
+			TestEqual(TEXT("Offer retains its authored category"),
+				Shop->Offers[0].CategoryId, FName(TEXT("projectile")));
+		}
+	}
+	Runtime.ReloadDefaultContentPack(Error);
 	return true;
 }
 
@@ -98,7 +174,7 @@ bool FMatterFluxCreatureBehaviorTreeLuaTest::RunTest(
 content.set_manifest("behavior.tree.test", 1, 2)
 creature.define({
     id="enemy.tree", name="Tree Enemy", faction="hostile", level="normal",
-    health=20, width=60, height=120
+    health=20, width=60, height=120, wait_for_first_sight=true
 }, function(ai)
     ai.tree({
       sight={ range=900, memory_seconds=5 },
@@ -147,6 +223,8 @@ end)
 			Creature.PerceptionRange, 900.0f);
 		TestEqual(TEXT("Movement speed is compiled from the tree"),
 			Creature.MoveSpeed, 250.0f);
+		TestTrue(TEXT("First-sight waiting is compiled from creature metadata"),
+			Creature.bWaitForFirstSight);
 		TestEqual(TEXT("Attack distance is owned by its condition"),
 			Creature.AttackRange, 600.0f);
 		TestEqual(TEXT("Attack cooldown is owned by its action"),
@@ -431,6 +509,14 @@ bool FMatterFluxCreatureAIDecisionTest::RunTest(const FString& Parameters)
 			false,
 			Context.TargetDistance,
 			Context.AttackRange));
+	TestTrue(TEXT("Configured creature waits before its first visible target"),
+		MatterFlux::Creatures::ShouldWaitForFirstSight(true, false, false));
+	TestFalse(TEXT("First visible target wakes the configured creature"),
+		MatterFlux::Creatures::ShouldWaitForFirstSight(true, false, true));
+	TestFalse(TEXT("Creature stays awake after losing its first target"),
+		MatterFlux::Creatures::ShouldWaitForFirstSight(true, true, false));
+	TestFalse(TEXT("Ordinary creatures keep their authored patrol behavior"),
+		MatterFlux::Creatures::ShouldWaitForFirstSight(false, false, false));
 	Context.TargetDistance = 100.0f;
 	TestTrue(TEXT("Too-close cooldown tree evaluates"),
 		FMatterFluxCreatureBehaviorTreeEvaluator::Evaluate(
@@ -488,21 +574,116 @@ bool FMatterFluxPaperMagicCreatureCatalogTest::RunTest(
 	}
 	const FMatterFluxShopDefinition& Shop =
 		Registry->Shops.FindChecked(TEXT("std.template_merchant"));
-	TestEqual(TEXT("PaperMagic merchant carries all ten offers"),
-		Shop.Offers.Num(), 10);
+	const auto ExpectedCategoryForSpellKind = [](
+		const EMatterFluxSpellKind Kind) -> FName
+	{
+		switch (Kind)
+		{
+		case EMatterFluxSpellKind::Projectile:
+			return TEXT("projectile");
+		case EMatterFluxSpellKind::Modifier:
+			return TEXT("modifier");
+		case EMatterFluxSpellKind::Multicast:
+			return TEXT("multicast");
+		case EMatterFluxSpellKind::Trigger:
+			return TEXT("trigger");
+		case EMatterFluxSpellKind::TriggerModifier:
+			return TEXT("trigger_modifier");
+		case EMatterFluxSpellKind::Jump:
+			return TEXT("jump");
+		default:
+			return NAME_None;
+		}
+	};
+	TSet<FName> OfferedSpellIds;
+	for (const FMatterFluxShopOfferDefinition& Offer : Shop.Offers)
+	{
+		if (Offer.ProductKind == EMatterFluxShopProductKind::Spell)
+		{
+			OfferedSpellIds.Add(Offer.ProductId);
+			const FMatterFluxSpellDefinition& Spell =
+				Registry->Spells.FindChecked(Offer.ProductId);
+			TestEqual(*FString::Printf(
+				TEXT("Story merchant categorizes %s by spell kind"),
+				*Offer.ProductId.ToString()),
+				Offer.CategoryId,
+				ExpectedCategoryForSpellKind(Spell.Kind));
+		}
+	}
+	TestEqual(TEXT("Story merchant carries every registered spell exactly once"),
+		OfferedSpellIds.Num(), Registry->Spells.Num());
+	for (const TPair<FName, FMatterFluxSpellDefinition>& Pair : Registry->Spells)
+	{
+		TestTrue(*FString::Printf(
+			TEXT("Story merchant sells registered spell %s"),
+			*Pair.Key.ToString()),
+			OfferedSpellIds.Contains(Pair.Key));
+	}
+	TestEqual(TEXT("Story merchant keeps one supply and one wand offer"),
+		Shop.Offers.Num(), Registry->Spells.Num() + 2);
 	TestEqual(TEXT("PaperMagic merchant preserves the advanced wand product id"),
 		Shop.Offers.Last().ProductId, FName(TEXT("std.advanced_wand")));
-	TestEqual(TEXT("Tutorial spawns exactly two slimes"),
-		Registry->Creatures.FindChecked(TEXT("std.slime")).SpawnCount, 2);
-	TestEqual(TEXT("Tutorial spawns exactly one elite"),
-		Registry->Creatures.FindChecked(TEXT("std.elite_patrol")).SpawnCount, 1);
-	TestEqual(TEXT("Patrol template is not added to the tutorial wave"),
-		Registry->Creatures.FindChecked(TEXT("std.patrol")).SpawnCount, 0);
-	TestEqual(TEXT("Boss wave waits for the side quest"),
-		Registry->Creatures.FindChecked(TEXT("std.test_boss")).SpawnQuestId,
-		FName(TEXT("std.side_kill_boss")));
+	const FMatterFluxQuestDefinition& TutorialCombatQuest =
+		Registry->Quests.FindChecked(TEXT("std.init_quest.kill_enemy"));
+	TestEqual(TEXT("Tutorial task owns exactly three creature spawns"),
+		TutorialCombatQuest.ActivationCreatureSpawns.Num(), 3);
+	if (TutorialCombatQuest.ActivationCreatureSpawns.Num() == 3)
+	{
+		TestEqual(TEXT("Tutorial first slime uses its authored marker"),
+			TutorialCombatQuest.ActivationCreatureSpawns[0].MarkerId,
+			FName(TEXT("creature.std.slime.0")));
+		TestEqual(TEXT("Tutorial second slime uses its authored marker"),
+			TutorialCombatQuest.ActivationCreatureSpawns[1].MarkerId,
+			FName(TEXT("creature.std.slime.1")));
+		TestEqual(TEXT("Tutorial elite uses its authored marker"),
+			TutorialCombatQuest.ActivationCreatureSpawns[2].MarkerId,
+			FName(TEXT("creature.std.elite_patrol.0")));
+	}
+	const FMatterFluxCreatureDefinition& Slime =
+		Registry->Creatures.FindChecked(TEXT("std.slime"));
+	TestEqual(TEXT("Tutorial slimes retain their existing health"),
+		Slime.MaxHealth, 15.0f);
+	TestEqual(TEXT("Story slimes are twice the original width"),
+		Slime.Width, 180.0f);
+	TestEqual(TEXT("Story slimes are twice the original height"),
+		Slime.Height, 170.0f);
+	TestEqual(TEXT("Tutorial elite uses the reduced opening-wave health"),
+		Registry->Creatures.FindChecked(TEXT("std.elite_patrol")).MaxHealth,
+		25.0f);
+	const FMatterFluxQuestDefinition& BossQuest =
+		Registry->Quests.FindChecked(TEXT("std.side_kill_boss"));
+	TestEqual(TEXT("Boss task owns both boss spawns"),
+		BossQuest.ActivationCreatureSpawns.Num(), 2);
+	if (BossQuest.ActivationCreatureSpawns.Num() == 2)
+	{
+		TestEqual(TEXT("First boss uses its authored marker"),
+			BossQuest.ActivationCreatureSpawns[0].MarkerId,
+			FName(TEXT("creature.std.test_boss.0")));
+		TestEqual(TEXT("Second boss uses its authored marker"),
+			BossQuest.ActivationCreatureSpawns[1].MarkerId,
+			FName(TEXT("creature.std.test_boss.1")));
+	}
+	const FMatterFluxCustomMapDefinition& StoryMap =
+		Registry->CustomMaps.FindChecked(TEXT("story.paper_magic"));
+	TestEqual(TEXT("Story map owns one non-quest occupant"),
+		StoryMap.InitialCreatureSpawns.Num(), 1);
+	if (StoryMap.InitialCreatureSpawns.Num() == 1)
+	{
+		TestEqual(TEXT("Story map initializes the merchant"),
+			StoryMap.InitialCreatureSpawns[0].CreatureId,
+			FName(TEXT("std.merchant_base")));
+		TestEqual(TEXT("Merchant uses the authored map marker"),
+			StoryMap.InitialCreatureSpawns[0].MarkerId,
+			FName(TEXT("creature.std.merchant_base.0")));
+	}
 	const FMatterFluxCreatureDefinition& Boss =
 		Registry->Creatures.FindChecked(TEXT("std.test_boss"));
+	TestEqual(TEXT("Boss uses the enlarged authored width"),
+		Boss.Width, 150.0f);
+	TestEqual(TEXT("Boss uses the enlarged authored height"),
+		Boss.Height, 300.0f);
+	TestTrue(TEXT("Boss waits for its first sight of the player"),
+		Boss.bWaitForFirstSight);
 	TestEqual(TEXT("Boss attack keeps PaperMagic double cast"),
 		Boss.AttackProgram.ProjectileCount, 2);
 	TestEqual(TEXT("Boss attack keeps PaperMagic random spread"),

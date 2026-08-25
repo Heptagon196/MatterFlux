@@ -29,6 +29,7 @@ namespace
 		case 1: return TEXT("右键");
 		case 2: return TEXT("Q");
 		case 3: return TEXT("E");
+		case 4: return TEXT("空格");
 		default: return TEXT("?");
 		}
 	}
@@ -97,7 +98,7 @@ namespace MatterFluxPlayerStatusUI
 			const FString& Name,
 			const float Value,
 			const float Maximum,
-			const bool bActive)
+			const bool bShowValue)
 		{
 			if (Progress.IsValid())
 			{
@@ -106,12 +107,13 @@ namespace MatterFluxPlayerStatusUI
 			}
 			if (Label.IsValid())
 			{
-				Label->SetText(FText::FromString(FString::Printf(
-					TEXT("%s%s    %.0f / %.0f"),
-					bActive ? TEXT("▶ ") : TEXT(""),
-					*Name,
-					Value,
-					Maximum)));
+				Label->SetText(FText::FromString(bShowValue
+					? FString::Printf(
+						TEXT("%s    %.0f / %.0f"),
+						*Name,
+						Value,
+						Maximum)
+					: Name));
 			}
 		}
 
@@ -187,7 +189,7 @@ namespace MatterFluxPlayerStatusUI
 					TEXT("生命"),
 					Snapshot.Health,
 					Snapshot.MaxHealth,
-					false);
+					true);
 			}
 			for (int32 SlotIndex = 0;
 				SlotIndex < WandRows.Num();
@@ -204,7 +206,7 @@ namespace MatterFluxPlayerStatusUI
 					Wand.Label.ToString(),
 					Wand.Mana,
 					Wand.MaxMana,
-					Wand.bActive);
+					false);
 			}
 		}
 
@@ -262,15 +264,7 @@ UMatterFluxPlayerStatusWidget::BuildStatusSnapshot(
 			? FMath::Max(0.0f, Definition->ManaMax)
 			: 0.0f;
 		View.Mana = FMath::Min(View.Mana, View.MaxMana);
-		const FString WandName = Definition
-			? Definition->DisplayName
-			: Wand
-				? Wand->DefinitionId.ToString()
-				: TEXT("空槽");
-		View.Label = FText::FromString(FString::Printf(
-			TEXT("%s · %s"),
-			*InputLabel,
-			*WandName));
+		View.Label = FText::FromString(InputLabel);
 	}
 	return Snapshot;
 }

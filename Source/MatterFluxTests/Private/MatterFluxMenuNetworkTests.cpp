@@ -3,11 +3,119 @@
 #include "Game/MatterFluxPlayerController.h"
 #include "Engine/Engine.h"
 #include "Engine/PendingNetGame.h"
+#include "Framework/Application/SlateApplication.h"
 #include "Progression/MatterFluxQuestTrackerWidget.h"
 #include "UI/MatterFluxShellWidget.h"
 #include "Tests/AutomationEditorCommon.h"
+#include "Widgets/Input/SButton.h"
+#include "Widgets/SBoxPanel.h"
+#include "Widgets/SWindow.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
+
+namespace
+{
+class FVerifyDeferredGameplayFocus final : public IAutomationLatentCommand
+{
+public:
+	FVerifyDeferredGameplayFocus(
+		FAutomationTestBase* InTest,
+		const TSharedRef<SWidget>& InGameplayFocusTarget,
+		const TSharedRef<SWindow>& InTestWindow)
+		: Test(InTest)
+		, GameplayFocusTarget(InGameplayFocusTarget)
+		, TestWindow(InTestWindow)
+	{
+	}
+
+	virtual bool Update() override
+	{
+		if (!FSlateApplication::IsInitialized())
+		{
+			Test->AddError(TEXT("Slate shut down before deferred gameplay focus could be verified"));
+			return true;
+		}
+
+		FSlateApplication& Slate = FSlateApplication::Get();
+		Test->TestEqual(
+			TEXT("Gameplay focus survives the remainder of the menu activation frame"),
+			Slate.GetUserFocusedWidget(0),
+			GameplayFocusTarget);
+		Slate.RequestDestroyWindow(TestWindow.ToSharedRef());
+		return true;
+	}
+
+private:
+	FAutomationTestBase* Test = nullptr;
+	TSharedPtr<SWidget> GameplayFocusTarget;
+	TSharedPtr<SWindow> TestWindow;
+};
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxGameplayFocusRestorationTest,
+	"MatterFlux.Menu.Input.GameplayRestoresViewportKeyboardFocus",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxGameplayFocusRestorationTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	if (!TestTrue(TEXT("Slate is initialized"),
+		FSlateApplication::IsInitialized()))
+	{
+		return false;
+	}
+
+	FSlateApplication& Slate = FSlateApplication::Get();
+	const TSharedRef<SButton> MenuFocusTarget = SNew(SButton);
+	const TSharedRef<SButton> GameplayFocusTarget = SNew(SButton);
+	const TSharedRef<SWindow> TestWindow = SNew(SWindow)
+		.Title(FText::FromString(TEXT("MatterFlux Focus Test")))
+		.ClientSize(FVector2D(320.0f, 180.0f))
+		.SupportsMaximize(false)
+		.SupportsMinimize(false)
+		[
+			SNew(SVerticalBox)
+			+ SVerticalBox::Slot()
+			[
+				MenuFocusTarget
+			]
+			+ SVerticalBox::Slot()
+			[
+				GameplayFocusTarget
+			]
+		];
+	Slate.AddWindow(TestWindow, false);
+	Slate.SetUserFocus(0, MenuFocusTarget, EFocusCause::SetDirectly);
+	TestEqual(TEXT("Fixture begins with keyboard focus on menu content"),
+		Slate.GetUserFocusedWidget(0),
+		TSharedPtr<SWidget>(MenuFocusTarget));
+
+	AMatterFluxPlayerController::RestoreGameplayViewportFocus(
+		GameplayFocusTarget);
+	TestEqual(TEXT("Entering gameplay restores keyboard focus to the viewport"),
+		Slate.GetUserFocusedWidget(0),
+		TSharedPtr<SWidget>(GameplayFocusTarget));
+	AMatterFluxPlayerController::RestoreGameplayViewportFocusAfterSlateEvent(
+		GameplayFocusTarget,
+		[]() { return true; });
+
+	// A menu button can finish processing its Slate reply after the gameplay
+	// transition callback returns. Model that ordering explicitly: the old menu
+	// focus wins the current frame unless gameplay also repairs focus after the
+	// event has unwound.
+	Slate.SetUserFocus(0, MenuFocusTarget, EFocusCause::SetDirectly);
+	TestEqual(TEXT("Fixture models a late menu focus reply"),
+		Slate.GetUserFocusedWidget(0),
+		TSharedPtr<SWidget>(MenuFocusTarget));
+	ADD_LATENT_AUTOMATION_COMMAND(FVerifyDeferredGameplayFocus(
+		this,
+		GameplayFocusTarget,
+		TestWindow));
+	return true;
+}
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxJoinAddressNormalizationTest,

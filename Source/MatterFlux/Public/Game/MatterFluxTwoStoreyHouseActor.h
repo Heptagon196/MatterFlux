@@ -97,6 +97,9 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "House|Collision")
 	TObjectPtr<UBoxComponent> StairRampCollision;
 
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "House|Collision")
+	TObjectPtr<UBoxComponent> ExteriorGroundCollision;
+
 private:
 	struct FStructureFadeGroup
 	{

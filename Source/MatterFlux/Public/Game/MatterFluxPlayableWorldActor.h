@@ -7,6 +7,7 @@
 #include "GameFramework/Actor.h"
 #include "Game/MatterFluxPlayableLevel.h"
 #include "Material/MatterFluxGroundReactionRuntime.h"
+#include "Material/MatterFluxCustomMap.h"
 #include "Material/MatterFluxLogicalSourceReactionIndex.h"
 #include "Material/MatterFluxSourceReactionRuntime.h"
 #include "Material/MatterFluxMaterialSimulationRuntime.h"
@@ -22,6 +23,7 @@ class USceneComponent;
 class USkyAtmosphereComponent;
 class USkyLightComponent;
 class UStaticMesh;
+class UStaticMeshComponent;
 class UMaterialInterface;
 class UMaterialInstanceDynamic;
 class UProceduralMeshComponent;
@@ -71,9 +73,32 @@ enum class EMatterFluxWorldGenerationPhase : uint8
 struct FMatterFluxMaterialDisplacementState
 {
 	FName MaterialId = NAME_None;
+	EMatterFluxMaterialPhase Phase = EMatterFluxMaterialPhase::StaticSolid;
 	int32 SupportHeight = 0;
-	uint8 ReferenceAmount = 0;
-	uint8 MaximumRemainingAmount = 0;
+	uint16 ReferenceAmount = 0;
+	uint16 MaximumRemainingAmount = 0;
+};
+
+/** A vertical liquid or powder column that resists body movement. */
+struct FMatterFluxMovementMediumColumn
+{
+	FName MaterialId = NAME_None;
+	EMatterFluxMaterialPhase Phase = EMatterFluxMaterialPhase::StaticSolid;
+	float MovementResistance = 0.0f;
+	float BottomZ = 0.0f;
+	float SurfaceZ = 0.0f;
+
+	bool IsValid() const
+	{
+		return !MaterialId.IsNone()
+			&& (Phase == EMatterFluxMaterialPhase::Liquid
+				|| Phase == EMatterFluxMaterialPhase::Powder)
+			&& FMath::IsFinite(MovementResistance)
+			&& MovementResistance >= 0.0f
+			&& FMath::IsFinite(BottomZ)
+			&& FMath::IsFinite(SurfaceZ)
+			&& SurfaceZ > BottomZ;
+	}
 };
 
 struct FMatterFluxLiquidProjectionHeightAudit
@@ -99,6 +124,8 @@ class MATTERFLUX_API AMatterFluxPlayableWorldActor : public AActor
 	GENERATED_BODY()
 
 public:
+	static constexpr int32 PaperMagicStorySeed = 8403;
+
 	AMatterFluxPlayableWorldActor();
 
 	virtual void BeginPlay() override;
@@ -107,9 +134,18 @@ public:
 	virtual void Tick(float DeltaSeconds) override;
 
 	void Regenerate(int32 NewSeed = 0);
+	/** Sets a deterministic seed before deferred spawning reaches BeginPlay. */
+	bool SetInitialMapSeed(int32 InitialSeed);
 	bool RequestRegenerateAsync(
 		int32 NewSeed = 0,
 		bool bForceExactSeed = false);
+	bool LoadCustomMap(FName MapId, int32 Seed, FString& OutError);
+	FName GetActiveCustomMapId() const { return ActiveCustomMapId; }
+	int32 GetCustomMapLoadSerial() const { return CustomMapLoadSerial; }
+	bool IsCustomMapActive() const { return !ActiveCustomMapId.IsNone(); }
+	bool TryGetCustomMapMarker(
+		FName MarkerId,
+		FVector& OutWorldLocation) const;
 	bool IsGenerationInProgress() const;
 	float GetGenerationProgress() const { return GenerationProgress; }
 	const FString& GetGenerationStatusText() const
@@ -164,6 +200,33 @@ public:
 		const FVector& WorldLocation,
 		float& OutWorldHeight) const;
 	/**
+	 * Places a requested capsule center above every canonical terrain sample
+	 * that can contribute to the smoothed collision surface under its footprint.
+	 */
+	bool TryResolveTerrainSpawnLocation(
+		const FVector& RequestedWorldLocation,
+		float HorizontalRadius,
+		float CapsuleHalfHeight,
+		float Clearance,
+		FVector& OutWorldLocation) const;
+	/**
+	 * Pins a not-yet-possessed player's spawn chunk as a streaming focus and
+	 * synchronously commits its terrain behind the entry/loading gate.
+	 */
+	bool RequestPlayerSpawnRegion(
+		const FVector& WorldLocation,
+		FIntPoint& OutTerrainChunk);
+	void ReleasePlayerSpawnRegion(const FIntPoint& TerrainChunk);
+	bool IsPlayerSpawnRegionTerrainReady(
+		const FIntPoint& TerrainChunk) const;
+	/**
+	 * Initial-entry barrier: every requested terrain/population transaction and
+	 * its material presentation are complete, including river projections.
+	 * Later joins use the per-region terrain check so active traversal elsewhere
+	 * cannot indefinitely delay a new player.
+	 */
+	bool IsInitialWorldEntryReady() const;
+	/**
 	 * 将世界坐标映射到材质格，并返回与渲染一致的液柱。
 	 * 非液体、空格和未初始化状态均返回 false。
 	 */
@@ -177,11 +240,23 @@ public:
 	bool TrySampleAmbientLiquidColumnAtWorldLocation(
 		const FVector& WorldLocation,
 		MatterFlux::Liquid::FLiquidColumn& OutColumn) const;
+	/** Samples liquid or powder, including the column vacated by a body last frame. */
+	bool TrySampleMovementMediumColumnAtWorldLocation(
+		const FVector& WorldLocation,
+		FMatterFluxMovementMediumColumn& OutColumn) const;
 	/**
 	 * Authority-only material transaction used by every buoyant body. Liquid
 	 * overlapping the submitted body volume is moved to nearby free cells.
 	 */
 	bool DisplaceLiquidInWorldBounds(
+		const FVector& Center,
+		const FVector& HorizontalExtent,
+		float BottomZ,
+		float TopZ,
+		bool bCapsuleShape = false,
+		bool bDeferMaterialSolve = false);
+	/** Shared body-volume transaction for liquids and surface powders. */
+	bool DisplaceMaterialInWorldBounds(
 		const FVector& Center,
 		const FVector& HorizontalExtent,
 		float BottomZ,
@@ -203,7 +278,8 @@ public:
 	{
 		int32 PendingCount = PendingProceduralPopulationChunks.Num()
 			+ PendingProceduralPopulationRemovals.Num()
-			+ ProceduralPopulationChunksBuilding.Num();
+			+ ProceduralPopulationChunksBuilding.Num()
+			+ PendingInitialLiquidProjectionChunks.Num();
 		// Surface topology and river particles are streamed on the same bounded
 		// queue as decorations. Treat the unseeded near-focus window as pending
 		// work as well, so loading/drain callers do not observe a visually complete
@@ -225,7 +301,27 @@ public:
 				}
 			}
 		}
-		return PendingCount + PendingSurfaceChunks.Num();
+		for (const FIntPoint Chunk : ProceduralSurfaceSeedPriorityChunks)
+		{
+			if (DesiredProceduralPopulationChunks.Contains(Chunk)
+				&& ProceduralRiverChunks.Contains(Chunk)
+				&& !PrefetchedProceduralRiverSurfaceChunks.Contains(Chunk))
+			{
+				PendingSurfaceChunks.Add(Chunk);
+			}
+		}
+		// Surface seeding dirties the material presentation before the liquid
+		// projection queue is populated. Keep the stream non-ready across that
+		// hand-off as well; otherwise callers can reveal a river in the one-frame
+		// gap between canonical water creation and projection discovery.
+		const int32 PendingVisualizationHandoff =
+			bMaterialVisualizationDeferredForStreaming
+			&& bMaterialVisualizationDirty
+				? 1
+				: 0;
+		return PendingCount
+			+ PendingSurfaceChunks.Num()
+			+ PendingVisualizationHandoff;
 	}
 	int32 GetPendingTerrainChunkPrefetchCount() const
 	{
@@ -270,6 +366,14 @@ public:
 	void GatherFragmentSourcesInBounds(
 		const FBox& Bounds,
 		TArray<AFragment2DSourceActor*>& OutSources);
+	/** Sweeps only fixed authored sources; characters and detached fragments are excluded. */
+	bool SweepFixedFragmentSource(
+		const FVector& Start,
+		const FVector& End,
+		float Radius,
+		FVector& OutImpactLocation,
+		FVector& OutImpactNormal,
+		AFragment2DSourceActor*& OutSource);
 	int32 MaterializeFragmentSourcesForDamage(
 		const FFragmentDamageShape& DamageShape);
 	/** Commits a cut to the canonical sparse terrain facts and refreshes resident projections. */
@@ -352,6 +456,10 @@ public:
 	{
 		return GeneratedMaterialInstances.Num();
 	}
+	/** True only after the canonical liquid projection covering this point is renderable. */
+	bool HasLiquidProjectionAtWorldLocation(
+		FName MaterialId,
+		const FVector& WorldLocation) const;
 
 	UFUNCTION(BlueprintPure, Category = "Playable World|Material Simulation")
 	int32 GetSimulatedMaterialCount(FName MaterialId) const;
@@ -366,11 +474,32 @@ public:
 		const FVector& WorldLocation,
 		FName MaterialId);
 
+	/** Finds the first occupied 2.5D material column touched by a swept sphere. */
+	bool SweepSimulatedMaterial(
+		const FVector& Start,
+		const FVector& End,
+		float Radius,
+		FVector& OutImpactLocation,
+		FName& OutMaterialId) const;
+
 	/** Deposits a compact deterministic patch without overwriting its neighbors. */
 	int32 DepositSimulatedMaterialAtWorldLocation(
 		const FVector& WorldLocation,
 		FName MaterialId,
 		int32 CellCount);
+	/** Deposits a projectile payload and preserves the physical actor it contacted. */
+	int32 DepositSimulatedMaterialFromImpact(
+		const FVector& WorldLocation,
+		FName MaterialId,
+		int32 CellCount,
+		AActor* ImpactActor,
+		float ImpactRadius = 0.0f);
+	/** Read-only proof that powder is currently carried by object support. */
+	int32 GetExternalMaterialSupportCellCount() const
+	{
+		return ExternalMaterialSupportCells.Num();
+	}
+	int64 GetExternalMaterialSupportedAmount(FName MaterialId) const;
 
 	/**
 	 * Resolves one world-space material particle against every reactive storage
@@ -502,6 +631,9 @@ protected:
 	UPROPERTY(EditAnywhere, ReplicatedUsing = OnRep_MapSeed, Category = "Playable World", meta = (ClampMin = "1"))
 	int32 MapSeed = 0;
 
+	UPROPERTY(ReplicatedUsing = OnRep_ActiveCustomMapId)
+	FName ActiveCustomMapId = NAME_None;
+
 	UPROPERTY(EditAnywhere, Category = "Playable World|Material Simulation", meta = (ClampMin = "0.01", ClampMax = "0.25"))
 	float MaterialSimulationStepSeconds = 0.05f;
 
@@ -510,6 +642,14 @@ protected:
 
 	UPROPERTY(EditAnywhere, Category = "Playable World|Material Simulation", meta = (ClampMin = "0", ClampMax = "8"))
 	int32 MaterialSimulationActiveChunkRadius = 1;
+
+	/**
+	 * Newly generated or projectile-deposited water/powder may enter the camera
+	 * window during this interval and receive one settling wake outside the
+	 * smaller player-focus simulation window.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Playable World|Material Simulation", meta = (ClampMin = "0.25", ClampMax = "30.0"))
+	float MaterialRecentViewWakeSeconds = 5.0f;
 
 	UPROPERTY(EditAnywhere, Category = "Playable World|Streaming", meta = (ClampMin = "8", ClampMax = "128"))
 	int32 TerrainStreamingChunkSize = 64;
@@ -562,6 +702,9 @@ private:
 	void OnRep_MapSeed();
 
 	UFUNCTION()
+	void OnRep_ActiveCustomMapId();
+
+	UFUNCTION()
 	void OnRep_MaterialSimulationState();
 
 	UFUNCTION()
@@ -571,6 +714,16 @@ private:
 	void OnRep_TerrainHeightOverrides();
 
 	void RebuildLevel();
+	bool RebuildActiveCustomMap(FString& OutError);
+	bool RebuildProceduralStoryMap(
+		const FMatterFluxContentRegistry& Registry,
+		FString& OutError);
+	void PrepareForProceduralWorld();
+	void BuildCustomMapSceneBoxes(
+		const FMatterFluxContentRegistry& Registry);
+	void BuildCustomMapStructures(
+		const FMatterFluxContentRegistry& Registry);
+	void DestroyCustomMapSceneBoxes();
 	void SanitizeGenerationSettings();
 	void AdvanceAsyncGeneration();
 	void CompleteAsyncGeneration(bool bSuccess, const FString& Message);
@@ -586,9 +739,11 @@ private:
 	void RefreshProceduralPopulation(
 		TConstArrayView<FIntPoint> OrderedDesiredChunks,
 		TConstArrayView<FIntPoint> FocusChunks);
-	void ProcessPendingProceduralPopulationUpdates(
+	bool ProcessPendingProceduralPopulationUpdates(
 		bool bAllowSurfaceSeed = true,
-		bool bAllowChunkCommit = true);
+		bool bAllowChunkCommit = true,
+		bool bAllowSurfaceFinalization = true,
+		bool* bOutDidChunkCommit = nullptr);
 	void DestroyGeneratedStreamedHouses();
 	void HandleFragmentSourcePresenceChanged(
 		const FGuid& SourceId,
@@ -688,6 +843,13 @@ private:
 		TArray<FIntPoint>& OutFocusChunks) const;
 	void GatherMaterialSimulationFocusCells(
 		TArray<FIntPoint>& OutFocusCells) const;
+	void RegisterRecentMaterialWakeCells(
+		TConstArrayView<FIntPoint> WorldCells);
+	void RegisterRecentMaterialWakeSeedCells(
+		TConstArrayView<MatterFlux::Material::FSeedCell> SeedCells);
+	void WakeRecentVisibleMaterialChunks();
+	void PruneExternalMaterialSupports();
+	bool IsMaterialCellInsideTerrainView(const FIntPoint& WorldCell) const;
 	void RefreshVisibleLevelLayers(bool bForce);
 	bool RefreshVisibleTerrainChunks(
 		bool bForce,
@@ -726,9 +888,17 @@ private:
 	UPROPERTY(Transient)
 	TMap<FName, TObjectPtr<UHierarchicalInstancedStaticMeshComponent>> GeneratedLayerInstances;
 	UPROPERTY(Transient)
+	TArray<TObjectPtr<UStaticMeshComponent>> GeneratedCustomMapSceneBoxes;
+	UPROPERTY(Transient)
 	TMap<FName, TObjectPtr<UProceduralMeshComponent>> GeneratedLiquidLayerMeshes;
 	TMap<FName, FName> LiquidProjectionMaterials;
 	TMap<FName, FIntPoint> LiquidProjectionChunks;
+	// A loading barrier waits for each newly seeded visible liquid chunk to be
+	// projected once. The ordinary dirty queue is deliberately excluded: flowing
+	// water can dirty the same chunks forever and is not finite initialization work.
+	TSet<FIntPoint> PendingInitialLiquidProjectionChunks;
+	TSet<FIntPoint> PendingLiquidProjectionDirtyChunks;
+	bool bCaptureInitialLiquidProjectionRequirements = false;
 	TMap<FName, FLayerStreamingCache> LayerStreamingCaches;
 	TMap<FName, MatterFlux::PlayableLevel::FLevelLayer>
 		LiquidLayerDefinitions;
@@ -740,6 +910,7 @@ private:
 		GeneratedTerrainChunks;
 	TSet<FIntPoint> DesiredTerrainChunks;
 	TSet<FIntPoint> ActiveTerrainChunks;
+	TMap<FIntPoint, int32> PlayerSpawnRegionFocusCounts;
 	TArray<FIntPoint> PendingTerrainChunkPrefetches;
 	TSet<FIntPoint> TerrainChunksBuilding;
 	TSharedPtr<FMatterFluxAsyncTerrainBuildState, ESPMode::ThreadSafe>
@@ -773,8 +944,25 @@ private:
 		AsyncPopulationBuildState;
 	TArray<FIntPoint> PendingProceduralPopulationRemovals;
 	TArray<FIntPoint> ProceduralPopulationFocusChunks;
+	/** Visible chunks first, followed by the off-screen prefetch ring. */
+	TArray<FIntPoint> ProceduralSurfaceSeedPriorityChunks;
+	/** Population-build result used to preseed only water-bearing distant chunks. */
+	TSet<FIntPoint> ProceduralRiverChunks;
+	/** Exact river facts retained from the async population build for sparse preseed. */
+	TMap<
+		FIntPoint,
+		TArray<MatterFlux::PlayableLevel::FStreamingRiverCell>>
+		ProceduralRiverCellsByChunk;
+	/** Chunks whose river is renderable but whose full dry topology may be absent. */
+	TSet<FIntPoint> PrefetchedProceduralRiverSurfaceChunks;
 	bool bPreferProceduralSurfaceSeed = false;
 	TSet<FIntPoint> SeededProceduralSurfaceChunks;
+	TOptional<FIntPoint> ProceduralSurfaceSeedChunkInProgress;
+	bool bProceduralSurfaceSeedIsRiverPrefetch = false;
+	int32 ProceduralSurfaceSeedNextTerrainCell = 0;
+	TSet<FIntPoint> ProceduralSurfaceSeedMaterialCells;
+	TOptional<MatterFlux::Material::FSeedCell>
+		ProceduralSurfaceSeedFirstCell;
 	MatterFlux::Fragment::FSourceSpatialIndex
 		FragmentSourceDefinitionIndex;
 	TMap<FGuid, FIntPoint> FragmentSourceChunkById;
@@ -800,6 +988,10 @@ private:
 
 	UPROPERTY(EditAnywhere, Category = "Playable World|Streaming", meta = (ClampMin = "0.25", ClampMax = "16.0"))
 	float ProceduralPopulationBudgetMilliseconds = 4.0f;
+
+	/** Maximum terrain samples applied by one incremental surface-seed frame. */
+	UPROPERTY(EditAnywhere, Category = "Playable World|Streaming", meta = (ClampMin = "64", ClampMax = "2048"))
+	int32 ProceduralSurfaceSeedCellsPerFrame = 512;
 
 	UPROPERTY(EditAnywhere, Category = "Playable World|Streaming", meta = (ClampMin = "1", ClampMax = "16"))
 	int32 MaxAsyncStreamingBuildTasks = 4;
@@ -903,15 +1095,43 @@ private:
 
 	TUniquePtr<MatterFlux::Material::FSimulationRuntime>
 		MaterialSimulation;
+	struct FRecentMaterialWake
+	{
+		FIntPoint SampleCell = FIntPoint::ZeroValue;
+		double ExpiresAtWorldSeconds = 0.0;
+	};
+	/** One pending eligibility record per material chunk, independent of focus budget. */
+	TMap<FIntPoint, FRecentMaterialWake> RecentMaterialChunkWakes;
 	struct FPendingMaterialStimulus
 	{
 		FVector WorldLocation = FVector::ZeroVector;
+		/** Exact 2.5D cell written by the deposit; do not reconstruct it from a wall impact point. */
+		FIntPoint WorldCell = FIntPoint::ZeroValue;
+		/** Sources resolved while the impact projection still existed. */
+		TArray<TWeakObjectPtr<AFragment2DSourceActor>> AuthoredSources;
 		FName MaterialId = NAME_None;
 		int32 EventSeed = 0;
 	};
 	TArray<FPendingMaterialStimulus> PendingMaterialStimuli;
+	struct FExternalMaterialSupportState
+	{
+		FName MaterialId = NAME_None;
+		/** Fixed source only. Players and detached fragments use displacement. */
+		TWeakObjectPtr<AFragment2DSourceActor> FixedSource;
+	};
+	/** Object-carried flow columns; heights live in the runtime's disposable support overlay. */
+	TMap<FIntPoint, FExternalMaterialSupportState>
+		ExternalMaterialSupportCells;
 	/** 热路径液柱查询只读缓存，避免每个浮力采样重复访问脚本注册表。 */
 	TMap<FName, float> MaterialLiquidDensities;
+	struct FMovementMediumDefinition
+	{
+		EMatterFluxMaterialPhase Phase = EMatterFluxMaterialPhase::StaticSolid;
+		float MovementResistance = 0.0f;
+		float FullColumnHeight = 0.0f;
+	};
+	/** Hot-path physical properties for body-displaceable materials. */
+	TMap<FName, FMovementMediumDefinition> MaterialMovementMedia;
 	/** Idempotent per-column volume constraints submitted by bodies this frame. */
 	TMap<FIntPoint, FMatterFluxMaterialDisplacementState>
 		PendingMaterialDisplacementCells;
@@ -980,4 +1200,8 @@ private:
 	float GenerationProgress = 0.0f;
 	FString GenerationStatusText;
 	FOnMatterFluxWorldGenerationFinished GenerationFinished;
+	MatterFlux::Material::FCustomMapScene ActiveCustomMapScene;
+	int32 CustomMapLoadSerial = 0;
+	float ProceduralMaterialSimulationCellSize =
+		MatterFlux::PlayableLevel::TerrainCellSize;
 };

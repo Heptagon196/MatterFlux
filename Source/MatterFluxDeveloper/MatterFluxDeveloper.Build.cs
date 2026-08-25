@@ -15,7 +15,8 @@ public class MatterFluxDeveloper : ModuleRules
 			"GameplayAbilities",
 			"Json",
 			"MatterFlux",
-			"MatterFluxLua"
+			"MatterFluxLua",
+			"ProceduralMeshComponent"
 		});
 	}
 }

@@ -4,8 +4,9 @@ creature.define({
 	faction = "hostile",
 	level = "boss",
 	health = 50,
-	width = 95,
-	height = 210,
+	width = 150,
+	height = 300,
+	wait_for_first_sight = true,
 	density = 1.40, -- 首领体型和装备使其稳定下沉。
 	color_r = 0.72, color_g = 0.04, color_b = 0.12, color_a = 1,
 }, function(ai)
@@ -24,7 +25,7 @@ creature.define({
 					cooldown = 10, spell = "std.default",
 					projectiles = 12, radial = true,
 					projectile_interval = 0.2, recovery = 1,
-					horizontal_impulse = 500, vertical_impulse = 1500,
+					horizontal_impulse = 500, vertical_impulse = 600,
 					override_color = true,
 					color_r = 1, color_g = 0, color_b = 0, color_a = 1,
 				}),
@@ -45,5 +46,4 @@ creature.define({
 		}),
 	})
 	ai.drop("std.coin", 50000)
-	ai.spawn_on_quest("std.side_kill_boss", 2, 1500)
 end)

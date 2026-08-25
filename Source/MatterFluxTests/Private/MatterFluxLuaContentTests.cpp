@@ -4,6 +4,7 @@
 #include "IMatterFluxScriptRuntime.h"
 #include "Material/MatterFluxCustomMap.h"
 #include "Material/MatterFluxCustomMapPour.h"
+#include "Material/MatterFluxMaterialSimulationRuntime.h"
 #include "Material/MatterFluxMaterialWorld.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/FileHelper.h"
@@ -51,8 +52,8 @@ bool FMatterFluxLuaModularSpellApiTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("All item modules loaded"), First->Items.Num(), 2);
 	TestEqual(TEXT("All quest modules loaded"), First->Quests.Num(), 10);
 	TestEqual(TEXT("All structure modules loaded"), First->Structures.Num(), 1);
-	TestEqual(TEXT("All custom map modules loaded"), First->CustomMaps.Num(), 2);
-	TestEqual(TEXT("Modular content revision"), First->Manifest.Revision, 21);
+	TestEqual(TEXT("All custom map modules loaded"), First->CustomMaps.Num(), 3);
+	TestEqual(TEXT("Modular content revision"), First->Manifest.Revision, 23);
 	const FMatterFluxMaterialDefinition* Fire = First->Materials.Find(TEXT("fire"));
 	if (TestNotNull(TEXT("Default fire material compiled"), Fire))
 	{
@@ -60,6 +61,18 @@ bool FMatterFluxLuaModularSpellApiTest::RunTest(const FString& Parameters)
 			Fire->Phase == EMatterFluxMaterialPhase::Gas);
 		TestEqual(TEXT("Named lifetime_steps field is compiled"),
 			static_cast<int32>(Fire->LifetimeSteps), 6);
+	}
+	const FMatterFluxMaterialDefinition* Water = First->Materials.Find(TEXT("water"));
+	const FMatterFluxMaterialDefinition* Sand = First->Materials.Find(TEXT("sand"));
+	const FMatterFluxMaterialDefinition* Lava = First->Materials.Find(TEXT("lava"));
+	if (TestNotNull(TEXT("Default water material compiled"), Water)
+		&& TestNotNull(TEXT("Default sand material compiled"), Sand)
+		&& TestNotNull(TEXT("Default lava material compiled"), Lava))
+	{
+		TestTrue(TEXT("Powder resists movement more than water"),
+			Sand->MovementResistance > Water->MovementResistance);
+		TestTrue(TEXT("Viscous lava resists movement more than sand"),
+			Lava->MovementResistance > Sand->MovementResistance);
 	}
 	const FMatterFluxStructureDefinition* House = First->Structures.Find(
 		TEXT("structure.house.two_storey"));
@@ -568,6 +581,218 @@ bool FMatterFluxLuaCustomMapDefinitionTest::RunTest(
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxLuaStoryMapTest,
+	"MatterFlux.Lua.StoryMapPlacesReferenceQuestActors",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxLuaStoryMapTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(TEXT("Default content with story map loads"),
+		Runtime.ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry = Runtime.GetActiveRegistry();
+	const FMatterFluxCustomMapDefinition* Map = Registry.IsValid()
+		? Registry->CustomMaps.Find(TEXT("story.paper_magic"))
+		: nullptr;
+	if (!TestNotNull(TEXT("PaperMagic story map is registered"), Map))
+	{
+		return false;
+	}
+	TSet<FName> MarkerIds;
+	for (const FMatterFluxCustomMapMarkerDefinition& Marker : Map->Markers)
+	{
+		MarkerIds.Add(Marker.Id);
+	}
+	TestTrue(TEXT("Story map places the player"),
+		MarkerIds.Contains(TEXT("player_start")));
+	TestTrue(TEXT("Story map places the camp merchant"),
+		MarkerIds.Contains(TEXT("creature.std.merchant_base.0")));
+	TestTrue(TEXT("Story camp places one fixed two-storey house"),
+		MarkerIds.Contains(TEXT("structure.house.two_storey.0")));
+	TestTrue(TEXT("Story map places both tutorial slimes"),
+		MarkerIds.Contains(TEXT("creature.std.slime.0"))
+			&& MarkerIds.Contains(TEXT("creature.std.slime.1")));
+	TestTrue(TEXT("Story map places the tutorial elite"),
+		MarkerIds.Contains(TEXT("creature.std.elite_patrol.0")));
+	TestTrue(TEXT("Story map places both final enemies"),
+		MarkerIds.Contains(TEXT("creature.std.test_boss.0"))
+			&& MarkerIds.Contains(TEXT("creature.std.test_boss.1")));
+	const int32 MapWidth = Map->MaximumCellExclusive.X - Map->MinimumCell.X;
+	const int32 MapHeight = Map->MaximumCellExclusive.Y - Map->MinimumCell.Y;
+	TestTrue(TEXT("Story corridor is compact instead of free-mode scale"),
+		MapWidth <= 55 && MapHeight <= 20);
+
+	const FMatterFluxQuestDefinition* EquipWand = Registry->Quests.Find(
+		TEXT("std.init_quest.equip_wand"));
+	if (TestNotNull(TEXT("Story starts with the wand equipment objective"),
+		EquipWand))
+	{
+		TestEqual(TEXT("Initial wand objective targets the attack slot"),
+			EquipWand->EquipmentSlot, 0);
+		TestEqual(TEXT("Initial story reward contains one wand and one spell"),
+			EquipWand->ActivationRewards.Num(), 2);
+		if (EquipWand->ActivationRewards.Num() == 2)
+		{
+			TestEqual(TEXT("Initial reward grants the default wand"),
+				EquipWand->ActivationRewards[0].ContentId,
+				FName(TEXT("std.default")));
+			TestEqual(TEXT("Initial reward grants one attack spell"),
+				EquipWand->ActivationRewards[1].ContentId,
+				FName(TEXT("std.default")));
+		}
+	}
+	const FMatterFluxQuestDefinition* EquipSpell = Registry->Quests.Find(
+		TEXT("std.init_quest.equip_spell"));
+	if (TestNotNull(TEXT("Story has the attack spell objective"), EquipSpell))
+	{
+		TestEqual(TEXT("Attack spell objective targets the default spell"),
+			EquipSpell->TargetId, FName(TEXT("std.default")));
+		TestEqual(TEXT("Attack spell objective targets the attack slot"),
+			EquipSpell->EquipmentSlot, 0);
+		TestTrue(TEXT("Attack spell objective grants no bonus spell bundle"),
+			EquipSpell->ActivationRewards.IsEmpty());
+	}
+	const FMatterFluxQuestDefinition* KillEnemies = Registry->Quests.Find(
+		TEXT("std.init_quest.kill_enemy"));
+	if (TestNotNull(TEXT("Story has the enclosed arena combat objective"),
+		KillEnemies))
+	{
+		TestEqual(TEXT("Combat objective requires all three enemies"),
+			KillEnemies->TargetCount, 3);
+		TestEqual(TEXT("Combat completion grants shoe and jump"),
+			KillEnemies->CompletionRewards.Num(), 2);
+		if (KillEnemies->CompletionRewards.Num() == 2)
+		{
+			TestEqual(TEXT("Shoe reward is bound to the leg slot"),
+				KillEnemies->CompletionRewards[0].EquipmentSlot, 4);
+			TestEqual(TEXT("Jump reward is explicit"),
+				KillEnemies->CompletionRewards[1].ContentId,
+				FName(TEXT("std.jump")));
+		}
+	}
+
+	MatterFlux::Material::FSimulationRuntime PlayableRuntime;
+	MatterFlux::Material::FCustomMapScene Scene;
+	TestTrue(TEXT("Story map is adopted by the playable simulation runtime"),
+		MatterFlux::Material::BuildPlayableCustomMap(
+			TEXT("story.paper_magic"),
+			*Registry,
+			8403,
+			0.05f,
+			4,
+			PlayableRuntime,
+			Scene,
+			Error));
+	TestTrue(TEXT("Playable story runtime is initialized"),
+		PlayableRuntime.IsInitialized());
+	TestTrue(TEXT("Playable scene retains the merchant marker"),
+		Scene.MarkerLocations.Contains(
+			TEXT("creature.std.merchant_base.0")));
+	TestTrue(TEXT("Playable scene retains the fixed camp house marker"),
+		Scene.MarkerLocations.Contains(
+			TEXT("structure.house.two_storey.0")));
+	const FVector* PlayerMarker = Scene.MarkerLocations.Find(
+		TEXT("player_start"));
+	const FVector* LeftBarrierMarker = Scene.MarkerLocations.Find(
+		TEXT("story.left_barrier"));
+	const FVector* RightBarrierMarker = Scene.MarkerLocations.Find(
+		TEXT("story.right_barrier"));
+	if (TestNotNull(TEXT("Story exposes the left region boundary"),
+		LeftBarrierMarker)
+		&& TestNotNull(TEXT("Story exposes the right region boundary"),
+			RightBarrierMarker)
+		&& TestNotNull(TEXT("Story retains the player location"), PlayerMarker))
+	{
+		TestTrue(TEXT("Training region is compact"),
+			LeftBarrierMarker->X - PlayerMarker->X <= 900.0f);
+		TestTrue(TEXT("Camp region is smaller than the boss arena"),
+			RightBarrierMarker->X - LeftBarrierMarker->X <= 1800.0f
+				&& Scene.MaximumCellExclusive.X * Scene.CellSizeCentimeters
+					- RightBarrierMarker->X >= 2000.0f);
+		for (const FName EnemyMarker : {
+			FName(TEXT("creature.std.slime.0")),
+			FName(TEXT("creature.std.slime.1")),
+			FName(TEXT("creature.std.elite_patrol.0")) })
+		{
+			const FVector* Enemy = Scene.MarkerLocations.Find(EnemyMarker);
+			TestTrue(TEXT("Every tutorial enemy is inside the initial region"),
+				Enemy && Enemy->X > PlayerMarker->X
+					&& Enemy->X < LeftBarrierMarker->X);
+		}
+	}
+	MatterFlux::Material::FChunkedMaterialWorld StoryWorld;
+	MatterFlux::Material::FCustomMapScene StoryWorldScene;
+	if (TestTrue(TEXT("Story material world compiles for terrain assertions"),
+		MatterFlux::Material::BuildCustomMap(
+			TEXT("story.paper_magic"),
+			*Registry,
+			8403,
+			StoryWorld,
+			StoryWorldScene,
+			Error)))
+	{
+		TestEqual(TEXT("Story compiler retains its bounded grassland fallback"),
+			StoryWorld.GetMaterialAt(FIntPoint(-2, 0)),
+			FName(TEXT("grassland")));
+		TestEqual(TEXT("Story map no longer authors a fixed river cell"),
+			StoryWorld.GetMaterialAt(FIntPoint(31, 0)),
+			FName(TEXT("grassland")));
+	}
+	MatterFlux::PlayableLevel::FLevelLayout FirstGeneratedStory;
+	MatterFlux::PlayableLevel::FLevelLayout SecondGeneratedStory;
+	if (TestTrue(TEXT("Story seed generates its natural environment"),
+		MatterFlux::PlayableLevel::BuildLevelLayout(
+			8403, FirstGeneratedStory, Registry.Get()))
+		&& TestTrue(TEXT("The same story seed regenerates successfully"),
+			MatterFlux::PlayableLevel::BuildLevelLayout(
+				8403, SecondGeneratedStory, Registry.Get())))
+	{
+		TestTrue(TEXT("Generated story terrain is valid"),
+			FirstGeneratedStory.Terrain.IsValid());
+		TestNotNull(TEXT("Generated story contains a river"),
+			FirstGeneratedStory.FindLayer(TEXT("Stream")));
+		TestTrue(TEXT("Generated story contains trees, flowers and grass"),
+			!FirstGeneratedStory.FragmentSources.IsEmpty());
+		TestTrue(TEXT("Fixed story seed reproduces terrain heights"),
+			FirstGeneratedStory.Terrain.Heights
+				== SecondGeneratedStory.Terrain.Heights);
+		TestEqual(TEXT("Fixed story seed reproduces decoration count"),
+			FirstGeneratedStory.FragmentSources.Num(),
+			SecondGeneratedStory.FragmentSources.Num());
+	}
+	int32 LeftRockCount = 0;
+	int32 RightRockCount = 0;
+	bool bAllBarrierRocksAreJumpable = true;
+	for (const MatterFlux::Material::FCustomMapSceneBox& Box : Scene.Boxes)
+	{
+		const FString BoxId = Box.Id.ToString();
+		const bool bLeftRock = BoxId.StartsWith(TEXT("story.left_rocks."));
+		const bool bRightRock = BoxId.StartsWith(TEXT("story.right_rocks."));
+		LeftRockCount += bLeftRock ? 1 : 0;
+		RightRockCount += bRightRock ? 1 : 0;
+		if (bLeftRock || bRightRock)
+		{
+			bAllBarrierRocksAreJumpable &= Box.bCollision
+				&& Box.Size.Z >= 70.0f
+				&& Box.Size.Z <= 80.0f;
+		}
+	}
+	TestTrue(TEXT("Training arena has a complete jumpable rock row"),
+		LeftRockCount >= 8);
+	TestTrue(TEXT("Camp right edge has a complete rock row"),
+		RightRockCount >= 8);
+	TestTrue(TEXT("Both rock rows are collidable jump-height barriers"),
+		bAllBarrierRocksAreJumpable);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxLuaStackedContainerPourMapTest,
 	"MatterFlux.Lua.StackedContainerPourMapIsRegistered",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
@@ -1027,14 +1252,18 @@ bool FMatterFluxLuaAcidChemistryTest::RunTest(const FString& Parameters)
 				*Target.ToString()),
 			Found))
 		{
-			TestEqual(TEXT("Corrosion preserves acid"),
-				Found->OutputA, FName(TEXT("acid")));
-			TestEqual(TEXT("Corrosion emits acid gas in the consumed cell"),
-				Found->OutputB, FName(TEXT("acid_gas")));
+			TestEqual(TEXT("Corrosion consumes its acid input"),
+				Found->OutputA, FName(TEXT("empty")));
+			TestEqual(TEXT("Corrosion creates no acid-family product"),
+				Found->OutputB, FName(TEXT("empty")));
+			TestTrue(TEXT("Contact corrosion has no additional emission"),
+				Found->EmissionMaterial.IsNone()
+					|| Found->EmissionMaterial == TEXT("empty"));
 		}
 	}
 
 	bool bHasAcidWaterReaction = false;
+	bool bHasPropagatingAcidReaction = false;
 	for (const TPair<FName, FMatterFluxReactionDefinition>& Pair
 		: Registry->Reactions)
 	{
@@ -1042,9 +1271,14 @@ bool FMatterFluxLuaAcidChemistryTest::RunTest(const FString& Parameters)
 		bHasAcidWaterReaction |=
 			(Rule.InputA == TEXT("acid") && Rule.InputB == TEXT("water"))
 			|| (Rule.InputA == TEXT("water") && Rule.InputB == TEXT("acid"));
+		bHasPropagatingAcidReaction |=
+			Rule.Kind == FMatterFluxReactionDefinition::EKind::Propagating
+			&& (Rule.InputA == TEXT("acid") || Rule.InputB == TEXT("acid"));
 	}
 	TestFalse(TEXT("Acid and water have no chemical reaction rule"),
 		bHasAcidWaterReaction);
+	TestFalse(TEXT("Acid corrosion never self-propagates through solids"),
+		bHasPropagatingAcidReaction);
 	return true;
 }
 

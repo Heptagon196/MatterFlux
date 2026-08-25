@@ -47,6 +47,18 @@ public:
 	UFUNCTION(BlueprintPure, Category = "MatterFlux|Liquid")
 	float GetLastLiquidDensity() const { return LastLiquidDensity; }
 
+	UFUNCTION(BlueprintPure, Category = "MatterFlux|Material")
+	float GetLastMovementMediumFraction() const
+	{
+		return LastMovementMediumFraction;
+	}
+
+	UFUNCTION(BlueprintPure, Category = "MatterFlux|Material")
+	float GetLastMovementResistance() const
+	{
+		return LastMovementResistance;
+	}
+
 protected:
 	/** 身体体积密度；小于液体密度时倾向上浮，反之下沉。 */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "MatterFlux|Liquid",
@@ -81,4 +93,6 @@ private:
 	float WorldResolveCooldown = 0.0f;
 	float LastSubmergedFraction = 0.0f;
 	float LastLiquidDensity = 0.0f;
+	float LastMovementMediumFraction = 0.0f;
+	float LastMovementResistance = 0.0f;
 };

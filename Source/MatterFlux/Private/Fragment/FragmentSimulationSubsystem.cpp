@@ -1,5 +1,6 @@
 #include "Fragment/FragmentSimulationSubsystem.h"
 
+#include "Algo/Count.h"
 #include "EngineUtils.h"
 #include "Fragment/Fragment2DActor.h"
 #include "Fragment/Fragment2DSourceActor.h"
@@ -10,6 +11,7 @@
 namespace
 {
 	int32 GMatterFluxFragmentDebug = 0;
+	int32 GMatterFluxFragmentCutLog = 0;
 	TAutoConsoleVariable<int32> CVarMatterFluxRenderOnlyFragmentSpawnsPerFrame(
 		TEXT("mf.Fragment.RenderOnlySpawnsPerFrame"),
 		4,
@@ -75,6 +77,22 @@ namespace
 			UE_LOG(LogMatterFlux, Log, TEXT("Fragment debug: %d"), GMatterFluxFragmentDebug);
 		}));
 
+	FAutoConsoleCommandWithWorldAndArgs GFragmentCutLogCommand(
+		TEXT("mf.Fragment.CutLog"),
+		TEXT("Enable or disable one-shot world-cut diagnostics: mf.Fragment.CutLog 0|1"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld*)
+		{
+			if (Args.Num() > 0)
+			{
+				GMatterFluxFragmentCutLog = FCString::Atoi(*Args[0]) != 0 ? 1 : 0;
+			}
+			UE_LOG(
+				LogMatterFlux,
+				Display,
+				TEXT("[FragmentCut] logging=%s"),
+				GMatterFluxFragmentCutLog != 0 ? TEXT("on") : TEXT("off"));
+		}));
+
 	FAutoConsoleCommandWithWorldAndArgs GForceDamageCircleCommand(
 		TEXT("mf.Fragment.ForceDamageCircle"),
 		TEXT("Apply a circle damage shape to the first Fragment2DSourceActor: mf.Fragment.ForceDamageCircle <radius>"),
@@ -113,6 +131,11 @@ namespace
 			Shape.Thickness = Args.Num() > 1 ? FCString::Atof(*Args[1]) : 80.0f;
 			RequestDamageOnFirstSource(World, Shape, 1200.0f, 1337);
 		}));
+}
+
+bool UFragmentSimulationSubsystem::IsCutLoggingEnabled()
+{
+	return GMatterFluxFragmentCutLog != 0;
 }
 
 void UFragmentSimulationSubsystem::Tick(const float DeltaTime)
@@ -248,24 +271,29 @@ bool UFragmentSimulationSubsystem::RequestFragmentDamage(AFragment2DSourceActor*
 	return ExecuteFragmentDamage(SourceActor, DamageEvent);
 }
 
-void UFragmentSimulationSubsystem::RegisterSourceActor(
+bool UFragmentSimulationSubsystem::RegisterSourceActor(
 	AFragment2DSourceActor& SourceActor)
 {
 	if (!SourceActor.SourceId.IsValid())
 	{
-		return;
+		return false;
 	}
 	const TWeakObjectPtr<AFragment2DSourceActor>* Existing =
 		RegisteredSources.Find(SourceActor.SourceId);
-	if (Existing && Existing->Get() == &SourceActor)
+	const bool bAlreadyRegistered =
+		Existing && Existing->Get() == &SourceActor;
+	if (!RegisteredSourceIndex.Upsert(
+		SourceActor.SourceId,
+		SourceActor.GetCanonicalWorldBounds()))
 	{
-		return;
+		return false;
 	}
 	RegisteredSources.Add(SourceActor.SourceId, &SourceActor);
-	RegisteredSourceIndex.Upsert(
-		SourceActor.SourceId,
-		SourceActor.GetComponentsBoundingBox(true));
-	SourcePresenceChanged.Broadcast(SourceActor.SourceId, true);
+	if (!bAlreadyRegistered)
+	{
+		SourcePresenceChanged.Broadcast(SourceActor.SourceId, true);
+	}
+	return true;
 }
 
 void UFragmentSimulationSubsystem::UnregisterSourceActor(
@@ -327,7 +355,7 @@ void UFragmentSimulationSubsystem::GatherSourcesInBoundsMany(
 		{
 			continue;
 		}
-		const FBox CurrentBounds = Source->GetComponentsBoundingBox(true);
+		const FBox CurrentBounds = Source->GetCanonicalWorldBounds();
 		if (!CurrentBounds.IsValid)
 		{
 			continue;
@@ -428,6 +456,23 @@ int32 UFragmentSimulationSubsystem::ExecuteWorldCut(
 
 	const FVector ShapeCenter =
 		Shape.WorldTransform.GetLocation();
+	if (IsCutLoggingEnabled())
+	{
+		UE_LOG(
+			LogMatterFlux,
+			Display,
+			TEXT("[FragmentCut] begin seed=%d shape=%d center=(%.1f,%.1f,%.1f) length=%.1f thickness=%.1f radius=%.1f power=%.1f maxTargets=%d"),
+			Request.EventSeed,
+			static_cast<int32>(Shape.Type),
+			ShapeCenter.X,
+			ShapeCenter.Y,
+			ShapeCenter.Z,
+			Shape.Extents.X,
+			Shape.Thickness,
+			Shape.Radius,
+			Request.DamagePower,
+			Request.MaxAffectedSources);
+	}
 	int32 AcceptedTerrainCuts = 0;
 	for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
 	{
@@ -493,7 +538,7 @@ int32 UFragmentSimulationSubsystem::ExecuteWorldCut(
 		{
 			continue;
 		}
-		const FBox Bounds = Source->GetComponentsBoundingBox(true);
+		const FBox Bounds = Source->GetCanonicalWorldBounds();
 		if (!Bounds.IsValid)
 		{
 			continue;
@@ -595,6 +640,16 @@ int32 UFragmentSimulationSubsystem::ExecuteWorldCut(
 		});
 	int32 AcceptedCuts = 0;
 	int32 AttemptedTargets = 0;
+	if (IsCutLoggingEnabled())
+	{
+		UE_LOG(
+			LogMatterFlux,
+			Display,
+			TEXT("[FragmentCut] candidates=%d logicalTargets=%d terrainAccepted=%d"),
+			CandidateSources.Num(),
+			TargetGroups.Num(),
+			AcceptedTerrainCuts);
+	}
 	for (FCutTargetGroup& Group : TargetGroups)
 	{
 		if (Request.MaxAffectedSources > 0
@@ -604,9 +659,35 @@ int32 UFragmentSimulationSubsystem::ExecuteWorldCut(
 		}
 		++AttemptedTargets;
 		bool bTargetAccepted = false;
+		if (IsCutLoggingEnabled())
+		{
+			UE_LOG(
+				LogMatterFlux,
+				Display,
+				TEXT("[FragmentCut] target=%s sources=%d root=%s detachedItem=%s distance=%.1f"),
+				*Group.StableId.ToString(EGuidFormats::Short),
+				Group.Sources.Num(),
+				IsValid(Group.Root) ? *Group.Root->SourceId.ToString(EGuidFormats::Short) : TEXT("none"),
+				IsValid(Group.DetachedItem) ? *Group.DetachedItem->GetName() : TEXT("none"),
+				FMath::Sqrt(Group.DistanceSquared));
+		}
 		if (IsValid(Group.DetachedItem))
 		{
+			const int32 CutsBefore = Group.DetachedItem->GetAcceptedCutCount();
 			bTargetAccepted = Group.DetachedItem->TryAcceptWorldCut(Shape);
+			if (IsCutLoggingEnabled())
+			{
+				UE_LOG(
+					LogMatterFlux,
+					Display,
+					TEXT("[FragmentCut] item=%s accepted=%s cuts=%d->%d cutFade=%s transientFade=%.2f"),
+					*Group.DetachedItem->GetName(),
+					bTargetAccepted ? TEXT("true") : TEXT("false"),
+					CutsBefore,
+					Group.DetachedItem->GetAcceptedCutCount(),
+					Group.DetachedItem->IsCutFadeActive() ? TEXT("true") : TEXT("false"),
+					Group.DetachedItem->SpawnPayload.FadeOutDuration);
+			}
 			AcceptedCuts += bTargetAccepted ? 1 : 0;
 			continue;
 		}
@@ -618,6 +699,9 @@ int32 UFragmentSimulationSubsystem::ExecuteWorldCut(
 				InitialRevisions.Add(Source->SourceId, Source->Revision);
 			}
 		}
+		FFragmentDamageEvent AggregateRootEvent;
+		bool bHasAggregateRootEvent = false;
+		bool bAggregateMembersTransferred = false;
 		for (AFragment2DSourceActor* Source : Group.Sources)
 		{
 			if (!IsValid(Source)
@@ -642,9 +726,51 @@ int32 UFragmentSimulationSubsystem::ExecuteWorldCut(
 			Event.DamagePower = Request.DamagePower;
 			Event.EventSeed = Request.EventSeed
 				^ static_cast<int32>(GetTypeHash(Source->SourceId));
-			if (ExecuteFragmentDamage(Source, Event))
+			if (Source == Group.Root.Get())
+			{
+				AggregateRootEvent = Event;
+				bHasAggregateRootEvent = true;
+			}
+			AFragment2DActor* PrimaryCarrier = nullptr;
+			if (ExecuteFragmentDamage(Source, Event, &PrimaryCarrier))
 			{
 				bTargetAccepted = true;
+				if (PrimaryCarrier && Source == Group.Root.Get())
+				{
+					bAggregateMembersTransferred = true;
+				}
+				else if (PrimaryCarrier
+					&& !bAggregateMembersTransferred
+					&& IsValid(Group.Root)
+					&& bHasAggregateRootEvent)
+				{
+					const int32* RootInitialRevision =
+						InitialRevisions.Find(Group.Root->SourceId);
+					if (RootInitialRevision
+						&& Group.Root->Revision > *RootInitialRevision)
+					{
+						// A wide vertical band can remove the root's entire upper
+						// segment, leaving only a stump and therefore no root payload
+						// to act as carrier. Promote the first persistent member body
+						// and transfer every untouched canopy slice into it.
+						Group.Root->TransferAggregateMembersTo(
+							*PrimaryCarrier,
+							&AggregateRootEvent);
+						Group.Root->BeginAggregateSeparationGracePeriod(
+							*PrimaryCarrier);
+						if (IsCutLoggingEnabled())
+						{
+							UE_LOG(
+								LogMatterFlux,
+								Display,
+								TEXT("[FragmentCut] promoted member carrier=%s aggregateRoot=%s layers=%d"),
+								*GetNameSafe(PrimaryCarrier),
+								*GetNameSafe(Group.Root.Get()),
+								PrimaryCarrier->GetAggregateMemberCount());
+						}
+						bAggregateMembersTransferred = true;
+					}
+				}
 				// 不提前终止：没有产生 carrier 的表面刻痕仍需穿过木叶
 				// 多材质层。已由根事务接管的成员会在循环顶部按 revision
 				// 或对象有效性跳过，整棵树仍只计作一个法术目标。
@@ -652,11 +778,37 @@ int32 UFragmentSimulationSubsystem::ExecuteWorldCut(
 		}
 		AcceptedCuts += bTargetAccepted ? 1 : 0;
 	}
+	if (IsCutLoggingEnabled())
+	{
+		UE_LOG(
+			LogMatterFlux,
+			Display,
+			TEXT("[FragmentCut] end seed=%d attempted=%d objectAccepted=%d terrainAccepted=%d total=%d"),
+			Request.EventSeed,
+			AttemptedTargets,
+			AcceptedCuts,
+			AcceptedTerrainCuts,
+			AcceptedCuts + AcceptedTerrainCuts);
+	}
 	return AcceptedCuts + AcceptedTerrainCuts;
 }
 
-bool UFragmentSimulationSubsystem::ExecuteFragmentDamage(AFragment2DSourceActor* SourceActor, const FFragmentDamageEvent& DamageEvent)
+bool UFragmentSimulationSubsystem::ExecuteFragmentDamage(
+	AFragment2DSourceActor* SourceActor,
+	const FFragmentDamageEvent& DamageEvent)
 {
+	return ExecuteFragmentDamage(SourceActor, DamageEvent, nullptr);
+}
+
+bool UFragmentSimulationSubsystem::ExecuteFragmentDamage(
+	AFragment2DSourceActor* SourceActor,
+	const FFragmentDamageEvent& DamageEvent,
+	AFragment2DActor** OutPrimaryCarrier)
+{
+	if (OutPrimaryCarrier)
+	{
+		*OutPrimaryCarrier = nullptr;
+	}
 	if (!SourceActor)
 	{
 		return false;
@@ -675,9 +827,52 @@ bool UFragmentSimulationSubsystem::ExecuteFragmentDamage(AFragment2DSourceActor*
 	}
 
 	AFragment2DSourceActor::FPreparedFragmentDamage Transaction;
-	if (!SourceActor->PrepareDamageEvent(DamageEvent, Transaction))
+	const int32 SolidCellsBefore = Algo::Count(
+		SourceActor->GetRuntimeMask(),
+		static_cast<uint8>(1));
+	// A non-root aggregate layer is normally collision-free because the intact
+	// root owns the compound body's collision. When a vertical cut leaves the
+	// root terrain-supported, however, detached branches/leaves are processed
+	// independently and need their own physical bodies instead of render-only
+	// actors that remain suspended in place.
+	const bool bDetachedAggregateMemberNeedsPhysics =
+		SourceActor->AggregateId.IsValid()
+		&& !SourceActor->bAggregateRoot;
+	if (!SourceActor->PrepareDamageEvent(
+		DamageEvent,
+		Transaction,
+		bDetachedAggregateMemberNeedsPhysics))
 	{
 		return false;
+	}
+	if (IsCutLoggingEnabled())
+	{
+		int32 PersistentPayloads = 0;
+		int32 FadingPayloads = 0;
+		int32 CollisionPayloads = 0;
+		for (const FFragmentSpawnPayload& Payload : Transaction.Payloads)
+		{
+			PersistentPayloads += Payload.FadeOutDuration <= 0.0f ? 1 : 0;
+			FadingPayloads += Payload.FadeOutDuration > 0.0f ? 1 : 0;
+			CollisionPayloads += Payload.bEnableCollision ? 1 : 0;
+		}
+		UE_LOG(
+			LogMatterFlux,
+			Display,
+			TEXT("[FragmentCut] prepared actor=%s source=%s aggregate=%s root=%s material=%s revision=%d cellsBefore=%d cellsSupported=%d payloads=%d persistent=%d fading=%d collision=%d forcePhysics=%s"),
+			*SourceActor->GetName(),
+			*SourceActor->SourceId.ToString(EGuidFormats::Short),
+			SourceActor->AggregateId.IsValid() ? *SourceActor->AggregateId.ToString(EGuidFormats::Short) : TEXT("none"),
+			SourceActor->bAggregateRoot ? TEXT("true") : TEXT("false"),
+			*SourceActor->SourceMaterialId.ToString(),
+			SourceActor->Revision,
+			SolidCellsBefore,
+			Algo::Count(Transaction.SupportedMask, static_cast<uint8>(1)),
+			Transaction.Payloads.Num(),
+			PersistentPayloads,
+			FadingPayloads,
+			CollisionPayloads,
+			bDetachedAggregateMemberNeedsPhysics ? TEXT("true") : TEXT("false"));
 	}
 
 	TArray<AFragment2DActor*> DeferredFragments;
@@ -703,6 +898,12 @@ bool UFragmentSimulationSubsystem::ExecuteFragmentDamage(AFragment2DSourceActor*
 	const bool bCanDeferRenderOnlyFragments =
 		World->IsGameWorld()
 		&& !SourceActor->bEnableSourceCollision
+		&& !bDetachedAggregateMemberNeedsPhysics
+		// Aggregate roots must synchronously create their carrier so every
+		// member can transfer into one authoritative falling object before the
+		// root source returns to batched rendering.
+		&& !(SourceActor->AggregateId.IsValid()
+			&& SourceActor->bAggregateRoot)
 		// The stock actor has already passed complete payload validation.
 		// Custom actor classes may add fallible initialization and therefore
 		// retain the strict spawn-before-commit transaction below.
@@ -783,7 +984,6 @@ bool UFragmentSimulationSubsystem::ExecuteFragmentDamage(AFragment2DSourceActor*
 		RollBackDeferredSpawns();
 		return false;
 	}
-
 	if (!DeferredFragments.IsEmpty())
 	{
 		if (SourceActor->AggregateId.IsValid()
@@ -807,6 +1007,24 @@ bool UFragmentSimulationSubsystem::ExecuteFragmentDamage(AFragment2DSourceActor*
 			SourceActor->BeginAggregateSeparationGracePeriod(
 				*DeferredFragments[0]);
 		}
+		if (OutPrimaryCarrier)
+		{
+			*OutPrimaryCarrier = DeferredFragments[0];
+		}
+	}
+	if (IsCutLoggingEnabled())
+	{
+		UE_LOG(
+			LogMatterFlux,
+			Display,
+			TEXT("[FragmentCut] committed actor=%s revision=%d cells=%d spawned=%d aggregateLayers=%d"),
+			*SourceActor->GetName(),
+			SourceActor->Revision,
+			Algo::Count(SourceActor->GetRuntimeMask(), static_cast<uint8>(1)),
+			DeferredFragments.Num(),
+			!DeferredFragments.IsEmpty()
+				? DeferredFragments[0]->GetAggregateMemberCount()
+				: 0);
 	}
 
 	const bool bReturnedToBatch =

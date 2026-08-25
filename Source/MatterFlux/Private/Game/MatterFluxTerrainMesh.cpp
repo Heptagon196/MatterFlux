@@ -182,21 +182,26 @@ namespace MatterFlux::TerrainMesh
 		const int64 FirstSampleWorldCellY = Terrain.bInfinite
 			? ChunkWorldMinY
 			: static_cast<int64>(FirstWorldCell.Y) + LocalMin.Y;
-		const int32 SampleStride = CellCountX + 2;
+		constexpr int32 SampleHalo = 3;
+		const int32 SampleStride = CellCountX + SampleHalo * 2;
 		TArray<float> SampledHeights;
 		TArray<uint8> SampledBands;
 		SampledHeights.SetNumUninitialized(
-			SampleStride * (CellCountY + 2));
+			SampleStride * (CellCountY + SampleHalo * 2));
 		SampledBands.SetNumUninitialized(SampledHeights.Num());
 		const auto ToSampleIndex = [SampleStride](
 			const int32 X,
 			const int32 Y)
 			{
-				return (Y + 1) * SampleStride + X + 1;
+				return (Y + SampleHalo) * SampleStride + X + SampleHalo;
 			};
-		for (int32 SampleY = -1; SampleY <= CellCountY; ++SampleY)
+		for (int32 SampleY = -SampleHalo;
+			SampleY < CellCountY + SampleHalo;
+			++SampleY)
 		{
-			for (int32 SampleX = -1; SampleX <= CellCountX; ++SampleX)
+			for (int32 SampleX = -SampleHalo;
+				SampleX < CellCountX + SampleHalo;
+				++SampleX)
 			{
 				float Height = Terrain.BottomZ;
 				uint8 Band = 0;
@@ -212,15 +217,19 @@ namespace MatterFlux::TerrainMesh
 		}
 
 		// Render the exact quantized heightfield, but let physics see a shared
-		// piecewise-linear surface through cell corners. Every corner depends on
-		// the same four world cells, so independently streamed neighbor chunks
-		// produce identical seam vertices without coordinating their lifetimes.
+		// piecewise-linear surface without vertical step faces. Each two-cell
+		// collision patch takes the upper envelope of every rendered cell touched
+		// by either neighboring patch. This keeps the collider smooth without ever
+		// placing it below visible terrain, where a grounded capsule would appear
+		// buried. World-cell sampling also keeps independently streamed seams
+		// identical without coordinating chunk lifetimes.
 		FSection& CollisionSurface = OutChunk.CollisionSurface;
 		constexpr int32 CollisionCellStride = 2;
+		constexpr int32 CollisionSampleMin = -1;
 		const int32 CollisionCellCountX =
-			FMath::DivideAndRoundUp(CellCountX, CollisionCellStride);
+			FMath::DivideAndRoundUp(CellCountX + 2, CollisionCellStride);
 		const int32 CollisionCellCountY =
-			FMath::DivideAndRoundUp(CellCountY, CollisionCellStride);
+			FMath::DivideAndRoundUp(CellCountY + 2, CollisionCellStride);
 		const int32 CollisionStride = CollisionCellCountX + 1;
 		const auto ToCollisionIndex = [CollisionStride](
 			const int32 X,
@@ -247,19 +256,30 @@ namespace MatterFlux::TerrainMesh
 		for (int32 GridY = 0; GridY <= CollisionCellCountY; ++GridY)
 		{
 			const int32 SampleY = FMath::Min(
-				GridY * CollisionCellStride,
-				CellCountY);
+				CollisionSampleMin + GridY * CollisionCellStride,
+				CellCountY + 1);
 			for (int32 GridX = 0; GridX <= CollisionCellCountX; ++GridX)
 			{
 				const int32 SampleX = FMath::Min(
-					GridX * CollisionCellStride,
-					CellCountX);
-				const double Height = (
-					static_cast<double>(SampledHeights[
-						ToSampleIndex(SampleX - 1, SampleY - 1)])
-					+ SampledHeights[ToSampleIndex(SampleX, SampleY - 1)]
-					+ SampledHeights[ToSampleIndex(SampleX - 1, SampleY)]
-					+ SampledHeights[ToSampleIndex(SampleX, SampleY)]) * 0.25;
+					CollisionSampleMin + GridX * CollisionCellStride,
+					CellCountX + 1);
+				double Height = -TNumericLimits<double>::Max();
+				for (int32 OffsetY = -CollisionCellStride;
+					OffsetY < CollisionCellStride;
+					++OffsetY)
+				{
+					for (int32 OffsetX = -CollisionCellStride;
+						OffsetX < CollisionCellStride;
+						++OffsetX)
+					{
+						Height = FMath::Max(
+							Height,
+							static_cast<double>(SampledHeights[
+								ToSampleIndex(
+									SampleX + OffsetX,
+									SampleY + OffsetY)]));
+					}
+				}
 				const double WorldX =
 					CollisionOriginX + SampleX * Terrain.CellSize;
 				const double WorldY =

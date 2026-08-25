@@ -15,9 +15,57 @@ namespace MatterFlux::Material
 		constexpr int32 MaximumActiveStateBytes = 1024 * 1024;
 		constexpr uint16 FullCellAmount = 255;
 		/** World-space pile height represented by one full powder unit. */
-		constexpr int32 PowderFullColumnHeight = 14;
+		constexpr int32 PowderFullColumnHeight = SurfacePowderFullColumnHeight;
 		constexpr uint8 MinimumLiquidEdgeAmount = 24;
 		constexpr int32 MaximumLiquidTransferPerStep = 72;
+		// A body wake is not an ordinary free-surface imbalance. Keeping its
+		// conserved refill below one fifth of a typical 120-unit lake column makes
+		// the material visibly flow through the trail over several fixed steps.
+		constexpr int32 MaximumBodyWakeTransferPerStep = 24;
+		constexpr uint8 FreeFlowTransitionStart = 210;
+		constexpr uint8 FreeFlowTransitionEnd = 220;
+
+		float GetLiquidFreeFlowBlend(const uint8 Dispersion)
+		{
+			return FMath::Clamp(
+				(static_cast<float>(Dispersion) - FreeFlowTransitionStart)
+					/ static_cast<float>(
+						FreeFlowTransitionEnd - FreeFlowTransitionStart),
+				0.0f,
+				1.0f);
+		}
+
+		int32 GetLiquidTargetAverageAmount(const uint8 Dispersion)
+		{
+			// Water should settle as a shallow sheet while viscous liquids retain
+			// a deeper mound. Previously every liquid targeted a half-full 64 cm
+			// column, which made a small spell payload stand upright on flat ground.
+			constexpr int32 ShallowTargetAmount = 8;
+			constexpr int32 ViscousTargetAmount = 128;
+			// Only freely flowing liquids should target a shallow sheet. Acid and
+			// other cohesive liquids retain the original compact-puddle depth; the
+			// 210..220 transition lets content authors opt into water-like flow
+			// without a discontinuity. Once the freely flowing threshold is reached,
+			// use the authored shallow target directly instead of retaining a residual
+			// fraction of the viscous depth.
+			return FMath::Clamp(
+				FMath::RoundToInt(FMath::Lerp(
+					static_cast<float>(ViscousTargetAmount),
+					static_cast<float>(ShallowTargetAmount),
+					GetLiquidFreeFlowBlend(Dispersion))),
+				ShallowTargetAmount,
+				ViscousTargetAmount);
+		}
+
+		int32 GetLiquidEdgeTransferAmount(const uint8 Dispersion)
+		{
+			return FMath::Clamp(
+				FMath::RoundToInt(
+					static_cast<float>(MinimumLiquidEdgeAmount)
+						* (255.0f - static_cast<float>(Dispersion)) / 255.0f),
+				1,
+				MinimumLiquidEdgeAmount);
+		}
 		// A vacancy is a canonical, short-lived body/material interaction fact.
 		// Runtime creatures can traverse a large basin for hundreds of simulation
 		// steps before their earliest wake is free to settle. Expiring after 64
@@ -332,6 +380,8 @@ namespace MatterFlux::Material
 		TMap<FIntPoint, FArchivedChunk> ArchivedChunks;
 		/** Deterministic generated-map seed used as the replication baseline. */
 		TMap<FIntPoint, FArchivedChunk> BaselineChunks;
+		/** Disposable collision supports supplied by world objects; never saved. */
+		TMap<FIntPoint, int16> ExternalSupportHeights;
 		/** Sparse transient columns whose liquid volume was constrained by bodies. */
 		TSet<FIntPoint> BodyDisplacementVacancies;
 		/** Chunks whose canonical facts changed since the last render projection. */
@@ -341,9 +391,9 @@ namespace MatterFlux::Material
 		TArray<FIntPoint> FocusCells;
 		TSet<FIntPoint> ActiveChunks;
 		/**
-		 * Surface chunks temporarily kept resident while liquid crosses the
-		 * player-focused simulation window. They retire as soon as their dirty
-		 * work settles, so a streaming seam can never act as physical terrain.
+		 * Surface chunks temporarily kept resident while liquid or powder settles
+		 * beyond the player-focused simulation window. They retire as soon as their
+		 * dirty work settles, so a streaming seam can never act as physical terrain.
 		 */
 		TSet<FIntPoint> SurfaceFlowChunks;
 		uint32 Seed = 0;
@@ -742,9 +792,13 @@ namespace MatterFlux::Material
 			const FIntPoint& WorldCell,
 			int16& OutSupportHeight) const
 		{
+			const int16* ExternalSupport =
+				ExternalSupportHeights.Find(WorldCell);
 			if (const FCell* Cell = FindCell(WorldCell))
 			{
-				OutSupportHeight = Cell->SupportHeight;
+				OutSupportHeight = ExternalSupport
+					? FMath::Max(Cell->SupportHeight, *ExternalSupport)
+					: Cell->SupportHeight;
 				return true;
 			}
 			const FArchivedChunk* Archive =
@@ -758,7 +812,9 @@ namespace MatterFlux::Material
 			{
 				if (RemainingIndex < Run.Length)
 				{
-					OutSupportHeight = Run.SupportHeight;
+					OutSupportHeight = ExternalSupport
+						? FMath::Max(Run.SupportHeight, *ExternalSupport)
+						: Run.SupportHeight;
 					return true;
 				}
 				RemainingIndex -= Run.Length;
@@ -1214,6 +1270,38 @@ namespace MatterFlux::Material
 			{
 				return false;
 			}
+			bool bHasReachableLowerNeighbor = false;
+			for (const FIntPoint Direction : Directions)
+			{
+				FIntPoint Neighbor;
+				if (!TryOffsetCell(Source, Direction, Neighbor)
+					|| (Settings.bCullOutsideSurfaceBounds
+						&& !IsInsideSurfaceBounds(Neighbor)))
+				{
+					continue;
+				}
+				int16 NeighborSupport = 0;
+				if (!FindSupportHeight(Neighbor, NeighborSupport)
+					|| NeighborSupport >= SourceSupport)
+				{
+					continue;
+				}
+				const FCell* NeighborCell = FindCell(Neighbor);
+				bHasReachableLowerNeighbor = !NeighborCell
+					|| NeighborCell->MaterialIndex == 0
+					|| (NeighborCell->MaterialIndex == SourceCell->MaterialIndex
+						&& NeighborCell->Amount < FullCellAmount);
+				if (bHasReachableLowerNeighbor)
+				{
+					break;
+				}
+			}
+			// Round-puddle shaping is a level-ground presentation preference.
+			// Gravity must own the decision wherever a lower reachable column
+			// exists, otherwise shallow spell deposits are merged back into their
+			// authored circle before the hydraulic solver can move them downhill.
+			const FSurfacePuddleShape* EffectivePuddleShape =
+				bHasReachableLowerNeighbor ? nullptr : PuddleShape;
 			int32 MinimumRetainedAmount =
 				SourceCell->bHasBodyDisplacementVacancy
 					? SourceCell->BodyDisplacedReferenceAmount
@@ -1245,27 +1333,27 @@ namespace MatterFlux::Material
 				// but cannot immediately donate them again in the same transaction.
 				return false;
 			}
-			const int8 AxisBias = PuddleShape
-				? PuddleShape->AxisBias
+			const int8 AxisBias = EffectivePuddleShape
+				? EffectivePuddleShape->AxisBias
 				: 0;
-			const auto RadialDistance = [PuddleShape](const FIntPoint& Cell)
+			const auto RadialDistance = [EffectivePuddleShape](const FIntPoint& Cell)
 			{
-				if (!PuddleShape)
+				if (!EffectivePuddleShape)
 				{
 					return 0.0f;
 				}
 				const FVector2D Delta(
-					static_cast<double>(Cell.X) - PuddleShape->Center.X,
-					static_cast<double>(Cell.Y) - PuddleShape->Center.Y);
+					static_cast<double>(Cell.X) - EffectivePuddleShape->Center.X,
+					static_cast<double>(Cell.Y) - EffectivePuddleShape->Center.Y);
 				return static_cast<float>(Delta.Length());
 			};
 
 			// 小型水洼以液量推导目标圆盘。超出圆盘的低量边缘优先并回
 			// 更靠近质心的同材质格，这一步只做局部转移并严格守恒。
-			if (PuddleShape)
+			if (EffectivePuddleShape)
 			{
 				const float SourceRadius = RadialDistance(Source);
-				if (SourceRadius > PuddleShape->Radius + 0.35f
+				if (SourceRadius > EffectivePuddleShape->Radius + 0.35f
 					&& SourceCell->Amount <= 176)
 				{
 					FIntPoint MergeDestination = Source;
@@ -1337,8 +1425,11 @@ namespace MatterFlux::Material
 
 			// 表面张力会把只靠少量邻格连接的极薄毛刺并回水洼主体。
 			// 液量被完整转移而非删除，避免随机边缘退化成孤立方块。
-			if (MinimumRetainedAmount == 0
-				&& SourceCell->Amount <= MinimumLiquidEdgeAmount + 4)
+			const int32 LiquidEdgeTransferAmount =
+				GetLiquidEdgeTransferAmount(Material.Dispersion);
+			if (!bHasReachableLowerNeighbor
+				&& MinimumRetainedAmount == 0
+				&& SourceCell->Amount <= LiquidEdgeTransferAmount + 4)
 			{
 				int32 SameMaterialNeighborCount = 0;
 				uint8 BestNeighborAmount = 0;
@@ -1400,10 +1491,13 @@ namespace MatterFlux::Material
 			int64 LowestEffectiveSurface255 = MAX_int64;
 			int64 LowestSurface255 = MAX_int64;
 			FIntPoint LateralDestination = Source;
+			int16 LateralDestinationSupport = SourceSupport;
 			const int64 SourceSurface255 =
 				static_cast<int64>(SourceSupport) * FullCellAmount
-				+ static_cast<int64>(Settings.LiquidFullColumnHeight)
-					* SourceCell->Amount;
+					+ static_cast<int64>(Settings.LiquidFullColumnHeight)
+						* SourceCell->Amount;
+			const float CohesionScale =
+				(255.0f - static_cast<float>(Material.Dispersion)) / 255.0f;
 			for (int32 Offset = 0;
 				Offset < UE_ARRAY_COUNT(Directions);
 				++Offset)
@@ -1457,6 +1551,14 @@ namespace MatterFlux::Material
 					&& DestinationCell->bHasBodyDisplacementVacancy
 					&& DestinationCell->BodyDisplacedMaterialIndex
 						== SourceCell->MaterialIndex;
+				// Restitution already spent this wake column's bounded transfer
+				// budget for the fixed step. Do not let the ordinary lateral solver
+				// add another transfer and collapse a visible trail in one update.
+				if (bRecentBodyVacancy
+					&& DestinationCell->LastUpdatedTick == Tick)
+				{
+					continue;
+				}
 				const bool bInteriorLiquidCoordinate =
 					CardinalLiquidNeighborCount >= 2 || bRecentBodyVacancy;
 				// Uneven terrain does not disconnect a liquid. Permit cross-support
@@ -1494,12 +1596,20 @@ namespace MatterFlux::Material
 				}
 				else if (bInteriorLiquidCoordinate)
 				{
-					DirectionPenalty -= 128;
+					// Interior preference is surface cohesion, not a wall. Keeping this
+					// at a fixed -128 made water repeatedly choose a slightly lower
+					// occupied neighbor over a dry, much lower shoreline coordinate,
+					// freezing a continuous spray into a one-sided 5x4 block.
+					const float InteriorPreference = FMath::Lerp(
+						128.0f,
+						128.0f * CohesionScale,
+						GetLiquidFreeFlowBlend(Material.Dispersion));
+					DirectionPenalty -= FMath::RoundToInt(InteriorPreference);
 				}
 				if (DestinationAmount == 0)
 				{
 					const FIntPoint Direction = Directions[DirectionIndex];
-					if (PuddleShape)
+					if (EffectivePuddleShape)
 					{
 						const float DestinationRadius =
 							RadialDistance(Destination);
@@ -1511,7 +1621,7 @@ namespace MatterFlux::Material
 							(static_cast<float>(BoundaryHash % 17u) - 8.0f)
 							* 0.045f;
 						const float EffectiveRadius =
-							PuddleShape->Radius + BoundaryJitter;
+							EffectivePuddleShape->Radius + BoundaryJitter;
 						if (DestinationRadius > EffectiveRadius)
 						{
 							DirectionPenalty += 112
@@ -1550,6 +1660,7 @@ namespace MatterFlux::Material
 					LowestEffectiveSurface255 = EffectiveSurface255;
 					LowestSurface255 = DestinationSurface255;
 					LateralDestination = Destination;
+					LateralDestinationSupport = DestinationSupport;
 					bLowestInteriorLiquidCoordinate =
 						bInteriorLiquidCoordinate;
 					bLowestRecentBodyVacancy = bRecentBodyVacancy;
@@ -1562,13 +1673,15 @@ namespace MatterFlux::Material
 
 			const uint32 EdgeHash = MixBits(
 				Seed
-				^ static_cast<uint32>(LateralDestination.X) * 0x27d4eb2du
-				^ static_cast<uint32>(LateralDestination.Y) * 0x165667b1u
-				^ static_cast<uint32>(SourceCell->MaterialIndex) * 0x85ebca6bu);
+					^ static_cast<uint32>(LateralDestination.X) * 0x27d4eb2du
+					^ static_cast<uint32>(LateralDestination.Y) * 0x165667b1u
+					^ static_cast<uint32>(SourceCell->MaterialIndex) * 0x85ebca6bu);
 			int32 SurfaceTension = LowestAmount == 0
 				? (bLowestInteriorLiquidCoordinate
-					? 8
-					: 84 + static_cast<int32>(EdgeHash % 37u))
+					? FMath::Max(FMath::RoundToInt(8.0f * CohesionScale), 0)
+					: FMath::Max(FMath::RoundToInt(
+						(84.0f + static_cast<float>(EdgeHash % 37u))
+							* CohesionScale), 0))
 				: 8;
 			if (LowestAmount == 0 && AxisBias != 0)
 			{
@@ -1579,19 +1692,37 @@ namespace MatterFlux::Material
 				const bool bAlongShortAxis = AxisBias < 0
 					? Movement.Y == 0
 					: Movement.X == 0;
+				const int32 AxisPenalty = FMath::RoundToInt(
+					32.0f * CohesionScale);
 				SurfaceTension = bAlongLongAxis
-					? SurfaceTension + 32
+					? SurfaceTension + AxisPenalty
 					: (bAlongShortAxis
-						? FMath::Max(SurfaceTension - 32, 24)
+						? FMath::Max(
+							SurfaceTension - AxisPenalty,
+							LiquidEdgeTransferAmount)
 						: SurfaceTension);
 			}
-			if (LowestAmount == 0 && PuddleShape)
+			if (LowestAmount == 0 && EffectivePuddleShape)
 			{
 				const float DestinationRadius =
 					RadialDistance(LateralDestination);
-				SurfaceTension = DestinationRadius <= PuddleShape->Radius
-					? FMath::Max(SurfaceTension - 28, 24)
-					: SurfaceTension + 56;
+				const int32 BoundaryPenalty = FMath::Max(
+					FMath::RoundToInt(56.0f * CohesionScale),
+					LiquidEdgeTransferAmount);
+				SurfaceTension = DestinationRadius <= EffectivePuddleShape->Radius
+					? FMath::Max(
+						SurfaceTension - LiquidEdgeTransferAmount,
+						0)
+					: SurfaceTension + BoundaryPenalty;
+			}
+			const bool bDownhill =
+				LateralDestinationSupport < SourceSupport;
+			if (bDownhill)
+			{
+				// Surface tension may shape a level shoreline, but it cannot
+				// cancel gravity. This also lets very shallow projectile liquid
+				// cross a dry edge in several small, conserved transfers.
+				SurfaceTension = 0;
 			}
 			const int32 AmountDifference = static_cast<int32>(
 				(SourceSurface255 - LowestSurface255)
@@ -1603,8 +1734,9 @@ namespace MatterFlux::Material
 			int32 TransferAmount = FMath::Min(
 				(AmountDifference - SurfaceTension) / 2,
 				MaximumLiquidTransferPerStep);
-			if (LowestAmount == 0
-				&& TransferAmount < MinimumLiquidEdgeAmount)
+			if (!bDownhill
+				&& LowestAmount == 0
+				&& TransferAmount < LiquidEdgeTransferAmount)
 			{
 				return false;
 			}
@@ -2038,7 +2170,7 @@ namespace MatterFlux::Material
 		Impl->MarkDirtyNeighborhood(WorldCell);
 		const FIntPoint ChunkCoordinate =
 			Impl->ToChunkCoordinate(WorldCell);
-		if (!Impl->IsChunkActive(ChunkCoordinate))
+		if (!Impl->IsChunkSimulated(ChunkCoordinate))
 		{
 			Impl->ArchiveChunk(ChunkCoordinate);
 		}
@@ -2083,7 +2215,7 @@ namespace MatterFlux::Material
 		Impl->MarkDirtyNeighborhood(WorldCell);
 		const FIntPoint ChunkCoordinate =
 			Impl->ToChunkCoordinate(WorldCell);
-		if (!Impl->IsChunkActive(ChunkCoordinate))
+		if (!Impl->IsChunkSimulated(ChunkCoordinate))
 		{
 			Impl->ArchiveChunk(ChunkCoordinate);
 		}
@@ -2110,16 +2242,67 @@ namespace MatterFlux::Material
 		Impl->MarkDirtyNeighborhood(WorldCell);
 		const FIntPoint ChunkCoordinate =
 			Impl->ToChunkCoordinate(WorldCell);
-		if (!Impl->IsChunkActive(ChunkCoordinate))
+		if (!Impl->IsChunkSimulated(ChunkCoordinate))
 		{
 			Impl->ArchiveChunk(ChunkCoordinate);
 		}
 		return true;
 	}
 
+	bool FChunkedMaterialWorld::SetExternalSupportHeight(
+		const FIntPoint& WorldCell,
+		const int32 Height)
+	{
+		if (!Impl->bInitialized
+			|| !Impl->Settings.bUseSurfaceTopology
+			|| (Impl->Settings.bCullOutsideSurfaceBounds
+				&& !Impl->IsInsideSurfaceBounds(WorldCell)))
+		{
+			return false;
+		}
+
+		const int16 ClampedHeight = static_cast<int16>(FMath::Clamp(
+			Height,
+			static_cast<int32>(MIN_int16),
+			static_cast<int32>(MAX_int16)));
+		if (const int16* Existing =
+			Impl->ExternalSupportHeights.Find(WorldCell);
+			Existing && *Existing == ClampedHeight)
+		{
+			return true;
+		}
+		Impl->ExternalSupportHeights.Add(WorldCell, ClampedHeight);
+		Impl->WakeSurfaceFlow(WorldCell);
+		Impl->FindOrAddCell(WorldCell);
+		Impl->MarkDirtyNeighborhood(WorldCell);
+		return true;
+	}
+
+	bool FChunkedMaterialWorld::ClearExternalSupportHeight(
+		const FIntPoint& WorldCell)
+	{
+		if (!Impl->bInitialized
+			|| Impl->ExternalSupportHeights.Remove(WorldCell) == 0)
+		{
+			return false;
+		}
+		Impl->WakeSurfaceFlow(WorldCell);
+		Impl->FindOrAddCell(WorldCell);
+		Impl->MarkDirtyNeighborhood(WorldCell);
+		return true;
+	}
+
 	bool FChunkedMaterialWorld::SeedSurface(
 		const TArray<FSeedCell>& SeedCells)
 	{
+		return SeedSurface(SeedCells, true);
+	}
+
+	bool FChunkedMaterialWorld::SeedSurface(
+		const TArray<FSeedCell>& SeedCells,
+		const bool bFinalizeBaseline)
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(MatterFlux_MaterialWorld_SeedSurface);
 		if (!Impl->bInitialized
 			|| !Impl->Settings.bUseSurfaceTopology)
 		{
@@ -2175,9 +2358,16 @@ namespace MatterFlux::Material
 				Impl->ToChunkCoordinate(SeedCell.WorldCell));
 		}
 
+		if (!bFinalizeBaseline)
+		{
+			return true;
+		}
+
+		TRACE_CPUPROFILER_EVENT_SCOPE(
+			MatterFlux_MaterialWorld_FinalizeSurfaceBaseline);
 		for (const FIntPoint& ChunkCoordinate : TouchedChunks)
 		{
-			if (!Impl->IsChunkActive(ChunkCoordinate))
+			if (!Impl->IsChunkSimulated(ChunkCoordinate))
 			{
 				Impl->ArchiveChunk(ChunkCoordinate);
 			}
@@ -2206,12 +2396,65 @@ namespace MatterFlux::Material
 			{
 				Impl->BaselineChunks.Remove(ChunkCoordinate);
 			}
-			if (Impl->IsChunkActive(ChunkCoordinate))
+			if (Impl->SurfaceFlowChunks.Contains(ChunkCoordinate))
+			{
+				if (TUniquePtr<FImpl::FChunk>* Chunk =
+					Impl->Chunks.Find(ChunkCoordinate);
+					Chunk && Chunk->IsValid())
+				{
+					(**Chunk).DirtyMin = FIntPoint::ZeroValue;
+					(**Chunk).DirtyMax = FIntPoint(
+						Impl->Settings.ChunkSize - 1,
+						Impl->Settings.ChunkSize - 1);
+					(**Chunk).bHasDirtyCells = true;
+				}
+			}
+			else if (Impl->IsChunkActive(ChunkCoordinate))
 			{
 				Impl->MarkChunkForBaselineResume(ChunkCoordinate);
 			}
 		}
 		return true;
+	}
+
+	void FChunkedMaterialWorld::WakeSurfaceCells(
+		const TConstArrayView<FIntPoint> WorldCells)
+	{
+		if (!Impl->bInitialized
+			|| !Impl->Settings.bUseSurfaceTopology
+			|| WorldCells.IsEmpty())
+		{
+			return;
+		}
+
+		TSet<FIntPoint> UniqueChunks;
+		for (const FIntPoint WorldCell : WorldCells)
+		{
+			if (Impl->Settings.bCullOutsideSurfaceBounds
+				&& !Impl->IsInsideSurfaceBounds(WorldCell))
+			{
+				continue;
+			}
+			UniqueChunks.Add(Impl->ToChunkCoordinate(WorldCell));
+		}
+		TArray<FIntPoint> OrderedChunks = UniqueChunks.Array();
+		OrderedChunks.Sort([](const FIntPoint A, const FIntPoint B)
+		{
+			return A.X != B.X ? A.X < B.X : A.Y < B.Y;
+		});
+		for (const FIntPoint ChunkCoordinate : OrderedChunks)
+		{
+			Impl->SurfaceFlowChunks.Add(ChunkCoordinate);
+			FImpl::FChunk& Chunk = Impl->FindOrAddChunk(ChunkCoordinate);
+			// Generated baseline liquids are intentionally dormant when restored
+			// through ordinary player focus. An explicit visibility wake means the
+			// caller wants one real settling solve, including pristine water.
+			Chunk.DirtyMin = FIntPoint::ZeroValue;
+			Chunk.DirtyMax = FIntPoint(
+				Impl->Settings.ChunkSize - 1,
+				Impl->Settings.ChunkSize - 1);
+			Chunk.bHasDirtyCells = true;
+		}
 	}
 
 	int32 FChunkedMaterialWorld::DisplaceLiquids(
@@ -2239,11 +2482,11 @@ namespace MatterFlux::Material
 			return 0;
 		}
 
-		TMap<FIntPoint, uint8> MaximumRemainingAmounts;
+		TMap<FIntPoint, uint16> MaximumRemainingAmounts;
 		MaximumRemainingAmounts.Reserve(Constraints.Num());
 		for (const FLiquidDisplacementConstraint& Constraint : Constraints)
 		{
-			uint8* Existing = MaximumRemainingAmounts.Find(
+			uint16* Existing = MaximumRemainingAmounts.Find(
 				Constraint.WorldCell);
 			if (Existing)
 			{
@@ -2522,6 +2765,15 @@ namespace MatterFlux::Material
 								const uint8 CandidateAmount = CandidateCell
 									? CandidateCell->Amount
 									: Impl->FindArchivedAmount(Candidate);
+								// A recent body wake owns its own bounded, conserved
+								// restitution path. Feeding it directly from a new body's
+								// pressure transaction lets a walking footprint refill its
+								// trailing edge in the same render frame.
+								if (CandidateCell
+									&& CandidateCell->bHasBodyDisplacementVacancy)
+								{
+									continue;
+								}
 								const uint32 StableOrder = HashCombine(
 									FootprintHash, GetTypeHash(Candidate));
 								if (CandidateMaterialIndex == MaterialIndex
@@ -2848,6 +3100,397 @@ namespace MatterFlux::Material
 		return MovedCells;
 	}
 
+	int32 FChunkedMaterialWorld::DisplacePowders(
+		const TConstArrayView<FLiquidDisplacementConstraint> Constraints,
+		const int32 MaxSearchRadius)
+	{
+		if (!Impl->bInitialized || Constraints.IsEmpty() || MaxSearchRadius <= 0)
+		{
+			return 0;
+		}
+
+		TMap<FIntPoint, uint16> MaximumRemainingAmounts;
+		MaximumRemainingAmounts.Reserve(Constraints.Num());
+		for (const FLiquidDisplacementConstraint& Constraint : Constraints)
+		{
+			uint16* Existing = MaximumRemainingAmounts.Find(Constraint.WorldCell);
+			if (Existing)
+			{
+				*Existing = FMath::Min(
+					*Existing, Constraint.MaximumRemainingAmount);
+			}
+			else
+			{
+				MaximumRemainingAmounts.Add(
+					Constraint.WorldCell,
+					Constraint.MaximumRemainingAmount);
+			}
+		}
+
+		TArray<FIntPoint> StableOccupiedCells;
+		MaximumRemainingAmounts.GetKeys(StableOccupiedCells);
+		StableOccupiedCells.Sort([](const FIntPoint A, const FIntPoint B)
+		{
+			return A.Y != B.Y ? A.Y < B.Y : A.X < B.X;
+		});
+		TSet<FIntPoint> OccupiedSet;
+		OccupiedSet.Reserve(StableOccupiedCells.Num());
+		for (const FIntPoint Cell : StableOccupiedCells)
+		{
+			OccupiedSet.Add(Cell);
+		}
+
+		// Keep independent bodies independent. A nearby lower valley must not
+		// teleport sand from another actor's footprint merely because both actors
+		// submitted constraints in the same frame.
+		TSet<FIntPoint> Unvisited = OccupiedSet;
+		TArray<TArray<FIntPoint>> ConnectedFootprints;
+		for (const FIntPoint Start : StableOccupiedCells)
+		{
+			if (Unvisited.Remove(Start) == 0)
+			{
+				continue;
+			}
+			TArray<FIntPoint>& Footprint =
+				ConnectedFootprints.AddDefaulted_GetRef();
+			TArray<FIntPoint> Queue = { Start };
+			for (int32 QueueIndex = 0; QueueIndex < Queue.Num(); ++QueueIndex)
+			{
+				const FIntPoint Cell = Queue[QueueIndex];
+				Footprint.Add(Cell);
+				for (int32 Y = -1; Y <= 1; ++Y)
+				{
+					for (int32 X = -1; X <= 1; ++X)
+					{
+						if (X == 0 && Y == 0)
+						{
+							continue;
+						}
+						FIntPoint Neighbor;
+						if (TryOffsetCell(Cell, FIntPoint(X, Y), Neighbor)
+							&& Unvisited.Remove(Neighbor) > 0)
+						{
+							Queue.Add(Neighbor);
+						}
+					}
+				}
+			}
+			Footprint.Sort([](const FIntPoint A, const FIntPoint B)
+			{
+				return A.Y != B.Y ? A.Y < B.Y : A.X < B.X;
+			});
+		}
+
+		struct FSource
+		{
+			FIntPoint WorldCell = FIntPoint::ZeroValue;
+			int32 AmountToMove = 0;
+			uint8 RemainingLifetime = 0;
+		};
+		struct FDestination
+		{
+			FIntPoint WorldCell = FIntPoint::ZeroValue;
+			int64 SurfaceHeight255 = 0;
+			uint32 StableOrder = 0;
+			uint16 Amount = 0;
+			int32 TransferAmount = 0;
+		};
+
+		int32 MovedCells = 0;
+		TSet<FIntPoint> TouchedChunks;
+		const int32 SearchRadius = FMath::Clamp(MaxSearchRadius, 1, 256);
+		for (const TArray<FIntPoint>& Footprint : ConnectedFootprints)
+		{
+			TMap<uint16, TArray<FSource>> SourcesByMaterial;
+			for (const FIntPoint Source : Footprint)
+			{
+				FImpl::FCell* SourceCell = Impl->FindCell(Source);
+				if (!SourceCell)
+				{
+					const uint16 ArchivedMaterialIndex =
+						Impl->FindArchivedMaterialIndex(Source);
+					if (ArchivedMaterialIndex != 0
+						&& ArchivedMaterialIndex < Impl->Materials.Num()
+						&& Impl->Materials[ArchivedMaterialIndex].Phase
+							== EMatterFluxMaterialPhase::Powder)
+					{
+						SourceCell = &Impl->FindOrAddCell(Source);
+						TouchedChunks.Add(Impl->ToChunkCoordinate(Source));
+					}
+				}
+				if (!SourceCell
+					|| SourceCell->MaterialIndex == 0
+					|| SourceCell->MaterialIndex >= Impl->Materials.Num()
+					|| SourceCell->Amount == 0
+					|| Impl->Materials[SourceCell->MaterialIndex].Phase
+						!= EMatterFluxMaterialPhase::Powder)
+				{
+					continue;
+				}
+				const int32 AmountToMove = FMath::Max(
+					static_cast<int32>(SourceCell->Amount)
+						- static_cast<int32>(
+							MaximumRemainingAmounts.FindChecked(Source)),
+					0);
+				if (AmountToMove > 0)
+				{
+					SourcesByMaterial.FindOrAdd(SourceCell->MaterialIndex).Add({
+						Source, AmountToMove, SourceCell->RemainingLifetime });
+				}
+			}
+
+			TArray<uint16> MaterialIndices;
+			SourcesByMaterial.GetKeys(MaterialIndices);
+			MaterialIndices.Sort();
+			for (const uint16 MaterialIndex : MaterialIndices)
+			{
+				TArray<FSource>& Sources = SourcesByMaterial.FindChecked(MaterialIndex);
+				int64 RemainingToMove = 0;
+				uint8 TransferLifetime = 0;
+				for (const FSource& Source : Sources)
+				{
+					RemainingToMove += Source.AmountToMove;
+					if (Source.RemainingLifetime != 0)
+					{
+						TransferLifetime = TransferLifetime == 0
+							? Source.RemainingLifetime
+							: FMath::Min(TransferLifetime, Source.RemainingLifetime);
+					}
+				}
+				const int64 InitialAmountToMove = RemainingToMove;
+				TArray<FDestination> Destinations;
+				TSet<FIntPoint> AddedDestinationCells;
+				int64 DestinationCapacity = 0;
+				const uint32 FootprintHash = GetTypeHash(Footprint[0]);
+				for (int32 Radius = 1;
+					Radius <= SearchRadius && DestinationCapacity < RemainingToMove;
+					++Radius)
+				{
+					TSet<FIntPoint> RingCells;
+					for (const FIntPoint Source : Footprint)
+					{
+						for (int32 Offset = -Radius; Offset <= Radius; ++Offset)
+						{
+							const FIntPoint Offsets[4] = {
+								FIntPoint(Offset, -Radius), FIntPoint(Radius, Offset),
+								FIntPoint(Offset, Radius), FIntPoint(-Radius, Offset)
+							};
+							for (const FIntPoint CellOffset : Offsets)
+							{
+								FIntPoint Candidate;
+								if (TryOffsetCell(Source, CellOffset, Candidate)
+									&& !OccupiedSet.Contains(Candidate))
+								{
+									RingCells.Add(Candidate);
+								}
+							}
+						}
+					}
+					TArray<FIntPoint> StableRing = RingCells.Array();
+					StableRing.Sort([](const FIntPoint A, const FIntPoint B)
+					{
+						return A.Y != B.Y ? A.Y < B.Y : A.X < B.X;
+					});
+					for (const FIntPoint Candidate : StableRing)
+					{
+						if (AddedDestinationCells.Contains(Candidate)
+							|| (Impl->Settings.bUseSurfaceTopology
+							? Impl->Settings.bCullOutsideSurfaceBounds
+								&& !Impl->IsInsideSurfaceBounds(Candidate)
+							: Impl->Settings.bCullOutsideVerticalBounds
+								&& !Impl->IsInsideVerticalBounds(Candidate.Y)))
+						{
+							continue;
+						}
+						int16 SupportHeight = 0;
+						if (Impl->Settings.bUseSurfaceTopology
+							&& !Impl->FindSupportHeight(Candidate, SupportHeight))
+						{
+							continue;
+						}
+						const FImpl::FCell* CandidateCell = Impl->FindCell(Candidate);
+						const uint16 CandidateMaterial = CandidateCell
+							? CandidateCell->MaterialIndex
+							: Impl->FindArchivedMaterialIndex(Candidate);
+						if (CandidateMaterial != 0 && CandidateMaterial != MaterialIndex)
+						{
+							continue;
+						}
+						const uint16 CandidateAmount = CandidateCell
+							? CandidateCell->Amount
+							: Impl->FindArchivedAmount(Candidate);
+						if (CandidateAmount == MAX_uint16)
+						{
+							continue;
+						}
+						Destinations.Add({
+							Candidate,
+							static_cast<int64>(SupportHeight) * FullCellAmount
+								+ static_cast<int64>(PowderFullColumnHeight)
+									* CandidateAmount,
+							HashCombine(FootprintHash, GetTypeHash(Candidate)),
+							CandidateAmount,
+							0 });
+						AddedDestinationCells.Add(Candidate);
+						DestinationCapacity += MAX_uint16 - CandidateAmount;
+					}
+				}
+				if (Destinations.IsEmpty())
+				{
+					continue;
+				}
+
+				const int64 TransferTarget = FMath::Min(
+					RemainingToMove, DestinationCapacity);
+				int64 Low = MAX_int64;
+				int64 High = MIN_int64;
+				for (const FDestination& Destination : Destinations)
+				{
+					Low = FMath::Min(Low, Destination.SurfaceHeight255);
+					High = FMath::Max(
+						High,
+						Destination.SurfaceHeight255
+							+ static_cast<int64>(MAX_uint16 - Destination.Amount - 1)
+								* PowderFullColumnHeight);
+				}
+				while (Low < High)
+				{
+					const int64 Middle = Low + (High - Low) / 2;
+					int64 PlacementCount = 0;
+					for (const FDestination& Destination : Destinations)
+					{
+						if (Middle >= Destination.SurfaceHeight255)
+						{
+							PlacementCount += FMath::Min<int64>(
+								MAX_uint16 - Destination.Amount,
+								(Middle - Destination.SurfaceHeight255)
+									/ PowderFullColumnHeight + 1);
+						}
+						if (PlacementCount >= TransferTarget)
+						{
+							break;
+						}
+					}
+					if (PlacementCount >= TransferTarget)
+					{
+						High = Middle;
+					}
+					else
+					{
+						Low = Middle + 1;
+					}
+				}
+				const int64 Cutoff = Low;
+				int64 Placed = 0;
+				TArray<int32> Ties;
+				for (int32 Index = 0; Index < Destinations.Num(); ++Index)
+				{
+					FDestination& Destination = Destinations[Index];
+					const int32 Capacity = MAX_uint16 - Destination.Amount;
+					if (Cutoff > Destination.SurfaceHeight255)
+					{
+						Destination.TransferAmount = static_cast<int32>(
+							FMath::Min<int64>(
+								Capacity,
+								(Cutoff - 1 - Destination.SurfaceHeight255)
+									/ PowderFullColumnHeight + 1));
+					}
+					Placed += Destination.TransferAmount;
+					if (Destination.TransferAmount < Capacity
+						&& Destination.SurfaceHeight255
+							+ static_cast<int64>(Destination.TransferAmount)
+								* PowderFullColumnHeight == Cutoff)
+					{
+						Ties.Add(Index);
+					}
+				}
+				Ties.Sort([&Destinations](const int32 A, const int32 B)
+				{
+					return Destinations[A].StableOrder < Destinations[B].StableOrder;
+				});
+				for (const int32 Index : Ties)
+				{
+					if (Placed >= TransferTarget)
+					{
+						break;
+					}
+					++Destinations[Index].TransferAmount;
+					++Placed;
+				}
+
+				for (const FDestination& Destination : Destinations)
+				{
+					if (Destination.TransferAmount <= 0)
+					{
+						continue;
+					}
+					FImpl::FCell& DestinationCell =
+						Impl->FindOrAddCell(Destination.WorldCell);
+					const bool bWasEmpty = DestinationCell.MaterialIndex == 0;
+					DestinationCell.MaterialIndex = MaterialIndex;
+					DestinationCell.Amount = static_cast<uint16>(
+						static_cast<int32>(DestinationCell.Amount)
+							+ Destination.TransferAmount);
+					if (TransferLifetime != 0)
+					{
+						DestinationCell.RemainingLifetime = bWasEmpty
+							|| DestinationCell.RemainingLifetime == 0
+							? TransferLifetime
+							: FMath::Min(
+								DestinationCell.RemainingLifetime,
+								TransferLifetime);
+					}
+					DestinationCell.LastUpdatedTick = Impl->Tick;
+					TouchedChunks.Add(
+						Impl->ToChunkCoordinate(Destination.WorldCell));
+					Impl->MarkDirtyNeighborhood(Destination.WorldCell);
+				}
+
+				int64 SourceAmountToConsume = Placed;
+				for (const FSource& Source : Sources)
+				{
+					if (SourceAmountToConsume <= 0)
+					{
+						break;
+					}
+					FImpl::FCell* SourceCell = Impl->FindCell(Source.WorldCell);
+					if (!SourceCell || SourceCell->MaterialIndex != MaterialIndex)
+					{
+						continue;
+					}
+					const int32 Transfer = static_cast<int32>(FMath::Min3<int64>(
+						SourceAmountToConsume,
+						Source.AmountToMove,
+						SourceCell->Amount));
+					SourceCell->Amount = static_cast<uint16>(
+						static_cast<int32>(SourceCell->Amount) - Transfer);
+					if (SourceCell->Amount == 0)
+					{
+						SourceCell->MaterialIndex = 0;
+						SourceCell->RemainingLifetime = 0;
+					}
+					SourceCell->LastUpdatedTick = Impl->Tick;
+					TouchedChunks.Add(Impl->ToChunkCoordinate(Source.WorldCell));
+					Impl->MarkDirtyNeighborhood(Source.WorldCell);
+					SourceAmountToConsume -= Transfer;
+					++MovedCells;
+				}
+				check(SourceAmountToConsume == 0);
+				RemainingToMove -= Placed;
+				check(RemainingToMove == InitialAmountToMove - Placed);
+			}
+		}
+
+		for (const FIntPoint ChunkCoordinate : TouchedChunks)
+		{
+			if (!Impl->IsChunkActive(ChunkCoordinate))
+			{
+				Impl->ArchiveChunk(ChunkCoordinate);
+			}
+		}
+		return MovedCells;
+	}
+
 	const FLiquidDisplacementStats&
 	FChunkedMaterialWorld::GetLastLiquidDisplacementStats() const
 	{
@@ -3026,8 +3669,11 @@ namespace MatterFlux::Material
 						+ CellIndex / Impl->Settings.ChunkSize);
 				Snapshot.MaterialId =
 					Impl->Materials[MaterialIndex].Id;
-				Snapshot.SupportHeight =
+				int16 EffectiveSupport =
 					Pair.Value->Cells[CellIndex].SupportHeight;
+				Impl->FindSupportHeight(
+					Snapshot.WorldCell, EffectiveSupport);
+				Snapshot.SupportHeight = EffectiveSupport;
 				Snapshot.Amount = Pair.Value->Cells[CellIndex].Amount;
 				Snapshot.RemainingLifetime =
 					Pair.Value->Cells[CellIndex].RemainingLifetime;
@@ -3075,7 +3721,10 @@ namespace MatterFlux::Material
 					Pair.Key.Y * Impl->Settings.ChunkSize
 						+ CellIndex / Impl->Settings.ChunkSize);
 				Snapshot.MaterialId = Impl->Materials[Cell.MaterialIndex].Id;
-				Snapshot.SupportHeight = Cell.SupportHeight;
+				int16 EffectiveSupport = Cell.SupportHeight;
+				Impl->FindSupportHeight(
+					Snapshot.WorldCell, EffectiveSupport);
+				Snapshot.SupportHeight = EffectiveSupport;
 				Snapshot.Amount = Cell.Amount;
 				Snapshot.RemainingLifetime = Cell.RemainingLifetime;
 			}
@@ -3103,7 +3752,10 @@ namespace MatterFlux::Material
 						Pair.Key.Y * Impl->Settings.ChunkSize
 							+ CellIndex / Impl->Settings.ChunkSize);
 					Snapshot.MaterialId = Impl->Materials[Run.MaterialIndex].Id;
-					Snapshot.SupportHeight = Run.SupportHeight;
+					int16 EffectiveSupport = Run.SupportHeight;
+					Impl->FindSupportHeight(
+						Snapshot.WorldCell, EffectiveSupport);
+					Snapshot.SupportHeight = EffectiveSupport;
 					Snapshot.Amount = Run.Amount;
 					Snapshot.RemainingLifetime = 0;
 				}
@@ -4396,8 +5048,8 @@ namespace MatterFlux::Material
 					FMath::Min(
 						static_cast<int32>(
 							DestinationCell->BodyDisplacedReferenceAmount)
-							- static_cast<int32>(DestinationCell->Amount),
-						MaximumLiquidTransferPerStep) });
+								- static_cast<int32>(DestinationCell->Amount),
+							MaximumBodyWakeTransferPerStep) });
 			}
 
 			// Noita's falling-material update visits a dirty region once rather than
@@ -4723,9 +5375,11 @@ namespace MatterFlux::Material
 					Shape.Center = FVector2D(
 						WeightedX / static_cast<double>(TotalAmount),
 						WeightedY / static_cast<double>(TotalAmount));
-					// 约半格液量形成一个可见表面格；由总液量推导圆盘面积，
-					// 让形状收敛与初始矩形朝向无关。
-					constexpr float TargetAverageAmount = 128.0f;
+					// 由扩散率决定稳定深度：水形成浅而宽的水洼，熔岩等
+					// 低扩散液体保留更深、更紧凑的形状。
+					const float TargetAverageAmount = static_cast<float>(
+						GetLiquidTargetAverageAmount(
+							Impl->Materials[RootCell->MaterialIndex].Dispersion));
 					const float TargetArea = static_cast<float>(TotalAmount)
 						/ TargetAverageAmount;
 					Shape.Radius = FMath::Sqrt(

@@ -5,6 +5,9 @@
 
 namespace MatterFlux::Material
 {
+	/** Physical height represented by Amount=255 for a surface powder pile. */
+	inline constexpr int32 SurfacePowderFullColumnHeight = 14;
+
 	struct FWorldSettings
 	{
 		int32 ChunkSize = 64;
@@ -61,7 +64,7 @@ namespace MatterFlux::Material
 	struct FLiquidDisplacementConstraint
 	{
 		FIntPoint WorldCell = FIntPoint::ZeroValue;
-		uint8 MaximumRemainingAmount = 0;
+		uint16 MaximumRemainingAmount = 0;
 	};
 
 	/** Deterministic work counters for the most recent body displacement solve. */
@@ -95,7 +98,28 @@ namespace MatterFlux::Material
 			FName MaterialId,
 			uint16 Amount);
 		bool SetSupportHeight(const FIntPoint& WorldCell, int32 Height);
+		/**
+		 * Adds a non-serialized physical support supplied by a world object such as
+		 * a tree canopy. The canonical terrain support remains untouched.
+		 */
+		bool SetExternalSupportHeight(const FIntPoint& WorldCell, int32 Height);
+		bool ClearExternalSupportHeight(const FIntPoint& WorldCell);
+		/**
+		 * Seeds a bounded surface batch. Streaming callers may defer baseline
+		 * encoding until the last batch so one logical terrain chunk can be
+		 * spread across frames without repeatedly serializing the same chunk.
+		 */
 		bool SeedSurface(const TArray<FSeedCell>& SeedCells);
+		bool SeedSurface(
+			const TArray<FSeedCell>& SeedCells,
+			bool bFinalizeBaseline);
+		/**
+		 * Temporarily admits surface chunks containing the supplied cells into the
+		 * solver without consuming the player-focus chunk budget. Call this before
+		 * authoring newly visible generated or projectile material. The chunks stay
+		 * resident only while they still have dirty work.
+		 */
+		void WakeSurfaceCells(TConstArrayView<FIntPoint> WorldCells);
 		/**
 		 * Atomically moves liquid out of transiently occupied surface cells.
 		 * Destinations are deterministic, material-compatible, and outside the
@@ -105,6 +129,10 @@ namespace MatterFlux::Material
 			TConstArrayView<FIntPoint> OccupiedCells,
 			int32 MaxSearchRadius = 64);
 		int32 DisplaceLiquids(
+			TConstArrayView<FLiquidDisplacementConstraint> Constraints,
+			int32 MaxSearchRadius = 64);
+		/** Conservatively pushes stacked surface powder out of occupied cells. */
+		int32 DisplacePowders(
 			TConstArrayView<FLiquidDisplacementConstraint> Constraints,
 			int32 MaxSearchRadius = 64);
 		const FLiquidDisplacementStats& GetLastLiquidDisplacementStats() const;

@@ -18,6 +18,7 @@
 #include "IMatterFluxScriptRuntime.h"
 #include "Misc/Crc.h"
 #include "Net/UnrealNetwork.h"
+#include "ProceduralMeshComponent.h"
 #include "UObject/ConstructorHelpers.h"
 
 AMatterFluxMagicProjectile::AMatterFluxMagicProjectile()
@@ -102,16 +103,58 @@ void AMatterFluxMagicProjectile::BeginPlay()
 		Collision->IgnoreActorWhenMoving(InstigatorPawn, true);
 	}
 	ApplyPresentation();
-	SetActorTickEnabled(
-		HasAuthority() && Presentation.OrbitRadius > UE_SMALL_NUMBER);
+	MaterialSweepOriginLocation = GetActorLocation();
+	PreviousMaterialSweepLocation = GetActorLocation();
+	bHasPreviousMaterialSweepLocation = true;
+	// Every projectile is a moving particle in the material world, even when
+	// it does not carry a body material of its own. Authority keeps the sweep
+	// active so sand, liquid, and other simulated entities can block it.
+	SetActorTickEnabled(HasAuthority());
 }
 
 void AMatterFluxMagicProjectile::Tick(const float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
-	if (!HasAuthority()
-		|| Presentation.OrbitRadius <= UE_SMALL_NUMBER
-		|| !ProjectileMovement)
+	if (!HasAuthority() || bImpactHandled)
+	{
+		return;
+	}
+
+	const FVector CurrentLocation = GetActorLocation();
+	if (bHasPreviousMaterialSweepLocation
+		&& !CurrentLocation.Equals(
+			PreviousMaterialSweepLocation,
+			UE_SMALL_NUMBER))
+	{
+		if (UWorld* World = GetWorld())
+		{
+			for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
+			{
+				FVector ImpactLocation;
+				FName ContactMaterial;
+				if (!It->SweepSimulatedMaterial(
+					PreviousMaterialSweepLocation,
+					CurrentLocation,
+					FMath::Clamp(Presentation.Radius, 2.0f, 100.0f),
+					ImpactLocation,
+					ContactMaterial))
+				{
+					continue;
+				}
+				FHitResult MaterialHit;
+				MaterialHit.Location = ImpactLocation;
+				MaterialHit.ImpactPoint = ImpactLocation;
+				MaterialHit.TraceStart = PreviousMaterialSweepLocation;
+				MaterialHit.TraceEnd = CurrentLocation;
+				ResolveImpactAuthority(MaterialHit);
+				return;
+			}
+		}
+	}
+	PreviousMaterialSweepLocation = CurrentLocation;
+	bHasPreviousMaterialSweepLocation = true;
+
+	if (Presentation.OrbitRadius <= UE_SMALL_NUMBER || !ProjectileMovement)
 	{
 		return;
 	}
@@ -180,12 +223,20 @@ void AMatterFluxMagicProjectile::InitializeProjectile(
 	Presentation.Color = Plan.Color;
 	Presentation.OrbitRadius = Plan.OrbitRadius;
 	Presentation.BodyMaterial = Plan.BodyMaterial;
+	Presentation.MaterialAmount = Plan.MaterialAmount;
 	Presentation.bUsePlaneVisual = Plan.bUsePlaneVisual;
 	Presentation.bUseVerticalPlaneVisual = Plan.bUseVerticalPlaneVisual;
 	ProjectileMovement->ProjectileGravityScale = FMath::Clamp(
 		Plan.GravityScale,
 		0.0f,
 		4.0f);
+	MaterialSweepOriginLocation = GetActorLocation();
+	PreviousMaterialSweepLocation = GetActorLocation();
+	bHasPreviousMaterialSweepLocation = true;
+	// InitializeProjectile is also used by deferred/editor-world spawns where
+	// BeginPlay has not run yet. Arm the authority sweep immediately so the
+	// first movement segment cannot escape material contact testing.
+	SetActorTickEnabled(true);
 	// Deferred-spawned actors may not have entered BeginPlay yet (notably in
 	// editor worlds), but their immutable material body is already complete.
 	BuildMaterialBodyPresentation(
@@ -302,6 +353,12 @@ void AMatterFluxMagicProjectile::BuildMaterialBodyPresentation(
 		1,
 		FMath::CeilToInt(BodyRadius / Spacing));
 	const float VoxelScale = Spacing * 0.72f / 100.0f;
+	struct FBodyVoxel
+	{
+		FVector Position = FVector::ZeroVector;
+		float DistanceSquared = 0.0f;
+	};
+	TArray<FBodyVoxel> Voxels;
 	for (int32 X = -StepCount; X <= StepCount; ++X)
 	{
 		for (int32 Y = -StepCount; Y <= StepCount; ++Y)
@@ -314,12 +371,44 @@ void AMatterFluxMagicProjectile::BuildMaterialBodyPresentation(
 				{
 					continue;
 				}
-				MaterialBody->AddInstance(FTransform(
-					FQuat::Identity,
+				Voxels.Add({
 					LocalPosition,
-					FVector(VoxelScale)));
+					static_cast<float>(LocalPosition.SizeSquared()) });
 			}
 		}
+	}
+	Voxels.Sort([](const FBodyVoxel& Left, const FBodyVoxel& Right)
+	{
+		if (!FMath::IsNearlyEqual(
+			Left.DistanceSquared, Right.DistanceSquared))
+		{
+			return Left.DistanceSquared < Right.DistanceSquared;
+		}
+		if (!FMath::IsNearlyEqual(Left.Position.Z, Right.Position.Z))
+		{
+			return Left.Position.Z < Right.Position.Z;
+		}
+		if (!FMath::IsNearlyEqual(Left.Position.Y, Right.Position.Y))
+		{
+			return Left.Position.Y < Right.Position.Y;
+		}
+		return Left.Position.X < Right.Position.X;
+	});
+	// One presentation cube stands for several conserved powder/liquid units.
+	// Small spray payloads therefore no longer masquerade as large material balls.
+	const int32 MaximumVisibleVoxels = FMath::Clamp(
+		FMath::CeilToInt(
+			static_cast<float>(FMath::Max(Presentation.MaterialAmount, 1)) / 8.0f),
+		1,
+		96);
+	for (int32 Index = 0;
+		Index < FMath::Min(Voxels.Num(), MaximumVisibleVoxels);
+		++Index)
+	{
+		MaterialBody->AddInstance(FTransform(
+			FQuat::Identity,
+			Voxels[Index].Position,
+			FVector(VoxelScale)));
 	}
 }
 
@@ -329,7 +418,8 @@ int32 AMatterFluxMagicProjectile::GetMaterialBodyVoxelCount() const
 }
 
 void AMatterFluxMagicProjectile::ReleaseMaterialBodyAtWorldLocation(
-	const FVector& WorldLocation)
+	const FVector& WorldLocation,
+	AActor* ImpactActor)
 {
 	if (ServerPlan.BodyMaterial.IsNone())
 	{
@@ -339,10 +429,12 @@ void AMatterFluxMagicProjectile::ReleaseMaterialBodyAtWorldLocation(
 	{
 		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
 		{
-			It->DepositSimulatedMaterialAtWorldLocation(
+			It->DepositSimulatedMaterialFromImpact(
 				WorldLocation,
 				ServerPlan.BodyMaterial,
-				ServerPlan.MaterialAmount);
+				ServerPlan.MaterialAmount,
+				ImpactActor,
+				Presentation.Radius);
 		}
 	}
 }
@@ -371,7 +463,15 @@ void AMatterFluxMagicProjectile::ApplyWorldImpact(const FHitResult& Hit)
 		Subsystem->RequestWorldCut(Request);
 	}
 
-	ReleaseMaterialBodyAtWorldLocation(Hit.ImpactPoint);
+	AActor* ImpactActor = Hit.GetActor();
+	if (!IsValid(ImpactActor))
+	{
+		if (const UPrimitiveComponent* ImpactComponent = Hit.GetComponent())
+		{
+			ImpactActor = ImpactComponent->GetOwner();
+		}
+	}
+	ReleaseMaterialBodyAtWorldLocation(Hit.ImpactPoint, ImpactActor);
 }
 
 FFragmentDamageShape AMatterFluxMagicProjectile::BuildImpactCutShape(
@@ -379,7 +479,9 @@ FFragmentDamageShape AMatterFluxMagicProjectile::BuildImpactCutShape(
 	const FVector& ProjectileForward,
 	const FVector& ImpactPoint)
 {
-	constexpr float SingleMaterialCellThickness = 10.0f;
+	// Keep a conservative query width here; the canonical material operation
+	// below is rasterized as one cell in each target Source's own resolution.
+	constexpr float SingleLineQueryThickness = 10.0f;
 	if (!Plan.bUsePlaneVisual)
 	{
 		FFragmentDamageShape Shape;
@@ -421,9 +523,10 @@ FFragmentDamageShape AMatterFluxMagicProjectile::BuildImpactCutShape(
 			ThicknessDirection).ToQuat(),
 		ImpactPoint);
 	Shape.Extents.X = FMath::Max(
-		SingleMaterialCellThickness,
+		SingleLineQueryThickness,
 		Plan.Radius * 2.0f);
-	Shape.Thickness = SingleMaterialCellThickness;
+	Shape.Thickness = SingleLineQueryThickness;
+	Shape.bSingleCellLine = true;
 	return Shape;
 }
 
@@ -497,8 +600,43 @@ bool AMatterFluxMagicProjectile::ResolveImpactAuthority(
 	{
 		return false;
 	}
+	FHitResult ResolvedHit = Hit;
+	AFragment2DSourceActor* FixedSourceHit = nullptr;
+	if (!ServerPlan.BodyMaterial.IsNone())
+	{
+		if (UWorld* World = GetWorld())
+		{
+			for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
+			{
+				FVector FixedImpactLocation;
+				FVector FixedImpactNormal;
+				if (!It->SweepFixedFragmentSource(
+						MaterialSweepOriginLocation,
+						Hit.ImpactPoint,
+						FMath::Clamp(Presentation.Radius, 2.0f, 100.0f),
+						FixedImpactLocation,
+						FixedImpactNormal,
+						FixedSourceHit))
+				{
+					continue;
+				}
+				ResolvedHit.Location = FixedImpactLocation;
+				ResolvedHit.ImpactPoint = FixedImpactLocation;
+				ResolvedHit.Normal = FixedImpactNormal;
+				ResolvedHit.ImpactNormal = FixedImpactNormal;
+				ResolvedHit.Component = FixedSourceHit->MeshComponent.Get();
+				ResolvedHit.HitObjectHandle = FActorInstanceHandle(
+					FixedSourceHit,
+					FixedSourceHit->MeshComponent.Get(),
+					INDEX_NONE);
+				break;
+			}
+		}
+	}
 	bImpactHandled = true;
-	AActor* HitActor = Hit.GetActor();
+	AActor* HitActor = FixedSourceHit
+		? FixedSourceHit
+		: ResolvedHit.GetActor();
 	if (AMatterFluxCreatureActor* Creature =
 		Cast<AMatterFluxCreatureActor>(HitActor))
 	{
@@ -523,10 +661,10 @@ bool AMatterFluxMagicProjectile::ResolveImpactAuthority(
 			}
 		}
 	}
-	ApplyWorldImpact(Hit);
+	ApplyWorldImpact(ResolvedHit);
 	SpawnTriggerPayload(
 		ServerPlan.OnImpactProjectiles,
-		Hit.ImpactPoint,
+		ResolvedHit.ImpactPoint,
 		GetVelocity().GetSafeNormal(
 			UE_SMALL_NUMBER,
 			GetActorForwardVector()),

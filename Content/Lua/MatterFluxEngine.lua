@@ -49,7 +49,7 @@ function material.define(definition)
 	copy_fields(compiled, definition, {
 		"id", "density", "hardness",
 		"color_r", "color_g", "color_b", "color_a",
-		"phase", "mobility", "dispersion", "lifetime_steps",
+		"phase", "mobility", "dispersion", "movement_resistance", "lifetime_steps",
 		"shallow_opacity", "deep_opacity", "opacity_depth"
 	}, "material")
 	register_material_compiled(compiled)
@@ -91,7 +91,7 @@ function map.define(metadata, build_map)
 	end
 	local compiled = {
 		stamps = {}, markers = {}, scene_boxes = {}, cameras = {},
-		pour_containers = {},
+		pour_containers = {}, initial_creature_spawns = {},
 	}
 	copy_fields(compiled, metadata, {
 		"id", "name", "min_x", "min_y",
@@ -113,6 +113,11 @@ function map.define(metadata, build_map)
 	end
 	function api.marker(id, x, y)
 		compiled.markers[#compiled.markers + 1] = { id = id, x = x, y = y }
+	end
+	function api.spawn_creature(creature_id, marker_id)
+		compiled.initial_creature_spawns[#compiled.initial_creature_spawns + 1] = {
+			creature_id = creature_id, marker_id = marker_id,
+		}
 	end
 	function api.scene_box(id, material_id, center_x, center_y, center_z,
 			size_x, size_y, size_z, collision)
@@ -152,6 +157,7 @@ end
 local projectile_fields = {
 	"damage", "speed", "lifetime", "radius", "body_material",
 	"material_amount", "visual_shape", "gravity_scale",
+	"spawn_forward_offset", "spawn_height_offset", "spawn_stationary",
 	"cast_delay", "recharge_time"
 }
 local modifier_fields = {
@@ -327,6 +333,7 @@ function quest.define(metadata, build_quest)
 	}, "quest metadata")
 	compiled.activation_rewards = {}
 	compiled.completion_rewards = {}
+	compiled.activation_creature_spawns = {}
 	local objective_defined = false
 	local api = {}
 	local function set_objective(kind, parameters)
@@ -356,6 +363,12 @@ function quest.define(metadata, build_quest)
 	end
 	function api.never()
 		set_objective("never")
+	end
+	function api.spawn_creature(creature_id, marker_id)
+		compiled.activation_creature_spawns[
+			#compiled.activation_creature_spawns + 1] = {
+				creature_id = creature_id, marker_id = marker_id,
+			}
 	end
 	local function add_reward(target, kind, id, quantity, equipment_slot)
 		target[#target + 1] = {
@@ -391,7 +404,8 @@ function creature.define(metadata, build_ai)
 	local compiled = {}
 	copy_fields(compiled, metadata, {
 		"id", "name", "faction", "level", "health", "width", "height", "density",
-		"color_r", "color_g", "color_b", "color_a", "dialogue_id", "shop_id"
+		"color_r", "color_g", "color_b", "color_a", "dialogue_id", "shop_id",
+		"wait_for_first_sight"
 	}, "creature metadata")
 	local behavior_defined = false -- 是否已经提交唯一的行为树。
 	local configured_actions = {} -- 当前扁平运行时格式不允许同类动作使用两套参数。
@@ -495,11 +509,6 @@ function creature.define(metadata, build_ai)
 		compiled.drop_item = item_id
 		compiled.drop_count = count
 	end
-	function api.spawn_on_quest(quest_id, count, distance)
-		compiled.spawn_quest = quest_id
-		compiled.spawn_count = count
-		compiled.spawn_distance = distance
-	end
 	build_ai(api)
 	if not behavior_defined then
 		error("creature program does not contain an AI behavior", 2)
@@ -540,14 +549,19 @@ function shop.define(metadata, build_shop)
 	if type(metadata) ~= "table" or type(build_shop) ~= "function" then
 		error("shop.define expects metadata and a builder", 2)
 	end
-	local compiled = { offers = {} }
+	local compiled = { categories = {}, offers = {} }
 	copy_fields(compiled, metadata, { "id", "name" }, "shop metadata")
 	local api = {}
+	function api.category(parameters)
+		local category = {}
+		copy_fields(category, parameters, { "id", "name" }, "shop category")
+		compiled.categories[#compiled.categories + 1] = category
+	end
 	function api.offer(parameters)
 		local offer = {}
 		copy_fields(offer, parameters, {
 			"kind", "product_id", "product_count",
-			"cost_item", "cost_count", "limit"
+			"cost_item", "cost_count", "limit", "category"
 		}, "shop offer")
 		compiled.offers[#compiled.offers + 1] = offer
 	end

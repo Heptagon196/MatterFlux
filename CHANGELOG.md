@@ -1,6 +1,6 @@
 # MatterFlux Changelog
 
-## [0.5.0] - Unreleased
+## [0.5.0] - 2026-08-25
 
 MatterFlux 0.5.0 turns the fragment prototype into a one-click playable 2.5D
 sample that works in Standalone and Listen Server modes.

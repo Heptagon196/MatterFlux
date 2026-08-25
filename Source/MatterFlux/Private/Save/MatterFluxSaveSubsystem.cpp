@@ -1,6 +1,8 @@
 #include "Save/MatterFluxSaveSubsystem.h"
 
+#include "Async/Async.h"
 #include "EngineUtils.h"
+#include "Game/MatterFluxGameMode.h"
 #include "Game/MatterFluxPlayableWorldActor.h"
 #include "Game/MatterFluxPlayerState.h"
 #include "GameFramework/PlayerController.h"
@@ -14,9 +16,11 @@ namespace
 {
 	const FString MetadataSlotName = TEXT("MatterFlux_Save_Metadata");
 	constexpr float InitialWorldProgress = 0.05f;
-	constexpr float FinalGenerationProgress = 0.97f;
+	constexpr float FinalGenerationProgress = 0.72f;
 	constexpr float InitialLoadGenerationProgress = 0.15f;
-	constexpr float ApplyingWorldProgress = 0.98f;
+	constexpr float ApplyingWorldProgress = FinalGenerationProgress;
+	constexpr float FinalInitializationProgress = 0.995f;
+	constexpr float TerrainInitializationWeight = 0.65f;
 
 	const TArray<FMatterFluxSaveSlotInfo>& EmptySlots()
 	{
@@ -34,11 +38,17 @@ void UMatterFluxSaveSubsystem::Initialize(
 
 void UMatterFluxSaveSubsystem::Deinitialize()
 {
+	if (UWorld* World = GetGameInstance() ? GetGameInstance()->GetWorld() : nullptr)
+	{
+		World->GetTimerManager().ClearTimer(WorldInitializationTimer);
+	}
 	if (AMatterFluxPlayableWorldActor* World = PendingWorld.Get())
 	{
 		World->OnGenerationFinished().Remove(WorldGenerationHandle);
 	}
 	WorldGenerationHandle.Reset();
+	WorldInitializationTimer.Invalidate();
+	ResetWorldInitializationProgress();
 	PendingWorld.Reset();
 	PendingController.Reset();
 	PendingLoadedSave = nullptr;
@@ -174,19 +184,49 @@ float UMatterFluxSaveSubsystem::MapWorldGenerationProgress(
 	const float SafeWorldProgress = FMath::IsFinite(WorldProgress)
 		? FMath::Clamp(WorldProgress, InitialWorldProgress, 1.0f)
 		: InitialWorldProgress;
-	if (!bLoadingSave)
-	{
-		return FMath::Min(
-			SafeWorldProgress,
-			FinalGenerationProgress);
-	}
 	const float NormalizedWorldProgress =
 		(SafeWorldProgress - InitialWorldProgress)
 		/ (1.0f - InitialWorldProgress);
 	return FMath::Lerp(
-		InitialLoadGenerationProgress,
+		bLoadingSave
+			? InitialLoadGenerationProgress
+			: InitialWorldProgress,
 		FinalGenerationProgress,
 		NormalizedWorldProgress);
+}
+
+float UMatterFluxSaveSubsystem::MapWorldInitializationProgress(
+	const int32 PendingTerrainWork,
+	const int32 MaximumTerrainWork,
+	const int32 PendingPopulationWork,
+	const int32 MaximumPopulationWork,
+	const float PreviousProgress)
+{
+	const int32 SafeMaximumTerrain = FMath::Max(
+		MaximumTerrainWork, FMath::Max(PendingTerrainWork, 1));
+	const int32 SafeMaximumPopulation = FMath::Max(
+		MaximumPopulationWork, FMath::Max(PendingPopulationWork, 0));
+	const float TerrainCompletion = 1.0f - static_cast<float>(
+		FMath::Clamp(PendingTerrainWork, 0, SafeMaximumTerrain))
+		/ static_cast<float>(SafeMaximumTerrain);
+	const float PopulationCompletion = SafeMaximumPopulation > 0
+		? 1.0f - static_cast<float>(FMath::Clamp(
+			PendingPopulationWork, 0, SafeMaximumPopulation))
+			/ static_cast<float>(SafeMaximumPopulation)
+		: PendingTerrainWork <= 0 ? 1.0f : 0.0f;
+	const float WorkCompletion =
+		TerrainCompletion * TerrainInitializationWeight
+		+ PopulationCompletion * (1.0f - TerrainInitializationWeight);
+	const float CalculatedProgress = FMath::Lerp(
+		FinalGenerationProgress,
+		FinalInitializationProgress,
+		FMath::Clamp(WorkCompletion, 0.0f, 1.0f));
+	const float SafePreviousProgress = FMath::IsFinite(PreviousProgress)
+		? PreviousProgress : FinalGenerationProgress;
+	return FMath::Clamp(
+		FMath::Max(SafePreviousProgress, CalculatedProgress),
+		FinalGenerationProgress,
+		FinalInitializationProgress);
 }
 
 float UMatterFluxSaveSubsystem::GetApplyingWorldProgress()
@@ -217,7 +257,10 @@ FText UMatterFluxSaveSubsystem::GetOperationTitle() const
 				? TEXT("正在加载世界")
 				: TEXT("正在生成地图"));
 	case EMatterFluxSaveOperation::ApplyingWorld:
-		return FText::FromString(TEXT("正在恢复世界状态"));
+		return FText::FromString(
+			PendingGenerationPurpose == EPendingGenerationPurpose::NewGame
+				? TEXT("正在初始化自由模式")
+				: TEXT("正在恢复世界状态"));
 	case EMatterFluxSaveOperation::Failed:
 		return FText::FromString(TEXT("操作失败"));
 	case EMatterFluxSaveOperation::Complete:
@@ -299,6 +342,7 @@ bool UMatterFluxSaveSubsystem::CaptureSaveData(
 		return false;
 	}
 	Save.InitializeNew(World->GetMapSeed());
+	Save.CustomMapId = World->GetActiveCustomMapId();
 	Save.PlayerTransform = Pawn->GetActorTransform();
 	if (!Inventory->CaptureSaveState(Save.MagicInventory, OutError)
 		|| !Progression->CaptureSaveState(Save.Progression, OutError)
@@ -430,11 +474,18 @@ void UMatterFluxSaveSubsystem::HandleAsyncLoadComplete(
 		return;
 	}
 	PendingLoadedSave = Loaded;
-	if (!StartWorldGeneration(
-		PendingController.Get(),
-		Loaded->MapSeed,
-		EPendingGenerationPurpose::LoadGame,
-		true))
+	const bool bStarted = Loaded->CustomMapId.IsNone()
+		? StartWorldGeneration(
+			PendingController.Get(),
+			Loaded->MapSeed,
+			EPendingGenerationPurpose::LoadGame,
+			true)
+		: StartCustomMapLoad(
+			PendingController.Get(),
+			Loaded->CustomMapId,
+			Loaded->MapSeed,
+			EPendingGenerationPurpose::LoadGame);
+	if (!bStarted)
 	{
 		return;
 	}
@@ -575,6 +626,25 @@ bool UMatterFluxSaveSubsystem::RequestNewGame(
 		false);
 }
 
+bool UMatterFluxSaveSubsystem::RequestStoryGame(
+	APlayerController* Controller,
+	const FName CustomMapId,
+	const int32 Seed)
+{
+	FString Error;
+	if (!CanUseSharedWorldSave(Controller, Error))
+	{
+		FinishOperation(false, Error);
+		return false;
+	}
+	PendingLoadedSave = nullptr;
+	return StartCustomMapLoad(
+		Controller,
+		CustomMapId,
+		Seed,
+		EPendingGenerationPurpose::StoryGame);
+}
+
 bool UMatterFluxSaveSubsystem::StartWorldGeneration(
 	APlayerController* Controller,
 	const int32 Seed,
@@ -610,7 +680,70 @@ bool UMatterFluxSaveSubsystem::StartWorldGeneration(
 		FinishOperation(false, TEXT("地图生成请求被拒绝"));
 		return false;
 	}
+	if (Purpose == EPendingGenerationPurpose::NewGame)
+	{
+		// Returning to the title screen preserves the current world and pawn. A
+		// subsequent "new free mode" must nevertheless behave like a new game:
+		// remove the previous streaming focus now that generation was accepted, then
+		// let the terrain-safe entry queue create a fresh pawn at PlayerStart.
+		if (APawn* ExistingPawn = Controller->GetPawn())
+		{
+			Controller->UnPossess();
+			ExistingPawn->Destroy();
+		}
+	}
 	OperationChanged.Broadcast();
+	return true;
+}
+
+bool UMatterFluxSaveSubsystem::StartCustomMapLoad(
+	APlayerController* Controller,
+	const FName CustomMapId,
+	const int32 Seed,
+	const EPendingGenerationPurpose Purpose)
+{
+	AMatterFluxPlayableWorldActor* World = FindPlayableWorld();
+	if (!World || !Controller || CustomMapId.IsNone())
+	{
+		FinishOperation(false, TEXT("找不到故事地图或本地玩家"));
+		return false;
+	}
+	PendingController = Controller;
+	PendingWorld = World;
+	PendingGenerationPurpose = Purpose;
+	Operation = EMatterFluxSaveOperation::GeneratingWorld;
+	OperationProgress = Purpose == EPendingGenerationPurpose::LoadGame
+		? InitialLoadGenerationProgress : InitialWorldProgress;
+	OperationStatus = TEXT("正在加载故事地图与场景标记…");
+	LastResultMessage.Reset();
+	OperationChanged.Broadcast();
+	if (AMatterFluxGameMode* GameMode = World->GetWorld()
+		? Cast<AMatterFluxGameMode>(World->GetWorld()->GetAuthGameMode())
+		: nullptr)
+	{
+		// Close the entry gate before LoadCustomMap starts replacing terrain.
+		// Its completion callback is queued for a later game-thread pass, so
+		// closing it there would leave a window for configured creatures to spawn
+		// against an only partially prepared story world.
+		GameMode->PrepareForInitialWorldEntry();
+	}
+	FString Error;
+	if (!World->LoadCustomMap(CustomMapId, Seed, Error))
+	{
+		FinishOperation(false, Error.IsEmpty()
+			? TEXT("故事地图加载失败") : Error);
+		return false;
+	}
+	TWeakObjectPtr<UMatterFluxSaveSubsystem> WeakThis(this);
+	AsyncTask(ENamedThreads::GameThread, [WeakThis]()
+	{
+		if (UMatterFluxSaveSubsystem* Self = WeakThis.Get())
+		{
+			Self->HandleWorldGenerationFinished(
+				true,
+				TEXT("故事地图加载完成"));
+		}
+	});
 	return true;
 }
 
@@ -636,7 +769,9 @@ void UMatterFluxSaveSubsystem::HandleWorldGenerationFinished(
 	OperationStatus = PendingGenerationPurpose
 		== EPendingGenerationPurpose::LoadGame
 		? TEXT("正在恢复玩家、法术背包与世界变化…")
-		: TEXT("正在准备新游戏…");
+		: PendingGenerationPurpose == EPendingGenerationPurpose::StoryGame
+			? TEXT("正在启动故事任务与角色…")
+			: TEXT("正在准备自由模式…");
 	OperationChanged.Broadcast();
 
 	APlayerController* Controller = PendingController.Get();
@@ -664,7 +799,9 @@ void UMatterFluxSaveSubsystem::HandleWorldGenerationFinished(
 				Error)
 			|| !Progression->RestoreSaveStateAuthority(
 				PendingLoadedSave->Progression,
-				Error))
+				Error)
+			|| (PendingLoadedSave->CustomMapId.IsNone()
+				&& !Progression->ClearStoryQuestsAuthority(Error)))
 		{
 			FinishOperation(false, Error.IsEmpty()
 				? TEXT("存档状态恢复失败") : Error);
@@ -679,16 +816,189 @@ void UMatterFluxSaveSubsystem::HandleWorldGenerationFinished(
 				ETeleportType::TeleportPhysics);
 		}
 	}
-	else if (!Inventory->ResetToStarterLoadoutAuthority(Error)
-		|| !Progression->ResetToStarterStateAuthority(Error))
+	else if ((PendingGenerationPurpose == EPendingGenerationPurpose::StoryGame
+			? !Inventory->ResetToEmptyLoadoutAuthority(Error)
+			: !Inventory->ResetToStarterLoadoutAuthority(Error))
+		|| (PendingGenerationPurpose == EPendingGenerationPurpose::StoryGame
+			? !Progression->ResetToStoryStateAuthority(Error)
+			: !Progression->ResetToFreeModeStateAuthority(Error)))
 	{
 		FinishOperation(false, Error);
+		return;
+	}
+	if (PendingGenerationPurpose == EPendingGenerationPurpose::NewGame
+		|| PendingGenerationPurpose == EPendingGenerationPurpose::StoryGame)
+	{
+		AMatterFluxGameMode* GameMode = World->GetWorld()
+			? Cast<AMatterFluxGameMode>(World->GetWorld()->GetAuthGameMode())
+			: nullptr;
+		if (!GameMode)
+		{
+			FinishOperation(false, TEXT("无法找到玩家生成规则"));
+			return;
+		}
+		if (PendingGenerationPurpose == EPendingGenerationPurpose::StoryGame)
+		{
+			FVector PlayerStart;
+			if (!World->TryGetCustomMapMarker(TEXT("player_start"), PlayerStart))
+			{
+				FinishOperation(false, TEXT("故事地图缺少主角出生点"));
+				return;
+			}
+			if (APawn* ExistingPawn = Controller->GetPawn())
+			{
+				Controller->UnPossess();
+				ExistingPawn->Destroy();
+			}
+		}
+		GameMode->PrepareForInitialWorldEntry();
+		// The title screen owns only a spectator view target. Keep the controller
+		// in the terrain-safe entry queue. The save operation remains active until
+		// that queue passes the full terrain/population/creature entry barrier.
+		if (!Controller->GetPawn())
+		{
+			GameMode->HandleStartingNewPlayer_Implementation(Controller);
+		}
+		PendingLoadedSave = nullptr;
+		BeginWaitingForWorldInitialization();
+		return;
+	}
+	if (PendingGenerationPurpose == EPendingGenerationPurpose::LoadGame)
+	{
+		PendingLoadedSave = nullptr;
+		BeginWaitingForWorldInitialization();
 		return;
 	}
 	PendingLoadedSave = nullptr;
 	FinishOperation(true,
 		PendingGenerationPurpose == EPendingGenerationPurpose::LoadGame
-			? TEXT("存档加载完成") : TEXT("新地图生成完成"));
+			? TEXT("存档加载完成")
+			: PendingGenerationPurpose == EPendingGenerationPurpose::StoryGame
+				? TEXT("故事模式已开始")
+				: TEXT("自由模式地图生成完成"));
+}
+
+void UMatterFluxSaveSubsystem::BeginWaitingForWorldInitialization()
+{
+	AMatterFluxPlayableWorldActor* World = PendingWorld.Get();
+	UWorld* GameWorld = World ? World->GetWorld() : nullptr;
+	if (!World || !GameWorld || !PendingController.IsValid())
+	{
+		FinishOperation(false, TEXT("无法继续世界初始化"));
+		return;
+	}
+	ResetWorldInitializationProgress();
+	MaximumPendingTerrainInitializationWork =
+		World->GetPendingTerrainChunkPrefetchCount();
+	MaximumPendingPopulationInitializationWork =
+		World->GetPendingProceduralPopulationUpdateCount();
+	OperationProgress = FinalGenerationProgress;
+	OperationStatus = PendingGenerationPurpose
+		== EPendingGenerationPurpose::StoryGame
+		? TEXT("正在加载故事区域地形、装饰与水体…")
+		: PendingGenerationPurpose == EPendingGenerationPurpose::LoadGame
+			? TEXT("正在加载存档区域地形、装饰与碰撞…")
+			: TEXT("正在加载出生区域地形与碰撞…");
+	GameWorld->GetTimerManager().SetTimer(
+		WorldInitializationTimer,
+		this,
+		&UMatterFluxSaveSubsystem::PollWorldInitialization,
+		0.05f,
+		true,
+		0.0f);
+}
+
+void UMatterFluxSaveSubsystem::PollWorldInitialization()
+{
+	if (Operation != EMatterFluxSaveOperation::ApplyingWorld
+		|| (PendingGenerationPurpose != EPendingGenerationPurpose::NewGame
+			&& PendingGenerationPurpose
+				!= EPendingGenerationPurpose::StoryGame
+			&& PendingGenerationPurpose
+				!= EPendingGenerationPurpose::LoadGame))
+	{
+		if (UWorld* World = GetGameInstance()
+			? GetGameInstance()->GetWorld() : nullptr)
+		{
+			World->GetTimerManager().ClearTimer(WorldInitializationTimer);
+		}
+		return;
+	}
+
+	AMatterFluxPlayableWorldActor* World = PendingWorld.Get();
+	APlayerController* Controller = PendingController.Get();
+	if (!World || !Controller)
+	{
+		FinishOperation(false, TEXT("世界初始化期间丢失世界或玩家"));
+		return;
+	}
+
+	const int32 PendingTerrainWork =
+		World->GetPendingTerrainChunkPrefetchCount();
+	const int32 PendingPopulationWork =
+		World->GetPendingProceduralPopulationUpdateCount();
+	MaximumPendingTerrainInitializationWork = FMath::Max(
+		MaximumPendingTerrainInitializationWork,
+		PendingTerrainWork);
+	MaximumPendingPopulationInitializationWork = FMath::Max(
+		MaximumPendingPopulationInitializationWork,
+		PendingPopulationWork);
+	OperationProgress = MapWorldInitializationProgress(
+		PendingTerrainWork,
+		MaximumPendingTerrainInitializationWork,
+		PendingPopulationWork,
+		MaximumPendingPopulationInitializationWork,
+		OperationProgress);
+
+	if (PendingTerrainWork > 0)
+	{
+		OperationStatus = FString::Printf(
+			TEXT("正在加载地形与碰撞（剩余 %d 项）…"),
+			PendingTerrainWork);
+	}
+	else if (PendingPopulationWork > 0)
+	{
+		OperationStatus = FString::Printf(
+			TEXT("正在生成植被、装饰与河流表现（剩余 %d 项）…"),
+			PendingPopulationWork);
+	}
+	else if (!World->IsInitialWorldEntryReady())
+	{
+		OperationStatus = TEXT("正在完成材质表现与物理初始化…");
+	}
+	else if (!Controller->GetPawn())
+	{
+		OperationStatus = TEXT("正在生成玩家角色…");
+	}
+	else
+	{
+		if (PendingGenerationPurpose == EPendingGenerationPurpose::LoadGame
+			&& World->IsCustomMapActive())
+		{
+			AMatterFluxGameMode* GameMode = World->GetWorld()
+				? Cast<AMatterFluxGameMode>(
+					World->GetWorld()->GetAuthGameMode())
+				: nullptr;
+			if (!GameMode || !GameMode->CompleteExistingPlayerWorldLoad())
+			{
+				FinishOperation(false, TEXT("存档世界准备完成后无法恢复生物生成"));
+				return;
+			}
+		}
+		FinishOperation(
+			true,
+			PendingGenerationPurpose == EPendingGenerationPurpose::StoryGame
+				? TEXT("故事模式已开始")
+				: PendingGenerationPurpose == EPendingGenerationPurpose::LoadGame
+					? TEXT("存档加载完成")
+					: TEXT("自由模式初始化完成"));
+	}
+}
+
+void UMatterFluxSaveSubsystem::ResetWorldInitializationProgress()
+{
+	MaximumPendingTerrainInitializationWork = 0;
+	MaximumPendingPopulationInitializationWork = 0;
 }
 
 bool UMatterFluxSaveSubsystem::DeleteSlot(const int32 SlotIndex)
@@ -718,6 +1028,13 @@ void UMatterFluxSaveSubsystem::FinishOperation(
 	const bool bSuccess,
 	const FString& Message)
 {
+	if (UWorld* GameWorld = GetGameInstance()
+		? GetGameInstance()->GetWorld() : nullptr)
+	{
+		GameWorld->GetTimerManager().ClearTimer(WorldInitializationTimer);
+	}
+	WorldInitializationTimer.Invalidate();
+	ResetWorldInitializationProgress();
 	if (AMatterFluxPlayableWorldActor* World = PendingWorld.Get();
 		World && WorldGenerationHandle.IsValid())
 	{

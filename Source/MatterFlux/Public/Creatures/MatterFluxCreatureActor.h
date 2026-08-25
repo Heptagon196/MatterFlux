@@ -75,6 +75,8 @@ public:
 	TObjectPtr<UMatterFluxBuoyancyComponent> BuoyancyComponent;
 
 private:
+	void ApplyDefinitionRuntimeProperties(
+		const FMatterFluxCreatureDefinition& Definition);
 	void ApplyDefinitionPresentation();
 	void HandleDeathAuthority(AActor* DamageSource);
 	AMatterFluxPlayerState* ResolveKillerPlayerState(AActor* DamageSource) const;

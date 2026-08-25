@@ -7,6 +7,7 @@
 class UInputAction;
 class UInputMappingContext;
 class ULocalPlayer;
+class SWidget;
 class UMatterFluxMagicWorkbenchWidget;
 class UMatterFluxShellWidget;
 class UMatterFluxQuestTrackerWidget;
@@ -28,6 +29,7 @@ public:
 	virtual void OnPossess(APawn* InPawn) override;
 	virtual void OnRep_PlayerState() override;
 	virtual void SetupInputComponent() override;
+	virtual void PlayerTick(float DeltaTime) override;
 	bool AreDebugControlsEnabled() const { return bEnableDebugControls; }
 	void ToggleMagicWorkbench();
 	void ToggleQuestJournal();
@@ -49,6 +51,11 @@ public:
 	void EnterGameplayForVisualCapture();
 	/** 隐藏可视验收截图中的所有本地 UI，不改变实际游戏状态。 */
 	void HideUIForVisualCapture();
+	/** 通过实际交互弹窗打开指定商店，供项目内可视验收使用。 */
+	bool OpenCreatureShopForVisualCapture(
+		AMatterFluxCreatureActor* Creature,
+		FName DialogueId,
+		FName ShopId);
 	bool IsShellMenuOpen() const;
 	void HandleShellStateChanged(bool bMenuOpen, bool bOperationActive);
 	bool HostListenRoom(int32 SaveSlotIndex, FString& OutError);
@@ -60,6 +67,15 @@ public:
 		const FString& Address,
 		FString& OutNormalizedAddress,
 		FString& OutError);
+	/** Resolve a world-space cursor target into a level horizontal aim direction. */
+	bool TryGetHorizontalMouseAimDirection(
+		const FVector& AimOrigin,
+		FVector& OutDirection) const;
+	/** Pure helper shared with automation tests and replay-safe aiming code. */
+	static bool MakeHorizontalAimDirection(
+		const FVector& AimOrigin,
+		const FVector& TargetWorldLocation,
+		FVector& OutDirection);
 	void RequestCreaturePurchase(
 		AMatterFluxCreatureActor* Creature,
 		int32 OfferIndex,
@@ -80,11 +96,22 @@ protected:
 	int32 DebugMappingPriority = 0;
 
 private:
+	friend class FMatterFluxGameplayFocusRestorationTest;
+	/** Return keyboard routing to the viewport without capturing the mouse. */
+	static void RestoreGameplayViewportFocus(
+		const TSharedPtr<SWidget>& GameplayViewport);
+	/** Repair focus after the Slate event that closed a menu has fully unwound. */
+	static void RestoreGameplayViewportFocusAfterSlateEvent(
+		const TSharedPtr<SWidget>& GameplayViewport,
+		TFunction<bool()> ShouldRestoreFocus);
+	void ApplyGameplayMouseInputMode();
 	void CreateMagicWorkbench();
 	void CreateShell();
 	void CreateQuestTracker();
 	void CreatePlayerStatusHud();
 	void CreateInteractionWidget();
+	void RefreshInteractionPrompt();
+	AMatterFluxCreatureActor* FindNearestInteractableCreature() const;
 	void CloseMagicWorkbench();
 	void TryInteract();
 	void AddDebugMappingContext();
@@ -157,4 +184,6 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMatterFluxInteractionWidget> InteractionWidget;
+
+	float InteractionPromptRefreshRemaining = 0.0f;
 };

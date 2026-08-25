@@ -3,6 +3,7 @@
 #include "Components/CapsuleComponent.h"
 #include "Components/PrimitiveComponent.h"
 #include "EngineUtils.h"
+#include "Game/MatterFluxCharacterMovementComponent.h"
 #include "Game/MatterFluxPlayableWorldActor.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
@@ -111,6 +112,56 @@ namespace
 		}
 		return OutSubmergedFraction > UE_SMALL_NUMBER;
 	}
+
+	bool EvaluateMovementMedium(
+		const AMatterFluxPlayableWorldActor& PlayableWorld,
+		const FBodyBounds& Bounds,
+		const float SampleRadiusScale,
+		float& OutMediumFraction,
+		float& OutAverageResistance,
+		float& OutWeightedResistance)
+	{
+		OutMediumFraction = 0.0f;
+		OutAverageResistance = 0.0f;
+		OutWeightedResistance = 0.0f;
+		const FVector Offset(
+			Bounds.HorizontalExtent.X * SampleRadiusScale,
+			Bounds.HorizontalExtent.Y * SampleRadiusScale,
+			0.0f);
+		const FVector Samples[BuoyancySampleCount] = {
+			Bounds.Center,
+			Bounds.Center + FVector(Offset.X, 0.0f, 0.0f),
+			Bounds.Center - FVector(Offset.X, 0.0f, 0.0f),
+			Bounds.Center + FVector(0.0f, Offset.Y, 0.0f),
+			Bounds.Center - FVector(0.0f, Offset.Y, 0.0f)
+		};
+		const float BodyHeight = Bounds.TopZ - Bounds.BottomZ;
+		for (const FVector& Sample : Samples)
+		{
+			FMatterFluxMovementMediumColumn Medium;
+			if (!PlayableWorld.TrySampleMovementMediumColumnAtWorldLocation(
+					Sample, Medium))
+			{
+				continue;
+			}
+			const float OverlapHeight = FMath::Max(
+				0.0f,
+				FMath::Min(Bounds.TopZ, Medium.SurfaceZ)
+					- FMath::Max(Bounds.BottomZ, Medium.BottomZ));
+			const float Fraction = FMath::Clamp(
+				OverlapHeight / BodyHeight, 0.0f, 1.0f);
+			OutMediumFraction += Fraction
+				/ static_cast<float>(BuoyancySampleCount);
+			OutWeightedResistance += Medium.MovementResistance * Fraction
+				/ static_cast<float>(BuoyancySampleCount);
+		}
+		if (OutMediumFraction > UE_SMALL_NUMBER)
+		{
+			OutAverageResistance =
+				OutWeightedResistance / OutMediumFraction;
+		}
+		return OutWeightedResistance > UE_SMALL_NUMBER;
+	}
 }
 
 UMatterFluxBuoyancyComponent::UMatterFluxBuoyancyComponent()
@@ -160,6 +211,8 @@ void UMatterFluxBuoyancyComponent::TickComponent(
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 	LastSubmergedFraction = 0.0f;
 	LastLiquidDensity = 0.0f;
+	LastMovementMediumFraction = 0.0f;
+	LastMovementResistance = 0.0f;
 	if (!FMath::IsFinite(DeltaTime) || DeltaTime <= 0.0f)
 	{
 		return;
@@ -225,6 +278,12 @@ void UMatterFluxBuoyancyComponent::ApplyToCharacter(const float DeltaTime)
 	}
 	ACharacter* Character = CastChecked<ACharacter>(GetOwner());
 	UCharacterMovementComponent* Movement = Character->GetCharacterMovement();
+	UMatterFluxCharacterMovementComponent* MatterFluxMovement =
+		Cast<UMatterFluxCharacterMovementComponent>(Movement);
+	if (MatterFluxMovement)
+	{
+		MatterFluxMovement->SetMaterialMovementResistance(0.0f);
+	}
 	AMatterFluxPlayableWorldActor* PlayableWorld =
 		ResolvePlayableWorld(DeltaTime);
 	FBodyBounds Bounds;
@@ -240,7 +299,9 @@ void UMatterFluxBuoyancyComponent::ApplyToCharacter(const float DeltaTime)
 	Body.BottomZ = Bounds.BottomZ;
 	Body.TopZ = Bounds.TopZ;
 	Body.GravityZ = Movement->GetGravityZ();
-	Body.LinearDrag = LinearDrag;
+	// Material-specific drag is evaluated for both liquid and powder below;
+	// the liquid solver remains responsible only for Archimedes buoyancy here.
+	Body.LinearDrag = 0.0f;
 	Body.Velocity = Movement->Velocity;
 	FVector Acceleration;
 	const bool bSubmerged = EvaluateBody(
@@ -251,13 +312,32 @@ void UMatterFluxBuoyancyComponent::ApplyToCharacter(const float DeltaTime)
 			Acceleration,
 			LastSubmergedFraction,
 			LastLiquidDensity);
-	PlayableWorld->DisplaceLiquidInWorldBounds(
+	float WeightedResistance = 0.0f;
+	EvaluateMovementMedium(
+		*PlayableWorld,
+		Bounds,
+		SampleRadiusScale,
+		LastMovementMediumFraction,
+		LastMovementResistance,
+		WeightedResistance);
+	if (MatterFluxMovement)
+	{
+		MatterFluxMovement->SetMaterialMovementResistance(WeightedResistance);
+	}
+	PlayableWorld->DisplaceMaterialInWorldBounds(
 		Bounds.Center,
 		Bounds.HorizontalExtent,
 		Bounds.BottomZ,
 		Bounds.TopZ,
 		true,
 		true);
+	if (WeightedResistance > UE_SMALL_NUMBER)
+	{
+		// Exponential damping is stable across frame rates and cannot reverse a
+		// velocity on a long frame. Input is then integrated normally by CMC.
+		Movement->Velocity *= FMath::Exp(
+			-LinearDrag * WeightedResistance * DeltaTime);
+	}
 	if (!bSubmerged)
 	{
 		return;
@@ -299,7 +379,7 @@ void UMatterFluxBuoyancyComponent::ApplyToPhysicsBody(const float DeltaTime)
 	Body.BottomZ = Bounds.BottomZ;
 	Body.TopZ = Bounds.TopZ;
 	Body.GravityZ = GetWorld() ? GetWorld()->GetGravityZ() : -980.0f;
-	Body.LinearDrag = LinearDrag;
+	Body.LinearDrag = 0.0f;
 	Body.Velocity = Primitive->GetPhysicsLinearVelocity();
 	FVector Acceleration;
 	const bool bSubmerged = EvaluateBody(
@@ -310,13 +390,31 @@ void UMatterFluxBuoyancyComponent::ApplyToPhysicsBody(const float DeltaTime)
 			Acceleration,
 			LastSubmergedFraction,
 			LastLiquidDensity);
-	PlayableWorld->DisplaceLiquidInWorldBounds(
+	float WeightedResistance = 0.0f;
+	EvaluateMovementMedium(
+		*PlayableWorld,
+		Bounds,
+		SampleRadiusScale,
+		LastMovementMediumFraction,
+		LastMovementResistance,
+		WeightedResistance);
+	PlayableWorld->DisplaceMaterialInWorldBounds(
 		Bounds.Center,
 		Bounds.HorizontalExtent,
 		Bounds.BottomZ,
 		Bounds.TopZ,
 		false,
 		true);
+	if (WeightedResistance > UE_SMALL_NUMBER)
+	{
+		Primitive->AddForce(
+			-Primitive->GetPhysicsLinearVelocity()
+				* Primitive->GetMass()
+				* LinearDrag
+				* WeightedResistance,
+			NAME_None,
+			false);
+	}
 	if (!bSubmerged)
 	{
 		return;

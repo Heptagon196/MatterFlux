@@ -5,6 +5,7 @@
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Fragment/Fragment2DSourceActor.h"
 #include "Game/MatterFluxCharacter.h"
+#include "Game/MatterFluxPlayerController.h"
 #include "Engine/TargetPoint.h"
 #include "InputAction.h"
 #include "InputCoreTypes.h"
@@ -66,6 +67,34 @@ namespace
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxPlayerHorizontalMouseAimTest,
+	"MatterFlux.PlayerAbilities.HorizontalMouseAim",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxPlayerHorizontalMouseAimTest::RunTest(
+	const FString& Parameters)
+{
+	FVector Direction = FVector::ZeroVector;
+	TestTrue(
+		TEXT("A target at another height produces a valid aim direction"),
+		AMatterFluxPlayerController::MakeHorizontalAimDirection(
+			FVector(100.0f, 200.0f, 500.0f),
+			FVector(400.0f, -200.0f, -900.0f),
+			Direction));
+	TestTrue(
+		TEXT("Horizontal aim ignores vertical displacement"),
+		Direction.Equals(FVector(0.6f, -0.8f, 0.0f), KINDA_SMALL_NUMBER));
+	TestFalse(
+		TEXT("A target directly above or below the player has no horizontal direction"),
+		AMatterFluxPlayerController::MakeHorizontalAimDirection(
+			FVector(100.0f, 200.0f, 500.0f),
+			FVector(100.0f, 200.0f, -900.0f),
+			Direction));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxPlayerMouseAbilityInputTest,
 	"MatterFlux.PlayerAbilities.MouseInputMappings",
 	EAutomationTestFlags::EditorContext
@@ -93,11 +122,13 @@ bool FMatterFluxPlayerMouseAbilityInputTest::RunTest(
 	const UInputAction* RightWand = Character->GetCastWandAction(1);
 	const UInputAction* QWand = Character->GetCastWandAction(2);
 	const UInputAction* EWand = Character->GetCastWandAction(3);
+	const UInputAction* SpaceWand = Character->GetCastWandAction(4);
 	if (!TestNotNull(TEXT("Playable mapping context exists"), Context)
 		|| !TestNotNull(TEXT("Left wand action exists"), LeftWand)
 		|| !TestNotNull(TEXT("Right wand action exists"), RightWand)
 		|| !TestNotNull(TEXT("Q wand action exists"), QWand)
-		|| !TestNotNull(TEXT("E wand action exists"), EWand))
+		|| !TestNotNull(TEXT("E wand action exists"), EWand)
+		|| !TestNotNull(TEXT("Space wand action exists"), SpaceWand))
 	{
 		return false;
 	}
@@ -113,6 +144,19 @@ bool FMatterFluxPlayerMouseAbilityInputTest::RunTest(
 	TestTrue(
 		TEXT("E maps to equipment slot three"),
 		HasMapping(*Context, EWand, EKeys::E));
+	TestTrue(
+		TEXT("Space maps to equipment slot four"),
+		HasMapping(*Context, SpaceWand, EKeys::SpaceBar));
+	for (const FEnhancedActionKeyMapping& Mapping : Context->GetMappings())
+	{
+		if (Mapping.Key == EKeys::SpaceBar)
+		{
+			TestEqual(
+				TEXT("Space has no separate hard-coded jump action"),
+				Mapping.Action.Get(),
+				SpaceWand);
+		}
+	}
 	return true;
 }
 

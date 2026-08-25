@@ -154,9 +154,9 @@ public:
 	float GetTransientFadeAlpha() const { return TransientFadeAlpha; }
 	float GetVisualDepthOffset() const { return VisualDepthOffset; }
 	/**
-	 * Applies one world-space cut to this detached logical item. The material
-	 * projection stays authoritative on the carrier and retires through the
-	 * shared fade path after the configured number of accepted cuts.
+	 * Applies one world-space cut to this detached logical item. Mask-backed
+	 * material is removed immediately and both render and collision geometry
+	 * are rebuilt from the resulting state.
 	 */
 	bool TryAcceptWorldCut(const FFragmentDamageShape& CutShape);
 	int32 GetAcceptedCutCount() const { return AcceptedCutCount; }
@@ -193,15 +193,15 @@ public:
 	UPROPERTY(ReplicatedUsing = OnRep_RootReactionState, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Reaction")
 	FFragmentAggregateSourceState RootReactionState;
 
-	/** Number of exact world cuts this detached logical item has accepted. */
+	/** Telemetry: number of world cuts that changed this detached item. */
 	UPROPERTY(ReplicatedUsing = OnRep_CutState, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Cut")
 	int32 AcceptedCutCount = 0;
 
-	/** Detached items remain physical until this many exact cuts are accepted. */
+	/** Legacy saved-class setting retained for asset compatibility. */
 	UPROPERTY(EditDefaultsOnly, Replicated, BlueprintReadOnly, Category = "Fragment|Cut", meta = (ClampMin = "1", UIMin = "1"))
 	int32 CutsBeforeFade = 10;
 
-	/** Fade time used when the detached item exhausts its cut durability. */
+	/** Fade time used by legacy triangulated debris without an editable mask. */
 	UPROPERTY(EditDefaultsOnly, Replicated, BlueprintReadOnly, Category = "Fragment|Cut", meta = (ClampMin = "0.05", UIMin = "0.05"))
 	float CutExhaustionFadeDuration = 0.8f;
 

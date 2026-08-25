@@ -18,13 +18,16 @@
 #include "Game/MatterFluxCharacter.h"
 #include "Game/MatterFluxCharacterMovementComponent.h"
 #include "Game/MatterFluxGameMode.h"
+#include "Game/MatterFluxGameState.h"
 #include "Game/MatterFluxPlayableLevel.h"
 #include "Game/MatterFluxPlayableWorldActor.h"
+#include "Game/MatterFluxPlayerState.h"
 #include "Game/MatterFluxTerrainMesh.h"
 #include "Game/MatterFluxTwoStoreyHouseActor.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
+#include "GameFramework/PlayerStart.h"
 #include "GameFramework/SpringArmComponent.h"
 #include "HAL/IConsoleManager.h"
 #include "IMatterFluxScriptRuntime.h"
@@ -36,10 +39,13 @@
 #include "Material/MatterFluxBuoyancyComponent.h"
 #include "Material/MatterFluxLiquidBuoyancy.h"
 #include "MaterialShared.h"
+#include "Magic/MatterFluxMagicInventoryComponent.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/ConfigCacheIni.h"
 #include "ProceduralMeshComponent.h"
+#include "Progression/MatterFluxProgressionComponent.h"
 #include "Rendering/MatterFluxVoxelMaterialStyle.h"
+#include "Save/MatterFluxSaveTypes.h"
 
 #include <limits>
 #include "ProceduralMeshComponent.h"
@@ -63,6 +69,48 @@ bool AreTransformsEqual(const TArray<FTransform>& A, const TArray<FTransform>& B
 	}
 
 	return true;
+}
+
+bool TrySampleSurfaceHeight(
+	const MatterFlux::TerrainMesh::FSection& Surface,
+	const FVector2D& Point,
+	double& OutHeight)
+{
+	for (int32 TriangleIndex = 0;
+		TriangleIndex < Surface.Triangles.Num();
+		TriangleIndex += 3)
+	{
+		const FVector& A = Surface.Vertices[
+			Surface.Triangles[TriangleIndex]];
+		const FVector& B = Surface.Vertices[
+			Surface.Triangles[TriangleIndex + 1]];
+		const FVector& C = Surface.Vertices[
+			Surface.Triangles[TriangleIndex + 2]];
+		const double Denominator =
+			(B.Y - C.Y) * (A.X - C.X)
+			+ (C.X - B.X) * (A.Y - C.Y);
+		if (FMath::Abs(Denominator) <= UE_DOUBLE_SMALL_NUMBER)
+		{
+			continue;
+		}
+		const double WeightA = (
+			(B.Y - C.Y) * (Point.X - C.X)
+			+ (C.X - B.X) * (Point.Y - C.Y)) / Denominator;
+		const double WeightB = (
+			(C.Y - A.Y) * (Point.X - C.X)
+			+ (A.X - C.X) * (Point.Y - C.Y)) / Denominator;
+		const double WeightC = 1.0 - WeightA - WeightB;
+		constexpr double EdgeTolerance = 1.0e-6;
+		if (WeightA < -EdgeTolerance
+			|| WeightB < -EdgeTolerance
+			|| WeightC < -EdgeTolerance)
+		{
+			continue;
+		}
+		OutHeight = WeightA * A.Z + WeightB * B.Z + WeightC * C.Z;
+		return FMath::IsFinite(OutHeight);
+	}
+	return false;
 }
 
 bool AreLayoutsEqual(
@@ -162,6 +210,875 @@ bool IsSolidRegionOneRectangle(const FFragmentSourceMask& Mask)
 	}
 	return true;
 }
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxTerrainSafePlayerSpawnTest,
+	"MatterFlux.Playable.Spawn.PlayerCapsuleStartsAboveTerrain",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxTerrainSafePlayerSpawnTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* WorldActor = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	AMatterFluxGameMode* GameMode = World
+		? World->SpawnActor<AMatterFluxGameMode>()
+		: nullptr;
+	APlayerController* Controller = World
+		? World->SpawnActor<APlayerController>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Playable world spawns for grounded player test"),
+		WorldActor)
+		|| !TestNotNull(TEXT("GameMode spawns for grounded player test"),
+			GameMode)
+		|| !TestNotNull(TEXT("Controller spawns for grounded player test"),
+			Controller))
+	{
+		return false;
+	}
+	WorldActor->Regenerate(1337);
+	float TerrainHeight = 0.0f;
+	if (!TestTrue(TEXT("Terrain below the requested player start is sampleable"),
+		WorldActor->TrySampleTerrainHeightAtWorldLocation(
+			FVector::ZeroVector, TerrainHeight)))
+	{
+		return false;
+	}
+
+	const FTransform BuriedPlayerStart(
+		FRotator::ZeroRotator,
+		FVector(0.0f, 0.0f, TerrainHeight - 120.0f));
+	APawn* SpawnedPawn =
+		GameMode->SpawnDefaultPawnAtTransform_Implementation(
+			Controller, BuriedPlayerStart);
+	if (!TestNotNull(
+		TEXT("A terrain-overlapped PlayerStart is raised instead of rejected"),
+		SpawnedPawn))
+	{
+		return false;
+	}
+	const ACharacter* Character = Cast<ACharacter>(SpawnedPawn);
+	const UCapsuleComponent* Capsule = Character
+		? Character->GetCapsuleComponent()
+		: nullptr;
+	if (!TestNotNull(TEXT("Spawned player uses a capsule"), Capsule))
+	{
+		return false;
+	}
+	const float CapsuleBottom = SpawnedPawn->GetActorLocation().Z
+		- Capsule->GetScaledCapsuleHalfHeight();
+	TestTrue(*FString::Printf(
+		TEXT("Player capsule starts above terrain (bottom=%.2f terrain=%.2f)"),
+		CapsuleBottom, TerrainHeight),
+		CapsuleBottom >= TerrainHeight + 1.0f);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxPlayerSpawnRegionStreamingBarrierTest,
+	"MatterFlux.Playable.Spawn.PlayerRegionTerrainCommitsBeforeEntry",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxPlayerSpawnRegionStreamingBarrierTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* WorldActor = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Playable world exists for spawn-region barrier"),
+		WorldActor))
+	{
+		return false;
+	}
+	WorldActor->Regenerate(1337);
+	const FVector DistantPlayerStart(240000.0f, -180000.0f, 0.0f);
+	FIntPoint SpawnChunk = FIntPoint::ZeroValue;
+	if (!TestTrue(TEXT("Distant player start can pin its streaming region"),
+		WorldActor->RequestPlayerSpawnRegion(
+			DistantPlayerStart,
+			SpawnChunk)))
+	{
+		return false;
+	}
+	TestNotEqual(TEXT("Test start is outside the old fallback chunk"),
+		SpawnChunk,
+		FIntPoint::ZeroValue);
+	TestTrue(TEXT("Pinned player terrain is active immediately behind the gate"),
+		WorldActor->HasVisibleTerrainChunk(SpawnChunk));
+	TestTrue(TEXT("Pinned player terrain has committed collision before entry"),
+		WorldActor->IsPlayerSpawnRegionTerrainReady(SpawnChunk));
+	FVector GroundedLocation;
+	TestTrue(TEXT("The committed region can ground the future player capsule"),
+		WorldActor->TryResolveTerrainSpawnLocation(
+			DistantPlayerStart,
+			42.0f,
+			96.0f,
+			4.0f,
+			GroundedLocation));
+	WorldActor->ReleasePlayerSpawnRegion(SpawnChunk);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxInitialEntryOrderingTest,
+	"MatterFlux.Playable.Spawn.TerrainThenCreaturesThenPlayer",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxInitialEntryOrderingTest::RunTest(
+	const FString& Parameters)
+{
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString ReloadError;
+	if (!TestTrue(TEXT("Initial-entry content is available"),
+		Runtime.ReloadDefaultContentPack(ReloadError)))
+	{
+		AddError(ReloadError);
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry = Runtime.GetActiveRegistry();
+	MatterFlux::PlayableLevel::FLevelLayout Layout;
+	if (!TestTrue(TEXT("Initial-entry river layout builds"),
+		Registry.IsValid()
+			&& MatterFlux::PlayableLevel::BuildLevelLayout(
+				1337, Layout, Registry.Get())))
+	{
+		return false;
+	}
+
+	constexpr int32 PopulationChunkSize = 64;
+	constexpr int32 SearchChunkY = 400;
+	FIntPoint RiverChunk = FIntPoint::ZeroValue;
+	FIntPoint RiverCell = FIntPoint::ZeroValue;
+	bool bFoundRiver = false;
+	for (int32 ChunkX = -32; ChunkX <= 32 && !bFoundRiver; ++ChunkX)
+	{
+		for (int32 LocalY = 0;
+			LocalY < PopulationChunkSize && !bFoundRiver;
+			++LocalY)
+		{
+			for (int32 LocalX = 0; LocalX < PopulationChunkSize; ++LocalX)
+			{
+				const FIntPoint Candidate(
+					ChunkX * PopulationChunkSize + LocalX,
+					SearchChunkY * PopulationChunkSize + LocalY);
+				float RiverHeight = 0.0f;
+				float WaterSurface = 0.0f;
+				bool bContainsWater = false;
+				if (Layout.Terrain.TrySampleInfiniteRiverCell(
+					Candidate.X,
+					Candidate.Y,
+					RiverHeight,
+					WaterSurface,
+					bContainsWater)
+					&& bContainsWater)
+				{
+					RiverChunk = FIntPoint(ChunkX, SearchChunkY);
+					RiverCell = Candidate;
+					bFoundRiver = true;
+					break;
+				}
+			}
+		}
+	}
+	if (!TestTrue(TEXT("Initial entry targets a deterministic river region"),
+		bFoundRiver))
+	{
+		return false;
+	}
+	const int64 FirstWorldCellX = FMath::FloorToInt64(
+		Layout.Terrain.FirstCellCenter.X / Layout.Terrain.CellSize);
+	const int64 FirstWorldCellY = FMath::FloorToInt64(
+		Layout.Terrain.FirstCellCenter.Y / Layout.Terrain.CellSize);
+	const auto CellWorldLocation = [&](const FIntPoint Cell)
+	{
+		return FVector(
+			Layout.Terrain.FirstCellCenter.X
+				+ static_cast<double>(Cell.X - FirstWorldCellX)
+					* Layout.Terrain.CellSize,
+			Layout.Terrain.FirstCellCenter.Y
+				+ static_cast<double>(Cell.Y - FirstWorldCellY)
+					* Layout.Terrain.CellSize,
+			0.0);
+	};
+	const FVector RiverWorldLocation = CellWorldLocation(RiverCell);
+	const FVector InitialRegionLocation = CellWorldLocation(
+		RiverChunk * PopulationChunkSize
+			+ FIntPoint(PopulationChunkSize / 2));
+
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* WorldActor = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	AMatterFluxGameMode* GameMode = World
+		? World->SpawnActor<AMatterFluxGameMode>()
+		: nullptr;
+	APlayerController* Controller = World
+		? World->SpawnActor<APlayerController>()
+		: nullptr;
+	APlayerStart* PlayerStart = World
+		? World->SpawnActor<APlayerStart>(
+			InitialRegionLocation,
+			FRotator::ZeroRotator)
+		: nullptr;
+	AMatterFluxPlayerState* PlayerState = World
+		? World->SpawnActor<AMatterFluxPlayerState>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Playable world exists for entry ordering"),
+		WorldActor)
+		|| !TestNotNull(TEXT("GameMode exists for entry ordering"), GameMode)
+		|| !TestNotNull(TEXT("Controller exists for entry ordering"), Controller)
+		|| !TestNotNull(TEXT("PlayerStart exists for entry ordering"), PlayerStart)
+		|| !TestNotNull(TEXT("PlayerState exists for entry ordering"), PlayerState))
+	{
+		return false;
+	}
+
+	WorldActor->Regenerate(1337);
+	Controller->SetPlayerState(PlayerState);
+	if (!TestTrue(TEXT("The synthetic logged-in controller may restart"),
+		Controller->CanRestartPlayer()))
+	{
+		return false;
+	}
+	Controller->StartSpot = PlayerStart;
+	GameMode->HandleStartingNewPlayer_Implementation(Controller);
+	TestNull(TEXT("Queuing entry does not create the player early"),
+		Controller->GetPawn());
+
+	GameMode->AdvancePendingPlayerEntries();
+	if (!TestEqual(TEXT("Player remains queued while river streaming finishes"),
+		GameMode->PendingPlayerEntries.Num(),
+		1))
+	{
+		return false;
+	}
+	const AMatterFluxGameMode::FPendingPlayerEntry& Pending =
+		GameMode->PendingPlayerEntries[0];
+	TestTrue(TEXT("The queued PlayerStart terrain is collision-ready"),
+		WorldActor->IsPlayerSpawnRegionTerrainReady(Pending.TerrainChunk));
+	TestFalse(TEXT("Terrain collision alone does not open creature spawning"),
+		GameMode->bCreatureSpawnGateOpen);
+	TestFalse(TEXT("Initial entry waits for river simulation and presentation"),
+		WorldActor->IsInitialWorldEntryReady());
+	TestFalse(TEXT("The player remains absent during initial river streaming"),
+		Controller->GetPawn() != nullptr);
+
+	for (int32 Frame = 0;
+		Frame < 1536 && !WorldActor->IsInitialWorldEntryReady();
+		++Frame)
+	{
+		WorldActor->Tick(1.0f / 60.0f);
+	}
+	if (!TestTrue(TEXT("Initial river region reaches the complete entry barrier"),
+		WorldActor->IsInitialWorldEntryReady()))
+	{
+		return false;
+	}
+	MatterFlux::Liquid::FLiquidColumn InitialRiverColumn;
+	TestTrue(TEXT("Initial river water exists before creature spawning"),
+		WorldActor->TrySampleLiquidColumnAtWorldLocation(
+			RiverWorldLocation, InitialRiverColumn));
+	TestTrue(TEXT("Initial river projection exists before creature spawning"),
+		WorldActor->HasLiquidProjectionAtWorldLocation(
+			TEXT("water"), RiverWorldLocation));
+
+	GameMode->AdvancePendingPlayerEntries();
+	TestTrue(TEXT("Creature spawning opens only after the complete entry barrier"),
+		GameMode->bCreatureSpawnGateOpen);
+	TestTrue(TEXT("The initial creature pass completes before player entry"),
+		GameMode->bInitialCreaturePassComplete);
+	TestNull(TEXT("The player is still absent during the creature pass"),
+		Controller->GetPawn());
+
+	GameMode->AdvancePendingPlayerEntries();
+	TestNotNull(TEXT("The player is created only on the following pass"),
+		Controller->GetPawn().Get());
+	TestTrue(TEXT("The completed player is removed from the entry queue"),
+		GameMode->PendingPlayerEntries.IsEmpty());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxStoryMapPlayerEntryTest,
+	"MatterFlux.Playable.Spawn.StoryMapCreatesPlayerWithFollowCamera",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxStoryMapPlayerEntryTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(TEXT("Story-entry content is available"),
+		Runtime.ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* WorldActor = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	AMatterFluxGameMode* GameMode = World
+		? World->SpawnActor<AMatterFluxGameMode>()
+		: nullptr;
+	AMatterFluxGameState* GameState = World
+		? World->SpawnActor<AMatterFluxGameState>()
+		: nullptr;
+	APlayerController* Controller = World
+		? World->SpawnActor<APlayerController>()
+		: nullptr;
+	AMatterFluxPlayerState* PlayerState = World
+		? World->SpawnActor<AMatterFluxPlayerState>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Playable world exists for story entry"), WorldActor)
+		|| !TestNotNull(TEXT("GameMode exists for story entry"), GameMode)
+		|| !TestNotNull(TEXT("GameState exists for story entry"), GameState)
+		|| !TestNotNull(TEXT("Controller exists for story entry"), Controller)
+		|| !TestNotNull(TEXT("Player state exists for story entry"), PlayerState))
+	{
+		return false;
+	}
+	World->SetGameState(GameState);
+	GameMode->GameState = GameState;
+	Controller->SetPlayerState(PlayerState);
+	GameState->AddPlayerState(PlayerState);
+	WorldActor->Regenerate(1337);
+	GameMode->PrepareForInitialWorldEntry();
+	TestTrue(TEXT("The free-mode fixture begins with visible vegetation"),
+		WorldActor->GetVisibleFragmentSourceProxyCount() > 0);
+	if (!TestTrue(TEXT("Story map loads before the player exists"),
+		WorldActor->LoadCustomMap(TEXT("story.paper_magic"), 1, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	TestEqual(TEXT("Story mode retains its fixed procedural seed"),
+		WorldActor->GetMapSeed(),
+		AMatterFluxPlayableWorldActor::PaperMagicStorySeed);
+	TestTrue(TEXT("Story mode rebuilds seeded terrain chunks"),
+		WorldActor->GetVisibleTerrainChunkCount() > 0);
+	TestTrue(TEXT("Story mode rebuilds seeded rivers"),
+		WorldActor->GetGeneratedLiquidLayerCount() > 0);
+	TestTrue(TEXT("Story mode rebuilds seeded trees and ground cover"),
+		WorldActor->GetVisibleFragmentSourceProxyCount() > 0
+			|| WorldActor->GetGeneratedFragmentSourceCount() > 0);
+	AMatterFluxTwoStoreyHouseActor* StoryHouse =
+		WorldActor->GetGeneratedHouse();
+	FGuid NearestStoryTreeAggregate;
+	FGuid NearestStoryTreeRoot;
+	FBox NearestStoryTreeBounds(ForceInit);
+	FTransform NearestStoryTreeTransform = FTransform::Identity;
+	if (TestNotNull(TEXT("Story mode creates the fixed camp house"), StoryHouse)
+		&& TestTrue(TEXT("Story mode retains seeded trees outside the camp clearing"),
+		WorldActor->FindNearestTreeAggregateForVisualInspection(
+			StoryHouse->GetActorLocation(),
+			NearestStoryTreeAggregate,
+			NearestStoryTreeRoot,
+			NearestStoryTreeBounds,
+			NearestStoryTreeTransform)))
+	{
+		const FVector ClearingDelta =
+			NearestStoryTreeTransform.GetLocation()
+			- StoryHouse->GetActorLocation();
+		TestTrue(TEXT("No random tree root is generated in the fixed house area"),
+			FMath::Abs(ClearingDelta.X) >= 950.0f
+				|| FMath::Abs(ClearingDelta.Y) >= 950.0f);
+	}
+	GameMode->RefreshConfiguredCreatureSpawns();
+	TestFalse(TEXT("Loading the story map does not open creature spawning"),
+		GameMode->bCreatureSpawnGateOpen);
+	int32 EarlyConfiguredCreatureCount = 0;
+	for (TActorIterator<AMatterFluxCreatureActor> It(World); It; ++It)
+	{
+		if (It->Tags.Contains(TEXT("MatterFluxConfiguredCreature")))
+		{
+			++EarlyConfiguredCreatureCount;
+		}
+	}
+	TestEqual(TEXT("Story creatures remain absent before the entry barrier"),
+		EarlyConfiguredCreatureCount, 0);
+
+	UMatterFluxMagicInventoryComponent* Inventory =
+		PlayerState->GetMagicInventory();
+	UMatterFluxProgressionComponent* Progression =
+		PlayerState->GetProgression();
+	if (!TestNotNull(TEXT("Story magic inventory exists"), Inventory)
+		|| !TestNotNull(TEXT("Story progression exists"), Progression)
+		|| !TestTrue(TEXT("Story inventory begins empty"),
+			Inventory->ResetToEmptyLoadoutAuthority(Error))
+		|| !TestTrue(TEXT("Story tutorial state activates"),
+			Progression->ResetToStoryStateAuthority(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	FVector StoryPlayerStart = FVector::ZeroVector;
+	if (!TestTrue(TEXT("Story map exposes its player marker"),
+		WorldActor->TryGetCustomMapMarker(
+			TEXT("player_start"), StoryPlayerStart)))
+	{
+		return false;
+	}
+	GameMode->HandleStartingNewPlayer_Implementation(Controller);
+	TestNull(TEXT("Queuing story entry does not create the player early"),
+		Controller->GetPawn());
+	GameMode->AdvancePendingPlayerEntries();
+	TestFalse(TEXT("Story creatures wait for terrain, decoration, and water"),
+		GameMode->bCreatureSpawnGateOpen);
+	TestNull(TEXT("Story player remains absent while the world settles"),
+		Controller->GetPawn());
+
+	for (int32 Frame = 0;
+		Frame < 1536 && !WorldActor->IsInitialWorldEntryReady();
+		++Frame)
+	{
+		WorldActor->Tick(1.0f / 60.0f);
+	}
+	if (!TestTrue(TEXT("Story world reaches the complete entry barrier"),
+		WorldActor->IsInitialWorldEntryReady()))
+	{
+		return false;
+	}
+
+	GameMode->AdvancePendingPlayerEntries();
+	TestTrue(TEXT("Story creature spawning opens after the world barrier"),
+		GameMode->bCreatureSpawnGateOpen);
+	TestTrue(TEXT("Story creatures complete before player creation"),
+		GameMode->bInitialCreaturePassComplete);
+	TestNull(TEXT("Story player is absent during the creature pass"),
+		Controller->GetPawn());
+	AMatterFluxCreatureActor* StoryMerchant = nullptr;
+	for (TActorIterator<AMatterFluxCreatureActor> It(World); It; ++It)
+	{
+		if (It->GetDefinitionId() == TEXT("std.merchant_base"))
+		{
+			StoryMerchant = *It;
+			break;
+		}
+	}
+	if (!TestNotNull(TEXT("Story NPC spawns after the world barrier"),
+		StoryMerchant))
+	{
+		return false;
+	}
+
+	GameMode->AdvancePendingPlayerEntries();
+	AMatterFluxCharacter* Character =
+		Cast<AMatterFluxCharacter>(Controller->GetPawn());
+	if (!TestNotNull(TEXT("Story entry creates the normal player character"),
+		Character))
+	{
+		return false;
+	}
+	TestTrue(TEXT("Story player uses the authored horizontal marker"),
+		FVector2D(Character->GetActorLocation()).Equals(
+			FVector2D(StoryPlayerStart), 1.0));
+	TestTrue(TEXT("Completed story entry leaves the queue"),
+		GameMode->PendingPlayerEntries.IsEmpty());
+
+	const FGuid TutorialWand = Inventory->GetOwnedWands().IsEmpty()
+		? FGuid()
+		: Inventory->GetOwnedWands()[0].InstanceId;
+	FMatterFluxMagicEdit EquipWand;
+	EquipWand.Type = EMatterFluxMagicEditType::EquipWand;
+	EquipWand.ExpectedRevision = Inventory->GetInventoryRevision();
+	EquipWand.WandId = TutorialWand;
+	EquipWand.EquipmentSlot = 0;
+	FMatterFluxQuestEvent RefreshQuest;
+	RefreshQuest.Type = EMatterFluxQuestEventType::Refresh;
+	if (!TestTrue(TEXT("Tutorial wand equips"),
+			Inventory->ApplyEditAuthority(EquipWand, Error))
+		|| !TestTrue(TEXT("Wand equipment advances the tutorial"),
+			Progression->NotifyQuestEventAuthority(RefreshQuest, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	FMatterFluxMagicEdit AssignSpell;
+	AssignSpell.Type = EMatterFluxMagicEditType::AssignSpell;
+	AssignSpell.ExpectedRevision = Inventory->GetInventoryRevision();
+	AssignSpell.WandId = TutorialWand;
+	AssignSpell.SpellId = TEXT("std.default");
+	AssignSpell.ToSpellSlot = 0;
+	if (!TestTrue(TEXT("Tutorial attack spell equips"),
+			Inventory->ApplyEditAuthority(AssignSpell, Error))
+		|| !TestTrue(TEXT("Spell equipment activates the kill objective"),
+			Progression->NotifyQuestEventAuthority(RefreshQuest, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	const FMatterFluxQuestState* KillQuest =
+		Progression->FindQuestState(TEXT("std.init_quest.kill_enemy"));
+	if (!TestTrue(TEXT("Training fight is active after equipping the loadout"),
+		KillQuest
+			&& KillQuest->Status == EMatterFluxQuestRuntimeStatus::Active))
+	{
+		return false;
+	}
+	GameMode->RefreshConfiguredCreatureSpawns();
+	int32 TrainingEnemyCount = 0;
+	TArray<AMatterFluxCreatureActor*> TrainingEnemies;
+	for (TActorIterator<AMatterFluxCreatureActor> It(World); It; ++It)
+	{
+		if (It->GetDefinitionId() == TEXT("std.slime")
+			|| It->GetDefinitionId() == TEXT("std.elite_patrol"))
+		{
+			++TrainingEnemyCount;
+			TrainingEnemies.Add(*It);
+		}
+	}
+	TestEqual(TEXT("All three training enemies spawn inside the initial area"),
+		TrainingEnemyCount, 3);
+	const UCapsuleComponent* MerchantCapsule =
+		StoryMerchant->GetCapsuleComponent();
+	float MerchantTerrainHeight = 0.0f;
+	if (!TestNotNull(TEXT("Story NPC has a collision capsule"),
+		MerchantCapsule)
+		|| !TestTrue(TEXT("Story NPC terrain is sampleable"),
+			WorldActor->TrySampleTerrainHeightAtWorldLocation(
+				StoryMerchant->GetActorLocation(), MerchantTerrainHeight)))
+	{
+		return false;
+	}
+	const float MerchantCapsuleBottom = StoryMerchant->GetActorLocation().Z
+		- MerchantCapsule->GetScaledCapsuleHalfHeight();
+	TestTrue(TEXT("Story NPC starts above the completed terrain"),
+		MerchantCapsuleBottom >= MerchantTerrainHeight + 1.0f);
+	for (const AMatterFluxCreatureActor* Enemy : TrainingEnemies)
+	{
+		const UCapsuleComponent* EnemyCapsule = Enemy
+			? Enemy->GetCapsuleComponent() : nullptr;
+		float TerrainHeight = 0.0f;
+		if (!TestNotNull(TEXT("Story enemy has a collision capsule"),
+			EnemyCapsule)
+			|| !TestTrue(TEXT("Story enemy terrain is sampleable"),
+				WorldActor->TrySampleTerrainHeightAtWorldLocation(
+					Enemy->GetActorLocation(), TerrainHeight)))
+		{
+			return false;
+		}
+		const float CapsuleBottom = Enemy->GetActorLocation().Z
+			- EnemyCapsule->GetScaledCapsuleHalfHeight();
+		TestTrue(*FString::Printf(
+			TEXT("Story enemy '%s' starts above terrain "
+				"(bottom=%.2f terrain=%.2f)"),
+			*Enemy->GetDefinitionId().ToString(),
+			CapsuleBottom,
+			TerrainHeight),
+			CapsuleBottom >= TerrainHeight + 1.0f);
+	}
+	if (TestTrue(TEXT("Two enemies exist for hostile-on-hostile death coverage"),
+		TrainingEnemies.Num() >= 2))
+	{
+		AMatterFluxCreatureActor* Victim = TrainingEnemies[0];
+		AMatterFluxCreatureActor* Attacker = TrainingEnemies[1];
+		TestTrue(TEXT("Another enemy can deal the lethal blow"),
+			Victim->ApplyDamageAuthority(
+				Victim->GetCurrentHealth() + 1.0f,
+				Attacker));
+		KillQuest = Progression->FindQuestState(
+			TEXT("std.init_quest.kill_enemy"));
+		TestEqual(TEXT("Enemy-on-enemy death advances the active kill task"),
+			KillQuest ? KillQuest->Progress : INDEX_NONE,
+			1);
+	}
+
+	const UCapsuleComponent* PlayerCapsule =
+		Character->GetCapsuleComponent();
+	float PlayerTerrainHeight = 0.0f;
+	if (!TestNotNull(TEXT("Story player has a collision capsule"), PlayerCapsule)
+		|| !TestTrue(TEXT("Story player terrain is sampleable"),
+			WorldActor->TrySampleTerrainHeightAtWorldLocation(
+				Character->GetActorLocation(), PlayerTerrainHeight)))
+	{
+		return false;
+	}
+	const float PlayerCapsuleBottom = Character->GetActorLocation().Z
+		- PlayerCapsule->GetScaledCapsuleHalfHeight();
+	TestTrue(*FString::Printf(
+		TEXT("Story player starts above terrain (bottom=%.2f terrain=%.2f)"),
+		PlayerCapsuleBottom,
+		PlayerTerrainHeight),
+		PlayerCapsuleBottom >= PlayerTerrainHeight + 1.0f);
+	TestNotNull(TEXT("Story player keeps the normal follow camera"),
+		Character->FindComponentByClass<UCameraComponent>());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxStoryBossSpawnTest,
+	"MatterFlux.Playable.Spawn.LoadedActiveFinalQuestCreatesTwoBosses",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxStoryBossSpawnTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(TEXT("Final-boss content is available"),
+		Runtime.ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* WorldActor = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	AMatterFluxGameMode* GameMode = World
+		? World->SpawnActor<AMatterFluxGameMode>()
+		: nullptr;
+	AMatterFluxGameState* GameState = World
+		? World->SpawnActor<AMatterFluxGameState>()
+		: nullptr;
+	AMatterFluxPlayerState* PlayerState = World
+		? World->SpawnActor<AMatterFluxPlayerState>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Playable world exists for final bosses"), WorldActor)
+		|| !TestNotNull(TEXT("GameMode exists for final bosses"), GameMode)
+		|| !TestNotNull(TEXT("GameState exists for final bosses"), GameState)
+		|| !TestNotNull(TEXT("Player state exists for final bosses"), PlayerState))
+	{
+		return false;
+	}
+	World->SetGameState(GameState);
+	GameMode->GameState = GameState;
+	GameState->AddPlayerState(PlayerState);
+	WorldActor->Regenerate(AMatterFluxPlayableWorldActor::PaperMagicStorySeed);
+	if (!TestTrue(TEXT("PaperMagic story map loads for final bosses"),
+		WorldActor->LoadCustomMap(TEXT("story.paper_magic"), 1, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	FMatterFluxProgressionSaveState FinalQuestState;
+	FMatterFluxSavedQuestState& SavedQuest =
+		FinalQuestState.Quests.AddDefaulted_GetRef();
+	SavedQuest.QuestId = TEXT("std.side_kill_boss");
+	SavedQuest.Status = static_cast<uint8>(
+		EMatterFluxQuestRuntimeStatus::Active);
+	SavedQuest.bActivationRewardsGranted = true;
+	FinalQuestState.SelectedQuest = SavedQuest.QuestId;
+	if (!TestTrue(TEXT("Final quest restores as active"),
+		PlayerState->GetProgression()->RestoreSaveStateAuthority(
+			FinalQuestState, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	// Loading a story save closes the creature gate before replacing the map.
+	// Unlike a new story, the load path keeps its existing pawn and therefore
+	// does not enter the pending-player queue that normally reopens this gate.
+	GameMode->PrepareForInitialWorldEntry();
+	for (int32 Frame = 0;
+		Frame < 1536 && !WorldActor->IsInitialWorldEntryReady();
+		++Frame)
+	{
+		WorldActor->Tick(1.0f / 60.0f);
+	}
+	if (!TestTrue(TEXT("Loaded story world reaches its complete entry barrier"),
+		WorldActor->IsInitialWorldEntryReady())
+		|| !TestTrue(TEXT("Loaded story reopens configured creature spawning"),
+			GameMode->CompleteExistingPlayerWorldLoad()))
+	{
+		return false;
+	}
+	// Distant configured creatures are not allowed to begin physics until their
+	// authored collision chunk has committed. Drive the same half-second retry
+	// seam used by GameMode's timer rather than assuming the first refresh can
+	// synchronously cook every final-region terrain body.
+	for (int32 Frame = 0; Frame < 1536; ++Frame)
+	{
+		WorldActor->Tick(1.0f / 60.0f);
+		GameMode->RefreshConfiguredCreatureSpawns();
+		int32 BossCount = 0;
+		for (TActorIterator<AMatterFluxCreatureActor> It(World); It; ++It)
+		{
+			BossCount += It->GetDefinitionId() == TEXT("std.test_boss")
+				? 1 : 0;
+		}
+		if (BossCount == 2)
+		{
+			break;
+		}
+	}
+	TArray<AMatterFluxCreatureActor*> Bosses;
+	for (TActorIterator<AMatterFluxCreatureActor> It(World); It; ++It)
+	{
+		if (It->GetDefinitionId() == TEXT("std.test_boss"))
+		{
+			Bosses.Add(*It);
+		}
+	}
+	TestEqual(TEXT("Loaded active final quest creates both authored bosses"),
+		Bosses.Num(), 2);
+	for (const AMatterFluxCreatureActor* Boss : Bosses)
+	{
+		TestEqual(TEXT("Unseen final boss starts passive"),
+			Boss->GetRuntimeState(),
+			EMatterFluxCreatureRuntimeState::Passive);
+	}
+	for (int32 BossIndex = 0; BossIndex < 2; ++BossIndex)
+	{
+		const FName PinKey(*FString::Printf(
+			TEXT("quest.std.side_kill_boss.creature.std.test_boss.%d"),
+			BossIndex));
+		const FIntPoint* TerrainChunk =
+			GameMode->ConfiguredCreatureTerrainPins.Find(PinKey);
+		TestTrue(TEXT("Each final boss keeps its authored terrain chunk pinned"),
+			TerrainChunk
+				&& WorldActor->IsPlayerSpawnRegionTerrainReady(*TerrainChunk));
+	}
+	FVector StoryPlayerStart = FVector::ZeroVector;
+	if (!TestTrue(TEXT("Story player marker is available for boss waiting"),
+		WorldActor->TryGetCustomMapMarker(
+			TEXT("player_start"), StoryPlayerStart)))
+	{
+		return false;
+	}
+	WorldActor->SetWorldStreamingFocus(StoryPlayerStart);
+	for (int32 Frame = 0; Frame < 1800; ++Frame)
+	{
+		++GFrameCounter;
+		World->Tick(LEVELTICK_All, 1.0f / 60.0f);
+	}
+	for (const AMatterFluxCreatureActor* Boss : Bosses)
+	{
+		float TerrainHeight = 0.0f;
+		const UCapsuleComponent* Capsule = Boss
+			? Boss->GetCapsuleComponent() : nullptr;
+		const bool bHasTerrain = Boss
+			&& WorldActor->TrySampleTerrainHeightAtWorldLocation(
+				Boss->GetActorLocation(), TerrainHeight);
+		const float CapsuleBottom = Capsule
+			? Boss->GetActorLocation().Z
+				- Capsule->GetScaledCapsuleHalfHeight()
+			: -BIG_NUMBER;
+		TestTrue(TEXT("Each final boss remains alive in the authored final region"),
+			IsValid(Boss) && !Boss->IsActorBeingDestroyed()
+				&& Boss->GetActorLocation().X >= 3600.0f
+				&& Boss->GetActorLocation().X <= 4500.0f);
+		TestTrue(*FString::Printf(
+			TEXT("Each waiting final boss stays on terrain "
+				"(bottom=%.2f terrain=%.2f)"),
+			CapsuleBottom, TerrainHeight),
+			Capsule && bHasTerrain
+				&& CapsuleBottom >= TerrainHeight - 5.0f);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxTerrainSafeCreatureSpawnTest,
+	"MatterFlux.Playable.Spawn.CreatureCapsuleUsesDefinitionBeforeFinish",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxTerrainSafeCreatureSpawnTest::RunTest(
+	const FString& Parameters)
+{
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString ReloadError;
+	if (!TestTrue(TEXT("Default creature content loads for spawn grounding"),
+		Runtime.ReloadDefaultContentPack(ReloadError)))
+	{
+		AddError(ReloadError);
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry = Runtime.GetActiveRegistry();
+	const FMatterFluxCreatureDefinition* Slime = Registry.IsValid()
+		? Registry->Creatures.Find(TEXT("std.slime"))
+		: nullptr;
+	if (!TestNotNull(TEXT("Short creature definition is available"), Slime))
+	{
+		return false;
+	}
+
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* WorldActor = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Playable world spawns for creature grounding"),
+		WorldActor))
+	{
+		return false;
+	}
+	WorldActor->Regenerate(1337);
+	const FVector RequestedLocation(320.0f, -120.0f, -500.0f);
+	const AMatterFluxCreatureActor* CreatureDefault =
+		GetDefault<AMatterFluxCreatureActor>();
+	const UCapsuleComponent* DefaultCapsule = CreatureDefault
+		? CreatureDefault->GetCapsuleComponent()
+		: nullptr;
+	if (!TestNotNull(TEXT("Creature class has a construction capsule"),
+		DefaultCapsule))
+	{
+		return false;
+	}
+	const float FinalRadius = Slime->Width * 0.5f;
+	const float FinalHalfHeight = FMath::Max(
+		FinalRadius, Slime->Height * 0.5f);
+	FVector ConstructionLocation;
+	FVector FinalLocation;
+	if (!TestTrue(TEXT("Construction capsule receives a terrain-safe location"),
+		WorldActor->TryResolveTerrainSpawnLocation(
+			RequestedLocation,
+			FMath::Max(DefaultCapsule->GetScaledCapsuleRadius(), FinalRadius),
+			FMath::Max(
+				DefaultCapsule->GetScaledCapsuleHalfHeight(), FinalHalfHeight),
+			4.0f,
+			ConstructionLocation))
+		|| !TestTrue(TEXT("Authored creature capsule receives a terrain-safe location"),
+			WorldActor->TryResolveTerrainSpawnLocation(
+				RequestedLocation,
+				FinalRadius,
+				FinalHalfHeight,
+				4.0f,
+				FinalLocation)))
+	{
+		return false;
+	}
+
+	AMatterFluxCreatureActor* Creature =
+		World->SpawnActorDeferred<AMatterFluxCreatureActor>(
+			AMatterFluxCreatureActor::StaticClass(),
+			FTransform(FRotator::ZeroRotator, ConstructionLocation),
+			nullptr,
+			nullptr,
+			ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn);
+	if (!TestNotNull(TEXT("Deferred short creature spawns"), Creature))
+	{
+		return false;
+	}
+	Creature->InitializeCreature(TEXT("std.slime"));
+	TestEqual(TEXT("Creature uses its authored capsule before FinishSpawning"),
+		Creature->GetCapsuleComponent()->GetUnscaledCapsuleHalfHeight(),
+		FinalHalfHeight);
+	Creature->FinishSpawning(
+		FTransform(FRotator::ZeroRotator, FinalLocation));
+	float TerrainHeight = 0.0f;
+	if (TestTrue(TEXT("Terrain below the finished creature is sampleable"),
+		WorldActor->TrySampleTerrainHeightAtWorldLocation(
+			FinalLocation, TerrainHeight)))
+	{
+		const float CapsuleBottom = Creature->GetActorLocation().Z
+			- Creature->GetCapsuleComponent()->GetScaledCapsuleHalfHeight();
+		TestTrue(*FString::Printf(
+			TEXT("Creature capsule starts above terrain (bottom=%.2f terrain=%.2f)"),
+			CapsuleBottom, TerrainHeight),
+			CapsuleBottom >= TerrainHeight + 1.0f);
+	}
+	return true;
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -746,8 +1663,8 @@ bool FMatterFluxFineTerrainChunkMeshTest::RunTest(const FString& Parameters)
 {
 	MatterFlux::PlayableLevel::FLevelLayout Layout;
 	if (!TestTrue(
-		TEXT("Seeded level layout builds"),
-		MatterFlux::PlayableLevel::BuildLevelLayout(1337, Layout)))
+		TEXT("Reported embedded-player level layout builds"),
+		MatterFlux::PlayableLevel::BuildLevelLayout(2054944001, Layout)))
 	{
 		return false;
 	}
@@ -764,13 +1681,15 @@ bool FMatterFluxFineTerrainChunkMeshTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Every pixel has an independently generated height"),
 		Terrain.Heights.Num() == Terrain.Width * Terrain.Height);
 
+	constexpr int32 TestChunkSize = 32;
+	const FIntPoint TestChunkCoordinate = FIntPoint::ZeroValue;
 	MatterFlux::TerrainMesh::FChunk Chunk;
 	if (!TestTrue(
 		TEXT("A terrain chunk builds from the heightfield"),
 		MatterFlux::TerrainMesh::BuildChunk(
 			Terrain,
-			FIntPoint(-8, -6),
-			32,
+			TestChunkCoordinate,
+			TestChunkSize,
 			Chunk)))
 	{
 		return false;
@@ -783,8 +1702,8 @@ bool FMatterFluxFineTerrainChunkMeshTest::RunTest(const FString& Parameters)
 		Chunk.CollisionSurface.IsValid());
 	TestEqual(TEXT("Collision surface has two triangles per two-cell patch"),
 		Chunk.CollisionSurface.Triangles.Num() / 3,
-		FMath::DivideAndRoundUp(Chunk.CellBounds.Width(), 2)
-			* FMath::DivideAndRoundUp(Chunk.CellBounds.Height(), 2) * 2);
+		FMath::DivideAndRoundUp(Chunk.CellBounds.Width() + 2, 2)
+			* FMath::DivideAndRoundUp(Chunk.CellBounds.Height() + 2, 2) * 2);
 	for (int32 TriangleIndex = 0;
 		TriangleIndex < Chunk.CollisionSurface.Triangles.Num();
 		TriangleIndex += 3)
@@ -800,6 +1719,61 @@ bool FMatterFluxFineTerrainChunkMeshTest::RunTest(const FString& Parameters)
 			FMath::Abs(FVector::CrossProduct(B - A, C - A).Z)
 				> UE_SMALL_NUMBER);
 	}
+	double WorstCollisionClearance = TNumericLimits<double>::Max();
+	FIntPoint WorstClearanceCell = FIntPoint::ZeroValue;
+	bool bSampledEveryRenderedCell = true;
+	const int64 FirstWorldCellX = FMath::FloorToInt64(
+		Terrain.FirstCellCenter.X / Terrain.CellSize);
+	const int64 FirstWorldCellY = FMath::FloorToInt64(
+		Terrain.FirstCellCenter.Y / Terrain.CellSize);
+	for (int32 LocalY = 0; LocalY < TestChunkSize; ++LocalY)
+	{
+		for (int32 LocalX = 0; LocalX < TestChunkSize; ++LocalX)
+		{
+			const int64 WorldCellX =
+				static_cast<int64>(TestChunkCoordinate.X) * TestChunkSize
+				+ LocalX;
+			const int64 WorldCellY =
+				static_cast<int64>(TestChunkCoordinate.Y) * TestChunkSize
+				+ LocalY;
+			float RenderHeight = 0.0f;
+			uint8 Band = 0;
+			if (!Terrain.TrySampleWorldCell(
+				WorldCellX, WorldCellY, RenderHeight, Band))
+			{
+				bSampledEveryRenderedCell = false;
+				continue;
+			}
+			const FVector2D CellCenter(
+				Terrain.FirstCellCenter.X
+					+ static_cast<double>(WorldCellX - FirstWorldCellX)
+						* Terrain.CellSize,
+				Terrain.FirstCellCenter.Y
+					+ static_cast<double>(WorldCellY - FirstWorldCellY)
+						* Terrain.CellSize);
+			double CollisionHeight = 0.0;
+			if (!TrySampleSurfaceHeight(
+				Chunk.CollisionSurface, CellCenter, CollisionHeight))
+			{
+				bSampledEveryRenderedCell = false;
+				continue;
+			}
+			const double Clearance = CollisionHeight - RenderHeight;
+			if (Clearance < WorstCollisionClearance)
+			{
+				WorstCollisionClearance = Clearance;
+				WorstClearanceCell = FIntPoint(WorldCellX, WorldCellY);
+			}
+		}
+	}
+	TestTrue(TEXT("Every rendered terrain cell has a collision sample"),
+		bSampledEveryRenderedCell);
+	TestTrue(*FString::Printf(
+		TEXT("Smooth collision never passes below rendered terrain; worst %.2f cm at (%d,%d)"),
+		WorstCollisionClearance,
+		WorstClearanceCell.X,
+		WorstClearanceCell.Y),
+		WorstCollisionClearance >= -KINDA_SMALL_NUMBER);
 	double TopSurfaceArea = 0.0;
 	int32 TopTriangleCount = 0;
 	bool bHasVisibleVerticalStep = false;
@@ -849,46 +1823,55 @@ bool FMatterFluxFineTerrainChunkMeshTest::RunTest(const FString& Parameters)
 		bHasVisibleVerticalStep);
 
 	MatterFlux::TerrainMesh::FChunk EastChunk;
+	const FIntPoint EastChunkCoordinate =
+		TestChunkCoordinate + FIntPoint(1, 0);
 	if (TestTrue(
 		TEXT("Adjacent terrain chunk builds"),
 		MatterFlux::TerrainMesh::BuildChunk(
 			Terrain,
-			FIntPoint(-7, -6),
-			32,
+			EastChunkCoordinate,
+			TestChunkSize,
 			EastChunk)))
 	{
-		const double SeamX = -7.0 * 32.0 * Terrain.CellSize;
-		TMap<int32, double> WestEdgeHeights;
-		TMap<int32, double> EastEdgeHeights;
-		for (const FVector& Vertex : Chunk.CollisionSurface.Vertices)
+		const double SeamX = static_cast<double>(EastChunkCoordinate.X)
+			* TestChunkSize * Terrain.CellSize;
+		for (const int32 Offset : {-1, 1})
 		{
-			if (FMath::IsNearlyEqual(Vertex.X, SeamX))
+			const double OverlapX = SeamX + Offset * Terrain.CellSize;
+			TMap<int32, double> WestOverlapHeights;
+			TMap<int32, double> EastOverlapHeights;
+			for (const FVector& Vertex : Chunk.CollisionSurface.Vertices)
 			{
-				WestEdgeHeights.Add(
-					FMath::RoundToInt(Vertex.Y / Terrain.CellSize),
-					Vertex.Z);
+				if (FMath::IsNearlyEqual(Vertex.X, OverlapX))
+				{
+					WestOverlapHeights.Add(
+						FMath::RoundToInt(Vertex.Y / Terrain.CellSize),
+						Vertex.Z);
+				}
 			}
-		}
-		for (const FVector& Vertex : EastChunk.CollisionSurface.Vertices)
-		{
-			if (FMath::IsNearlyEqual(Vertex.X, SeamX))
+			for (const FVector& Vertex : EastChunk.CollisionSurface.Vertices)
 			{
-				EastEdgeHeights.Add(
-					FMath::RoundToInt(Vertex.Y / Terrain.CellSize),
-					Vertex.Z);
+				if (FMath::IsNearlyEqual(Vertex.X, OverlapX))
+				{
+					EastOverlapHeights.Add(
+						FMath::RoundToInt(Vertex.Y / Terrain.CellSize),
+						Vertex.Z);
+				}
 			}
-		}
-		TestEqual(TEXT("Adjacent collision surfaces expose the same seam vertices"),
-			WestEdgeHeights.Num(), EastEdgeHeights.Num());
-		for (const TPair<int32, double>& EdgeVertex : WestEdgeHeights)
-		{
-			const double* EastHeight = EastEdgeHeights.Find(EdgeVertex.Key);
-			TestNotNull(TEXT("Every west seam vertex has an east counterpart"),
-				EastHeight);
-			if (EastHeight)
+			TestTrue(TEXT("Adjacent collision surfaces overlap across the seam"),
+				!WestOverlapHeights.IsEmpty()
+					&& !EastOverlapHeights.IsEmpty());
+			for (const TPair<int32, double>& EdgeVertex : WestOverlapHeights)
 			{
-				TestTrue(TEXT("Adjacent collision surface heights are continuous"),
-					FMath::IsNearlyEqual(EdgeVertex.Value, *EastHeight));
+				const double* EastHeight =
+					EastOverlapHeights.Find(EdgeVertex.Key);
+				TestNotNull(TEXT("Every overlap vertex has an east counterpart"),
+					EastHeight);
+				if (EastHeight)
+				{
+					TestTrue(TEXT("Adjacent overlap heights are continuous"),
+						FMath::IsNearlyEqual(EdgeVertex.Value, *EastHeight));
+				}
 			}
 		}
 	}
@@ -1819,6 +2802,46 @@ bool FMatterFluxRandomLevelLayoutTest::RunTest(const FString& Parameters)
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxNaturalWorldOmitsDiagnosticSamplesTest,
+	"MatterFlux.Playable.NaturalWorldOmitsDiagnosticMaterialSamples",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxNaturalWorldOmitsDiagnosticSamplesTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* WorldActor =
+		World ? World->SpawnActor<AMatterFluxPlayableWorldActor>() : nullptr;
+	if (!TestNotNull(TEXT("Playable world actor spawned"), WorldActor))
+	{
+		return false;
+	}
+
+	WorldActor->Regenerate(1337);
+	TestTrue(TEXT("Seed 1337 retains its generated natural water"),
+		WorldActor->GetSimulatedMaterialCount(TEXT("water")) > 0);
+	for (const FName DiagnosticMaterial : {
+		FName(TEXT("sand")),
+		FName(TEXT("steam")),
+		FName(TEXT("lava")),
+		FName(TEXT("acid")),
+		FName(TEXT("acid_gas")),
+		FName(TEXT("stone")),
+		FName(TEXT("wood")),
+		FName(TEXT("grassland")) })
+	{
+		TestEqual(
+			*FString::Printf(
+				TEXT("Seed 1337 omits the '%s' diagnostic showcase"),
+				*DiagnosticMaterial.ToString()),
+			WorldActor->GetSimulatedMaterialCount(DiagnosticMaterial),
+			0);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxVoxelDecorationWorldTest,
 	"MatterFlux.Playable.VoxelDecorationsSpawnAsDamageableSources",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
@@ -1988,21 +3011,30 @@ bool FMatterFluxVoxelDecorationWorldTest::RunTest(const FString& Parameters)
 		WorldActor->GetVisibleFragmentSourceProxyCount() > 0);
 	TestTrue(TEXT("Playable world seeds visible liquid cells"),
 		WorldActor->GetSimulatedMaterialCount(TEXT("water")) > 0);
-	TestTrue(TEXT("Playable world seeds visible powder cells"),
-		WorldActor->GetSimulatedMaterialCount(TEXT("sand")) > 0);
-	TestTrue(TEXT("Playable world seeds visible gas cells"),
-		WorldActor->GetSimulatedMaterialCount(TEXT("steam")) > 0);
-	TestTrue(TEXT("Playable world seeds a reactive lava pool"),
-		WorldActor->GetSimulatedMaterialCount(TEXT("lava")) > 0);
-	TestTrue(TEXT("Playable world seeds the Lua-configured acid liquid"),
-		WorldActor->GetSimulatedMaterialCount(TEXT("acid")) > 0);
-	TestTrue(TEXT("Each active material has a voxel visualization layer"),
-		WorldActor->GetGeneratedMaterialLayerCount() >= 6);
+	for (const FName DiagnosticMaterial : {
+		FName(TEXT("sand")),
+		FName(TEXT("steam")),
+		FName(TEXT("lava")),
+		FName(TEXT("acid")),
+		FName(TEXT("acid_gas")),
+		FName(TEXT("stone")),
+		FName(TEXT("wood")),
+		FName(TEXT("grassland")) })
+	{
+		TestEqual(
+			*FString::Printf(
+				TEXT("Ordinary procedural worlds omit the '%s' diagnostic showcase"),
+				*DiagnosticMaterial.ToString()),
+			WorldActor->GetSimulatedMaterialCount(DiagnosticMaterial),
+			0);
+	}
+	TestEqual(TEXT("Natural water does not allocate diagnostic voxel layers"),
+		WorldActor->GetGeneratedMaterialLayerCount(), 0);
 	WorldActor->Tick(0.25f);
 	TestTrue(TEXT("Authority advances material simulation at a fixed step"),
 		WorldActor->GetMaterialSimulationStep() > 0);
-	TestTrue(TEXT("Seeded acid corrosion produces simulated gas"),
-		WorldActor->GetSimulatedMaterialCount(TEXT("acid_gas")) > 0);
+	TestEqual(TEXT("No seeded acid sample emits gas in an ordinary world"),
+		WorldActor->GetSimulatedMaterialCount(TEXT("acid_gas")), 0);
 
 	const MatterFlux::PlayableLevel::FLevelFragmentSource* TrunkLayout =
 		Layout.FragmentSources.FindByPredicate(
@@ -2853,7 +3885,7 @@ bool FMatterFluxMaterialSimulationCatchUpBudgetTest::RunTest(
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxPlayableAcidSourceContactTest,
-	"MatterFlux.Playable.Material.AcidContactCorrodesTreeAndEmitsGas",
+	"MatterFlux.Playable.Material.AcidContactCorrodesTreeLocallyAndIsConsumed",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 
 bool FMatterFluxPlayableAcidSourceContactTest::RunTest(
@@ -2916,6 +3948,9 @@ bool FMatterFluxPlayableAcidSourceContactTest::RunTest(
 	}
 	const int32 InitialGas =
 		WorldActor->GetSimulatedMaterialCount(TEXT("acid_gas"));
+	const int64 InitialAcidFamilyAmount =
+		WorldActor->GetSimulatedMaterialAmount(TEXT("acid"))
+		+ WorldActor->GetSimulatedMaterialAmount(TEXT("acid_gas"));
 	int32 InitialFragmentActors = 0;
 	for (TActorIterator<AFragment2DActor> It(World); It; ++It)
 	{
@@ -2940,16 +3975,20 @@ bool FMatterFluxPlayableAcidSourceContactTest::RunTest(
 	TestTrue(TEXT("Lua contact reaction commits tree mask damage"),
 		CorrodedRevision > InitialRevision
 			&& CorrodedMask.Num() == InitialMask.Num());
-	TestTrue(TEXT("Corroding a tree emits simulated acid gas"),
-		WorldActor->GetSimulatedMaterialCount(TEXT("acid_gas"))
-			> InitialGas);
+	TestEqual(TEXT("Corroding a tree creates no replacement acid gas"),
+		WorldActor->GetSimulatedMaterialCount(TEXT("acid_gas")),
+		InitialGas);
+	TestTrue(TEXT("Tree corrosion does not increase acid-family amount"),
+		WorldActor->GetSimulatedMaterialAmount(TEXT("acid"))
+			+ WorldActor->GetSimulatedMaterialAmount(TEXT("acid_gas"))
+			- InitialAcidFamilyAmount <= 255);
 	int32 FinalFragmentActors = 0;
 	for (TActorIterator<AFragment2DActor> It(World); It; ++It)
 	{
 		++FinalFragmentActors;
 	}
 	TestEqual(
-		TEXT("Repeated acid contact produces one aggregate carrier and dissolves later stump debris"),
+		TEXT("One conserved acid contact produces at most one aggregate carrier"),
 		FinalFragmentActors - InitialFragmentActors,
 		1);
 	AFragment2DSourceActor* RootSource = nullptr;
@@ -3087,9 +4126,13 @@ bool FMatterFluxCanonicalLiquidSurfaceProjectionTest::RunTest(
 		return false;
 	}
 	WorldActor->Regenerate(1337);
-	for (int32 Step = 0; Step < 30; ++Step)
+	// Preserve three seconds of settling while retaining the render-only frames
+	// that a real 60 Hz game has between fixed 10 Hz material steps. Advancing
+	// by 0.1 seconds here made every synthetic frame a simulation frame and
+	// starved the deliberately separated liquid-projection pass.
+	for (int32 Step = 0; Step < 180; ++Step)
 	{
-		WorldActor->Tick(0.1f);
+		WorldActor->Tick(1.0f / 60.0f);
 	}
 
 	const FMatterFluxContentRegistryPtr Registry =
@@ -3555,6 +4598,8 @@ bool FMatterFluxPlayableLiquidBuoyancyIntegrationTest::RunTest(
 	WorldActor->Tick(0.0f);
 	TestTrue(TEXT("Character capsule is measurably submerged"),
 		Character->BuoyancyComponent->GetLastSubmergedFraction() > 0.1f);
+	TestEqual(TEXT("Water uses its Lua-defined movement resistance"),
+		Character->BuoyancyComponent->GetLastMovementResistance(), 1.0f);
 	TestTrue(TEXT("A light character receives upward buoyancy"),
 		Character->GetCharacterMovement()->Velocity.Z > 0.0f);
 	MatterFlux::Liquid::FLiquidColumn DisplacedCenterColumn;
@@ -3689,6 +4734,61 @@ bool FMatterFluxPlayableLiquidBuoyancyIntegrationTest::RunTest(
 	TestEqual(TEXT("Rigid-body displacement conserves exact water volume"),
 		WorldActor->GetSimulatedMaterialAmount(TEXT("water")),
 		WaterBeforeObject);
+
+	FVector SandLocation = FVector::ZeroVector;
+	bool bPlacedSand = false;
+	for (int32 Y = 0; Y < Layout.Terrain.Height && !bPlacedSand; Y += 3)
+	{
+		for (int32 X = 0; X < Layout.Terrain.Width; X += 3)
+		{
+			const FVector Candidate(
+				Layout.Terrain.FirstCellCenter.X + X * Layout.Terrain.CellSize,
+				Layout.Terrain.FirstCellCenter.Y + Y * Layout.Terrain.CellSize,
+				Layout.Terrain.HeightAt(X, Y) + 10.0f);
+			MatterFlux::Liquid::FLiquidColumn ExistingLiquid;
+			if (!WorldActor->TrySampleLiquidColumnAtWorldLocation(
+					Candidate, ExistingLiquid)
+				&& WorldActor->DepositSimulatedMaterialAtWorldLocation(
+					Candidate, TEXT("sand"), 8) > 0)
+			{
+				SandLocation = Candidate;
+				bPlacedSand = true;
+				break;
+			}
+		}
+	}
+	if (TestTrue(TEXT("A dry terrain cell accepts a tall sand test pile"),
+		bPlacedSand))
+	{
+		float SandGroundZ = SandLocation.Z - 10.0f;
+		WorldActor->TrySampleTerrainHeightAtWorldLocation(
+			SandLocation, SandGroundZ);
+		Character->SetActorLocation(FVector(
+			SandLocation.X, SandLocation.Y, SandGroundZ + 88.0f));
+		Character->GetCharacterMovement()->Velocity = FVector(500.0f, 0.0f, 0.0f);
+		const int64 SandBeforeDisplacement =
+			WorldActor->GetSimulatedMaterialAmount(TEXT("sand"));
+		Character->BuoyancyComponent->TickComponent(
+			0.1f, LEVELTICK_All, nullptr);
+		TestTrue(TEXT("The player is immersed in the sand pile"),
+			Character->BuoyancyComponent->GetLastMovementMediumFraction() > 0.0f);
+		TestEqual(TEXT("Sand uses its own Lua-defined movement resistance"),
+			Character->BuoyancyComponent->GetLastMovementResistance(), 1.8f);
+		TestTrue(TEXT("Sand drag damps existing player momentum"),
+			Character->GetCharacterMovement()->Velocity.Size2D() < 500.0f);
+		const UMatterFluxCharacterMovementComponent* MaterialMovement =
+			Cast<UMatterFluxCharacterMovementComponent>(
+				Character->GetCharacterMovement());
+		TestTrue(TEXT("Sand resistance also lowers sustained movement limits"),
+			MaterialMovement
+				&& MaterialMovement->GetMaterialMovementResistance() > 0.0f
+				&& MaterialMovement->GetMaxSpeed()
+					< Character->GetCharacterMovement()->MaxWalkSpeed);
+		WorldActor->Tick(0.0f);
+		TestEqual(TEXT("Player displacement conserves exact sand volume"),
+			WorldActor->GetSimulatedMaterialAmount(TEXT("sand")),
+			SandBeforeDisplacement);
+	}
 	return true;
 }
 
@@ -4066,11 +5166,13 @@ bool FMatterFluxInfinitePopulationStreamingTest::RunTest(
 			* MatterFlux::PlayableLevel::TerrainCellSize,
 		0.0);
 	WorldActor->SetWorldStreamingFocus(FarFocus);
-	// Material fixed steps reserve every third 60 Hz frame from game-thread
-	// streaming commits. Give the deterministic drain the equivalent 256
-	// commit-capable frames while retaining the strict zero-pending assertion.
+	// This is a cold jump that replaces the complete population window at once.
+	// The readiness count now includes liquid presentation, whose mesh builder is
+	// intentionally capped at two chunks per quiet frame to prevent a hitch. Give
+	// that bounded queue enough synthetic frames to drain while retaining the
+	// strict zero-pending assertion.
 	for (int32 Step = 0;
-		Step < 384
+		Step < 1536
 			&& WorldActor->GetPendingProceduralPopulationUpdateCount() > 0;
 		++Step)
 	{
@@ -4137,6 +5239,148 @@ bool FMatterFluxInfinitePopulationStreamingTest::RunTest(
 	TestTrue(
 		TEXT("Far streamed chunks contain a generated house"),
 		bHasFarHouse);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxVisibleRiverWaterPrefetchTest,
+	"MatterFlux.Playable.Streaming.VisibleRiverWaterIsPrefetched",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxVisibleRiverWaterPrefetchTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	MatterFlux::PlayableLevel::FLevelLayout Layout;
+	if (!TestTrue(TEXT("River-prefetch layout builds"),
+		MatterFlux::PlayableLevel::BuildLevelLayout(1337, Layout)))
+	{
+		return false;
+	}
+
+	constexpr int32 ChunkSize = 64;
+	constexpr int32 SearchChunkY = 400;
+	FIntPoint TargetChunk = FIntPoint::ZeroValue;
+	FIntPoint TargetRiverCell = FIntPoint::ZeroValue;
+	bool bFoundTargetRiver = false;
+	for (int32 ChunkX = -32; ChunkX <= 32 && !bFoundTargetRiver; ++ChunkX)
+	{
+		for (int32 LocalY = 0; LocalY < ChunkSize && !bFoundTargetRiver;
+			++LocalY)
+		{
+			for (int32 LocalX = 0; LocalX < ChunkSize; ++LocalX)
+			{
+				const FIntPoint Cell(
+					ChunkX * ChunkSize + LocalX,
+					SearchChunkY * ChunkSize + LocalY);
+				float RiverHeight = 0.0f;
+				float WaterSurface = 0.0f;
+				bool bContainsWater = false;
+				if (Layout.Terrain.TrySampleInfiniteRiverCell(
+					Cell.X,
+					Cell.Y,
+					RiverHeight,
+					WaterSurface,
+					bContainsWater)
+					&& bContainsWater)
+				{
+					TargetChunk = FIntPoint(ChunkX, SearchChunkY);
+					TargetRiverCell = Cell;
+					bFoundTargetRiver = true;
+					break;
+				}
+			}
+		}
+	}
+	if (!TestTrue(TEXT("A deterministic far river chunk is available"),
+		bFoundTargetRiver))
+	{
+		return false;
+	}
+
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* WorldActor = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Playable world exists for river prefetch"),
+		WorldActor))
+	{
+		return false;
+	}
+	WorldActor->Regenerate(1337);
+
+	const int64 FirstWorldCellX = FMath::FloorToInt64(
+		Layout.Terrain.FirstCellCenter.X / Layout.Terrain.CellSize);
+	const int64 FirstWorldCellY = FMath::FloorToInt64(
+		Layout.Terrain.FirstCellCenter.Y / Layout.Terrain.CellSize);
+	const auto CellWorldLocation = [&](const FIntPoint Cell)
+	{
+		return FVector(
+			Layout.Terrain.FirstCellCenter.X
+				+ static_cast<double>(Cell.X - FirstWorldCellX)
+					* Layout.Terrain.CellSize,
+			Layout.Terrain.FirstCellCenter.Y
+				+ static_cast<double>(Cell.Y - FirstWorldCellY)
+					* Layout.Terrain.CellSize,
+			0.0);
+	};
+	// Warm the previous walking position first. The target is one chunk beyond
+	// its visible radius but inside the prefetch ring; after one normal chunk of
+	// movement it becomes the new far-edge terrain. The old focus-only 3x3
+	// surface queue reports itself drained without ever preparing this water.
+	const FIntPoint VisibleFocusChunk = TargetChunk - FIntPoint(0, 4);
+	const FIntPoint WarmFocusChunk = VisibleFocusChunk - FIntPoint(0, 1);
+	const auto ChunkCenterCell = [](const FIntPoint Chunk)
+	{
+		return Chunk * ChunkSize + FIntPoint(ChunkSize / 2);
+	};
+	const FVector RiverWorldLocation = CellWorldLocation(TargetRiverCell);
+	WorldActor->SetWorldStreamingFocus(
+		CellWorldLocation(ChunkCenterCell(WarmFocusChunk)));
+	for (int32 Frame = 0;
+		Frame < 1536
+			&& WorldActor->GetPendingProceduralPopulationUpdateCount() > 0;
+		++Frame)
+	{
+		WorldActor->Tick(1.0f / 60.0f);
+	}
+	const bool bWaterWasSimulatedBeforeReveal = [&]()
+	{
+		MatterFlux::Liquid::FLiquidColumn Column;
+		return WorldActor->TrySampleLiquidColumnAtWorldLocation(
+			RiverWorldLocation, Column);
+	}();
+	const bool bProjectionWasReadyBeforeReveal =
+		WorldActor->HasLiquidProjectionAtWorldLocation(
+			TEXT("water"), RiverWorldLocation);
+
+	WorldActor->SetWorldStreamingFocus(
+		CellWorldLocation(ChunkCenterCell(VisibleFocusChunk)));
+
+	bool bTerrainBecameVisible = false;
+	for (int32 Frame = 0; Frame < 120; ++Frame)
+	{
+		WorldActor->Tick(1.0f / 60.0f);
+		bTerrainBecameVisible |=
+			WorldActor->HasVisibleTerrainChunk(TargetChunk);
+		if (bTerrainBecameVisible)
+		{
+			break;
+		}
+	}
+	TestTrue(TEXT("The far-edge river terrain enters the visible window"),
+		bTerrainBecameVisible);
+	AddInfo(FString::Printf(
+		TEXT("River prefetch diagnostic: population=%d pending=%d pre_simulated=%d pre_projection=%d"),
+		WorldActor->HasProceduralPopulationChunk(TargetChunk) ? 1 : 0,
+		WorldActor->GetPendingProceduralPopulationUpdateCount(),
+		bWaterWasSimulatedBeforeReveal ? 1 : 0,
+		bProjectionWasReadyBeforeReveal ? 1 : 0));
+	TestTrue(TEXT("Visible river water is seeded before the player approaches"),
+		bWaterWasSimulatedBeforeReveal);
+	TestTrue(TEXT("Visible river water has a render projection while streaming"),
+		bProjectionWasReadyBeforeReveal);
 	return true;
 }
 

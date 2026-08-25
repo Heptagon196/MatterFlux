@@ -70,6 +70,10 @@ public:
 		EMatterFluxPlayerOperation Operation,
 		const FVector2D& Value = FVector2D::ZeroVector,
 		int32 IntegerValue = 0);
+	FVector GetCurrentWandCastAimDirection() const
+	{
+		return CurrentWandCastAimDirection;
+	}
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Playable|Visual")
 	TObjectPtr<UStaticMeshComponent> CharacterVisual;
@@ -117,8 +121,14 @@ private:
 	void HandleCastWandStarted(int32 EquipmentSlot);
 	void HandleCastWandStopped(int32 EquipmentSlot);
 	void HandleCastWandRequested(int32 EquipmentSlot);
+	void ExecuteCastWandRequest(
+		int32 EquipmentSlot,
+		const FVector& AimDirection);
+	FVector ResolveWandCastAimDirection() const;
 	void HandleRegenerateRequested();
-	void TryActivateWandSlot(int32 EquipmentSlot);
+	void TryActivateWandSlot(
+		int32 EquipmentSlot,
+		const FVector& AimDirection);
 	void ExecuteRegenerateRequest(int32 RequestedSeed = 0);
 	void PlayAbilityEffect(EMatterFluxPlayerAbilityEffect Effect);
 	void PublishPlayerOperation(
@@ -158,7 +168,9 @@ private:
 		int32 IntegerValue);
 
 	UFUNCTION(Server, Reliable, WithValidation)
-	void ServerActivateWandSlot(int32 EquipmentSlot);
+	void ServerActivateWandSlot(
+		int32 EquipmentSlot,
+		FVector_NetQuantizeNormal AimDirection);
 
 	UPROPERTY(Transient)
 	TObjectPtr<UInputMappingContext> PlayableMappingContext;
@@ -167,9 +179,6 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<UInputAction> MoveAction;
-
-	UPROPERTY(Transient)
-	TObjectPtr<UInputAction> JumpAction;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UInputAction> CameraZoomAction;
@@ -202,5 +211,6 @@ private:
 	FTimerHandle CutEffectTimer;
 	FTimerHandle FlameEffectTimer;
 	TArray<FTimerHandle> WandCastRepeatTimers;
+	FVector CurrentWandCastAimDirection = FVector::ForwardVector;
 	double LastRegenerateRequestTime = -1.0;
 };

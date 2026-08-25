@@ -101,6 +101,28 @@ content.register_spell({
 })
 )LUA");
 
+	const TCHAR* ExpandedTriggerBudgetPack = TEXT(R"LUA(
+content.set_manifest("magic.expanded_trigger_budget", 1, 2)
+content.register_spell({
+	id = "spell.projectile", name = "Projectile", kind = "projectile",
+	mana_cost = 0, damage = 1, speed = 1000, lifetime = 1, radius = 8
+})
+content.register_spell({
+	id = "spell.triple", name = "Triple", kind = "multicast",
+	mana_cost = 0, draw_count = 3
+})
+content.register_spell({
+	id = "spell.trigger_children", name = "Trigger Children",
+	kind = "trigger_modifier", mana_cost = 0, draw_count = 2,
+	trigger_event = "impact"
+})
+content.register_wand({
+	id = "wand.budget", name = "Budget Wand", capacity = 32,
+	shuffle = false, draw_count = 1, cast_delay = 0.1,
+	recharge_time = 0.1, mana_max = 100, mana_recharge = 10
+})
+)LUA");
+
 	void RestoreDefault(IMatterFluxScriptRuntime& Runtime)
 	{
 		FString Ignored;
@@ -436,6 +458,35 @@ bool FMatterFluxMagicProgramCombinationMatrixTest::RunTest(
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxMagicWorkbenchEquipmentSlotsTest,
+	"MatterFlux.Magic.Workbench.ExposesAllFiveEquipmentSlotsIncludingSpace",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxMagicWorkbenchEquipmentSlotsTest::RunTest(
+	const FString& Parameters)
+{
+	TArray<FMatterFluxMagicEquipmentSlotPresentation> Slots;
+	FMatterFluxMagicWorkbenchInteraction::BuildEquipmentSlotPresentations(Slots);
+	TestEqual(TEXT("Workbench follows the gameplay equipment slot count"),
+		Slots.Num(), UGA_CastWand::EquipmentSlotCount);
+	if (Slots.Num() != UGA_CastWand::EquipmentSlotCount)
+	{
+		return false;
+	}
+
+	for (int32 SlotIndex = 0; SlotIndex < Slots.Num(); ++SlotIndex)
+	{
+		TestEqual(TEXT("Workbench slot keeps its equipment index"),
+			Slots[SlotIndex].SlotIndex, SlotIndex);
+	}
+	TestEqual(TEXT("Fifth equipment slot is labelled for the Space key"),
+		Slots[4].KeyLabel, FString(TEXT("空格键")));
+	TestEqual(TEXT("Fifth equipment slot has a compact Space badge"),
+		Slots[4].KeyBadge, FString(TEXT("空格")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxMagicIncompleteBranchCastTest,
 	"MatterFlux.Magic.ProgramLayout.IncompleteMulticastBranchRemainsCastable",
 	EAutomationTestFlags::EditorContext
@@ -562,7 +613,6 @@ bool FMatterFluxMagicPaperMagicLibraryTest::RunTest(
 	}
 
 	const TArray<FName> PaperMagicSpellIds = {
-		TEXT("std.add_damage"),
 		TEXT("std.circle_trail"),
 		TEXT("std.default"),
 		TEXT("std.double_cast"),
@@ -594,6 +644,13 @@ bool FMatterFluxMagicPaperMagicLibraryTest::RunTest(
 					ESearchCase::IgnoreCase));
 		}
 	}
+	const FMatterFluxSpellDefinition* ScatterSpell =
+		Registry->Spells.Find(TEXT("std.double_cast"));
+	if (TestNotNull(TEXT("Scatter spell is registered"), ScatterSpell))
+	{
+		TestEqual(TEXT("The spread multicast has a distinct display name"),
+			ScatterSpell->DisplayName, FString(TEXT("散射")));
+	}
 	const TArray<FName> MatterFluxSpellIds = {
 		TEXT("spell.accelerate"),
 		TEXT("spell.add_damage"),
@@ -601,6 +658,7 @@ bool FMatterFluxMagicPaperMagicLibraryTest::RunTest(
 		TEXT("spell.double_cast"),
 		TEXT("spell.flame_jet"),
 		TEXT("spell.heavy_orb"),
+		TEXT("spell.sand_sphere"),
 		TEXT("spell.sand_spray"),
 		TEXT("spell.spark_bolt"),
 		TEXT("spell.spark_trigger"),
@@ -682,16 +740,12 @@ bool FMatterFluxMagicPaperMagicLibraryTest::RunTest(
 
 	const FMatterFluxSpellDefinition* DefaultProjectile =
 		Registry->Spells.Find(TEXT("std.default"));
-	const FMatterFluxSpellDefinition* AddDamage =
-		Registry->Spells.Find(TEXT("std.add_damage"));
 	const FMatterFluxSpellDefinition* TripleCast =
 		Registry->Spells.Find(TEXT("std.triple_cast"));
-	if (DefaultProjectile && AddDamage && TripleCast)
+	if (DefaultProjectile && TripleCast)
 	{
 		TestEqual(TEXT("Default projectile keeps PaperMagic damage"),
 			DefaultProjectile->Damage, 10.0f);
-		TestEqual(TEXT("Add damage keeps PaperMagic bonus"),
-			AddDamage->DamageAdd, 7.0f);
 		TestEqual(TEXT("Triple cast exposes three children"),
 			TripleCast->DrawCount, 3);
 	}
@@ -733,8 +787,17 @@ bool FMatterFluxMagicPaperMagicLibraryTest::RunTest(
 			PaperMagicShoe->ManaRechargePerSecond, 50.0f);
 		TestEqual(TEXT("Shoe caster interval"),
 			PaperMagicShoe->CastDelay, 0.5f);
-		TestEqual(TEXT("Shoe caster starts owned but unbound"),
+		TestEqual(TEXT("Shoe caster has one starter instance"),
 			PaperMagicShoe->StarterCount, 1);
+		TestEqual(TEXT("Shoe caster is bound to the Space slot"),
+			PaperMagicShoe->StarterEquipmentSlot, 4);
+		TestEqual(TEXT("Shoe caster starts with one spell"),
+			PaperMagicShoe->StarterDeck.Num(), 1);
+		if (PaperMagicShoe->StarterDeck.Num() == 1)
+		{
+			TestEqual(TEXT("Space starter spell is jump"),
+				PaperMagicShoe->StarterDeck[0], FName(TEXT("std.jump")));
+		}
 	}
 	return true;
 }
@@ -795,10 +858,10 @@ bool FMatterFluxMagicPaperMagicSemanticsTest::RunTest(
 
 	FMatterFluxWandCastPlan DamagePlan;
 	if (Compile(TEXT("Add damage compiles"),
-		{TEXT("std.add_damage"), TEXT("std.default")}, DamagePlan))
+		{TEXT("spell.add_damage"), TEXT("std.default")}, DamagePlan))
 	{
 		TestEqual(TEXT("Add damage affects its child"),
-			DamagePlan.Projectiles[0].Damage, 17.0f);
+			DamagePlan.Projectiles[0].Damage, 20.0f);
 	}
 
 	FMatterFluxWandCastPlan CirclePlan;
@@ -882,6 +945,383 @@ bool FMatterFluxMagicPaperMagicSemanticsTest::RunTest(
 		TestEqual(TEXT("Jump impulse"),
 			JumpPlan.CasterEffects[0].VerticalImpulse, 600.0f);
 	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxMagicComplexElementalProgramTest,
+	"MatterFlux.Magic.Combinations.MulticastTriggerModifiersKeepBranchScope",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxMagicComplexElementalProgramTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(TEXT("Default content pack loads"),
+		Runtime.ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry = Runtime.GetActiveRegistry();
+	if (!TestTrue(TEXT("Default registry exists"), Registry.IsValid()))
+	{
+		return false;
+	}
+
+	// Triple cast branches into:
+	// 1. damage modifier -> collision trigger(default carrier,
+	//    damage modifier -> fire payload)
+	// 2. water projectile
+	// 3. sand projectile
+	const TArray<FName> Slots = {
+		TEXT("std.triple_cast"),
+		TEXT("spell.add_damage"),
+		TEXT("std.trigger_on_collision"),
+		TEXT("std.default"),
+		TEXT("spell.add_damage"),
+		TEXT("spell.flame_jet"),
+		TEXT("spell.water_spray"),
+		TEXT("spell.sand_spray")
+	};
+	FMatterFluxWandProgramState State;
+	State.Mana = 220.0f;
+	State.CastSerial = 4;
+	FMatterFluxWandCastPlan First;
+	FMatterFluxWandCastPlan Second;
+	if (!TestTrue(TEXT("Complex elemental program compiles"),
+		FMatterFluxWandProgram::Evaluate(
+			*Registry,
+			TEXT("wand.precision"),
+			Slots,
+			State,
+			20260824,
+			First,
+			Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	Error.Reset();
+	TestTrue(TEXT("Equal state and seed reproduce the complete nested plan"),
+		FMatterFluxWandProgram::Evaluate(
+			*Registry,
+			TEXT("wand.precision"),
+			Slots,
+			State,
+			20260824,
+			Second,
+			Error));
+	TestTrue(TEXT("Nested plans are deterministic"), First == Second);
+
+	TestEqual(TEXT("Triple cast emits three root projectiles"),
+		First.Projectiles.Num(), 3);
+	if (First.Projectiles.Num() != 3)
+	{
+		return false;
+	}
+	const FMatterFluxMagicProjectilePlan& Carrier = First.Projectiles[0];
+	const FMatterFluxMagicProjectilePlan& Water = First.Projectiles[1];
+	const FMatterFluxMagicProjectilePlan& Sand = First.Projectiles[2];
+	TestEqual(TEXT("Outer damage modifier affects only the carrier"),
+		Carrier.Damage, 20.0f);
+	TestEqual(TEXT("Carrier keeps multicast spread"),
+		Carrier.SpreadDegrees, 10.5f);
+	TestEqual(TEXT("Collision trigger has one impact payload"),
+		Carrier.OnImpactProjectiles.Num(), 1);
+	if (Carrier.OnImpactProjectiles.Num() == 1)
+	{
+		const FMatterFluxMagicProjectilePlan& Fire =
+			Carrier.OnImpactProjectiles[0];
+		TestEqual(TEXT("Payload-local modifier affects the fire payload"),
+			Fire.Damage, 10.0f);
+		TestEqual(TEXT("Fire payload remains a material projectile"),
+			Fire.BodyMaterial, FName(TEXT("fire")));
+		TestEqual(TEXT("Fire payload carries its configured material amount"),
+			Fire.MaterialAmount, 5);
+	}
+	TestEqual(TEXT("Carrier modifier does not leak into water branch"),
+		Water.Damage, 0.0f);
+	TestEqual(TEXT("Payload modifier does not leak into water branch"),
+		Water.BodyMaterial, FName(TEXT("water")));
+	TestEqual(TEXT("Later branch retains multicast spread"),
+		Water.SpreadDegrees, 10.5f);
+	TestEqual(TEXT("Final branch remains sand"),
+		Sand.BodyMaterial, FName(TEXT("sand")));
+	TestEqual(TEXT("Every nested card contributes to mana cost"),
+		First.ManaSpent, 65.0f);
+	TestEqual(TEXT("The shared cursor consumes every nested card once"),
+		First.NextState.DeckCursor, Slots.Num());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxMagicTriggerCarrierSpreadTest,
+	"MatterFlux.Magic.Combinations.OuterMulticastSpreadReachesTriggerCarrierDirection",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxMagicTriggerCarrierSpreadTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(TEXT("Default content pack loads"),
+		Runtime.ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry = Runtime.GetActiveRegistry();
+	if (!TestTrue(TEXT("Default registry exists"), Registry.IsValid()))
+	{
+		return false;
+	}
+
+	const TArray<FName> Slots = {
+		TEXT("std.double_cast"),
+		TEXT("std.trigger_on_collision"),
+		TEXT("std.default"),
+		TEXT("std.default"),
+		TEXT("std.default")
+	};
+	FMatterFluxWandProgramState State;
+	State.Mana = 220.0f;
+	bool bObservedOuterSpread = false;
+	for (int32 Seed = 0; Seed < 32; ++Seed)
+	{
+		FMatterFluxWandCastPlan Plan;
+		Error.Reset();
+		if (!TestTrue(TEXT("Spread sample compiles"),
+			FMatterFluxWandProgram::Evaluate(
+				*Registry,
+				TEXT("wand.precision"),
+				Slots,
+				State,
+				Seed,
+				Plan,
+				Error)))
+		{
+			AddError(Error);
+			return false;
+		}
+		if (Plan.Projectiles.Num() == 2
+			&& FMath::Abs(Plan.Projectiles[0].SpawnAngleDegrees) > 0.5f)
+		{
+			bObservedOuterSpread = true;
+			break;
+		}
+	}
+	TestTrue(
+		TEXT("Trigger carrier directions use outer multicast spread, not only base wand spread"),
+		bObservedOuterSpread);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxMagicNestedTriggerRuntimeTest,
+	"MatterFlux.Magic.Combinations.CollisionThenExpiryTriggerSpawnsMaterialPayload",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxMagicNestedTriggerRuntimeTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(TEXT("Default content pack loads"),
+		Runtime.ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry = Runtime.GetActiveRegistry();
+	if (!TestTrue(TEXT("Default registry exists"), Registry.IsValid()))
+	{
+		return false;
+	}
+
+	const TArray<FName> Slots = {
+		TEXT("std.trigger_on_collision"),
+		TEXT("std.default"),
+		TEXT("std.trigger_on_expired"),
+		TEXT("std.default"),
+		TEXT("spell.flame_jet")
+	};
+	FMatterFluxWandProgramState State;
+	State.Mana = 220.0f;
+	FMatterFluxWandCastPlan Plan;
+	if (!TestTrue(TEXT("Two-stage trigger program compiles"),
+		FMatterFluxWandProgram::Evaluate(
+			*Registry,
+			TEXT("wand.precision"),
+			Slots,
+			State,
+			8181,
+			Plan,
+			Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	TestEqual(TEXT("Only the outer carrier is a root projectile"),
+		Plan.Projectiles.Num(), 1);
+	if (Plan.Projectiles.Num() != 1)
+	{
+		return false;
+	}
+	const FMatterFluxMagicProjectilePlan& OuterPlan = Plan.Projectiles[0];
+	TestEqual(TEXT("Outer collision has one nested carrier"),
+		OuterPlan.OnImpactProjectiles.Num(), 1);
+	if (OuterPlan.OnImpactProjectiles.Num() != 1)
+	{
+		return false;
+	}
+	const FMatterFluxMagicProjectilePlan& InnerPlan =
+		OuterPlan.OnImpactProjectiles[0];
+	TestEqual(TEXT("Nested carrier waits for expiry"),
+		InnerPlan.OnImpactProjectiles.Num(), 0);
+	TestEqual(TEXT("Nested expiry has one fire payload"),
+		InnerPlan.OnExpireProjectiles.Num(), 1);
+	if (InnerPlan.OnExpireProjectiles.Num() == 1)
+	{
+		TestEqual(TEXT("Deep payload remains fire material"),
+			InnerPlan.OnExpireProjectiles[0].BodyMaterial,
+			FName(TEXT("fire")));
+	}
+
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AActor* Avatar = World ? World->SpawnActor<AActor>() : nullptr;
+	if (!TestNotNull(TEXT("Authority avatar spawns"), Avatar))
+	{
+		return false;
+	}
+	if (!TestTrue(TEXT("Compiled nested plan passes runtime validation"),
+		UGA_CastWand::SpawnCastPlan(*Avatar, Plan, 8181)))
+	{
+		return false;
+	}
+
+	AMatterFluxMagicProjectile* Outer = nullptr;
+	for (TActorIterator<AMatterFluxMagicProjectile> It(World); It; ++It)
+	{
+		Outer = *It;
+		break;
+	}
+	if (!TestNotNull(TEXT("Outer trigger carrier spawns"), Outer))
+	{
+		return false;
+	}
+	FHitResult Hit;
+	Hit.ImpactPoint = Outer->GetActorLocation() + FVector(25.0f, 0.0f, 0.0f);
+	TestTrue(TEXT("Outer collision resolves"),
+		Outer->ResolveImpactAuthority(Hit));
+	TestFalse(TEXT("Outer collision remains exactly-once"),
+		Outer->ResolveImpactAuthority(Hit));
+
+	AMatterFluxMagicProjectile* Inner = nullptr;
+	for (TActorIterator<AMatterFluxMagicProjectile> It(World); It; ++It)
+	{
+		if (*It != Outer
+			&& It->GetPresentation().SpellId == TEXT("std.default"))
+		{
+			Inner = *It;
+			break;
+		}
+	}
+	if (!TestNotNull(TEXT("Collision creates the nested expiry carrier"), Inner))
+	{
+		return false;
+	}
+	Inner->LifeSpanExpired();
+
+	int32 FirePayloadCount = 0;
+	AMatterFluxMagicProjectile* FirePayload = nullptr;
+	for (TActorIterator<AMatterFluxMagicProjectile> It(World); It; ++It)
+	{
+		if (It->GetPresentation().SpellId == TEXT("spell.flame_jet"))
+		{
+			FirePayload = *It;
+			++FirePayloadCount;
+		}
+	}
+	TestEqual(TEXT("Nested expiry creates exactly one fire payload"),
+		FirePayloadCount, 1);
+	if (TestNotNull(TEXT("Fire payload exists"), FirePayload))
+	{
+		TestEqual(TEXT("Runtime presentation keeps fire material"),
+			FirePayload->GetPresentation().BodyMaterial,
+			FName(TEXT("fire")));
+		TestTrue(TEXT("Fire payload renders a material voxel body"),
+			FirePayload->GetMaterialBodyVoxelCount() > 0);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxMagicExpandedTriggerBudgetTest,
+	"MatterFlux.Magic.Combinations.ExpandedTriggerTreeHonorsProjectileBudget",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxMagicExpandedTriggerBudgetTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(TEXT("Expanded trigger budget pack loads"),
+		Runtime.LoadContentPackFromSource(
+			MatterFluxMagicTests::ExpandedTriggerBudgetPack,
+			TEXT("ExpandedTriggerBudget"),
+			Error)))
+	{
+		AddError(Error);
+		MatterFluxMagicTests::RestoreDefault(Runtime);
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry = Runtime.GetActiveRegistry();
+	const TArray<FName> Slots = {
+		TEXT("spell.trigger_children"),
+		TEXT("spell.triple"),
+		TEXT("spell.projectile"),
+		TEXT("spell.projectile"),
+		TEXT("spell.projectile"),
+		TEXT("spell.trigger_children"),
+		TEXT("spell.triple"),
+		TEXT("spell.projectile"),
+		TEXT("spell.projectile"),
+		TEXT("spell.projectile"),
+		TEXT("spell.triple"),
+		TEXT("spell.projectile"),
+		TEXT("spell.projectile"),
+		TEXT("spell.projectile")
+	};
+	FMatterFluxWandProgramState State;
+	State.Mana = 100.0f;
+	FMatterFluxWandCastPlan Plan;
+	TestFalse(
+		TEXT("A trigger tree expanded to 39 runtime projectiles is rejected"),
+		FMatterFluxWandProgram::Evaluate(
+			*Registry,
+			TEXT("wand.budget"),
+			Slots,
+			State,
+			5150,
+			Plan,
+			Error));
+	TestTrue(TEXT("Expanded tree rejection reports the projectile budget"),
+		Error.Contains(TEXT("projectile budget")));
+	TestEqual(TEXT("Budget rejection exposes no partial projectiles"),
+		Plan.Projectiles.Num(), 0);
+	TestEqual(TEXT("Budget rejection exposes no partial mana spend"),
+		Plan.ManaSpent, 0.0f);
+	MatterFluxMagicTests::RestoreDefault(Runtime);
 	return true;
 }
 
@@ -1474,8 +1914,159 @@ bool FMatterFluxMagicProjectileSpawnClearanceTest::RunTest(
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxDoubleCastCutSpawnTest,
+	"MatterFlux.Magic.Projectile.DoubleCastHorizontalAndVerticalCutsSurviveSpawn",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxDoubleCastCutSpawnTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(TEXT("Default content pack loads"),
+		Runtime.ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry = Runtime.GetActiveRegistry();
+	const FMatterFluxWandDefinition* CuttingWand = Registry.IsValid()
+		? Registry->Wands.Find(TEXT("wand.cutting"))
+		: nullptr;
+	if (!TestNotNull(TEXT("Cutting wand exists"), CuttingWand))
+	{
+		return false;
+	}
+
+	FMatterFluxContentRegistry TestRegistry = *Registry;
+	FMatterFluxWandDefinition TestWand = *CuttingWand;
+	TestWand.Id = TEXT("wand.double_cut_spawn_test");
+	TestWand.StarterDeck = {
+		TEXT("spell.double_cast"),
+		TEXT("spell.terrain_cut"),
+		TEXT("spell.vertical_terrain_cut"),
+		NAME_None
+	};
+	TestRegistry.Wands.Add(TestWand.Id, TestWand);
+	const TArray<TArray<FName>> WorkbenchDeckVariants = {
+		{ TEXT("spell.double_cast"), TEXT("spell.terrain_cut"),
+			TEXT("spell.vertical_terrain_cut"), NAME_None },
+		{ TEXT("spell.double_cast"), TEXT("spell.vertical_terrain_cut"),
+			TEXT("spell.terrain_cut"), NAME_None },
+		{ TEXT("std.double_cast"), TEXT("spell.terrain_cut"),
+			TEXT("spell.vertical_terrain_cut"), NAME_None },
+		{ TEXT("std.double_cast"), TEXT("spell.vertical_terrain_cut"),
+			TEXT("spell.terrain_cut"), NAME_None }
+	};
+	for (int32 VariantIndex = 0;
+		VariantIndex < WorkbenchDeckVariants.Num();
+		++VariantIndex)
+	{
+		FMatterFluxWandProgramState VariantState;
+		VariantState.Mana = TestWand.ManaMax;
+		FMatterFluxWandCastPlan VariantPlan;
+		Error.Reset();
+		if (TestTrue(
+			*FString::Printf(TEXT("Workbench double-cut variant %d compiles"),
+				VariantIndex),
+			FMatterFluxWandProgram::Evaluate(
+				TestRegistry,
+				TestWand.Id,
+				WorkbenchDeckVariants[VariantIndex],
+				VariantState,
+				20260825 + VariantIndex,
+				VariantPlan,
+				Error)))
+		{
+			TestEqual(
+				*FString::Printf(
+					TEXT("Workbench double-cut variant %d emits both cuts"),
+					VariantIndex),
+				VariantPlan.Projectiles.Num(),
+				2);
+		}
+		else
+		{
+			AddError(Error);
+		}
+	}
+
+	FMatterFluxWandProgramState State;
+	State.Mana = TestWand.ManaMax;
+	FMatterFluxWandCastPlan Plan;
+	if (!TestTrue(TEXT("Double-cut program compiles"),
+		FMatterFluxWandProgram::Evaluate(
+			TestRegistry,
+			TestWand.Id,
+			TestWand.StarterDeck,
+			State,
+			20260825,
+			Plan,
+			Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	TestTrue(TEXT("Double-cut program consumes mana"), Plan.ManaSpent > 0.0f);
+	TestEqual(TEXT("Double-cut program emits two root projectiles"),
+		Plan.Projectiles.Num(), 2);
+
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxCharacter* Avatar = World
+		? World->SpawnActor<AMatterFluxCharacter>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Caster character spawns"), Avatar)
+		|| !TestTrue(TEXT("Double-cut cast plan spawns"),
+			UGA_CastWand::SpawnCastPlan(*Avatar, Plan, 20260825)))
+	{
+		return false;
+	}
+
+	TArray<AMatterFluxMagicProjectile*> DoubleCutProjectiles;
+	for (TActorIterator<AMatterFluxMagicProjectile> It(World); It; ++It)
+	{
+		const FName SpellId = It->GetPresentation().SpellId;
+		if (SpellId == TEXT("spell.terrain_cut")
+			|| SpellId == TEXT("spell.vertical_terrain_cut"))
+		{
+			DoubleCutProjectiles.Add(*It);
+		}
+	}
+	TestEqual(TEXT("Both cut actors exist immediately after spawning"),
+		DoubleCutProjectiles.Num(), 2);
+	if (DoubleCutProjectiles.Num() == 2)
+	{
+		TestTrue(TEXT("First cut ignores its sibling projectile while moving"),
+			DoubleCutProjectiles[0]->Collision->GetMoveIgnoreActors().Contains(
+				DoubleCutProjectiles[1]));
+		TestTrue(TEXT("Second cut ignores its sibling projectile while moving"),
+			DoubleCutProjectiles[1]->Collision->GetMoveIgnoreActors().Contains(
+				DoubleCutProjectiles[0]));
+	}
+	for (AMatterFluxMagicProjectile* Projectile : DoubleCutProjectiles)
+	{
+		if (!Projectile->HasActorBegunPlay())
+		{
+			Projectile->DispatchBeginPlay();
+		}
+		Projectile->Tick(0.016f);
+	}
+	int32 SurvivingProjectiles = 0;
+	for (AMatterFluxMagicProjectile* Projectile : DoubleCutProjectiles)
+	{
+		SurvivingProjectiles += IsValid(Projectile)
+			&& !Projectile->IsActorBeingDestroyed();
+	}
+	TestEqual(TEXT("Horizontal and vertical cuts both survive their first frame"),
+		SurvivingProjectiles, 2);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxCutProjectileImpactShapeTest,
-	"MatterFlux.Magic.Projectile.CutImpactIsSingleCellLine",
+	"MatterFlux.Magic.Projectile.CutImpactUsesSingleCellLine",
 	EAutomationTestFlags::EditorContext
 		| EAutomationTestFlags::ProductFilter)
 
@@ -1515,14 +2106,18 @@ bool FMatterFluxCutProjectileImpactShapeTest::RunTest(
 		Horizontal.Type, EFragmentDamageShapeType::Line);
 	TestEqual(TEXT("Vertical cut uses a line shape"),
 		Vertical.Type, EFragmentDamageShapeType::Line);
+	TestTrue(TEXT("Horizontal cut requests source-resolution single-line rasterization"),
+		Horizontal.bSingleCellLine);
+	TestTrue(TEXT("Vertical cut requests source-resolution single-line rasterization"),
+		Vertical.bSingleCellLine);
 	TestTrue(TEXT("Horizontal cut spans the projectile diameter"),
 		FMath::IsNearlyEqual(Horizontal.Extents.X, 120.0f));
 	TestTrue(TEXT("Vertical cut spans the projectile diameter"),
 		FMath::IsNearlyEqual(Vertical.Extents.X, 120.0f));
-	TestTrue(TEXT("Horizontal cut is no thicker than one material cell"),
-		Horizontal.Thickness <= 10.0f);
-	TestTrue(TEXT("Vertical cut is no thicker than one material cell"),
-		Vertical.Thickness <= 10.0f);
+	TestTrue(TEXT("Horizontal cut is exactly one material cell thick"),
+		FMath::IsNearlyEqual(Horizontal.Thickness, 10.0f));
+	TestTrue(TEXT("Vertical cut is exactly one material cell thick"),
+		FMath::IsNearlyEqual(Vertical.Thickness, 10.0f));
 	TestTrue(TEXT("Horizontal cut runs along world right"),
 		FMath::Abs(FVector::DotProduct(
 			Horizontal.WorldTransform.GetUnitAxis(EAxis::X),
@@ -1572,9 +2167,9 @@ bool FMatterFluxCutProjectileImpactShapeTest::RunTest(
 		}
 		return RemovedCells;
 	};
-	TestEqual(TEXT("Horizontal cut removes exactly one 13-cell line"),
+	TestEqual(TEXT("Horizontal cut removes one 13-cell line"),
 		CountRemovedCells(FaceOnHorizontal), 13);
-	TestEqual(TEXT("Vertical cut removes exactly one 13-cell line"),
+	TestEqual(TEXT("Vertical cut removes one 13-cell line"),
 		CountRemovedCells(FaceOnVertical), 13);
 	return true;
 }
@@ -1745,18 +2340,24 @@ bool FMatterFluxMagicMaterialSpraySpellTest::RunTest(
 			Projectile->ResolveImpactAuthority(Hit));
 		TestTrue(TEXT("Impact retires the flight-only projectile state"),
 			Projectile->IsActorBeingDestroyed());
+		const bool bLiquidSpray = Expected.MaterialId == TEXT("water")
+			|| Expected.MaterialId == TEXT("acid");
+		// The surface world stores a full 128cm liquid column as 255. One
+		// authored 8cm material voxel therefore contributes 16 column units.
+		const int32 ExpectedAmountPerPayloadCell = bLiquidSpray ? 16 : 255;
 		TestEqual(TEXT("Spray conserves its authored material volume"),
 			MaterialWorld->GetSimulatedMaterialAmount(Expected.MaterialId)
 				- MaterialAmountBefore,
-			static_cast<int64>(Expected.MaterialAmount) * 255);
+			static_cast<int64>(Expected.MaterialAmount)
+				* ExpectedAmountPerPayloadCell);
 		const int32 DepositedCells =
 			MaterialWorld->GetSimulatedMaterialCount(Expected.MaterialId)
 				- MaterialCellsBefore;
-		if (Expected.MaterialId == TEXT("water")
-			|| Expected.MaterialId == TEXT("acid"))
+		if (bLiquidSpray)
 		{
-			TestTrue(TEXT("Liquid spray lands as a shallow connected splash"),
-				DepositedCells > Expected.MaterialAmount);
+			TestEqual(TEXT("Liquid spray deposits one shallow cell per payload voxel"),
+				DepositedCells,
+				Expected.MaterialAmount);
 		}
 		else
 		{
@@ -1770,7 +2371,7 @@ bool FMatterFluxMagicMaterialSpraySpellTest::RunTest(
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxMagicAcidCorrosionSpellTest,
-	"MatterFlux.Magic.Content.AcidSprayCorrodesSourcesAndEmitsGas",
+	"MatterFlux.Magic.Content.AcidSprayUsesConservedContactCorrosion",
 	EAutomationTestFlags::EditorContext
 		| EAutomationTestFlags::ProductFilter)
 
@@ -1793,12 +2394,11 @@ bool FMatterFluxMagicAcidCorrosionSpellTest::RunTest(
 	}
 	const FMatterFluxReactionDefinition* TerrainCorrosion =
 		Registry->Reactions.Find(TEXT("acid_stone_corrosion"));
-	const FMatterFluxReactionDefinition* SourceCorrosion =
+	const FMatterFluxReactionDefinition* PropagatingSourceCorrosion =
 		Registry->Reactions.Find(TEXT("wood_corrosion_acid"));
 	const FMatterFluxSpellDefinition* AcidSpell =
 		Registry->Spells.Find(TEXT("spell.acid_spray"));
 	if (!TestNotNull(TEXT("Acid corrodes stone terrain"), TerrainCorrosion)
-		|| !TestNotNull(TEXT("Acid corrodes wood sources"), SourceCorrosion)
 		|| !TestNotNull(TEXT("Acid spell is registered"), AcidSpell))
 	{
 		return false;
@@ -1808,13 +2408,12 @@ bool FMatterFluxMagicAcidCorrosionSpellTest::RunTest(
 	TestTrue(TEXT("Terrain corrosion is a contact reaction"),
 		TerrainCorrosion->Kind
 			== FMatterFluxReactionDefinition::EKind::Contact);
-	TestTrue(TEXT("Source corrosion propagates through the item"),
-		SourceCorrosion->Kind
-			== FMatterFluxReactionDefinition::EKind::Propagating);
-	TestEqual(TEXT("Source corrosion emits acid gas"),
-		SourceCorrosion->EmissionMaterial, FName(TEXT("acid_gas")));
-	TestEqual(TEXT("Corroded source cells leave no solid residue"),
-		SourceCorrosion->OutputA, FName(TEXT("empty")));
+	TestEqual(TEXT("Contact corrosion consumes the acid input"),
+		TerrainCorrosion->OutputA, FName(TEXT("empty")));
+	TestEqual(TEXT("Contact corrosion creates no replacement acid material"),
+		TerrainCorrosion->OutputB, FName(TEXT("empty")));
+	TestNull(TEXT("Acid has no fire-like source propagation rule"),
+		PropagatingSourceCorrosion);
 
 	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
 	AFragment2DSourceActor* Source = World
@@ -1840,17 +2439,18 @@ bool FMatterFluxMagicAcidCorrosionSpellTest::RunTest(
 	{
 		return false;
 	}
-	TestTrue(TEXT("Acid activates corrosion on an item source"),
+	TestFalse(TEXT("Acid cannot bypass material contact and activate a source directly"),
 		Source->ApplyMaterialStimulusAtWorldLocation(
 			Source->GetActorLocation()
 				+ FVector(0.0f, 0.0f, Mask.CellSize * 2.0f),
 			TEXT("acid"),
 			991));
-	TestTrue(TEXT("Acid source starts reacting"), Source->IsReacting());
+	TestFalse(TEXT("Direct acid stimulus never starts a propagating reaction"),
+		Source->IsReacting());
 	TArray<MatterFlux::Rendering::FMaterialEmissionAnchor> SmokeAnchors;
 	Source->GatherReactionSmokeAnchors(SmokeAnchors, 16);
-	TestTrue(TEXT("Active corrosion exposes smoke anchors"),
-		!SmokeAnchors.IsEmpty());
+	TestTrue(TEXT("Non-propagating corrosion exposes no source-wide anchors"),
+		SmokeAnchors.IsEmpty());
 	for (int32 Step = 0; Step < 5; ++Step)
 	{
 		Source->Tick(0.1f);
@@ -1880,8 +2480,8 @@ bool FMatterFluxMagicAcidCorrosionSpellTest::RunTest(
 		!CorrosionFlames || CorrosionFlames->GetInstanceCount() == 0);
 	TestTrue(TEXT("Corrosion does not illuminate wood like fire"),
 		!CorrosionFireLight || !CorrosionFireLight->IsVisible());
-	TestTrue(TEXT("Acid consumes source material"),
-		Source->GetRemainingInputCellCount() < Mask.SolidMask.Num());
+	TestEqual(TEXT("Direct acid stimulus cannot consume source material"),
+		Source->GetRemainingInputCellCount(), Mask.SolidMask.Num());
 
 	AFragment2DSourceActor* BurningSource =
 		World->SpawnActor<AFragment2DSourceActor>();
@@ -2007,7 +2607,6 @@ bool FMatterFluxMagicMaterialBodyProjectileTest::RunTest(
 		AddError(Error);
 		return false;
 	}
-
 	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
 	AActor* Avatar = World ? World->SpawnActor<AActor>() : nullptr;
 	if (!TestNotNull(TEXT("Authority avatar spawns"), Avatar)
@@ -2157,6 +2756,183 @@ bool FMatterFluxMagicProjectileMaterialImpactTest::RunTest(
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxMagicProjectileMaterialSweepTest,
+	"MatterFlux.Magic.MaterialProjectileStopsAtOccupiedMaterialColumns",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxMagicProjectileMaterialSweepTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(TEXT("Default material reactions load"),
+		Runtime.ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry = Runtime.GetActiveRegistry();
+	const FMatterFluxReactionDefinition* Extinguish = Registry.IsValid()
+		? Registry->Reactions.Find(TEXT("fire_water_extinguish"))
+		: nullptr;
+	if (!TestNotNull(TEXT("Water extinguishing is authored as contact chemistry"),
+		Extinguish))
+	{
+		return false;
+	}
+	TestTrue(TEXT("Water extinguishing uses the generic contact reaction kind"),
+		Extinguish->Kind == FMatterFluxReactionDefinition::EKind::Contact);
+	TestEqual(TEXT("Contact chemistry removes the incoming fire material"),
+		Extinguish->OutputA, FName(TEXT("empty")));
+
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* MaterialWorld = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Material world spawns"), MaterialWorld))
+	{
+		return false;
+	}
+	MaterialWorld->Regenerate(86420);
+
+	struct FContactCase
+	{
+		FName MaterialId;
+		float WorldY = 0.0f;
+		float HeightAboveSurface = 0.0f;
+		bool bConsumesIncomingFire = false;
+		bool bBlocksProjectiles = true;
+	};
+	const FContactCase Cases[] = {
+		{ TEXT("sand"), 0.0f, 4.0f, false },
+		{ TEXT("water"), 128.0f, 32.0f, true },
+		{ TEXT("smoke"), 256.0f, 4.0f, false, false }
+	};
+
+	for (int32 CaseIndex = 0; CaseIndex < UE_ARRAY_COUNT(Cases); ++CaseIndex)
+	{
+		const FContactCase& ContactCase = Cases[CaseIndex];
+		float SurfaceZ = 0.0f;
+		const FVector ContactXY(0.0f, ContactCase.WorldY, 0.0f);
+		if (!TestTrue(TEXT("Material contact has terrain support"),
+			MaterialWorld->TrySampleTerrainHeightAtWorldLocation(
+				ContactXY,
+				SurfaceZ)))
+		{
+			continue;
+		}
+		for (int32 X = -48; X <= 48; X += 8)
+		{
+			MaterialWorld->SetSimulatedMaterialAtWorldLocation(
+				FVector(static_cast<float>(X), ContactCase.WorldY, SurfaceZ),
+				NAME_None);
+		}
+		const FVector ContactLocation(
+			0.0f,
+			ContactCase.WorldY,
+			SurfaceZ + ContactCase.HeightAboveSurface);
+		if (!TestTrue(TEXT("Blocking material column is seeded"),
+			MaterialWorld->SetSimulatedMaterialAtWorldLocation(
+				ContactLocation,
+				ContactCase.MaterialId)))
+		{
+			continue;
+		}
+
+		FMatterFluxMagicProjectilePlan CutPlan;
+		CutPlan.SpellId = *FString::Printf(
+			TEXT("spell.cut_sweep_%d"), CaseIndex);
+		CutPlan.Speed = 1600.0f;
+		CutPlan.Lifetime = 1.0f;
+		CutPlan.Radius = 4.0f;
+		CutPlan.Damage = 12.0f;
+		CutPlan.bUsePlaneVisual = true;
+		const FVector Start = ContactLocation - FVector(32.0f, 0.0f, 0.0f);
+		const FVector End = ContactLocation + FVector(32.0f, 0.0f, 0.0f);
+		AMatterFluxMagicProjectile* CutProjectile =
+			World->SpawnActorDeferred<AMatterFluxMagicProjectile>(
+				AMatterFluxMagicProjectile::StaticClass(),
+				FTransform(Start),
+				nullptr,
+				nullptr,
+				ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+		if (TestNotNull(TEXT("Cut particle projectile spawns"), CutProjectile))
+		{
+			CutProjectile->InitializeProjectile(
+				CutPlan,
+				600 + CaseIndex);
+			CutProjectile->FinishSpawning(FTransform(Start));
+			TestTrue(TEXT("Every particle projectile keeps contact sweeping active"),
+				CutProjectile->IsActorTickEnabled());
+			CutProjectile->SetActorLocation(
+				End,
+				false,
+				nullptr,
+				ETeleportType::TeleportPhysics);
+			CutProjectile->Tick(0.016f);
+			TestEqual(*FString::Printf(
+				TEXT("%s column has the authored cut-projectile blocking state"),
+				*ContactCase.MaterialId.ToString()),
+				CutProjectile->IsActorBeingDestroyed(),
+				ContactCase.bBlocksProjectiles);
+			if (!CutProjectile->IsActorBeingDestroyed())
+			{
+				CutProjectile->Destroy();
+			}
+		}
+
+		FMatterFluxMagicProjectilePlan Plan;
+		Plan.SpellId = *FString::Printf(
+			TEXT("spell.material_sweep_%d"), CaseIndex);
+		Plan.Speed = 1600.0f;
+		Plan.Lifetime = 1.0f;
+		Plan.Radius = 4.0f;
+		Plan.BodyMaterial = TEXT("fire");
+		Plan.MaterialAmount = 1;
+		AMatterFluxMagicProjectile* Projectile =
+			World->SpawnActorDeferred<AMatterFluxMagicProjectile>(
+				AMatterFluxMagicProjectile::StaticClass(),
+				FTransform(Start),
+				nullptr,
+				nullptr,
+				ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+		if (!TestNotNull(TEXT("Material projectile spawns"), Projectile))
+		{
+			continue;
+		}
+		Projectile->InitializeProjectile(Plan, 700 + CaseIndex);
+		Projectile->FinishSpawning(FTransform(Start));
+		TestTrue(TEXT("Physical objects block material projectiles"),
+			Projectile->Collision->GetCollisionResponseToChannel(ECC_WorldDynamic)
+				== ECR_Block);
+
+		const int64 FireAmountBefore =
+			MaterialWorld->GetSimulatedMaterialAmount(TEXT("fire"));
+		Projectile->SetActorLocation(End, false, nullptr, ETeleportType::TeleportPhysics);
+		Projectile->Tick(0.016f);
+		TestEqual(*FString::Printf(
+			TEXT("%s column has the authored material-projectile blocking state"),
+			*ContactCase.MaterialId.ToString()),
+			Projectile->IsActorBeingDestroyed(),
+			ContactCase.bBlocksProjectiles);
+		if (ContactCase.bConsumesIncomingFire)
+		{
+			MaterialWorld->Tick(0.1f);
+			TestEqual(TEXT("Water contact consumes incoming fire through chemistry"),
+				MaterialWorld->GetSimulatedMaterialAmount(TEXT("fire")),
+				FireAmountBefore);
+		}
+		if (!Projectile->IsActorBeingDestroyed())
+		{
+			Projectile->Destroy();
+		}
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxMagicInventoryEditRulesTest,
 	"MatterFlux.Magic.InventoryEditsPreserveOwnershipAndRejectInvalidInput",
 	EAutomationTestFlags::EditorContext
@@ -2187,8 +2963,42 @@ bool FMatterFluxMagicInventoryEditRulesTest::RunTest(
 	Wand.DefinitionId = TEXT("wand.apprentice");
 	Wand.SpellSlots.Init(NAME_None, 8);
 	TArray<FGuid> Equipped;
-	Equipped.Init(FGuid(), 4);
+	Equipped.Init(FGuid(), UGA_CastWand::EquipmentSlotCount);
 	int32 ActiveSlot = 0;
+	constexpr int32 SpaceEquipmentSlot = 4;
+
+	FMatterFluxMagicEdit EquipOnSpace;
+	EquipOnSpace.Type = EMatterFluxMagicEditType::EquipWand;
+	EquipOnSpace.WandId = Wand.InstanceId;
+	EquipOnSpace.EquipmentSlot = SpaceEquipmentSlot;
+	TestTrue(
+		TEXT("Workbench-style wand drop equips the Space slot"),
+		FMatterFluxMagicInventoryRules::ApplyEdit(
+			*Registry,
+			Spells,
+			Wands,
+			Equipped,
+			ActiveSlot,
+			EquipOnSpace,
+			Error));
+	TestEqual(TEXT("Space slot contains the dropped wand"),
+		Equipped[SpaceEquipmentSlot], Wand.InstanceId);
+
+	FMatterFluxMagicEdit SelectSpace;
+	SelectSpace.Type = EMatterFluxMagicEditType::SelectEquipmentSlot;
+	SelectSpace.EquipmentSlot = SpaceEquipmentSlot;
+	TestTrue(
+		TEXT("Workbench can select the Space equipment slot for editing"),
+		FMatterFluxMagicInventoryRules::ApplyEdit(
+			*Registry,
+			Spells,
+			Wands,
+			Equipped,
+			ActiveSlot,
+			SelectSpace,
+			Error));
+	TestEqual(TEXT("Space slot becomes the active wand slot"),
+		ActiveSlot, SpaceEquipmentSlot);
 
 	FMatterFluxMagicEdit Assign;
 	Assign.Type = EMatterFluxMagicEditType::AssignSpell;
@@ -2196,7 +3006,7 @@ bool FMatterFluxMagicInventoryEditRulesTest::RunTest(
 	Assign.SpellId = Stack.SpellId;
 	Assign.ToSpellSlot = 0;
 	TestTrue(
-		TEXT("Owned spell can be assigned"),
+		TEXT("Spell can be assigned to the wand equipped on Space"),
 		FMatterFluxMagicInventoryRules::ApplyEdit(
 			*Registry,
 			Spells,

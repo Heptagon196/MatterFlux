@@ -45,6 +45,9 @@ struct MATTERFLUX_API FMatterFluxMagicProjectilePresentation
 	FName BodyMaterial;
 
 	UPROPERTY()
+	int32 MaterialAmount = 1;
+
+	UPROPERTY()
 	bool bUsePlaneVisual = false;
 
 	UPROPERTY()
@@ -96,7 +99,9 @@ public:
 private:
 	void ApplyPresentation();
 	void BuildMaterialBodyPresentation(float Radius);
-	void ReleaseMaterialBodyAtWorldLocation(const FVector& WorldLocation);
+	void ReleaseMaterialBodyAtWorldLocation(
+		const FVector& WorldLocation,
+		AActor* ImpactActor = nullptr);
 	void ApplyWorldImpact(const FHitResult& Hit);
 	void SpawnTriggerPayload(
 		TConstArrayView<FMatterFluxMagicProjectilePlan> Payload,
@@ -128,5 +133,8 @@ private:
 	int32 ServerEventSeed = 0;
 	bool bImpactHandled = false;
 	bool bOrbitInitialized = false;
+	bool bHasPreviousMaterialSweepLocation = false;
 	FVector OrbitCenter = FVector::ZeroVector;
+	FVector MaterialSweepOriginLocation = FVector::ZeroVector;
+	FVector PreviousMaterialSweepLocation = FVector::ZeroVector;
 };

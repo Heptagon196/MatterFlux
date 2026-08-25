@@ -16,7 +16,7 @@
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxPlayerStatusHudProjectionTest,
-	"MatterFlux.UI.PlayerStatusHudProjectsHealthAndFourWandSlots",
+	"MatterFlux.UI.PlayerStatusHudProjectsHealthAndFiveWandSlots",
 	EAutomationTestFlags::EditorContext
 		| EAutomationTestFlags::ProductFilter)
 
@@ -32,7 +32,7 @@ bool FMatterFluxPlayerStatusHudProjectionTest::RunTest(
 
 	const FMatterFluxPlayerStatusSnapshot Snapshot =
 		UMatterFluxPlayerStatusWidget::BuildStatusSnapshot(PlayerStateCDO);
-	TestEqual(TEXT("HUD always exposes four wand slots"),
+	TestEqual(TEXT("HUD always exposes five wand slots"),
 		Snapshot.Wands.Num(),
 		UMatterFluxPlayerStatusWidget::WandSlotCount);
 	TestTrue(TEXT("Health is finite"), FMath::IsFinite(Snapshot.Health));
@@ -41,6 +41,8 @@ bool FMatterFluxPlayerStatusHudProjectionTest::RunTest(
 	TestTrue(TEXT("Health remains inside its display range"),
 		Snapshot.Health >= 0.0f
 			&& Snapshot.Health <= Snapshot.MaxHealth);
+	const TArray<FString> ExpectedLabels = {
+		TEXT("左键"), TEXT("右键"), TEXT("Q"), TEXT("E"), TEXT("空格") };
 	for (int32 SlotIndex = 0; SlotIndex < Snapshot.Wands.Num(); ++SlotIndex)
 	{
 		const FMatterFluxPlayerStatusWandView& Wand =
@@ -48,6 +50,14 @@ bool FMatterFluxPlayerStatusHudProjectionTest::RunTest(
 		TestFalse(
 			*FString::Printf(TEXT("Wand row %d has a label"), SlotIndex),
 			Wand.Label.IsEmpty());
+		if (ExpectedLabels.IsValidIndex(SlotIndex))
+		{
+			TestEqual(
+				*FString::Printf(
+					TEXT("Wand row %d only shows its input"), SlotIndex),
+				Wand.Label.ToString(),
+				ExpectedLabels[SlotIndex]);
+		}
 		TestTrue(
 			*FString::Printf(TEXT("Wand row %d mana is finite"), SlotIndex),
 			FMath::IsFinite(Wand.Mana)

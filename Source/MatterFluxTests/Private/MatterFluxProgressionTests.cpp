@@ -1,12 +1,14 @@
 #include "Misc/AutomationTest.h"
 #include "AbilitySystemComponent.h"
 #include "Game/MatterFluxPlayerState.h"
+#include "GAS/GA_CastWand.h"
 #include "GAS/MatterFluxPlayerAttributeSet.h"
 #include "IMatterFluxScriptRuntime.h"
 #include "Magic/MatterFluxMagicInventoryComponent.h"
 #include "Progression/MatterFluxProgressionComponent.h"
 #include "Save/MatterFluxSaveTypes.h"
 #include "Tests/AutomationEditorCommon.h"
+#include "UI/MatterFluxShellWidget.h"
 
 namespace MatterFluxProgressionTests
 {
@@ -105,6 +107,39 @@ namespace MatterFluxProgressionTests
 			return State.QuestId == Id;
 		});
 	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxFreeModeProgressionTest,
+	"MatterFlux.Progression.FreeModeStartsWithoutStoryQuests",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxFreeModeProgressionTest::RunTest(const FString& Parameters)
+{
+	using namespace MatterFluxProgressionTests;
+	(void)Parameters;
+	const FMatterFluxContentRegistry Registry = BuildRegistry();
+	FMatterFluxProgressionEvaluationContext Context;
+	Context.EquippedWands.SetNum(4);
+	Context.EquippedSpellsBySlot.SetNum(4);
+	TArray<FMatterFluxItemStack> Items;
+	TArray<FMatterFluxQuestState> Quests;
+	FName SelectedQuest;
+	FMatterFluxProgressionEffects Effects;
+	FString Error;
+	if (!TestTrue(TEXT("Free-mode progression builds"),
+		FMatterFluxProgressionRules::BuildFreeModeState(
+			Registry, Context, Items, Quests, SelectedQuest, Effects, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	TestEqual(TEXT("Free mode keeps starter items"), Items.Num(), 1);
+	TestTrue(TEXT("Free mode has no story quests"), Quests.IsEmpty());
+	TestTrue(TEXT("Free mode selects no story quest"), SelectedQuest.IsNone());
+	TestTrue(TEXT("Free mode grants no quest activation rewards"),
+		Effects.Rewards.IsEmpty());
+	return true;
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -300,6 +335,72 @@ bool FMatterFluxProgressionHotReloadGraphTest::RunTest(
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxShellCoinQuantityTest,
+	"MatterFlux.UI.TopBarTracksOwnedCoins",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxShellCoinQuantityTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	FString Error;
+	if (!TestTrue(TEXT("Default content reloads for top-bar currency"),
+		IMatterFluxScriptRuntime::Get().ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayerState* PlayerState = World
+		? World->SpawnActor<AMatterFluxPlayerState>() : nullptr;
+	UMatterFluxProgressionComponent* Progression = PlayerState
+		? PlayerState->GetProgression() : nullptr;
+	if (!TestNotNull(TEXT("Player state exists for top-bar currency"),
+		PlayerState)
+		|| !TestNotNull(TEXT("Progression exists for top-bar currency"),
+			Progression))
+	{
+		return false;
+	}
+
+	int32 ChangeCount = 0;
+	const FDelegateHandle ChangeHandle =
+		Progression->OnProgressionChanged().AddLambda(
+			[&ChangeCount]() { ++ChangeCount; });
+	FMatterFluxProgressionSaveState State;
+	State.Revision = 1;
+	FMatterFluxSavedItemStack& Coin = State.Items.AddDefaulted_GetRef();
+	Coin.ItemId = TEXT("std.coin");
+	Coin.Quantity = 7;
+	if (!TestTrue(TEXT("Seven owned coins restore"),
+		Progression->RestoreSaveStateAuthority(State, Error)))
+	{
+		AddError(Error);
+		Progression->OnProgressionChanged().Remove(ChangeHandle);
+		return false;
+	}
+	TestEqual(TEXT("Top bar reads all owned coins"),
+		UMatterFluxShellWidget::ResolveOwnedCoinQuantity(PlayerState), 7);
+
+	Coin.Quantity = 3;
+	State.Revision = 2;
+	TestTrue(TEXT("Spent coin state restores"),
+		Progression->RestoreSaveStateAuthority(State, Error));
+	TestEqual(TEXT("Top bar follows a lower coin balance"),
+		UMatterFluxShellWidget::ResolveOwnedCoinQuantity(PlayerState), 3);
+
+	State.Items.Reset();
+	State.Revision = 3;
+	TestTrue(TEXT("Empty coin state restores"),
+		Progression->RestoreSaveStateAuthority(State, Error));
+	TestEqual(TEXT("Top bar shows zero without a coin stack"),
+		UMatterFluxShellWidget::ResolveOwnedCoinQuantity(PlayerState), 0);
+	TestEqual(TEXT("Each restored balance broadcasts a UI refresh event"),
+		ChangeCount, 3);
+	Progression->OnProgressionChanged().Remove(ChangeHandle);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxProgressionAuthorityComponentTest,
 	"MatterFlux.Progression.AuthorityComponentItemAndSaveTransaction",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
@@ -461,8 +562,11 @@ bool FMatterFluxProgressionMagicEffectsTransactionTest::RunTest(
 		AddError(Error);
 		return false;
 	}
-	TestEqual(TEXT("Starter loadout includes four bound and two unbound casters"),
+	TestEqual(TEXT("Starter loadout includes five bound and one unbound caster"),
 		Inventory->GetOwnedWands().Num(), 6);
+	TestEqual(TEXT("Starter loadout exposes five equipment keys"),
+		Inventory->GetEquippedWands().Num(),
+		UGA_CastWand::EquipmentSlotCount);
 	TestTrue(TEXT("PaperMagic default wand starts owned"),
 		Inventory->GetOwnedWands().ContainsByPredicate(
 			[](const FMatterFluxOwnedWand& Wand)
@@ -475,6 +579,20 @@ bool FMatterFluxProgressionMagicEffectsTransactionTest::RunTest(
 			{
 				return Wand.DefinitionId == TEXT("std.default_shoe");
 			}));
+	const FGuid SpaceWandId = Inventory->GetEquippedWandId(4);
+	const FMatterFluxOwnedWand* SpaceWand = Inventory->FindWand(SpaceWandId);
+	if (TestNotNull(TEXT("Space starts with an equipped wand"), SpaceWand))
+	{
+		TestEqual(TEXT("Space uses the shoe caster"),
+			SpaceWand->DefinitionId, FName(TEXT("std.default_shoe")));
+		TestEqual(TEXT("Space caster has one slot"),
+			SpaceWand->SpellSlots.Num(), 1);
+		if (SpaceWand->SpellSlots.Num() == 1)
+		{
+			TestEqual(TEXT("Space caster starts with jump"),
+				SpaceWand->SpellSlots[0], FName(TEXT("std.jump")));
+		}
+	}
 
 	FMatterFluxMagicInventorySaveState DrainedState;
 	if (!TestTrue(TEXT("Magic inventory snapshot captures"),
@@ -536,6 +654,97 @@ bool FMatterFluxProgressionMagicEffectsTransactionTest::RunTest(
 		Inventory->GetOwnedSpells().Num(), BeforeSpellCount);
 	TestEqual(TEXT("Rejected batch does not add wands"),
 		Inventory->GetOwnedWands().Num(), BeforeWandCount);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxStoryInitialInventoryTest,
+	"MatterFlux.Progression.StoryStartsEmptyThenGrantsOnlyTutorialLoadout",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxStoryInitialInventoryTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(TEXT("Default content reloads for story inventory"),
+		Runtime.ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayerState* PlayerState = World
+		? World->SpawnActor<AMatterFluxPlayerState>() : nullptr;
+	UMatterFluxMagicInventoryComponent* Inventory = PlayerState
+		? PlayerState->GetMagicInventory() : nullptr;
+	UMatterFluxProgressionComponent* Progression = PlayerState
+		? PlayerState->GetProgression() : nullptr;
+	if (!TestNotNull(TEXT("Story inventory exists"), Inventory)
+		|| !TestNotNull(TEXT("Story progression exists"), Progression))
+	{
+		return false;
+	}
+	if (!TestTrue(TEXT("Story magic inventory clears starter content"),
+		Inventory->ResetToEmptyLoadoutAuthority(Error))
+		|| !TestTrue(TEXT("Story progression activates from an empty item bag"),
+			Progression->ResetToStoryStateAuthority(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	TestTrue(TEXT("Story starts without ordinary items"),
+		Progression->GetItems().IsEmpty());
+	TestEqual(TEXT("Tutorial activation grants exactly one wand definition"),
+		Inventory->GetOwnedWands().Num(), 1);
+	TestEqual(TEXT("Tutorial activation grants exactly one spell stack"),
+		Inventory->GetOwnedSpells().Num(), 1);
+	if (Inventory->GetOwnedWands().Num() == 1)
+	{
+		TestEqual(TEXT("Tutorial wand is the default attack wand"),
+			Inventory->GetOwnedWands()[0].DefinitionId,
+			FName(TEXT("std.default")));
+	}
+	if (Inventory->GetOwnedSpells().Num() == 1)
+	{
+		TestEqual(TEXT("Tutorial spell is the default attack spell"),
+			Inventory->GetOwnedSpells()[0].SpellId,
+			FName(TEXT("std.default")));
+		TestEqual(TEXT("Tutorial grants one attack spell"),
+			Inventory->GetOwnedSpells()[0].Quantity, 1);
+	}
+	for (const FGuid Equipped : Inventory->GetEquippedWands())
+	{
+		TestFalse(TEXT("Tutorial rewards begin in the backpack"),
+			Equipped.IsValid());
+	}
+
+	FMatterFluxQuestRewardDefinition ShoeReward;
+	ShoeReward.Kind = EMatterFluxQuestRewardKind::Wand;
+	ShoeReward.ContentId = TEXT("std.default_shoe");
+	ShoeReward.Quantity = 1;
+	ShoeReward.EquipmentSlot = 4;
+	FMatterFluxQuestRewardDefinition JumpReward;
+	JumpReward.Kind = EMatterFluxQuestRewardKind::Spell;
+	JumpReward.ContentId = TEXT("std.jump");
+	JumpReward.Quantity = 1;
+	const TArray<FMatterFluxQuestRewardDefinition> CombatRewards = {
+		ShoeReward, JumpReward };
+	if (!TestTrue(TEXT("Combat rewards apply atomically"),
+		Inventory->ApplyQuestRewardsAuthority(CombatRewards, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	const FMatterFluxOwnedWand* Shoe = Inventory->FindWand(
+		Inventory->GetEquippedWandId(4));
+	if (TestNotNull(TEXT("Combat reward equips the leg wand"), Shoe))
+	{
+		TestEqual(TEXT("Leg reward uses the shoe caster"),
+			Shoe->DefinitionId, FName(TEXT("std.default_shoe")));
+		TestEqual(TEXT("Leg wand is immediately usable for jumping"),
+			Shoe->SpellSlots[0], FName(TEXT("std.jump")));
+	}
 	return true;
 }
 

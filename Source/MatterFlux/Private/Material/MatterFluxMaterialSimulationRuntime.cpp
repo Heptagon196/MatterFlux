@@ -257,10 +257,28 @@ namespace MatterFlux::Material
 	bool FSimulationRuntime::SeedSurface(
 		const TArray<FSeedCell>& SeedCells)
 	{
+		return SeedSurface(SeedCells, true);
+	}
+
+	bool FSimulationRuntime::SeedSurface(
+		const TArray<FSeedCell>& SeedCells,
+		const bool bFinalizeBaseline)
+	{
 		const bool bSeeded = MaterialWorld
-			&& MaterialWorld->SeedSurface(SeedCells);
+			&& MaterialWorld->SeedSurface(
+				SeedCells,
+				bFinalizeBaseline);
 		bReplicationDirty |= bSeeded;
 		return bSeeded;
+	}
+
+	void FSimulationRuntime::WakeSurfaceCells(
+		const TConstArrayView<FIntPoint> WorldCells)
+	{
+		if (MaterialWorld)
+		{
+			MaterialWorld->WakeSurfaceCells(WorldCells);
+		}
 	}
 
 	int32 FSimulationRuntime::DisplaceLiquids(
@@ -282,6 +300,17 @@ namespace MatterFlux::Material
 		const int32 Moved = MaterialWorld
 			? MaterialWorld->DisplaceLiquids(
 				Constraints, MaxSearchRadius)
+			: 0;
+		bReplicationDirty |= Moved > 0;
+		return Moved;
+	}
+
+	int32 FSimulationRuntime::DisplacePowders(
+		const TConstArrayView<FLiquidDisplacementConstraint> Constraints,
+		const int32 MaxSearchRadius)
+	{
+		const int32 Moved = MaterialWorld
+			? MaterialWorld->DisplacePowders(Constraints, MaxSearchRadius)
 			: 0;
 		bReplicationDirty |= Moved > 0;
 		return Moved;
@@ -323,6 +352,25 @@ namespace MatterFlux::Material
 				WorldCell,
 				MaterialId,
 				Amount);
+		bReplicationDirty |= bChanged;
+		return bChanged;
+	}
+
+	bool FSimulationRuntime::SetExternalSupportHeight(
+		const FIntPoint& WorldCell,
+		const int32 Height)
+	{
+		const bool bChanged = MaterialWorld.IsValid()
+			&& MaterialWorld->SetExternalSupportHeight(WorldCell, Height);
+		bReplicationDirty |= bChanged;
+		return bChanged;
+	}
+
+	bool FSimulationRuntime::ClearExternalSupportHeight(
+		const FIntPoint& WorldCell)
+	{
+		const bool bChanged = MaterialWorld.IsValid()
+			&& MaterialWorld->ClearExternalSupportHeight(WorldCell);
 		bReplicationDirty |= bChanged;
 		return bChanged;
 	}

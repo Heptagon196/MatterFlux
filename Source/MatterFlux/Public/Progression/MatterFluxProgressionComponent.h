@@ -178,6 +178,16 @@ public:
 		FMatterFluxProgressionEffects& OutEffects,
 		FString& OutError);
 
+	/** Keeps starter inventory while omitting every story quest and reward. */
+	static bool BuildFreeModeState(
+		const FMatterFluxContentRegistry& Registry,
+		const FMatterFluxProgressionEvaluationContext& Context,
+		TArray<FMatterFluxItemStack>& Items,
+		TArray<FMatterFluxQuestState>& Quests,
+		FName& SelectedQuest,
+		FMatterFluxProgressionEffects& OutEffects,
+		FString& OutError);
+
 	static bool AddItem(
 		const FMatterFluxContentRegistry& Registry,
 		TArray<FMatterFluxItemStack>& Items,
@@ -246,6 +256,10 @@ public:
 		const FMatterFluxQuestEvent& Event,
 		FString& OutError);
 	bool ResetToStarterStateAuthority(FString& OutError);
+	/** Starts story quests and their magic rewards without starter items. */
+	bool ResetToStoryStateAuthority(FString& OutError);
+	bool ResetToFreeModeStateAuthority(FString& OutError);
+	bool ClearStoryQuestsAuthority(FString& OutError);
 	bool CaptureSaveState(
 		FMatterFluxProgressionSaveState& OutState,
 		FString& OutError) const;

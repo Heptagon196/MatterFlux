@@ -16,5 +16,4 @@ creature.define({
 		locomotion = { speed = 0 },
 		root = ai.action("passive"),
 	})
-	ai.spawn_on_quest(nil, 1, 340)
 end)

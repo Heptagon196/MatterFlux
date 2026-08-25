@@ -25,9 +25,21 @@ struct MATTERFLUX_API FMatterFluxMagicDragPayload
 	int32 SpellSlot = INDEX_NONE;
 };
 
+/** 法术编辑页中一个法杖穿戴槽的稳定展示数据。 */
+struct MATTERFLUX_API FMatterFluxMagicEquipmentSlotPresentation
+{
+	int32 SlotIndex = INDEX_NONE;
+	FString KeyLabel;
+	FString KeyBadge;
+};
+
 class MATTERFLUX_API FMatterFluxMagicWorkbenchInteraction
 {
 public:
+	/** 生成全部法杖穿戴槽；数量始终跟随施法系统的槽位定义。 */
+	static void BuildEquipmentSlotPresentations(
+		TArray<FMatterFluxMagicEquipmentSlotPresentation>& OutSlots);
+
 	/** 所有法术背包、法术树、备用区和拖拽图标共用的外框尺寸。 */
 	static FVector2D GetSpellSlotSize();
 

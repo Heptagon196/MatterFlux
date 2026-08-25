@@ -63,6 +63,14 @@ struct MATTERFLUX_API FFragmentDamageShape
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Fragment")
 	float Thickness = 20.0f;
+
+	/**
+	 * Rasterize a line as one connected material-cell path in every target
+	 * Source, independent of that Source's authored cell size. Thickness then
+	 * remains a conservative world-query width instead of a damage-band width.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Fragment")
+	bool bSingleCellLine = false;
 };
 
 USTRUCT(BlueprintType)

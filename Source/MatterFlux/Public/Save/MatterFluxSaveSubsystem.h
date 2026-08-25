@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/GameInstanceSubsystem.h"
+#include "TimerManager.h"
 #include "Save/MatterFluxSaveTypes.h"
 #include "MatterFluxSaveSubsystem.generated.h"
 
@@ -37,6 +38,10 @@ public:
 	virtual void Deinitialize() override;
 
 	bool RequestNewGame(APlayerController* Controller, int32 Seed = 0);
+	bool RequestStoryGame(
+		APlayerController* Controller,
+		FName CustomMapId,
+		int32 Seed = 1);
 	bool RequestSave(APlayerController* Controller, int32 SlotIndex);
 	bool RequestLoad(APlayerController* Controller, int32 SlotIndex);
 	bool RequestDuplicate(int32 SourceSlotIndex);
@@ -66,6 +71,12 @@ public:
 	static float MapWorldGenerationProgress(
 		float WorldProgress,
 		bool bLoadingSave);
+	static float MapWorldInitializationProgress(
+		int32 PendingTerrainWork,
+		int32 MaximumTerrainWork,
+		int32 PendingPopulationWork,
+		int32 MaximumPopulationWork,
+		float PreviousProgress);
 	static float GetApplyingWorldProgress();
 	static bool IsDeterminateOperation(
 		EMatterFluxSaveOperation InOperation);
@@ -76,6 +87,7 @@ private:
 	{
 		None,
 		NewGame,
+		StoryGame,
 		LoadGame
 	};
 
@@ -94,6 +106,11 @@ private:
 		int32 Seed,
 		EPendingGenerationPurpose Purpose,
 		bool bForceExactSeed);
+	bool StartCustomMapLoad(
+		APlayerController* Controller,
+		FName CustomMapId,
+		int32 Seed,
+		EPendingGenerationPurpose Purpose);
 	void FinishOperation(bool bSuccess, const FString& Message);
 	void HandleAsyncSaveComplete(
 		const FString& SlotName,
@@ -114,6 +131,9 @@ private:
 	void HandleWorldGenerationFinished(
 		bool bSuccess,
 		const FString& Message);
+	void BeginWaitingForWorldInitialization();
+	void PollWorldInitialization();
+	void ResetWorldInitializationProgress();
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMatterFluxSaveMetadata> Metadata;
@@ -124,6 +144,7 @@ private:
 	TWeakObjectPtr<APlayerController> PendingController;
 	TWeakObjectPtr<AMatterFluxPlayableWorldActor> PendingWorld;
 	FDelegateHandle WorldGenerationHandle;
+	FTimerHandle WorldInitializationTimer;
 	EMatterFluxSaveOperation Operation = EMatterFluxSaveOperation::Idle;
 	EPendingGenerationPurpose PendingGenerationPurpose =
 		EPendingGenerationPurpose::None;
@@ -131,6 +152,8 @@ private:
 	int32 DuplicateDestinationSlotIndex = INDEX_NONE;
 	FString PendingDuplicateDisplayName;
 	float OperationProgress = 0.0f;
+	int32 MaximumPendingTerrainInitializationWork = 0;
+	int32 MaximumPendingPopulationInitializationWork = 0;
 	FString OperationStatus;
 	FString LastResultMessage;
 	FOnMatterFluxSaveOperationChanged OperationChanged;

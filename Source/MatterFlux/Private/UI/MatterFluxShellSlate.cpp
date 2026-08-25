@@ -12,6 +12,8 @@
 #include "UI/MatterFluxPaperStyle.h"
 #include "UI/MatterFluxPaperWindow.h"
 #include "UI/MatterFluxSettingsPanel.h"
+#include "Brushes/SlateDynamicImageBrush.h"
+#include "Misc/Paths.h"
 #include "Styling/CoreStyle.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SEditableText.h"
@@ -20,6 +22,7 @@
 #include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Layout/SSeparator.h"
 #include "Widgets/SBoxPanel.h"
+#include "Widgets/Images/SImage.h"
 #include "Widgets/SOverlay.h"
 #include "Widgets/SNullWidget.h"
 #include "Widgets/Text/STextBlock.h"
@@ -170,6 +173,15 @@ namespace MatterFluxShellUI
 		void Construct(const FArguments& Args)
 		{
 			OwnerWidget = Args._OwnerWidget;
+			const FString BackgroundPath = FPaths::Combine(
+				FPaths::ProjectContentDir(),
+				TEXT("UI/TitleBackgroundSeed1337.png"));
+			if (FPaths::FileExists(BackgroundPath))
+			{
+				TitleBackgroundBrush = MakeShared<FSlateDynamicImageBrush>(
+					FName(*BackgroundPath),
+					FVector2D(1707.0f, 1019.0f));
+			}
 			Refresh();
 		}
 
@@ -188,6 +200,14 @@ namespace MatterFluxShellUI
 				return SNullWidget::NullWidget;
 			}
 			TSharedRef<SOverlay> Root = SNew(SOverlay);
+			if (Owner->IsStartMenuOpen() && TitleBackgroundBrush.IsValid())
+			{
+				Root->AddSlot()
+				[
+					SNew(SImage)
+					.Image(TitleBackgroundBrush.Get())
+				];
+			}
 			if (Owner->IsMenuOpen())
 			{
 				const bool bUseWorkbenchFrame =
@@ -252,7 +272,34 @@ namespace MatterFluxShellUI
 				SNew(STextBlock)
 				.Text(FText::FromString(FString::Printf(TEXT("世界种子  %d"), Seed)))
 				.Font(Font(10))
-				.ColorAndOpacity(Muted)
+					.ColorAndOpacity(Muted)
+			];
+			TSharedRef<SHorizontalBox> CoinDisplay = SNew(SHorizontalBox);
+			CoinDisplay->AddSlot().AutoWidth().VAlign(VAlign_Center)
+			[
+				SNew(STextBlock)
+					.Text(FText::FromString(TEXT("金币")))
+					.Font(Font(10))
+					.ColorAndOpacity(Muted)
+			];
+			CoinDisplay->AddSlot().AutoWidth().VAlign(VAlign_Center)
+				.Padding(8.0f, 0.0f, 0.0f, 0.0f)
+			[
+				SNew(STextBlock)
+					.Text(FText::AsNumber(
+						Owner ? Owner->GetOwnedCoinQuantity() : 0))
+					.Font(Font(14, true))
+					.ColorAndOpacity(Ink)
+			];
+			Bar->AddSlot().AutoWidth().VAlign(VAlign_Center)
+				.Padding(4.0f, 0.0f, 10.0f, 0.0f)
+			[
+				SNew(SBox)
+					.WidthOverride(108.0f)
+					.HeightOverride(34.0f)
+					.HAlign(HAlign_Center)
+					.VAlign(VAlign_Center)
+					[Outline(CoinDisplay, FMargin(10.0f, 2.0f))]
 			];
 			if (Owner && !Owner->IsStartMenuOpen())
 			{
@@ -324,7 +371,9 @@ namespace MatterFluxShellUI
 				.Font(Font(10)).ColorAndOpacity(Muted)
 			];
 			Content->AddSlot().AutoHeight().Padding(0.0f, 4.0f)
-			[Button(TEXT("单人游戏"), [Owner]() { Owner->ShowSinglePlayerMenu(); return FReply::Handled(); }, TEXT("新建或载入本地世界"), true, 260.0f)];
+			[Button(TEXT("故事模式"), [Owner]() { Owner->RequestStoryMode(); return FReply::Handled(); }, TEXT("进入纸境序章，体验任务、商人与战斗流程"), true, 260.0f)];
+			Content->AddSlot().AutoHeight().Padding(0.0f, 4.0f)
+			[Button(TEXT("自由模式"), [Owner]() { Owner->ShowSinglePlayerMenu(); return FReply::Handled(); }, TEXT("生成随机地图，任务流程不会载入"), true, 260.0f)];
 			if (UMatterFluxShellWidget::IsMultiplayerEntryEnabled())
 			{
 				Content->AddSlot().AutoHeight().Padding(0.0f, 4.0f)
@@ -345,7 +394,7 @@ namespace MatterFluxShellUI
 			TSharedRef<SVerticalBox> Content = SNew(SVerticalBox);
 			Content->AddSlot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 16.0f)
 			[
-				SNew(STextBlock).Text(FText::FromString(TEXT("单人游戏")))
+				SNew(STextBlock).Text(FText::FromString(TEXT("自由模式")))
 					.Font(Font(20, true)).ColorAndOpacity(Ink)
 			];
 			Content->AddSlot().AutoHeight().Padding(0.0f, 4.0f)
@@ -808,6 +857,7 @@ namespace MatterFluxShellUI
 		}
 
 		TWeakObjectPtr<UMatterFluxShellWidget> OwnerWidget;
+		TSharedPtr<FSlateDynamicImageBrush> TitleBackgroundBrush;
 	};
 }
 

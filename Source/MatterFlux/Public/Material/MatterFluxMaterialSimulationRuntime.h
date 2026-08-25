@@ -80,10 +80,17 @@ namespace MatterFlux::Material
 			FIntPoint& OutPrimaryFocus,
 			FString& OutError);
 		bool SeedSurface(const TArray<FSeedCell>& SeedCells);
+		bool SeedSurface(
+			const TArray<FSeedCell>& SeedCells,
+			bool bFinalizeBaseline);
+		void WakeSurfaceCells(TConstArrayView<FIntPoint> WorldCells);
 		int32 DisplaceLiquids(
 			TConstArrayView<FIntPoint> OccupiedCells,
 			int32 MaxSearchRadius = 64);
 		int32 DisplaceLiquids(
+			TConstArrayView<FLiquidDisplacementConstraint> Constraints,
+			int32 MaxSearchRadius = 64);
+		int32 DisplacePowders(
 			TConstArrayView<FLiquidDisplacementConstraint> Constraints,
 			int32 MaxSearchRadius = 64);
 		void SetFocuses(TConstArrayView<FIntPoint> Focuses);
@@ -94,6 +101,10 @@ namespace MatterFlux::Material
 			const FIntPoint& WorldCell,
 			FName MaterialId,
 			uint16 Amount);
+		bool SetExternalSupportHeight(
+			const FIntPoint& WorldCell,
+			int32 Height);
+		bool ClearExternalSupportHeight(const FIntPoint& WorldCell);
 		FName GetMaterialAt(const FIntPoint& WorldCell) const;
 		bool TryGetCellSnapshot(
 			const FIntPoint& WorldCell,

@@ -13,6 +13,16 @@ namespace
 	constexpr float BlockedRecoveryDelaySeconds = 0.5f;
 }
 
+bool MatterFlux::Creatures::ShouldWaitForFirstSight(
+	const bool bWaitForFirstSight,
+	const bool bHasEverSeenTarget,
+	const bool bHasVisibleTarget)
+{
+	return bWaitForFirstSight
+		&& !bHasEverSeenTarget
+		&& !bHasVisibleTarget;
+}
+
 bool MatterFlux::Creatures::ShouldHoldCombatPosition(
 	const EMatterFluxCreatureRuntimeState State,
 	const bool bHasVisibleTarget,
@@ -48,6 +58,7 @@ void AMatterFluxCreatureAIController::OnPossess(APawn* InPawn)
 	RecoveryDirection = (Hash & 2u) == 0u ? 1.0f : -1.0f;
 	LastPatrolTurnTime = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
 	NextDecisionTime = -DBL_MAX;
+	bHasEverSeenTarget = false;
 	MovementTarget.Reset();
 	bMovementTargetVisible = false;
 	MovementState = EMatterFluxCreatureRuntimeState::Passive;
@@ -108,6 +119,19 @@ void AMatterFluxCreatureAIController::UpdateDecision(
 	{
 		VisibleTarget = nullptr;
 	}
+	if (MatterFlux::Creatures::ShouldWaitForFirstSight(
+		Definition.bWaitForFirstSight,
+		bHasEverSeenTarget,
+		VisibleTarget != nullptr))
+	{
+		RememberedTarget.Reset();
+		MovementTarget.Reset();
+		bMovementTargetVisible = false;
+		MovementState = EMatterFluxCreatureRuntimeState::Passive;
+		Creature.SetRuntimeStateAuthority(MovementState);
+		return;
+	}
+	bHasEverSeenTarget |= VisibleTarget != nullptr;
 	const bool bRemembers = RememberedTarget.IsValid()
 		&& Now - LastSeenTime <= Definition.TargetMemorySeconds;
 	if (!bRemembers) RememberedTarget.Reset();

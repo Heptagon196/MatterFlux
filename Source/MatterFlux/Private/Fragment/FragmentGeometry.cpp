@@ -385,6 +385,57 @@ namespace MatterFlux::FragmentGeometry
 				return false;
 			}
 		}
+		if (LocalDamageShape.Type == EFragmentDamageShapeType::Line
+			&& LocalDamageShape.bSingleCellLine)
+		{
+			// The spell describes an ideal zero-width segment. Rasterize that
+			// segment in the target Source's own grid instead of interpreting a
+			// world-space thickness as two or three rows on differently-authored
+			// materials. DDA produces one 8-connected cell path for horizontal,
+			// vertical and rotated Sources alike.
+			const float HalfLength = LocalDamageShape.Extents.X * 0.5f;
+			const FVector SegmentStart =
+				LocalDamageShape.WorldTransform.TransformPosition(
+					FVector(-HalfLength, 0.0f, 0.0f));
+			const FVector SegmentEnd =
+				LocalDamageShape.WorldTransform.TransformPosition(
+					FVector(HalfLength, 0.0f, 0.0f));
+			const auto ToGrid = [Width, Height, CellSize](const FVector& Point)
+			{
+				return FVector2D(
+					Point.X / CellSize + static_cast<float>(Width) * 0.5f - 0.5f,
+					Point.Z / CellSize + static_cast<float>(Height) * 0.5f - 0.5f);
+			};
+			const FVector2D StartGrid = ToGrid(SegmentStart);
+			const FVector2D EndGrid = ToGrid(SegmentEnd);
+			const FVector2D GridDelta = EndGrid - StartGrid;
+			const int32 StepCount = FMath::Max(
+				1,
+				FMath::CeilToInt(FMath::Max(
+					FMath::Abs(GridDelta.X),
+					FMath::Abs(GridDelta.Y))));
+			bool bChanged = false;
+			for (int32 Step = 0; Step <= StepCount; ++Step)
+			{
+				const FVector2D GridPoint = FMath::Lerp(
+					StartGrid,
+					EndGrid,
+					static_cast<float>(Step) / static_cast<float>(StepCount));
+				const int32 X = FMath::RoundToInt(GridPoint.X);
+				const int32 Y = FMath::RoundToInt(GridPoint.Y);
+				if (X < 0 || X >= Width || Y < 0 || Y >= Height)
+				{
+					continue;
+				}
+				const int32 Index = ToIndex(Width, X, Y);
+				if (Mask[Index] != 0)
+				{
+					Mask[Index] = 0;
+					bChanged = true;
+				}
+			}
+			return bChanged;
+		}
 		bool bChanged = false;
 		for (int32 Y = 0; Y < Height; ++Y)
 		{

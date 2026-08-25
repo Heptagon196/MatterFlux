@@ -1,5 +1,7 @@
 #include "Save/MatterFluxSaveGame.h"
 
+#include "MatterFluxContentTypes.h"
+
 namespace MatterFluxSaveValidation
 {
 	constexpr int32 MaximumInventoryEntries = 256;
@@ -7,7 +9,8 @@ namespace MatterFluxSaveValidation
 	constexpr int32 MaximumFragmentStates = 20000;
 	constexpr int32 MaximumMaskCells = 1024 * 1024;
 	constexpr int32 MaximumMaterialStateBytes = 1024 * 1024;
-	constexpr int32 EquipmentSlotCount = 4;
+	constexpr int32 EquipmentSlotCount =
+		MatterFlux::Magic::EquipmentSlotCount;
 
 	bool IsBinaryMask(const TArray<uint8>& Mask)
 	{
@@ -56,6 +59,7 @@ void UMatterFluxSaveGame::InitializeNew(const int32 InMapSeed)
 	SaveVersion = CurrentVersion;
 	SavedAtUtc = FDateTime::UtcNow();
 	MapSeed = FMath::Max(InMapSeed, 1);
+	CustomMapId = NAME_None;
 	PlayerTransform = FTransform::Identity;
 	MagicInventory = FMatterFluxMagicInventorySaveState();
 	MagicInventory.EquippedWands.SetNum(
@@ -80,8 +84,24 @@ bool UMatterFluxSaveGame::ValidateAndMigrate(FString& OutError)
 		// authoritative component to rebuild Lua-defined starter progression.
 		Progression = FMatterFluxProgressionSaveState();
 		Progression.Revision = 0;
-		SaveVersion = CurrentVersion;
 	}
+	if (SaveVersion <= 3)
+	{
+		// Version 4 turns Space from a hard-coded jump input into the fifth
+		// equipment key. Older valid inventories gain an empty slot; their owned
+		// wands and spells remain untouched.
+		if (MagicInventory.EquippedWands.Num() == 4)
+		{
+			MagicInventory.EquippedWands.SetNum(EquipmentSlotCount);
+		}
+	}
+	if (SaveVersion <= 4)
+	{
+		// Version 5 records whether a save belongs to the procedural free mode
+		// or to a Lua-authored story map. Older saves are all free-mode worlds.
+		CustomMapId = NAME_None;
+	}
+	SaveVersion = CurrentVersion;
 	if (MapSeed <= 0 || !PlayerTransform.IsValid())
 	{
 		OutError = TEXT("save has an invalid map seed or player transform");

@@ -10,6 +10,26 @@ namespace MatterFluxWandProgram
 	constexpr int32 MaximumCasterEffectsPerCast = 32;
 	constexpr int32 MaximumTriggerDepth = 4;
 
+	bool FitsExpandedProjectileBudget(
+		const TConstArrayView<FMatterFluxMagicProjectilePlan> Projectiles,
+		int32& InOutProjectileCount)
+	{
+		for (const FMatterFluxMagicProjectilePlan& Projectile : Projectiles)
+		{
+			if (++InOutProjectileCount > MaximumProjectilesPerCast
+				|| !FitsExpandedProjectileBudget(
+					Projectile.OnImpactProjectiles,
+					InOutProjectileCount)
+				|| !FitsExpandedProjectileBudget(
+					Projectile.OnExpireProjectiles,
+					InOutProjectileCount))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
 	struct FPendingModifiers
 	{
 		float DamageAdd = 0.0f;
@@ -234,7 +254,26 @@ namespace MatterFluxWandProgram
 								* Pending.DamageMultiplier);
 						Carrier.Speed *= Pending.SpeedMultiplier;
 						Carrier.Lifetime *= Pending.LifetimeMultiplier;
-						Carrier.SpreadDegrees += Pending.SpreadDegrees - Wand.Spread;
+						const float PreviousSpread = Carrier.SpreadDegrees;
+						Carrier.SpreadDegrees +=
+							Pending.SpreadDegrees - Wand.Spread;
+						if (FMath::IsNearlyZero(Carrier.SpreadDegrees))
+						{
+							Carrier.SpawnAngleDegrees = 0.0f;
+						}
+						else if (!FMath::IsNearlyZero(PreviousSpread))
+						{
+							// Preserve the carrier's deterministic random percentile
+							// while expanding it into the final outer spread range.
+							Carrier.SpawnAngleDegrees *=
+								Carrier.SpreadDegrees / PreviousSpread;
+						}
+						else
+						{
+							Carrier.SpawnAngleDegrees = Random.FRandRange(
+								-Carrier.SpreadDegrees,
+								Carrier.SpreadDegrees);
+						}
 						if (Pending.bOverrideColor)
 						{
 							Carrier.bOverrideColor = true;
@@ -280,8 +319,9 @@ namespace MatterFluxWandProgram
 						0.0f,
 						(Spell->Damage + Pending.DamageAdd)
 							* Pending.DamageMultiplier);
-					Projectile.Speed =
-						Spell->Speed * Pending.SpeedMultiplier;
+					Projectile.Speed = Spell->bSpawnStationary
+						? 0.0f
+						: Spell->Speed * Pending.SpeedMultiplier;
 					Projectile.Lifetime =
 						Spell->Lifetime * Pending.LifetimeMultiplier;
 					Projectile.Radius = Spell->Radius;
@@ -295,6 +335,10 @@ namespace MatterFluxWandProgram
 								Pending.SpreadDegrees);
 					Projectile.BodyMaterial = Spell->BodyMaterial;
 					Projectile.MaterialAmount = Spell->MaterialAmount;
+					Projectile.SpawnForwardOffset =
+						Spell->SpawnForwardOffset;
+					Projectile.SpawnHeightOffset =
+						Spell->SpawnHeightOffset;
 					Projectile.bUsePlaneVisual = Spell->bUsePlaneVisual;
 					Projectile.bUseVerticalPlaneVisual =
 						Spell->bUseVerticalPlaneVisual;
@@ -410,6 +454,14 @@ bool FMatterFluxWandProgram::Evaluate(
 		Context.Plan.CasterEffects))
 	{
 		OutError = Context.Error;
+		return false;
+	}
+	int32 ExpandedProjectileCount = 0;
+	if (!MatterFluxWandProgram::FitsExpandedProjectileBudget(
+		Context.Plan.Projectiles,
+		ExpandedProjectileCount))
+	{
+		OutError = TEXT("wand program exceeded its projectile budget");
 		return false;
 	}
 	if (Context.Plan.Projectiles.IsEmpty()

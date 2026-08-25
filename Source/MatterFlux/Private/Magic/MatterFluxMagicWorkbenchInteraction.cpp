@@ -1,5 +1,46 @@
 #include "Magic/MatterFluxMagicWorkbenchInteraction.h"
 
+void FMatterFluxMagicWorkbenchInteraction::BuildEquipmentSlotPresentations(
+	TArray<FMatterFluxMagicEquipmentSlotPresentation>& OutSlots)
+{
+	OutSlots.Reset(MatterFlux::Magic::EquipmentSlotCount);
+	for (int32 SlotIndex = 0;
+		SlotIndex < MatterFlux::Magic::EquipmentSlotCount;
+		++SlotIndex)
+	{
+		FMatterFluxMagicEquipmentSlotPresentation& Slot =
+			OutSlots.AddDefaulted_GetRef();
+		Slot.SlotIndex = SlotIndex;
+		switch (SlotIndex)
+		{
+		case 0:
+			Slot.KeyLabel = TEXT("左键");
+			Slot.KeyBadge = TEXT("L");
+			break;
+		case 1:
+			Slot.KeyLabel = TEXT("右键");
+			Slot.KeyBadge = TEXT("R");
+			break;
+		case 2:
+			Slot.KeyLabel = TEXT("Q 键");
+			Slot.KeyBadge = TEXT("Q");
+			break;
+		case 3:
+			Slot.KeyLabel = TEXT("E 键");
+			Slot.KeyBadge = TEXT("E");
+			break;
+		case 4:
+			Slot.KeyLabel = TEXT("空格键");
+			Slot.KeyBadge = TEXT("空格");
+			break;
+		default:
+			Slot.KeyLabel = TEXT("未绑定");
+			Slot.KeyBadge = TEXT("?");
+			break;
+		}
+	}
+}
+
 FVector2D FMatterFluxMagicWorkbenchInteraction::GetSpellSlotSize()
 {
 	return FVector2D(72.0f, 72.0f);

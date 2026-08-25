@@ -110,30 +110,6 @@ namespace MatterFluxMagicUI
 		}
 	}
 
-	FString EquipmentKeyLabel(const int32 EquipmentSlot)
-	{
-		switch (EquipmentSlot)
-		{
-		case 0: return TEXT("左键");
-		case 1: return TEXT("右键");
-		case 2: return TEXT("Q 键");
-		case 3: return TEXT("E 键");
-		default: return TEXT("未绑定");
-		}
-	}
-
-	FString EquipmentKeyBadge(const int32 EquipmentSlot)
-	{
-		switch (EquipmentSlot)
-		{
-		case 0: return TEXT("L");
-		case 1: return TEXT("R");
-		case 2: return TEXT("Q");
-		case 3: return TEXT("E");
-		default: return TEXT("?");
-		}
-	}
-
 	TSharedRef<SWidget> ItemVisual(
 		const FSlateBrush* IconBrush,
 		const FText& FallbackBadge)
@@ -222,6 +198,78 @@ namespace MatterFluxMagicUI
 		}
 	}
 
+	void AddToolTipStat(
+		const TSharedRef<SGridPanel>& Stats,
+		int32& Row,
+		const FString& Label,
+		const FText& Value)
+	{
+		Stats->AddSlot(0, Row)
+		.Padding(0.0f, 2.0f, 18.0f, 2.0f)
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+				.Text(FText::FromString(Label + TEXT("：")))
+				.Font(WorkbenchFont(12))
+				.ColorAndOpacity(Ink)
+		];
+		Stats->AddSlot(1, Row)
+		.Padding(0.0f, 2.0f)
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+				.Text(Value)
+				.Font(WorkbenchFont(12, true))
+				.ColorAndOpacity(ToolTipValue)
+		];
+		++Row;
+	}
+
+	TSharedRef<SWidget> BuildToolTipFrame(
+		const FString& Title,
+		const FString& Description,
+		const TSharedRef<SGridPanel>& Stats)
+	{
+		return SNew(SBorder)
+			.BorderImage(FCoreStyle::Get().GetBrush(TEXT("GenericWhiteBox")))
+			.BorderBackgroundColor(Ink)
+			.Padding(1.0f)
+			[
+				SNew(SBorder)
+					.BorderImage(FCoreStyle::Get().GetBrush(TEXT("GenericWhiteBox")))
+					.BorderBackgroundColor(FLinearColor::White)
+					.Padding(FMargin(17.0f, 14.0f, 18.0f, 16.0f))
+				[
+					SNew(SBox)
+						.WidthOverride(310.0f)
+					[
+						SNew(SVerticalBox)
+						+ SVerticalBox::Slot().AutoHeight()
+						[
+							SNew(STextBlock)
+								.Text(FText::FromString(Title))
+								.Font(WorkbenchFont(21, true))
+								.ColorAndOpacity(Ink)
+						]
+						+ SVerticalBox::Slot().AutoHeight()
+						.Padding(0.0f, 12.0f, 0.0f, 14.0f)
+						[
+							SNew(STextBlock)
+								.Text(FText::FromString(Description))
+								.Font(WorkbenchFont(12))
+								.ColorAndOpacity(Muted)
+								.AutoWrapText(true)
+								.WrapTextAt(280.0f)
+						]
+						+ SVerticalBox::Slot().AutoHeight()
+						[
+							Stats
+						]
+					]
+				]
+			];
+	}
+
 	TSharedRef<SWidget> BuildSpellToolTipContent(
 		const FMatterFluxSpellDefinition& Definition)
 	{
@@ -231,25 +279,7 @@ namespace MatterFluxMagicUI
 			const FString& Label,
 			const FText& Value)
 		{
-			Stats->AddSlot(0, Row)
-			.Padding(0.0f, 2.0f, 18.0f, 2.0f)
-			.VAlign(VAlign_Center)
-			[
-				SNew(STextBlock)
-				.Text(FText::FromString(Label + TEXT("：")))
-				.Font(WorkbenchFont(12))
-				.ColorAndOpacity(Ink)
-			];
-			Stats->AddSlot(1, Row)
-			.Padding(0.0f, 2.0f)
-			.VAlign(VAlign_Center)
-			[
-				SNew(STextBlock)
-				.Text(Value)
-				.Font(WorkbenchFont(12, true))
-				.ColorAndOpacity(ToolTipValue)
-			];
-			++Row;
+			AddToolTipStat(Stats, Row, Label, Value);
 		};
 
 		AddStat(TEXT("法术类型"), SpellKindDisplayName(Definition.Kind));
@@ -293,42 +323,117 @@ namespace MatterFluxMagicUI
 				TEXT("%+.2f 秒"), Definition.RechargeTimeDelta)));
 		}
 
-		TSharedRef<SVerticalBox> Details = SNew(SVerticalBox);
-		Details->AddSlot().AutoHeight()
-		[
-			SNew(STextBlock)
-			.Text(FText::FromString(Definition.DisplayName))
-			.Font(WorkbenchFont(21, true))
-			.ColorAndOpacity(Ink)
-		];
-		Details->AddSlot().AutoHeight().Padding(0.0f, 12.0f, 0.0f, 14.0f)
-		[
-			SNew(STextBlock)
-			.Text(FText::FromString(Definition.Description))
-			.Font(WorkbenchFont(12))
-			.ColorAndOpacity(Muted)
-			.AutoWrapText(true)
-			.WrapTextAt(280.0f)
-		];
-		Details->AddSlot().AutoHeight()[Stats];
+		return BuildToolTipFrame(
+			Definition.DisplayName,
+			Definition.Description,
+			Stats);
+	}
 
-		return SNew(SBorder)
-			.BorderImage(FCoreStyle::Get().GetBrush(TEXT("GenericWhiteBox")))
-			.BorderBackgroundColor(Ink)
-			.Padding(1.0f)
-			[
-				SNew(SBorder)
-					.BorderImage(FCoreStyle::Get().GetBrush(TEXT("GenericWhiteBox")))
-					.BorderBackgroundColor(FLinearColor::White)
-					.Padding(FMargin(17.0f, 14.0f, 18.0f, 16.0f))
-				[
-					SNew(SBox)
-						.WidthOverride(310.0f)
-					[
-						Details
-					]
-				]
-			];
+	FText ItemCategoryDisplayName(const EMatterFluxItemCategory Category)
+	{
+		switch (Category)
+		{
+		case EMatterFluxItemCategory::Quest:
+			return FText::FromString(TEXT("任务道具"));
+		case EMatterFluxItemCategory::Consumable:
+			return FText::FromString(TEXT("消耗品"));
+		default:
+			return FText::FromString(TEXT("材料"));
+		}
+	}
+
+	FText ItemUseDisplayName(const EMatterFluxItemUseAction UseAction)
+	{
+		switch (UseAction)
+		{
+		case EMatterFluxItemUseAction::RestoreHealth:
+			return FText::FromString(TEXT("恢复生命"));
+		case EMatterFluxItemUseAction::RestoreWandMana:
+			return FText::FromString(TEXT("恢复法杖法力"));
+		case EMatterFluxItemUseAction::GameplayEvent:
+			return FText::FromString(TEXT("触发特殊效果"));
+		default:
+			return FText::FromString(TEXT("不可主动使用"));
+		}
+	}
+
+	TSharedRef<SWidget> BuildItemToolTipContent(
+		const FMatterFluxItemDefinition& Definition,
+		const int32 Quantity)
+	{
+		TSharedRef<SGridPanel> Stats = SNew(SGridPanel);
+		int32 Row = 0;
+		AddToolTipStat(
+			Stats, Row, TEXT("物品类型"),
+			ItemCategoryDisplayName(Definition.Category));
+		AddToolTipStat(
+			Stats, Row, TEXT("持有数量"), FText::AsNumber(Quantity));
+		AddToolTipStat(
+			Stats, Row, TEXT("堆叠上限"), FText::AsNumber(Definition.MaxStack));
+		if (Definition.UseAction != EMatterFluxItemUseAction::None)
+		{
+			AddToolTipStat(
+				Stats, Row, TEXT("使用效果"),
+				ItemUseDisplayName(Definition.UseAction));
+			if (!FMath::IsNearlyZero(Definition.UseMagnitude))
+			{
+				AddToolTipStat(
+					Stats, Row, TEXT("效果强度"),
+					FText::AsNumber(Definition.UseMagnitude));
+			}
+			AddToolTipStat(
+				Stats, Row, TEXT("每次消耗"),
+				FText::AsNumber(Definition.ConsumeCount));
+			AddToolTipStat(
+				Stats, Row, TEXT("操作"),
+				FText::FromString(TEXT("右键或 Enter 使用")));
+		}
+		return BuildToolTipFrame(
+			Definition.DisplayName,
+			Definition.Description,
+			Stats);
+	}
+
+	TSharedRef<SWidget> BuildWandToolTipContent(
+		const FMatterFluxWandDefinition& Definition,
+		const FMatterFluxOwnedWand& Wand)
+	{
+		TSharedRef<SGridPanel> Stats = SNew(SGridPanel);
+		int32 Row = 0;
+		AddToolTipStat(
+			Stats, Row, TEXT("抽取方式"),
+			FText::FromString(Definition.bShuffle ? TEXT("乱序") : TEXT("顺序")));
+		AddToolTipStat(
+			Stats, Row, TEXT("法术上限"), FText::AsNumber(Definition.Capacity));
+		AddToolTipStat(
+			Stats, Row, TEXT("每次抽取"), FText::AsNumber(Definition.DrawCount));
+		AddToolTipStat(
+			Stats, Row, TEXT("当前法力"),
+			FText::FromString(FString::Printf(
+				TEXT("%.0f / %.0f"), Wand.Mana, Definition.ManaMax)));
+		AddToolTipStat(
+			Stats, Row, TEXT("恢复速度"),
+			FText::FromString(FString::Printf(
+				TEXT("+%.0f / 秒"), Definition.ManaRechargePerSecond)));
+		AddToolTipStat(
+			Stats, Row, TEXT("施法间隔"),
+			FText::FromString(FString::Printf(
+				TEXT("%.2f 秒"), Definition.CastDelay)));
+		AddToolTipStat(
+			Stats, Row, TEXT("充能时间"),
+			FText::FromString(FString::Printf(
+				TEXT("%.2f 秒"), Definition.RechargeTime)));
+		if (!FMath::IsNearlyZero(Definition.Spread))
+		{
+			AddToolTipStat(
+				Stats, Row, TEXT("散布角度"),
+				FText::FromString(FString::Printf(
+					TEXT("%.1f°"), Definition.Spread)));
+		}
+		return BuildToolTipFrame(
+			Definition.DisplayName,
+			Definition.Description,
+			Stats);
 	}
 
 	enum class EDragSource : uint8
@@ -715,25 +820,6 @@ namespace MatterFluxMagicUI
 		TArray<FMagicTreeLine> Lines;
 	};
 
-	FText WandToolTip(
-		const FMatterFluxWandDefinition& Definition,
-		const FMatterFluxOwnedWand& Wand)
-	{
-		return FText::FromString(FString::Printf(
-			TEXT("%s\n%s\n\n容量 %d  抽取 %d  %s\n法力 %.0f / %.0f  +%.0f/秒\n施法 %.2f秒  充能 %.2f秒  散布 %.1f"),
-			*Definition.DisplayName,
-			*Definition.Description,
-			Definition.Capacity,
-			Definition.DrawCount,
-			Definition.bShuffle ? TEXT("乱序") : TEXT("顺序"),
-			Wand.Mana,
-			Definition.ManaMax,
-			Definition.ManaRechargePerSecond,
-			Definition.CastDelay,
-			Definition.RechargeTime,
-			Definition.Spread));
-	}
-
 }
 
 namespace MatterFluxMagicUI
@@ -1012,11 +1098,6 @@ private:
 			const FName ItemId = Stack.ItemId;
 			const bool bUsable =
 				Definition->UseAction != EMatterFluxItemUseAction::None;
-			const FText ToolTip = FText::FromString(FString::Printf(
-				TEXT("%s\n%s\n\n持有 %d / %d%s"),
-				*Definition->DisplayName, *Definition->Description,
-				Stack.Quantity, Definition->MaxStack,
-				bUsable ? TEXT("\n右键或 Enter 使用") : TEXT("")));
 			Grid->AddSlot().Padding(4.0f)
 			[
 				SNew(SMagicItemSlot)
@@ -1024,7 +1105,9 @@ private:
 					.IconBrush(GetIconBrush(Definition->Icon))
 					.Label(FText::FromString(Definition->DisplayName))
 				.Subtitle(FText::AsNumber(Stack.Quantity))
-				.ToolTip(ToolTip)
+				.ToolTipContent(BuildItemToolTipContent(
+					*Definition,
+					Stack.Quantity))
 				.bSelected(SelectedItem == ItemId)
 				.OnLeftClick([Owner = OwnerWidget, ItemId]()
 				{
@@ -1297,7 +1380,7 @@ private:
 				.IconBrush(Payload.IconBrush)
 				.Label(FText::FromString(Definition->DisplayName))
 				.Subtitle(FText::GetEmpty())
-				.ToolTip(WandToolTip(*Definition, Wand))
+				.ToolTipContent(BuildWandToolTipContent(*Definition, Wand))
 				.Tint(SRGB(144, 94, 48))
 				.bSelected(OwnerWidget->GetSelectedWandId() == WandId)
 				.DragPayload(Payload)
@@ -1328,8 +1411,13 @@ private:
 		const FMatterFluxContentRegistry& Registry)
 	{
 		TSharedRef<SVerticalBox> Equipment = SNew(SVerticalBox);
-		for (int32 SlotIndex = 0; SlotIndex < 4; ++SlotIndex)
+		TArray<FMatterFluxMagicEquipmentSlotPresentation> EquipmentSlots;
+		FMatterFluxMagicWorkbenchInteraction::BuildEquipmentSlotPresentations(
+			EquipmentSlots);
+		for (const FMatterFluxMagicEquipmentSlotPresentation& SlotPresentation
+			: EquipmentSlots)
 		{
+			const int32 SlotIndex = SlotPresentation.SlotIndex;
 			const FGuid EquippedId = Inventory.GetEquippedWands().IsValidIndex(SlotIndex)
 				? Inventory.GetEquippedWands()[SlotIndex]
 				: FGuid();
@@ -1355,6 +1443,13 @@ private:
 			const bool bIsActiveSlot = Inventory.GetActiveEquipmentSlot() == SlotIndex;
 			const bool bIsEditedSlot = EquippedId.IsValid()
 				&& OwnerWidget->GetSelectedWandId() == EquippedId;
+			TSharedPtr<SWidget> WandRichToolTip;
+			if (EquippedWand && EquippedDefinition)
+			{
+				WandRichToolTip = BuildWandToolTipContent(
+					*EquippedDefinition,
+					*EquippedWand);
+			}
 			Equipment->AddSlot().AutoHeight().HAlign(HAlign_Center).Padding(4.0f)
 			[
 				SNew(SMagicItemSlot)
@@ -1362,12 +1457,13 @@ private:
 				.IconBrush(EquipmentIcon)
 				.Label(FText::FromString(
 					EquippedDefinition ? EquippedDefinition->DisplayName : TEXT("拖入法杖")))
-				.Subtitle(FText::FromString(EquipmentKeyBadge(SlotIndex)))
-				.ToolTip(EquippedWand && EquippedDefinition
-					? WandToolTip(*EquippedDefinition, *EquippedWand)
+				.Subtitle(FText::FromString(SlotPresentation.KeyBadge))
+				.ToolTipContent(WandRichToolTip)
+				.ToolTip(WandRichToolTip.IsValid()
+					? FText::GetEmpty()
 					: FText::FromString(FString::Printf(
 						TEXT("将法杖拖入此处，绑定到%s。"),
-						*EquipmentKeyLabel(SlotIndex))))
+						*SlotPresentation.KeyLabel)))
 				.Tint(EquippedId.IsValid() ? SRGB(144, 94, 48) : SRGB(126, 123, 115))
 				.bSelected(bIsEditedSlot)
 				.DragPayload(Payload)

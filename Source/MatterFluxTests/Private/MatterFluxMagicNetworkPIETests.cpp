@@ -170,7 +170,8 @@ namespace MatterFluxMagicNetworkTests
 					|| ClientInventory->GetInventoryRevision()
 						!= ServerInventory->GetInventoryRevision()
 					|| ClientInventory->GetOwnedWands().Num() != 6
-					|| ClientInventory->GetEquippedWands().Num() != 4
+					|| ClientInventory->GetEquippedWands().Num()
+						!= UGA_CastWand::EquipmentSlotCount
 					|| !ClientInventory->GetActiveWandId().IsValid())
 				{
 					return FailOnTimeout(TEXT("Starter wand inventory did not replicate coherently to its owning client."));

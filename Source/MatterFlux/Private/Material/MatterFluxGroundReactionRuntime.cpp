@@ -258,6 +258,102 @@ namespace MatterFlux::Reaction
 		return true;
 	}
 
+	bool FGroundReactionRuntime::ActivateNearestInput(
+		const FIntPoint RequestedCell,
+		const FName StimulusMaterial,
+		const int32 MaximumSearchRadius,
+		FIntPoint& OutActivatedCell)
+	{
+		OutActivatedCell = RequestedCell;
+		if (!Simulation
+			|| StimulusMaterial.IsNone()
+			|| MaximumSearchRadius < 0
+			|| RequestedCell.X < 0
+			|| RequestedCell.X >= RuntimeSettings.Width
+			|| RequestedCell.Y < 0
+			|| RequestedCell.Y >= RuntimeSettings.Height)
+		{
+			return false;
+		}
+
+		const TArray<uint8>& InputMask = Simulation->GetInputMask();
+		const TArray<uint8>& ActiveMask = Simulation->GetActiveMask();
+		const TArray<uint8>& OutputMask = Simulation->GetOutputMask();
+		auto GetCellIndex = [this](const FIntPoint Cell)
+		{
+			return Cell.Y * RuntimeSettings.Width + Cell.X;
+		};
+		auto IsInside = [this](const FIntPoint Cell)
+		{
+			return Cell.X >= 0
+				&& Cell.X < RuntimeSettings.Width
+				&& Cell.Y >= 0
+				&& Cell.Y < RuntimeSettings.Height;
+		};
+		auto IsAvailableInput = [&](const FIntPoint Cell)
+		{
+			if (!IsInside(Cell))
+			{
+				return false;
+			}
+			const int32 CellIndex = GetCellIndex(Cell);
+			return InputMask.IsValidIndex(CellIndex)
+				&& ActiveMask.IsValidIndex(CellIndex)
+				&& OutputMask.IsValidIndex(CellIndex)
+				&& InputMask[CellIndex] != 0
+				&& ActiveMask[CellIndex] == 0
+				&& OutputMask[CellIndex] == 0;
+		};
+
+		const int32 RequestedIndex = GetCellIndex(RequestedCell);
+		if (!InputMask.IsValidIndex(RequestedIndex)
+			|| !ActiveMask.IsValidIndex(RequestedIndex)
+			|| !OutputMask.IsValidIndex(RequestedIndex)
+			|| ActiveMask[RequestedIndex] != 0
+			|| OutputMask[RequestedIndex] != 0)
+		{
+			return false;
+		}
+
+		// A request that already targets reaction input is authoritative. If it
+		// cannot activate (for example because the stimulus is wrong), do not
+		// silently redirect that contact to a neighboring cell.
+		if (InputMask[RequestedIndex] != 0)
+		{
+			return Activate(RequestedCell, StimulusMaterial);
+		}
+
+		bool bActivated = false;
+		for (int32 Radius = 1;
+			!bActivated && Radius <= MaximumSearchRadius;
+			++Radius)
+		{
+			for (int32 Y = -Radius; Y <= Radius && !bActivated; ++Y)
+			{
+				for (int32 X = -Radius; X <= Radius; ++X)
+				{
+					if (FMath::Max(FMath::Abs(X), FMath::Abs(Y)) != Radius)
+					{
+						continue;
+					}
+					const FIntPoint Candidate =
+						RequestedCell + FIntPoint(X, Y);
+					if (!IsAvailableInput(Candidate))
+					{
+						continue;
+					}
+					bActivated = Activate(Candidate, StimulusMaterial);
+					if (bActivated)
+					{
+						OutActivatedCell = Candidate;
+						break;
+					}
+				}
+			}
+		}
+		return bActivated;
+	}
+
 	FGroundAdvanceResult FGroundReactionRuntime::AdvanceAuthority(
 		const float DeltaSeconds)
 	{

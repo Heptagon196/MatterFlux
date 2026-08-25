@@ -11,7 +11,7 @@ class MATTERFLUX_API UMatterFluxSaveGame : public USaveGame
 	GENERATED_BODY()
 
 public:
-	static constexpr int32 CurrentVersion = 3;
+	static constexpr int32 CurrentVersion = 5;
 
 	void InitializeNew(int32 InMapSeed);
 	bool ValidateAndMigrate(FString& OutError);
@@ -24,6 +24,10 @@ public:
 
 	UPROPERTY(SaveGame)
 	int32 MapSeed = 0;
+
+	/** Empty for procedural free mode; otherwise the Lua custom-map id. */
+	UPROPERTY(SaveGame)
+	FName CustomMapId = NAME_None;
 
 	UPROPERTY(SaveGame)
 	FTransform PlayerTransform = FTransform::Identity;

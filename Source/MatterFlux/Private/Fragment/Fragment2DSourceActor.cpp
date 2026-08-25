@@ -1,5 +1,6 @@
 #include "Fragment/Fragment2DSourceActor.h"
 
+#include "Algo/Count.h"
 #include "Fragment/Fragment2DActor.h"
 #include "Fragment/Fragment2DAsset.h"
 #include "Fragment/FragmentGeometry.h"
@@ -726,10 +727,12 @@ void AFragment2DSourceActor::TransferAggregateMembersTo(
 		if (FragmentCarrier && SharedDamageEvent)
 		{
 			FFragmentDamageEvent MemberEvent;
-			if (!Member->BuildSynchronizedDamageEventFrom(
+			const bool bMappedSynchronizedDamage =
+				Member->BuildSynchronizedDamageEventFrom(
 				*this,
 				*SharedDamageEvent,
-				MemberEvent))
+				MemberEvent);
+			if (!bMappedSynchronizedDamage)
 			{
 				MemberEvent = *SharedDamageEvent;
 				MemberEvent.SourceId = Member->SourceId;
@@ -744,8 +747,41 @@ void AFragment2DSourceActor::TransferAggregateMembersTo(
 			{
 				const int32 AvailableLayers = 16
 					- FragmentCarrier->GetAggregateMemberCount();
+				if (UFragmentSimulationSubsystem::IsCutLoggingEnabled())
+				{
+					int32 FadingPayloads = 0;
+					for (const FFragmentSpawnPayload& Payload
+						: MemberTransaction.Payloads)
+					{
+						FadingPayloads += Payload.FadeOutDuration > 0.0f ? 1 : 0;
+					}
+					UE_LOG(
+						LogMatterFlux,
+						Display,
+						TEXT("[FragmentCut] transfer member=%s source=%s material=%s mapped=%s revision=%d cellsBefore=%d cellsSupported=%d payloads=%d fading=%d availableLayers=%d"),
+						*Member->GetName(),
+						*Member->SourceId.ToString(EGuidFormats::Short),
+						*Member->SourceMaterialId.ToString(),
+						bMappedSynchronizedDamage ? TEXT("true") : TEXT("false"),
+						Member->Revision,
+						Algo::Count(Member->GetRuntimeMask(), static_cast<uint8>(1)),
+						Algo::Count(MemberTransaction.SupportedMask, static_cast<uint8>(1)),
+						MemberTransaction.Payloads.Num(),
+						FadingPayloads,
+						AvailableLayers);
+				}
 				if (MemberTransaction.Payloads.Num() > AvailableLayers)
 				{
+					if (UFragmentSimulationSubsystem::IsCutLoggingEnabled())
+					{
+						UE_LOG(
+							LogMatterFlux,
+							Display,
+							TEXT("[FragmentCut] transfer rejected source=%s reason=layer-budget needed=%d available=%d"),
+							*Member->SourceId.ToString(EGuidFormats::Short),
+							MemberTransaction.Payloads.Num(),
+							AvailableLayers);
+					}
 					UE_LOG(
 						LogMatterFlux,
 						Error,
@@ -775,8 +811,30 @@ void AFragment2DSourceActor::TransferAggregateMembersTo(
 						*Member->SourceId.ToString());
 					continue;
 				}
+				if (UFragmentSimulationSubsystem::IsCutLoggingEnabled())
+				{
+					UE_LOG(
+						LogMatterFlux,
+						Display,
+						TEXT("[FragmentCut] transfer committed source=%s revision=%d residualCells=%d carrierLayers=%d"),
+						*Member->SourceId.ToString(EGuidFormats::Short),
+						Member->Revision,
+						Algo::Count(Member->GetRuntimeMask(), static_cast<uint8>(1)),
+						FragmentCarrier->GetAggregateMemberCount());
+				}
 				if (Member->GetRuntimeMask().Contains(1))
 				{
+					// Only layout-compatible parallel slices own a static stump
+					// remainder. A differently shaped/materialed member (for
+					// example the canopy) is supported by the aggregate root, not
+					// by terrain. If its synchronized vertical cut leaves a
+					// locally "supported" mask, that remainder still belongs to
+					// the falling carrier and must not remain as a floating Source.
+					if (!bMappedSynchronizedDamage
+						&& FragmentCarrier->AbsorbAggregateSource(*Member))
+					{
+						continue;
+					}
 					// 方柱树干由多个深度切片组成。每个留下残余的切片都必须
 					// 与动态树冠完成分离后再回到区块批次；只保护 aggregate
 					// root 会让背面的树桩切片仍从树叶中露出来。
@@ -799,6 +857,16 @@ void AFragment2DSourceActor::TransferAggregateMembersTo(
 		if (FragmentCarrier
 			&& FragmentCarrier->AbsorbAggregateSource(*Member))
 		{
+			if (UFragmentSimulationSubsystem::IsCutLoggingEnabled())
+			{
+				UE_LOG(
+					LogMatterFlux,
+					Display,
+					TEXT("[FragmentCut] transfer whole-source source=%s material=%s carrierLayers=%d"),
+					*Member->SourceId.ToString(EGuidFormats::Short),
+					*Member->SourceMaterialId.ToString(),
+					FragmentCarrier->GetAggregateMemberCount());
+			}
 			continue;
 		}
 		Member->AttachToActor(
@@ -912,7 +980,8 @@ void AFragment2DSourceActor::EndAggregateSeparationGracePeriod()
 
 bool AFragment2DSourceActor::PrepareDamageEvent(
 	const FFragmentDamageEvent& DamageEvent,
-	FPreparedFragmentDamage& OutTransaction) const
+	FPreparedFragmentDamage& OutTransaction,
+	const bool bForceDetachedPhysics) const
 {
 	OutTransaction = FPreparedFragmentDamage();
 	if (GetWorld() && GetWorld()->IsGameWorld() && !HasAuthority())
@@ -1019,7 +1088,16 @@ bool AFragment2DSourceActor::PrepareDamageEvent(
 	for (FFragmentSpawnPayload& Payload : OutTransaction.Payloads)
 	{
 		Payload.MaterialId = SourceMaterialId;
-		Payload.bEnableCollision = bEnableSourceCollision
+		// An aggregate member has lost the structural root that kept it aloft.
+		// Even a sub-threshold remainder is now persistent physical material;
+		// the generic 0.45 s decoration-debris fade is not the repeated-cut
+		// exhaustion rule and must never retire tree canopy on its first cut.
+		if (bForceDetachedPhysics && Payload.FadeOutDuration > 0.0f)
+		{
+			Payload.FadeOutDuration = 0.0f;
+		}
+		Payload.bEnableCollision = (bEnableSourceCollision
+			|| bForceDetachedPhysics)
 			&& Payload.FadeOutDuration <= 0.0f;
 		if (!Payload.bEnableCollision)
 		{
@@ -1165,6 +1243,15 @@ void AFragment2DSourceActor::MarkBroken()
 	bBroken = true;
 	ReactionSimulation.Reset();
 	VisibleActiveMask.Init(0, RuntimeMask.Num());
+	if (FlameInstances)
+	{
+		FlameInstances->ClearInstances();
+	}
+	if (FireLight)
+	{
+		FireLight->SetVisibility(false);
+	}
+	bReactionVisualDirty = false;
 	SetActorTickEnabled(false);
 	MarkSharedSmokeVisualizationDirty();
 	ForceNetUpdate();
@@ -1194,10 +1281,6 @@ void AFragment2DSourceActor::OnRep_SourceId()
 
 void AFragment2DSourceActor::RefreshPresenceRegistration()
 {
-	if (RegisteredPresenceSourceId == SourceId)
-	{
-		return;
-	}
 	UFragmentSimulationSubsystem* Subsystem =
 		GetWorld()
 			? GetWorld()->GetSubsystem<UFragmentSimulationSubsystem>()
@@ -1206,15 +1289,21 @@ void AFragment2DSourceActor::RefreshPresenceRegistration()
 	{
 		return;
 	}
-	if (RegisteredPresenceSourceId.IsValid())
+	if (RegisteredPresenceSourceId.IsValid()
+		&& RegisteredPresenceSourceId != SourceId)
 	{
 		Subsystem->UnregisterSourceActor(*this);
 		RegisteredPresenceSourceId.Invalidate();
 	}
 	if (SourceId.IsValid())
 	{
-		RegisteredPresenceSourceId = SourceId;
-		Subsystem->RegisterSourceActor(*this);
+		// InitializeFromProceduralMask can run before deferred spawning has
+		// finished. Re-register the same ID at BeginPlay so its spatial entry
+		// reflects the final world transform instead of the pre-spawn bounds.
+		if (Subsystem->RegisterSourceActor(*this))
+		{
+			RegisteredPresenceSourceId = SourceId;
+		}
 	}
 }
 
@@ -1302,8 +1391,14 @@ void AFragment2DSourceActor::AdvanceReaction(
 	}
 
 	ReactionVisualAccumulator += ClampedDelta;
+	const bool bReactionFinishedThisFrame =
+		bStateChanged
+		&& HasAuthority()
+		&& ReactionSimulation
+		&& !ReactionSimulation->IsActive();
 	if (bReactionVisualDirty
-		&& ReactionVisualAccumulator >= 0.1f)
+		&& (ReactionVisualAccumulator >= 0.1f
+			|| bReactionFinishedThisFrame))
 	{
 		ReactionVisualAccumulator = 0.0f;
 		RebuildReactionVisualization();
@@ -1797,6 +1892,32 @@ bool AFragment2DSourceActor::IsReacting() const
 	return ReactionSimulation
 		? ReactionSimulation->IsActive()
 		: GetActiveCellCount() > 0;
+}
+
+FBox AFragment2DSourceActor::GetCanonicalWorldBounds() const
+{
+	const int32 Width = GetMaskWidth();
+	const int32 Height = GetMaskHeight();
+	const float CellSize = GetCellSize();
+	const FTransform& WorldTransform = GetActorTransform();
+	if (Width <= 0
+		|| Height <= 0
+		|| !FMath::IsFinite(CellSize)
+		|| CellSize <= 0.0f
+		|| !WorldTransform.IsValid())
+	{
+		return FBox(ForceInit);
+	}
+
+	// Fragment masks live in local XZ and are extruded by one cell on local Y.
+	// Actor scale carries the authored wall thickness, so transforming this
+	// logical box produces stable bounds even when the projection is hidden.
+	const FVector HalfExtent(
+		static_cast<double>(Width) * CellSize * 0.5,
+		CellSize * 0.5,
+		static_cast<double>(Height) * CellSize * 0.5);
+	return FBox(-HalfExtent, HalfExtent).TransformBy(
+		WorldTransform.ToMatrixWithScale());
 }
 
 FBox AFragment2DSourceActor::GetActiveWorldBounds() const

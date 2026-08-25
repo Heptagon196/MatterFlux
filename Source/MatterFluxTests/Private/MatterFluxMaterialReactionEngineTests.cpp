@@ -66,33 +66,33 @@ bool FMatterFluxUnifiedMaterialReactionEngineTest::RunTest(const FString& Parame
 	TestEqual(TEXT("Completed cell enters the output mask"),
 		static_cast<int32>(Engine.GetOutputMask()[0]), 1);
 
-	FMatterFluxReactionDefinition Corrosion = Active;
-	Corrosion.Id = TEXT("metal_acid_corrosion");
-	Corrosion.InputA = TEXT("metal");
-	Corrosion.InputB = TEXT("acid");
-	Corrosion.OutputA = TEXT("empty");
-	Corrosion.OutputB = TEXT("acid");
-	Corrosion.EmissionMaterial = TEXT("empty");
-	Corrosion.EmissionChancePermille = 0;
+	FMatterFluxReactionDefinition Growth = Active;
+	Growth.Id = TEXT("moss_growth");
+	Growth.InputA = TEXT("stone");
+	Growth.InputB = TEXT("moss");
+	Growth.OutputA = TEXT("moss");
+	Growth.OutputB = TEXT("moss");
+	Growth.EmissionMaterial = TEXT("empty");
+	Growth.EmissionChancePermille = 0;
 	FFragmentSourceMask MetalMask = Mask;
-	MatterFlux::Reaction::FMaterialReactionEngine CorrosionEngine;
+	MatterFlux::Reaction::FMaterialReactionEngine GrowthEngine;
 	TestTrue(TEXT("A non-fire propagating rule needs no fake emission"),
-		CorrosionEngine.InitializeGrid(MetalMask, Corrosion, 19, Error));
+		GrowthEngine.InitializeGrid(MetalMask, Growth, 19, Error));
 	TestTrue(TEXT("A non-fire stimulus activates the generic grid"),
-		CorrosionEngine.Activate(FIntPoint(1, 0), TEXT("acid")));
+		GrowthEngine.Activate(FIntPoint(1, 0), TEXT("moss")));
 	TestEqual(TEXT("No emission produces no presentation events"),
-		CorrosionEngine.Step(0).EmissionCells.Num(), 0);
+		GrowthEngine.Step(0).EmissionCells.Num(), 0);
 
 	FMatterFluxContentRegistry Registry;
-	FMatterFluxReactionDefinition Later = Corrosion;
+	FMatterFluxReactionDefinition Later = Growth;
 	Later.Id = TEXT("z_rule");
-	FMatterFluxReactionDefinition Earlier = Corrosion;
+	FMatterFluxReactionDefinition Earlier = Growth;
 	Earlier.Id = TEXT("a_rule");
 	Registry.Reactions.Add(Later.Id, Later);
 	Registry.Reactions.Add(Earlier.Id, Earlier);
 	const FMatterFluxReactionDefinition* Found =
 		MatterFlux::Reaction::FMaterialReactionEngine::FindPropagatingRule(
-			Registry, TEXT("metal"), TEXT("acid"));
+			Registry, TEXT("stone"), TEXT("moss"));
 	TestTrue(TEXT("Generic rule lookup finds a match"), Found != nullptr);
 	if (Found)
 	{

@@ -46,7 +46,7 @@ bool FMatterFluxSaveInitializationTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("Seed is retained"), Save->MapSeed, 9876);
 	TestEqual(TEXT("All equipment slots are initialized"),
 		Save->MagicInventory.EquippedWands.Num(),
-		4);
+		5);
 
 	FString Error;
 	TestTrue(TEXT("Fresh save validates"), Save->ValidateAndMigrate(Error));
@@ -57,6 +57,14 @@ bool FMatterFluxSaveInitializationTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("Migration updates version"),
 		Save->SaveVersion,
 		UMatterFluxSaveGame::CurrentVersion);
+
+	UMatterFluxSaveGame* FourSlotSave = MakeValidSave(9877);
+	FourSlotSave->SaveVersion = 3;
+	FourSlotSave->MagicInventory.EquippedWands.SetNum(4);
+	TestTrue(TEXT("Version three gains the Space equipment slot"),
+		FourSlotSave->ValidateAndMigrate(Error));
+	TestEqual(TEXT("Migrated equipment has five slots"),
+		FourSlotSave->MagicInventory.EquippedWands.Num(), 5);
 
 	Save->SaveVersion = UMatterFluxSaveGame::CurrentVersion + 1;
 	TestFalse(TEXT("Future save version is rejected"),
@@ -167,6 +175,7 @@ bool FMatterFluxSaveMemoryRoundTripTest::RunTest(const FString& Parameters)
 	Quest.Progress = 2;
 	Source->Progression.SelectedQuest = Quest.QuestId;
 	Source->Progression.Revision = 7;
+	Source->CustomMapId = TEXT("story.paper_magic");
 	Source->PlayerTransform.SetLocation(FVector(120.0, 0.0, 340.0));
 
 	TArray<uint8> Bytes;
@@ -197,6 +206,8 @@ bool FMatterFluxSaveMemoryRoundTripTest::RunTest(const FString& Parameters)
 		Loaded->Progression.Items[0].Quantity, 9);
 	TestEqual(TEXT("Quest selection round-trips"),
 		Loaded->Progression.SelectedQuest, FName(TEXT("std.quest")));
+	TestEqual(TEXT("Story map selection round-trips"),
+		Loaded->CustomMapId, FName(TEXT("story.paper_magic")));
 	TestEqual(TEXT("Player location round-trips"),
 		Loaded->PlayerTransform.GetLocation(),
 		FVector(120.0, 0.0, 340.0));
@@ -297,26 +308,51 @@ bool FMatterFluxOperationProgressModelTest::RunTest(
 
 	TestEqual(TEXT("New-game generation begins at five percent"),
 		Map(0.05f, false), 0.05f, 0.001f);
-	TestEqual(TEXT("New-game tree phase matches world progress"),
-		Map(0.82f, false), 0.82f, 0.001f);
-	TestEqual(TEXT("New-game generation reserves final apply step"),
-		Map(1.0f, false), 0.97f, 0.001f);
+	TestEqual(TEXT("New-game generation reserves initialization progress"),
+		Map(0.82f, false), 0.593f, 0.002f);
+	TestEqual(TEXT("New-game generation ends before initialization"),
+		Map(1.0f, false), 0.72f, 0.001f);
 	TestEqual(TEXT("Load generation begins after disk-read phase"),
 		Map(0.05f, true), 0.15f, 0.001f);
-	TestEqual(TEXT("Load tree phase remains semantically aligned"),
-		Map(0.82f, true), 0.815f, 0.002f);
-	TestEqual(TEXT("Load generation reserves final apply step"),
-		Map(1.0f, true), 0.97f, 0.001f);
+	TestEqual(TEXT("Load generation reserves initialization progress"),
+		Map(0.82f, true), 0.612f, 0.002f);
+	TestEqual(TEXT("Load generation ends before initialization"),
+		Map(1.0f, true), 0.72f, 0.001f);
 	TestEqual(TEXT("Negative new-game progress clamps to its start"),
 		Map(-10.0f, false), 0.05f, 0.001f);
 	TestEqual(TEXT("Oversized load progress clamps to its endpoint"),
-		Map(10.0f, true), 0.97f, 0.001f);
+		Map(10.0f, true), 0.72f, 0.001f);
 	TestEqual(TEXT("Non-finite load progress repairs to its start"),
 		Map(std::numeric_limits<float>::quiet_NaN(), true),
 		0.15f,
 		0.001f);
-	TestTrue(TEXT("Applying world follows completed generation"),
-		UMatterFluxSaveSubsystem::GetApplyingWorldProgress() > 0.97f);
+	TestEqual(TEXT("Applying world begins at initialization boundary"),
+		UMatterFluxSaveSubsystem::GetApplyingWorldProgress(), 0.72f, 0.001f);
+
+	const auto MapInitialization = [](
+		const int32 PendingTerrain,
+		const int32 MaximumTerrain,
+		const int32 PendingPopulation,
+		const int32 MaximumPopulation,
+		const float Previous)
+	{
+		return UMatterFluxSaveSubsystem::MapWorldInitializationProgress(
+			PendingTerrain,
+			MaximumTerrain,
+			PendingPopulation,
+			MaximumPopulation,
+			Previous);
+	};
+	TestEqual(TEXT("Initialization begins at generation endpoint"),
+		MapInitialization(100, 100, 50, 50, 0.72f), 0.72f, 0.001f);
+	TestEqual(TEXT("Terrain work advances initialization progress"),
+		MapInitialization(50, 100, 50, 50, 0.72f), 0.809f, 0.002f);
+	TestEqual(TEXT("Population work advances final initialization range"),
+		MapInitialization(0, 100, 25, 50, 0.809f), 0.947f, 0.002f);
+	TestEqual(TEXT("Completed initialization reserves Complete transition"),
+		MapInitialization(0, 100, 0, 50, 0.947f), 0.995f, 0.001f);
+	TestEqual(TEXT("Dynamic queue growth cannot move progress backwards"),
+		MapInitialization(80, 100, 80, 100, 0.90f), 0.90f, 0.001f);
 
 	for (const bool bLoading : { false, true })
 	{

@@ -255,8 +255,22 @@ namespace MatterFlux::Reaction
 			PendingActivationEpoch = 1;
 		}
 
-		for (const int32 ActiveIndex : Current)
+		// The front budget throttles simulation work, not reaction lifetime.
+		// Cells queued behind a saturated budget must keep their remaining steps;
+		// otherwise a branching connected mask can expire before its turn and
+		// leave permanent input islands.
+		int32 ProcessedCurrentCount = 0;
+		for (int32 CurrentIndex = 0;
+			CurrentIndex < Current.Num();
+			++CurrentIndex)
 		{
+			if (MaxNewActivations > 0
+				&& Pending.Num() >= MaxNewActivations)
+			{
+				break;
+			}
+			const int32 ActiveIndex = Current[CurrentIndex];
+			++ProcessedCurrentCount;
 			const FIntPoint Cell(ActiveIndex % Width, ActiveIndex / Width);
 			if (!Rule.EmissionMaterial.IsNone()
 				&& Rule.EmissionMaterial != TEXT("empty")
@@ -267,7 +281,8 @@ namespace MatterFlux::Reaction
 			}
 			for (const FIntPoint Offset : NeighborOffsets)
 			{
-				if (Pending.Num() >= MaxNewActivations)
+				if (MaxNewActivations <= 0
+					|| Pending.Num() >= MaxNewActivations)
 				{
 					break;
 				}
@@ -292,8 +307,16 @@ namespace MatterFlux::Reaction
 
 		TArray<int32> Next;
 		Next.Reserve(Current.Num() + Pending.Num());
-		for (const int32 Index : Current)
+		for (int32 CurrentIndex = 0;
+			CurrentIndex < Current.Num();
+			++CurrentIndex)
 		{
+			const int32 Index = Current[CurrentIndex];
+			if (CurrentIndex >= ProcessedCurrentCount)
+			{
+				Next.Add(Index);
+				continue;
+			}
 			Result.ChangedCellIndices.Add(Index);
 			if (ActiveState[Index] > 0)
 			{

@@ -5,6 +5,8 @@
 #include "MatterFluxShellWidget.generated.h"
 
 class AMatterFluxPlayerController;
+class AMatterFluxPlayerState;
+class UMatterFluxProgressionComponent;
 class UMatterFluxSaveSubsystem;
 enum class EMatterFluxSaveOperation : uint8;
 
@@ -32,8 +34,12 @@ public:
 	// Multiplayer is intentionally kept behind one compile-time presentation
 	// gate while its unfinished implementation remains available for later work.
 	static constexpr bool IsMultiplayerEntryEnabled() { return false; }
+	static FName GetStoryMapId() { return TEXT("story.paper_magic"); }
+	static int32 ResolveOwnedCoinQuantity(
+		const AMatterFluxPlayerState* PlayerState);
 
 	void InitializeForPlayer(AMatterFluxPlayerController* Controller);
+	int32 GetOwnedCoinQuantity() const;
 	void ShowStartMenu();
 	void ShowSinglePlayerMenu();
 	void ShowMultiplayerMenu();
@@ -58,6 +64,7 @@ public:
 	void SetJoinAddress(const FString& Address) { JoinAddress = Address; }
 
 	void RequestNewGame();
+	void RequestStoryMode();
 	void RequestContinue();
 	void RequestHostRoom(int32 SaveSlotIndex = INDEX_NONE);
 	void SelectHostSlot(int32 SlotIndex);
@@ -84,6 +91,8 @@ public:
 	void RefreshShell();
 
 protected:
+	virtual void NativeConstruct() override;
+	virtual void NativeDestruct() override;
 	virtual void NativeTick(
 		const FGeometry& MyGeometry,
 		float InDeltaTime) override;
@@ -102,9 +111,14 @@ private:
 	void SetView(EMatterFluxShellView NewView);
 	void EnterGameplayAfterSuccessfulOperation();
 	void NotifyControllerState(bool bOperationActive = false) const;
+	UMatterFluxProgressionComponent* ResolveProgression() const;
+	void BindProgression();
+	void UnbindProgression();
 
 	UPROPERTY(Transient)
 	TObjectPtr<AMatterFluxPlayerController> OwnerController;
+	TWeakObjectPtr<UMatterFluxProgressionComponent> BoundProgression;
+	FDelegateHandle ProgressionChangedHandle;
 
 	EMatterFluxShellView View = EMatterFluxShellView::Gameplay;
 	EMatterFluxShellView SubmenuReturnView = EMatterFluxShellView::PauseMenu;

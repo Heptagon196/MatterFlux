@@ -11,7 +11,8 @@ class MATTERFLUX_API UGA_CastWand : public UGameplayAbility
 	GENERATED_BODY()
 
 public:
-	static constexpr int32 EquipmentSlotCount = 4;
+	static constexpr int32 EquipmentSlotCount =
+		MatterFlux::Magic::EquipmentSlotCount;
 	UGA_CastWand();
 
 	virtual void ActivateAbility(
@@ -23,7 +24,8 @@ public:
 	static bool SpawnCastPlan(
 		AActor& Avatar,
 		const FMatterFluxWandCastPlan& Plan,
-		int32 EventSeed);
+		int32 EventSeed,
+		const FVector& AimDirection = FVector::ZeroVector);
 
 private:
 	int32 ActivationSerial = 0;

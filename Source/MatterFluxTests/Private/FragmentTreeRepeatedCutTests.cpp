@@ -1,6 +1,8 @@
 #include "Fragment/Fragment2DActor.h"
 #include "Fragment/Fragment2DSourceActor.h"
 #include "Fragment/FragmentSimulationSubsystem.h"
+#include "Game/MatterFluxPlayableLevel.h"
+#include "Magic/MatterFluxMagicProjectile.h"
 
 #include "Algo/Count.h"
 #include "Engine/World.h"
@@ -104,6 +106,85 @@ namespace
 		return Mask;
 	}
 
+	FFragmentSourceMask MakeVerticalSeparationTrunkMask()
+	{
+		FFragmentSourceMask Mask;
+		Mask.Width = 21;
+		Mask.Height = 21;
+		Mask.CellSize = TreeCellSize;
+		Mask.MinFragmentAreaPixels = 4;
+		Mask.MaxFragmentsPerBreak = 4;
+		Mask.SupportMode = EFragmentSupportMode::Bottom;
+		Mask.SolidMask.Init(0, Mask.Width * Mask.Height);
+
+		for (int32 Y = 0; Y <= 12; ++Y)
+		{
+			for (int32 X = 3; X <= 5; ++X)
+			{
+				SetSolid(Mask, X, Y);
+			}
+		}
+		for (int32 Y = 10; Y <= 12; ++Y)
+		{
+			for (int32 X = 5; X <= 14; ++X)
+			{
+				SetSolid(Mask, X, Y);
+			}
+		}
+		for (int32 Y = 6; Y < Mask.Height; ++Y)
+		{
+			for (int32 X = 11; X < Mask.Width; ++X)
+			{
+				SetSolid(Mask, X, Y);
+			}
+		}
+		return Mask;
+	}
+
+	FFragmentSourceMask MakeVerticalSeparationLeafMask()
+	{
+		FFragmentSourceMask Mask;
+		Mask.Width = 11;
+		Mask.Height = 11;
+		Mask.CellSize = TreeCellSize;
+		Mask.MinFragmentAreaPixels = 4;
+		Mask.MaxFragmentsPerBreak = 4;
+		Mask.SupportMode = EFragmentSupportMode::Bottom;
+		Mask.SolidMask.Init(1, Mask.Width * Mask.Height);
+		return Mask;
+	}
+
+	FFragmentSourceMask MakeVerticalSplitColumnMask()
+	{
+		FFragmentSourceMask Mask;
+		Mask.Width = 5;
+		Mask.Height = 12;
+		Mask.CellSize = TreeCellSize;
+		Mask.MinFragmentAreaPixels = 3;
+		Mask.MaxFragmentsPerBreak = 4;
+		Mask.SupportMode = EFragmentSupportMode::Bottom;
+		Mask.SolidMask.Init(0, Mask.Width * Mask.Height);
+		for (int32 Y = 0; Y < Mask.Height; ++Y)
+		{
+			SetSolid(Mask, 1, Y);
+			SetSolid(Mask, 2, Y);
+		}
+		return Mask;
+	}
+
+	FFragmentSourceMask MakeUnsupportedCanopyMask()
+	{
+		FFragmentSourceMask Mask;
+		Mask.Width = 7;
+		Mask.Height = 7;
+		Mask.CellSize = TreeCellSize;
+		Mask.MinFragmentAreaPixels = 3;
+		Mask.MaxFragmentsPerBreak = 4;
+		Mask.SupportMode = EFragmentSupportMode::None;
+		Mask.SolidMask.Init(1, Mask.Width * Mask.Height);
+		return Mask;
+	}
+
 	FVector CellCenterLocal(
 		const int32 Width,
 		const int32 Height,
@@ -197,6 +278,426 @@ namespace
 		}
 		return true;
 	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxTreeVerticalCutSeparatesLeavesTest,
+	"MatterFlux.Fragment.Aggregate.VerticalCutSeparatesLeaves",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxTreeVerticalCutSeparatesLeavesTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Vertical-cut world exists"), World))
+	{
+		return false;
+	}
+
+	AFragment2DSourceActor* Trunk =
+		World->SpawnActor<AFragment2DSourceActor>();
+	AFragment2DSourceActor* Leaves =
+		World->SpawnActor<AFragment2DSourceActor>(
+			FVector(40.0f, -16.0f, 24.0f),
+			FRotator::ZeroRotator);
+	if (!TestNotNull(TEXT("Vertical-cut trunk spawns"), Trunk)
+		|| !TestNotNull(TEXT("Vertical-cut leaves spawn"), Leaves))
+	{
+		return false;
+	}
+
+	const FGuid AggregateId =
+		FGuid::NewDeterministicGuid(
+			TEXT("TreeVerticalCutAggregate"),
+			1);
+	Trunk->bDestroySourceOnFirstBreak = false;
+	Leaves->bDestroySourceOnFirstBreak = false;
+	if (!TestTrue(
+			TEXT("Vertical-cut trunk mask initializes"),
+			Trunk->InitializeFromProceduralMask(
+				MakeVerticalSeparationTrunkMask(),
+				FGuid::NewDeterministicGuid(
+					TEXT("TreeVerticalCutTrunk"),
+					1),
+				FLinearColor(0.32f, 0.12f, 0.035f),
+				TEXT("wood")))
+		|| !TestTrue(
+			TEXT("Vertical-cut leaf mask initializes"),
+			Leaves->InitializeFromProceduralMask(
+				MakeVerticalSeparationLeafMask(),
+				FGuid::NewDeterministicGuid(
+					TEXT("TreeVerticalCutLeaves"),
+					1),
+				FLinearColor(0.08f, 0.55f, 0.12f),
+				TEXT("leaf"))))
+	{
+		return false;
+	}
+	Trunk->ConfigureAggregate(AggregateId, true);
+	Leaves->ConfigureAggregate(AggregateId, false);
+	Leaves->SetSourceCollisionEnabled(false);
+	const FGuid LeafSourceId = Leaves->SourceId;
+
+	UFragmentSimulationSubsystem* Subsystem =
+		World->GetSubsystem<UFragmentSimulationSubsystem>();
+	if (!TestNotNull(TEXT("Vertical-cut fragment subsystem exists"), Subsystem))
+	{
+		return false;
+	}
+
+	FFragmentWorldCutRequest VerticalCut;
+	VerticalCut.CutShape.Type = EFragmentDamageShapeType::Line;
+	VerticalCut.CutShape.WorldTransform = FTransform(
+		FQuat(FVector::YAxisVector, -UE_HALF_PI),
+		FVector::ZeroVector);
+	VerticalCut.CutShape.Extents.X = 2.0f * 21.0f * TreeCellSize;
+	VerticalCut.CutShape.Thickness = TreeCellSize * 0.9f;
+	VerticalCut.DamagePower = 600.0f;
+	VerticalCut.EventSeed = 9101;
+	VerticalCut.TargetPadding = TreeCellSize;
+	TestEqual(
+		TEXT("Vertical cut targets one logical tree"),
+		Subsystem->RequestWorldCut(VerticalCut),
+		1);
+
+	AFragment2DActor* Carrier = nullptr;
+	int32 FragmentCount = 0;
+	for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+	{
+		Carrier = Carrier ? Carrier : *It;
+		++FragmentCount;
+	}
+	TestEqual(
+		TEXT("Vertical cut creates one detached tree carrier"),
+		FragmentCount,
+		1);
+	if (TestNotNull(TEXT("Vertical cut has a physical carrier"), Carrier))
+	{
+		TestTrue(
+			TEXT("Vertical-cut leaf remainder transfers into the carrier"),
+			Carrier->ContainsAggregateSource(LeafSourceId));
+		TestEqual(
+			TEXT("Vertical-cut leaf material remains a carrier layer"),
+			Carrier->GetAggregateSourceMaterialId(LeafSourceId),
+			FName(TEXT("leaf")));
+	}
+
+	bool bLeafActorStillExists = false;
+	for (TActorIterator<AFragment2DSourceActor> It(World); It; ++It)
+	{
+		bLeafActorStillExists |= !It->IsActorBeingDestroyed()
+			&& It->SourceId == LeafSourceId;
+	}
+	TestFalse(
+		TEXT("Vertical-cut leaves do not remain as a floating static source"),
+		bLeafActorStillExists);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxTreeVerticalCutMakesLeavesPhysicalTest,
+	"MatterFlux.Fragment.Aggregate.VerticalCutMakesDetachedLeavesPhysical",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxTreeVerticalCutMakesLeavesPhysicalTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AFragment2DSourceActor* Trunk = World
+		? World->SpawnActor<AFragment2DSourceActor>()
+		: nullptr;
+	AFragment2DSourceActor* Leaves = World
+		? World->SpawnActor<AFragment2DSourceActor>(
+			FVector(0.0f, -16.0f, 48.0f),
+			FRotator::ZeroRotator)
+		: nullptr;
+	if (!TestNotNull(TEXT("Physical vertical-cut world exists"), World)
+		|| !TestNotNull(TEXT("Physical vertical-cut trunk spawns"), Trunk)
+		|| !TestNotNull(TEXT("Physical vertical-cut leaves spawn"), Leaves))
+	{
+		return false;
+	}
+
+	const FGuid AggregateId = FGuid::NewDeterministicGuid(
+		TEXT("TreeVerticalPhysicalAggregate"),
+		1);
+	Trunk->bDestroySourceOnFirstBreak = false;
+	Leaves->bDestroySourceOnFirstBreak = false;
+	if (!TestTrue(
+			TEXT("Physical vertical-cut trunk initializes"),
+			Trunk->InitializeFromProceduralMask(
+				MakeVerticalSplitColumnMask(),
+				FGuid::NewDeterministicGuid(
+					TEXT("TreeVerticalPhysicalTrunk"),
+					1),
+				FLinearColor(0.32f, 0.12f, 0.035f),
+				TEXT("wood")))
+		|| !TestTrue(
+			TEXT("Physical vertical-cut leaves initialize"),
+			Leaves->InitializeFromProceduralMask(
+				MakeUnsupportedCanopyMask(),
+				FGuid::NewDeterministicGuid(
+					TEXT("TreeVerticalPhysicalLeaves"),
+					1),
+				FLinearColor(0.08f, 0.55f, 0.12f),
+				TEXT("leaf"))))
+	{
+		return false;
+	}
+	Trunk->ConfigureAggregate(AggregateId, true);
+	Leaves->ConfigureAggregate(AggregateId, false);
+	Leaves->SetSourceCollisionEnabled(false);
+
+	UFragmentSimulationSubsystem* Subsystem =
+		World->GetSubsystem<UFragmentSimulationSubsystem>();
+	if (!TestNotNull(TEXT("Physical vertical-cut subsystem exists"), Subsystem))
+	{
+		return false;
+	}
+	FFragmentWorldCutRequest VerticalCut;
+	VerticalCut.CutShape.Type = EFragmentDamageShapeType::Line;
+	VerticalCut.CutShape.WorldTransform = FTransform(
+		FQuat(FVector::YAxisVector, -UE_HALF_PI),
+		FVector::ZeroVector);
+	VerticalCut.CutShape.Extents.X = 200.0f;
+	VerticalCut.CutShape.Thickness = TreeCellSize * 0.9f;
+	VerticalCut.DamagePower = 600.0f;
+	VerticalCut.EventSeed = 9102;
+	VerticalCut.TargetPadding = TreeCellSize;
+	TestEqual(
+		TEXT("Physical vertical cut targets one logical tree"),
+		Subsystem->RequestWorldCut(VerticalCut),
+		1);
+
+	int32 LeafFragmentCount = 0;
+	for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+	{
+		if (It->SpawnPayload.MaterialId != FName(TEXT("leaf")))
+		{
+			continue;
+		}
+		++LeafFragmentCount;
+		TestTrue(
+			TEXT("Every vertically detached leaf payload enables physics collision"),
+			It->SpawnPayload.bEnableCollision);
+		TestEqual(
+			TEXT("Every vertically detached leaf body has query and physics collision"),
+			It->MeshComponent->GetCollisionEnabled(),
+			ECollisionEnabled::QueryAndPhysics);
+		// CreateNewMap produces an editor world, where InitializeFromPayload
+		// intentionally does not start Chaos simulation. The collision-bearing
+		// payload is the invariant that makes the same authority actor simulate
+		// immediately when this path runs in a game world.
+	}
+	TestEqual(
+		TEXT("Vertical canopy split creates two detached leaf bodies"),
+		LeafFragmentCount,
+		2);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxGeneratedTreeFirstVerticalCutTest,
+	"MatterFlux.Fragment.Aggregate.GeneratedTreeFirstVerticalCutKeepsCanopy",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxGeneratedTreeFirstVerticalCutTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	MatterFlux::PlayableLevel::FLevelLayout Layout;
+	if (!TestTrue(
+		TEXT("Generated-tree layout builds"),
+		MatterFlux::PlayableLevel::BuildLevelLayout(1337, Layout)))
+	{
+		return false;
+	}
+
+	TArray<FGuid> TreeAggregates;
+	for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Definition
+		: Layout.FragmentSources)
+	{
+		if (Definition.Name == TEXT("TreeTrunk")
+			&& Definition.bAggregateRoot
+			&& Definition.AggregateId.IsValid())
+		{
+			TreeAggregates.AddUnique(Definition.AggregateId);
+		}
+	}
+	if (!TestTrue(
+		TEXT("Generated layout contains enough tree variants"),
+		TreeAggregates.Num() >= 6))
+	{
+		return false;
+	}
+
+	FMatterFluxMagicProjectilePlan VerticalPlan;
+	VerticalPlan.Radius = 60.0f;
+	VerticalPlan.bUsePlaneVisual = true;
+	VerticalPlan.bUseVerticalPlaneVisual = true;
+	constexpr int32 CaseCount = 6;
+	for (int32 CaseIndex = 0; CaseIndex < CaseCount; ++CaseIndex)
+	{
+		UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+		if (!TestNotNull(
+			*FString::Printf(TEXT("Generated-tree case %d world exists"), CaseIndex),
+			World))
+		{
+			return false;
+		}
+
+		const FGuid AggregateId = TreeAggregates[CaseIndex];
+		TArray<FGuid> LeafSourceIds;
+		FVector CanopyCenter = FVector::ZeroVector;
+		int32 CanopySliceCount = 0;
+		FQuat TreeRotation = FQuat::Identity;
+		for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Definition
+			: Layout.FragmentSources)
+		{
+			if (Definition.AggregateId != AggregateId)
+			{
+				continue;
+			}
+			AFragment2DSourceActor* Source =
+				World->SpawnActor<AFragment2DSourceActor>(
+					AFragment2DSourceActor::StaticClass(),
+					Definition.Transform);
+			if (!TestNotNull(
+				*FString::Printf(
+					TEXT("Generated-tree case %d source spawns"),
+					CaseIndex),
+				Source))
+			{
+				return false;
+			}
+			Source->bDestroySourceOnFirstBreak = false;
+			if (!TestTrue(
+				*FString::Printf(
+					TEXT("Generated-tree case %d source initializes"),
+					CaseIndex),
+				Source->InitializeFromProceduralMask(
+					Definition.Mask,
+					Definition.SourceId,
+					Definition.Color,
+					Definition.MaterialId)))
+			{
+				return false;
+			}
+			Source->ConfigureAggregate(
+				Definition.AggregateId,
+				Definition.bAggregateRoot);
+			Source->SetSourceCollisionEnabled(Definition.bEnableCollision);
+			if (Definition.Name == TEXT("TreeLeaves"))
+			{
+				LeafSourceIds.Add(Definition.SourceId);
+				CanopyCenter += Definition.Transform.GetLocation();
+				++CanopySliceCount;
+				TreeRotation = Definition.Transform.GetRotation();
+			}
+		}
+		if (!TestEqual(
+			*FString::Printf(
+				TEXT("Generated-tree case %d has five canopy slices"),
+				CaseIndex),
+			CanopySliceCount,
+			5))
+		{
+			return false;
+		}
+		CanopyCenter /= static_cast<float>(CanopySliceCount);
+		const float LateralOffsets[] = { 0.0f, -8.0f, 8.0f };
+		const float HeightOffsets[] = { 0.0f, -16.0f };
+		const FVector ImpactPoint = CanopyCenter
+			+ TreeRotation.RotateVector(FVector(
+				LateralOffsets[CaseIndex % UE_ARRAY_COUNT(LateralOffsets)],
+				0.0f,
+				HeightOffsets[CaseIndex / UE_ARRAY_COUNT(LateralOffsets)]));
+
+		FFragmentWorldCutRequest Cut;
+		Cut.CutShape = AMatterFluxMagicProjectile::BuildImpactCutShape(
+			VerticalPlan,
+			FVector::ForwardVector,
+			ImpactPoint);
+		Cut.DamagePower = 1200.0f;
+		Cut.EventSeed = 9300 + CaseIndex;
+		Cut.TargetPadding = VerticalPlan.Radius;
+		Cut.MaxAffectedSources = 1;
+		UFragmentSimulationSubsystem* Subsystem =
+			World->GetSubsystem<UFragmentSimulationSubsystem>();
+		if (!TestNotNull(
+			*FString::Printf(
+				TEXT("Generated-tree case %d subsystem exists"),
+				CaseIndex),
+			Subsystem))
+		{
+			return false;
+		}
+		TestEqual(
+			*FString::Printf(
+				TEXT("Generated-tree case %d first vertical cut targets one tree"),
+				CaseIndex),
+			Subsystem->RequestWorldCut(Cut),
+			1);
+
+		int32 PersistentLeafBodies = 0;
+		int32 PrematurelyFadingLeafBodies = 0;
+		for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+		{
+			const bool bLeafBody = It->SpawnPayload.MaterialId == TEXT("leaf")
+				|| LeafSourceIds.ContainsByPredicate(
+					[&It](const FGuid& SourceId)
+					{
+						return It->ContainsAggregateSource(SourceId);
+					});
+			if (!bLeafBody)
+			{
+				continue;
+			}
+			PrematurelyFadingLeafBodies +=
+				It->SpawnPayload.FadeOutDuration > 0.0f
+					|| It->IsCutFadeActive()
+				? 1
+				: 0;
+			PersistentLeafBodies +=
+				It->SpawnPayload.FadeOutDuration <= 0.0f
+					&& !It->IsCutFadeActive()
+				? 1
+				: 0;
+		}
+
+		int32 FloatingStaticLeafSources = 0;
+		for (TActorIterator<AFragment2DSourceActor> It(World); It; ++It)
+		{
+			FloatingStaticLeafSources +=
+				LeafSourceIds.Contains(It->SourceId)
+					&& !It->IsActorBeingDestroyed()
+					&& !It->bBroken
+					&& It->GetRuntimeMask().Contains(1)
+				? 1
+				: 0;
+		}
+		TestTrue(
+			*FString::Printf(
+				TEXT("Generated-tree case %d keeps visible leaf bodies after one cut"),
+				CaseIndex),
+			PersistentLeafBodies > 0);
+		TestEqual(
+			*FString::Printf(
+				TEXT("Generated-tree case %d has no premature fade after one cut"),
+				CaseIndex),
+			PrematurelyFadingLeafBodies,
+			0);
+		TestEqual(
+			*FString::Printf(
+				TEXT("Generated-tree case %d leaves no static canopy floating"),
+				CaseIndex),
+			FloatingStaticLeafSources,
+			0);
+	}
+	return true;
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
