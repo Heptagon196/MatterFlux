@@ -150,9 +150,19 @@ namespace
 					- FMath::Max(Bounds.BottomZ, Medium.BottomZ));
 			const float Fraction = FMath::Clamp(
 				OverlapHeight / BodyHeight, 0.0f, 1.0f);
-			OutMediumFraction += Fraction
+			// A dense powder surface resists the feet even when its query-only
+			// support keeps the capsule just above the canonical column. Preserve
+			// the Lua material distinction without treating sand as a liquid volume.
+			const float EffectiveFraction =
+				Medium.Phase == EMatterFluxMaterialPhase::Powder
+				&& Bounds.BottomZ >= Medium.SurfaceZ
+				&& Bounds.BottomZ <= Medium.SurfaceZ + 8.0f
+					? FMath::Max(Fraction, 0.08f)
+					: Fraction;
+			OutMediumFraction += EffectiveFraction
 				/ static_cast<float>(BuoyancySampleCount);
-			OutWeightedResistance += Medium.MovementResistance * Fraction
+			OutWeightedResistance += Medium.MovementResistance
+				* EffectiveFraction
 				/ static_cast<float>(BuoyancySampleCount);
 		}
 		if (OutMediumFraction > UE_SMALL_NUMBER)
@@ -270,6 +280,136 @@ bool UMatterFluxBuoyancyComponent::ShouldSimulateCharacter() const
 		&& (Character->HasAuthority() || Character->IsLocallyControlled());
 }
 
+void UMatterFluxBuoyancyComponent::UpdatePowderCollisionInteraction(
+	AMatterFluxPlayableWorldActor& PlayableWorld,
+	const FVector& Center,
+	const FVector& HorizontalExtent,
+	const float BottomZ,
+	const float TopZ,
+	const FVector& Velocity,
+	const bool bEnableFootsteps,
+	const bool bMovingOnGround,
+	const float DeltaTime)
+{
+	AActor* Owner = GetOwner();
+	if (!Owner || !Owner->HasAuthority())
+	{
+		return;
+	}
+
+	PowderImpactCooldown = FMath::Max(
+		PowderImpactCooldown - DeltaTime,
+		0.0f);
+	if (!bHasPowderInteractionSample)
+	{
+		bHasPowderInteractionSample = true;
+		LastPowderInteractionLocation = Center;
+		LastPowderInteractionVelocity = Velocity;
+		return;
+	}
+
+	const FVector ImpactVelocity =
+		LastPowderInteractionVelocity.SizeSquared() >= Velocity.SizeSquared()
+			? LastPowderInteractionVelocity
+			: Velocity;
+	const FVector ImpactDirection = ImpactVelocity.GetSafeNormal();
+	FVector ContactProbe = Center;
+	const FVector2D HorizontalDirection(
+		ImpactDirection.X,
+		ImpactDirection.Y);
+	if (!HorizontalDirection.IsNearlyZero())
+	{
+		const FVector2D UnitDirection = HorizontalDirection.GetSafeNormal();
+		ContactProbe.X += UnitDirection.X * HorizontalExtent.X;
+		ContactProbe.Y += UnitDirection.Y * HorizontalExtent.Y;
+	}
+	ContactProbe.Z = ImpactDirection.Z < -0.15f
+		? BottomZ + 1.0f
+		: ImpactDirection.Z > 0.15f
+			? TopZ - 1.0f
+			: Center.Z;
+
+	FMatterFluxMovementMediumColumn ContactMedium;
+	bool bTouchingPowder =
+		PlayableWorld.TrySampleMovementMediumColumnAtWorldLocation(
+			ContactProbe,
+			ContactMedium)
+		&& ContactMedium.Phase == EMatterFluxMaterialPhase::Powder
+		&& TopZ >= ContactMedium.BottomZ - 4.0f
+		&& BottomZ <= ContactMedium.SurfaceZ + 8.0f;
+	if (!bTouchingPowder)
+	{
+		// A body can stop exactly at the powder boundary, leaving the forward
+		// probe one cell beyond a narrow pile. The center sample catches that
+		// resolved contact without widening the actual disturbance footprint.
+		bTouchingPowder =
+			PlayableWorld.TrySampleMovementMediumColumnAtWorldLocation(
+				Center,
+				ContactMedium)
+			&& ContactMedium.Phase == EMatterFluxMaterialPhase::Powder
+			&& TopZ >= ContactMedium.BottomZ - 4.0f
+			&& BottomZ <= ContactMedium.SurfaceZ + 8.0f;
+		if (bTouchingPowder)
+		{
+			ContactProbe.X = Center.X;
+			ContactProbe.Y = Center.Y;
+		}
+	}
+
+	const float CollisionSpeed = ImpactVelocity.Size();
+	const float VelocityChange =
+		(Velocity - LastPowderInteractionVelocity).Size();
+	const bool bNewCollision = bTouchingPowder && !bWasTouchingPowder;
+	const bool bCollisionImpulse = bTouchingPowder
+		&& VelocityChange >= 160.0f;
+	if (PowderImpactCooldown <= 0.0f
+		&& CollisionSpeed >= 120.0f
+		&& (bNewCollision || bCollisionImpulse))
+	{
+		const float EffectiveImpactSpeed = FMath::Max(
+			CollisionSpeed,
+			VelocityChange);
+		const int32 ImpactAmount = FMath::Clamp(
+			FMath::RoundToInt((EffectiveImpactSpeed - 80.0f) * 0.08f),
+			16,
+			128);
+		PlayableWorld.DisturbPowderAtWorldLocation(
+			ContactProbe,
+			ImpactAmount,
+			4);
+		PowderImpactCooldown = 0.12f;
+	}
+
+	const FVector HorizontalTravelDelta(
+		Center.X - LastPowderInteractionLocation.X,
+		Center.Y - LastPowderInteractionLocation.Y,
+		0.0f);
+	const float TravelDistance = HorizontalTravelDelta.Size();
+	if (bEnableFootsteps && bMovingOnGround && bTouchingPowder
+		&& TravelDistance <= 200.0f)
+	{
+		PowderGroundTravel += TravelDistance;
+		int32 StepsThisFrame = 0;
+		while (PowderGroundTravel >= 70.0f && StepsThisFrame < 2)
+		{
+			PlayableWorld.DisturbPowderAtWorldLocation(
+				FVector(Center.X, Center.Y, BottomZ + 1.0f),
+				24,
+				3);
+			PowderGroundTravel -= 70.0f;
+			++StepsThisFrame;
+		}
+	}
+	else if (!bTouchingPowder || TravelDistance > 200.0f)
+	{
+		PowderGroundTravel = 0.0f;
+	}
+
+	LastPowderInteractionLocation = Center;
+	LastPowderInteractionVelocity = Velocity;
+	bWasTouchingPowder = bTouchingPowder;
+}
+
 void UMatterFluxBuoyancyComponent::ApplyToCharacter(const float DeltaTime)
 {
 	if (!ShouldSimulateCharacter())
@@ -330,7 +470,18 @@ void UMatterFluxBuoyancyComponent::ApplyToCharacter(const float DeltaTime)
 		Bounds.BottomZ,
 		Bounds.TopZ,
 		true,
-		true);
+		true,
+		false);
+	UpdatePowderCollisionInteraction(
+		*PlayableWorld,
+		Bounds.Center,
+		Bounds.HorizontalExtent,
+		Bounds.BottomZ,
+		Bounds.TopZ,
+		Movement->Velocity,
+		true,
+		Movement->IsMovingOnGround(),
+		DeltaTime);
 	if (WeightedResistance > UE_SMALL_NUMBER)
 	{
 		// Exponential damping is stable across frame rates and cannot reverse a
@@ -404,7 +555,18 @@ void UMatterFluxBuoyancyComponent::ApplyToPhysicsBody(const float DeltaTime)
 		Bounds.BottomZ,
 		Bounds.TopZ,
 		false,
-		true);
+		true,
+		false);
+	UpdatePowderCollisionInteraction(
+		*PlayableWorld,
+		Bounds.Center,
+		Bounds.HorizontalExtent,
+		Bounds.BottomZ,
+		Bounds.TopZ,
+		Primitive->GetPhysicsLinearVelocity(),
+		false,
+		false,
+		DeltaTime);
 	if (WeightedResistance > UE_SMALL_NUMBER)
 	{
 		Primitive->AddForce(

@@ -1,6 +1,6 @@
 spell.define({
 	id = "spell.sand_sphere", name = "悬空沙球",
-	description = "在施法方向前方的上空生成一颗大型沙球；沙球随后受重力落下。",
+	description = "在施法方向前方的上空生成大量真实沙粒；沙粒从生成起便受重力落下。",
 	icon = "sand_spray", mana_cost = 24, starter_count = 2
 }, function(api)
 	api.projectile({

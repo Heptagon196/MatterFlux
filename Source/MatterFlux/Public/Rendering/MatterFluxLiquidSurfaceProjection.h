@@ -16,7 +16,11 @@ namespace MatterFlux::Rendering
 		TArray<int32> Triangles;
 		TArray<FVector> Normals;
 		TArray<FVector2D> UVs;
+		/** Canonical liquid-column depth, aligned one-to-one with Vertices. */
+		TArray<float> ColumnDepths;
 		TMap<FIntPoint, float> SurfaceHeights;
+		/** Number of leading vertices belonging to upward free surfaces. */
+		int32 TopVertexCount = 0;
 		/** Number of leading triangle indices belonging to upward free surfaces. */
 		int32 TopTriangleIndexCount = 0;
 		int32 SurfacePatchCount = 0;
@@ -32,10 +36,12 @@ namespace MatterFlux::Rendering
 	/**
 	 * Builds disposable surface geometry from the current canonical snapshot only.
 	 * A waterfall can belong to one material body without forcing its upper and
-	 * lower surfaces into one stretched sheet. Adjacent cells share a corner whose
-	 * height interpolates only those current cells. The projection never fills an
-	 * empty coordinate or changes a current column height; no temporal or body-wide
-	 * height is allowed to exist independently of material facts.
+	 * lower surfaces into one stretched sheet. Every material cell owns its four
+	 * top vertices so interpolation cannot turn adjacent liquid particles into a
+	 * continuous curved sheet. Different-height cells retain separate flat tops
+	 * and an explicit stepped side. The projection never fills an empty coordinate
+	 * or changes a current column height; no temporal or body-wide height is
+	 * allowed to exist independently of material facts.
 	 */
 	MATTERFLUX_API void BuildLiquidSurfaceProjection(
 		TConstArrayView<Material::FCellSnapshot> Cells,
@@ -45,7 +51,7 @@ namespace MatterFlux::Rendering
 
 	/**
 	 * Builds only the top/side faces owned by one render chunk. Cells may include
-	 * a one-cell halo; halo facts influence shared corners and exposed-edge tests
+	 * a one-cell halo; halo facts influence shared vertices and exposed-edge tests
 	 * but never emit geometry into this chunk's mesh.
 	 */
 	MATTERFLUX_API void BuildLiquidSurfaceChunkProjection(
@@ -61,4 +67,15 @@ namespace MatterFlux::Rendering
 		TConstArrayView<FIntPoint> Chunks,
 		TArray<FIntPoint>& OutEvenChunks,
 		TArray<FIntPoint>& OutOddChunks);
+
+	/**
+	 * Selects the bounded projection work for one visualization pass. This is a
+	 * render scheduler only; it never changes canonical material state.
+	 */
+	MATTERFLUX_API void SelectLiquidProjectionChunksForRebuild(
+		TConstArrayView<FIntPoint> PendingChunks,
+		FIntPoint FocusChunk,
+		TArray<FIntPoint>& OutSelectedChunks,
+		const TMap<FIntPoint, uint64>* EnqueueOrders = nullptr,
+		int32 MaximumChunksPerPass = 8);
 }

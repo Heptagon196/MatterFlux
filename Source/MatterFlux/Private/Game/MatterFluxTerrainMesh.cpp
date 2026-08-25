@@ -217,14 +217,15 @@ namespace MatterFlux::TerrainMesh
 		}
 
 		// Render the exact quantized heightfield, but let physics see a shared
-		// piecewise-linear surface without vertical step faces. Each two-cell
-		// collision patch takes the upper envelope of every rendered cell touched
-		// by either neighboring patch. This keeps the collider smooth without ever
-		// placing it below visible terrain, where a grounded capsule would appear
-		// buried. World-cell sampling also keeps independently streamed seams
-		// identical without coordinating chunk lifetimes.
+		// piecewise-linear surface without vertical step faces. Collision vertices
+		// pass through the canonical height at every terrain-cell center, then join
+		// adjacent centers with slopes. Using the highest surrounding cell at each
+		// corner made high banks expand into neighboring water cells as invisible
+		// shelves. Center samples preserve smooth movement without dilating land.
+		// World-cell sampling also keeps independently streamed seams identical
+		// without coordinating chunk lifetimes.
 		FSection& CollisionSurface = OutChunk.CollisionSurface;
-		constexpr int32 CollisionCellStride = 2;
+		constexpr int32 CollisionCellStride = 1;
 		constexpr int32 CollisionSampleMin = -1;
 		const int32 CollisionCellCountX =
 			FMath::DivideAndRoundUp(CellCountX + 2, CollisionCellStride);
@@ -249,10 +250,6 @@ namespace MatterFlux::TerrainMesh
 		const double FirstCollisionCenterY = Terrain.FirstCellCenter.Y
 			+ static_cast<double>(FirstSampleWorldCellY - FirstWorldCell.Y)
 				* Terrain.CellSize;
-		const double CollisionOriginX =
-			FirstCollisionCenterX - Terrain.CellSize * 0.5;
-		const double CollisionOriginY =
-			FirstCollisionCenterY - Terrain.CellSize * 0.5;
 		for (int32 GridY = 0; GridY <= CollisionCellCountY; ++GridY)
 		{
 			const int32 SampleY = FMath::Min(
@@ -263,27 +260,12 @@ namespace MatterFlux::TerrainMesh
 				const int32 SampleX = FMath::Min(
 					CollisionSampleMin + GridX * CollisionCellStride,
 					CellCountX + 1);
-				double Height = -TNumericLimits<double>::Max();
-				for (int32 OffsetY = -CollisionCellStride;
-					OffsetY < CollisionCellStride;
-					++OffsetY)
-				{
-					for (int32 OffsetX = -CollisionCellStride;
-						OffsetX < CollisionCellStride;
-						++OffsetX)
-					{
-						Height = FMath::Max(
-							Height,
-							static_cast<double>(SampledHeights[
-								ToSampleIndex(
-									SampleX + OffsetX,
-									SampleY + OffsetY)]));
-					}
-				}
+				const double Height = static_cast<double>(
+					SampledHeights[ToSampleIndex(SampleX, SampleY)]);
 				const double WorldX =
-					CollisionOriginX + SampleX * Terrain.CellSize;
+					FirstCollisionCenterX + SampleX * Terrain.CellSize;
 				const double WorldY =
-					CollisionOriginY + SampleY * Terrain.CellSize;
+					FirstCollisionCenterY + SampleY * Terrain.CellSize;
 				if (!FMath::IsFinite(Height)
 					|| !FMath::IsFinite(WorldX)
 					|| !FMath::IsFinite(WorldY))
@@ -332,14 +314,92 @@ namespace MatterFlux::TerrainMesh
 		}
 		CollisionSurface.Triangles.Reserve(
 			CollisionCellCountX * CollisionCellCountY * 6);
+		TBitArray<> MergedCollisionCells(
+			false,
+			CollisionCellCountX * CollisionCellCountY);
+		const auto ToCollisionCellIndex = [CollisionCellCountX](
+			const int32 X,
+			const int32 Y)
+			{
+				return Y * CollisionCellCountX + X;
+			};
 		for (int32 Y = 0; Y < CollisionCellCountY; ++Y)
 		{
 			for (int32 X = 0; X < CollisionCellCountX; ++X)
 			{
+				if (MergedCollisionCells[ToCollisionCellIndex(X, Y)])
+				{
+					continue;
+				}
+				const double Height = CollisionSurface.Vertices[
+					ToCollisionIndex(X, Y)].Z;
+				const auto IsFlatCellAtHeight = [
+					&CollisionSurface,
+					&ToCollisionIndex,
+					Height](const int32 CellX, const int32 CellY)
+					{
+						return CollisionSurface.Vertices[
+							ToCollisionIndex(CellX, CellY)].Z == Height
+							&& CollisionSurface.Vertices[
+								ToCollisionIndex(CellX + 1, CellY)].Z == Height
+							&& CollisionSurface.Vertices[
+								ToCollisionIndex(CellX + 1, CellY + 1)].Z == Height
+							&& CollisionSurface.Vertices[
+								ToCollisionIndex(CellX, CellY + 1)].Z == Height;
+					};
+				int32 RectangleWidth = 1;
+				int32 RectangleHeight = 1;
+				if (IsFlatCellAtHeight(X, Y))
+				{
+					while (X + RectangleWidth < CollisionCellCountX
+						&& !MergedCollisionCells[ToCollisionCellIndex(
+							X + RectangleWidth, Y)]
+						&& IsFlatCellAtHeight(X + RectangleWidth, Y))
+					{
+						++RectangleWidth;
+					}
+					bool bCanExtend = true;
+					while (Y + RectangleHeight < CollisionCellCountY
+						&& bCanExtend)
+					{
+						for (int32 OffsetX = 0;
+							OffsetX < RectangleWidth;
+							++OffsetX)
+						{
+							const int32 CandidateX = X + OffsetX;
+							const int32 CandidateY = Y + RectangleHeight;
+							if (MergedCollisionCells[ToCollisionCellIndex(
+								CandidateX, CandidateY)]
+								|| !IsFlatCellAtHeight(
+									CandidateX, CandidateY))
+							{
+								bCanExtend = false;
+								break;
+							}
+						}
+						if (bCanExtend)
+						{
+							++RectangleHeight;
+						}
+					}
+				}
+				for (int32 OffsetY = 0;
+					OffsetY < RectangleHeight;
+					++OffsetY)
+				{
+					for (int32 OffsetX = 0;
+						OffsetX < RectangleWidth;
+						++OffsetX)
+					{
+						MergedCollisionCells[ToCollisionCellIndex(
+							X + OffsetX, Y + OffsetY)] = true;
+					}
+				}
 				const int32 A = ToCollisionIndex(X, Y);
-				const int32 B = ToCollisionIndex(X + 1, Y);
-				const int32 C = ToCollisionIndex(X + 1, Y + 1);
-				const int32 D = ToCollisionIndex(X, Y + 1);
+				const int32 B = ToCollisionIndex(X + RectangleWidth, Y);
+				const int32 C = ToCollisionIndex(
+					X + RectangleWidth, Y + RectangleHeight);
+				const int32 D = ToCollisionIndex(X, Y + RectangleHeight);
 				CollisionSurface.Triangles.Append({A, C, B, A, D, C});
 			}
 		}

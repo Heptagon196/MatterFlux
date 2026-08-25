@@ -2,6 +2,7 @@
 #include "Components/CapsuleComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/PointLightComponent.h"
+#include "Components/SceneComponent.h"
 #include "Components/SphereComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "EngineUtils.h"
@@ -11,6 +12,7 @@
 #include "Game/MatterFluxCharacter.h"
 #include "Game/MatterFluxPlayableWorldActor.h"
 #include "GameFramework/ProjectileMovementComponent.h"
+#include "HAL/PlatformTime.h"
 #include "Magic/MatterFluxWandProgram.h"
 #include "Magic/MatterFluxSpellProgramLayout.h"
 #include "Magic/MatterFluxMagicInventoryComponent.h"
@@ -2285,6 +2287,14 @@ bool FMatterFluxMagicMaterialSpraySpellTest::RunTest(
 				Expected.GravityScale));
 		TestTrue(TEXT("Spray remains short range"),
 			Plan.Projectiles[0].Lifetime < 1.0f);
+		const bool bLiquidSpray = Expected.MaterialId == TEXT("water")
+			|| Expected.MaterialId == TEXT("acid");
+		const int32 ExpectedAmountPerParticle = bLiquidSpray ? 16 : 255;
+		const int32 AirborneParticlesBefore =
+			MaterialWorld->GetAirborneSimulatedMaterialParticleCount(
+				Expected.MaterialId);
+		const int64 MaterialAmountBefore =
+			MaterialWorld->GetSimulatedMaterialAmount(Expected.MaterialId);
 		if (!TestTrue(TEXT("Spray projectile spawns"),
 			UGA_CastWand::SpawnCastPlan(*Avatar, Plan, 77)))
 		{
@@ -2304,68 +2314,725 @@ bool FMatterFluxMagicMaterialSpraySpellTest::RunTest(
 		{
 			continue;
 		}
-		TestTrue(TEXT("Spawned spray travels in front of the caster"),
-			FVector::DotProduct(
-				Projectile->ProjectileMovement->Velocity,
-				Avatar->GetActorForwardVector()) > 0.0f);
-		TestTrue(TEXT("Material projectile uses swept collision"),
-			Projectile->ProjectileMovement->bSweepCollision);
-		TestTrue(TEXT("Blocking movement stop is wired to material impact"),
-			Projectile->ProjectileMovement->OnProjectileStop.IsBound());
-		TestTrue(TEXT("Material projectile blocks world geometry"),
-			Projectile->Collision->GetCollisionResponseToChannel(ECC_WorldStatic)
-				== ECR_Block);
-		TestTrue(TEXT("Projectile movement applies authored gravity"),
-			FMath::IsNearlyEqual(
-				Projectile->ProjectileMovement->ProjectileGravityScale,
-				Expected.GravityScale));
-
-		for (int32 Y = -4; Y <= 4; ++Y)
+		if (!Projectile->HasActorBegunPlay())
 		{
-			for (int32 X = -4; X <= 4; ++X)
-			{
-				MaterialWorld->SetSimulatedMaterialAtWorldLocation(
-					Expected.ImpactPoint
-						+ FVector(X * 8.0f, Y * 8.0f, 0.0f),
-					NAME_None);
-			}
+			Projectile->DispatchBeginPlay();
 		}
-		const int32 MaterialCellsBefore =
-			MaterialWorld->GetSimulatedMaterialCount(Expected.MaterialId);
-		const int64 MaterialAmountBefore =
-			MaterialWorld->GetSimulatedMaterialAmount(Expected.MaterialId);
-		FHitResult Hit;
-		Hit.ImpactPoint = Expected.ImpactPoint;
-		TestTrue(TEXT("Spray resolves its authority impact"),
-			Projectile->ResolveImpactAuthority(Hit));
-		TestTrue(TEXT("Impact retires the flight-only projectile state"),
-			Projectile->IsActorBeingDestroyed());
-		const bool bLiquidSpray = Expected.MaterialId == TEXT("water")
-			|| Expected.MaterialId == TEXT("acid");
-		// The surface world stores a full 128cm liquid column as 255. One
-		// authored 8cm material voxel therefore contributes 16 column units.
-		const int32 ExpectedAmountPerPayloadCell = bLiquidSpray ? 16 : 255;
-		TestEqual(TEXT("Spray conserves its authored material volume"),
+		TestEqual(TEXT("Spray creates real airborne particles immediately"),
+			MaterialWorld->GetAirborneSimulatedMaterialParticleCount(
+				Expected.MaterialId) - AirborneParticlesBefore,
+			Expected.MaterialAmount);
+		TestEqual(TEXT("Airborne particles own the authored volume immediately"),
 			MaterialWorld->GetSimulatedMaterialAmount(Expected.MaterialId)
 				- MaterialAmountBefore,
 			static_cast<int64>(Expected.MaterialAmount)
-				* ExpectedAmountPerPayloadCell);
-		const int32 DepositedCells =
-			MaterialWorld->GetSimulatedMaterialCount(Expected.MaterialId)
-				- MaterialCellsBefore;
-		if (bLiquidSpray)
+				* ExpectedAmountPerParticle);
+		TestTrue(TEXT("Flight-only sphere collision is disabled"),
+			Projectile->Collision->GetCollisionEnabled()
+				== ECollisionEnabled::NoCollision);
+		TestFalse(TEXT("Flight-only projectile movement no longer owns material"),
+			Projectile->ProjectileMovement->IsActive());
+		FHitResult SyntheticHit;
+		SyntheticHit.ImpactPoint = Expected.ImpactPoint;
+		TestFalse(TEXT("A synthetic carrier hit cannot duplicate material"),
+			Projectile->ResolveImpactAuthority(SyntheticHit));
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxMagicSandSphereCompactPileTest,
+	"MatterFlux.Magic.Content.SandSphereFallsAsCompactConservedPile",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxMagicSandSphereCompactPileTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(TEXT("Default content pack loads"),
+		Runtime.ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry = Runtime.GetActiveRegistry();
+	const FMatterFluxSpellDefinition* Definition = Registry.IsValid()
+		? Registry->Spells.Find(TEXT("spell.sand_sphere"))
+		: nullptr;
+	if (!TestNotNull(TEXT("The falling-sand spell is registered"), Definition))
+	{
+		return false;
+	}
+
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* MaterialWorld = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Material world spawns"), MaterialWorld))
+	{
+		return false;
+	}
+	MaterialWorld->Regenerate(24680);
+	TArray<MatterFlux::Material::FCellSnapshot> InitialSand;
+	MaterialWorld->GetSimulatedMaterialCells(TEXT("sand"), InitialSand);
+	TMap<FIntPoint, int32> InitialSandAmounts;
+	for (const MatterFlux::Material::FCellSnapshot& Cell : InitialSand)
+	{
+		InitialSandAmounts.Add(Cell.WorldCell, Cell.Amount);
+	}
+	const int64 InitialSandAmount =
+		MaterialWorld->GetSimulatedMaterialAmount(TEXT("sand"));
+
+	float TerrainZ = 0.0f;
+	MaterialWorld->TrySampleTerrainHeightAtWorldLocation(
+		FVector::ZeroVector,
+		TerrainZ);
+	const FVector SpawnLocation(0.0f, 0.0f, TerrainZ + 300.0f);
+	FMatterFluxMagicProjectilePlan Plan;
+	Plan.SpellId = Definition->Id;
+	Plan.Speed = Definition->Speed;
+	Plan.Lifetime = Definition->Lifetime;
+	Plan.Radius = Definition->Radius;
+	Plan.GravityScale = Definition->GravityScale;
+	Plan.BodyMaterial = Definition->BodyMaterial;
+	Plan.MaterialAmount = Definition->MaterialAmount;
+	const FTransform SpawnTransform(FRotator::ZeroRotator, SpawnLocation);
+	AMatterFluxMagicProjectile* Projectile =
+		World->SpawnActorDeferred<AMatterFluxMagicProjectile>(
+			AMatterFluxMagicProjectile::StaticClass(),
+			SpawnTransform,
+			nullptr,
+			nullptr,
+			ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+	if (!TestNotNull(TEXT("The falling-sand projectile spawns"), Projectile))
+	{
+		return false;
+	}
+	Projectile->InitializeProjectile(Plan, 0x53414e44);
+	Projectile->FinishSpawning(SpawnTransform);
+	if (!Projectile->HasActorBegunPlay())
+	{
+		Projectile->DispatchBeginPlay();
+	}
+	TestEqual(TEXT("The falling body displays one grain per authored sand unit"),
+		Projectile->GetMaterialBodyVoxelCount(),
+		Definition->MaterialAmount);
+	TestEqual(TEXT("The sand sphere enters the material simulation on spawn"),
+		MaterialWorld->GetAirborneSimulatedMaterialParticleCount(TEXT("sand")),
+		Definition->MaterialAmount);
+	TestEqual(TEXT("The airborne sand sphere already owns its conserved volume"),
+		MaterialWorld->GetAirborneSimulatedMaterialAmount(TEXT("sand")),
+		static_cast<int64>(Definition->MaterialAmount) * 255ll);
+
+	float MaximumVisibleHorizontalSpan = 0.0f;
+	int32 MaximumTransientAddedColumnAmount = 0;
+	constexpr float SimulationStepSeconds = 1.0f / 30.0f;
+	for (int32 Step = 0; Step < 360; ++Step)
+	{
+		if (!Projectile->IsActorBeingDestroyed())
 		{
-			TestEqual(TEXT("Liquid spray deposits one shallow cell per payload voxel"),
-				DepositedCells,
-				Expected.MaterialAmount);
+			Projectile->Tick(SimulationStepSeconds);
+		}
+		MaterialWorld->Tick(SimulationStepSeconds);
+		TArray<MatterFlux::Material::FCellSnapshot> TransientSand;
+		MaterialWorld->GetSimulatedMaterialCells(TEXT("sand"), TransientSand);
+		for (const MatterFlux::Material::FCellSnapshot& Cell : TransientSand)
+		{
+			MaximumTransientAddedColumnAmount = FMath::Max(
+				MaximumTransientAddedColumnAmount,
+				FMath::Max(
+					static_cast<int32>(Cell.Amount)
+						- InitialSandAmounts.FindRef(Cell.WorldCell),
+					0));
+		}
+		FBox VisibleBounds(ForceInit);
+		for (int32 InstanceIndex = 0;
+			InstanceIndex < Projectile->MaterialBody->GetInstanceCount();
+			++InstanceIndex)
+		{
+			FTransform InstanceTransform;
+			if (Projectile->MaterialBody->GetInstanceTransform(
+					InstanceIndex,
+					InstanceTransform,
+					true))
+			{
+				VisibleBounds += InstanceTransform.GetLocation();
+			}
+		}
+		if (VisibleBounds.IsValid)
+		{
+			MaximumVisibleHorizontalSpan = FMath::Max(
+				MaximumVisibleHorizontalSpan,
+				FMath::Max(
+					VisibleBounds.GetSize().X,
+					VisibleBounds.GetSize().Y));
+		}
+	}
+
+	TestTrue(TEXT("The sand body finishes settling"),
+		Projectile->IsActorBeingDestroyed());
+	TestTrue(TEXT("Falling grains remain a compact body instead of a wide ring"),
+		MaximumVisibleHorizontalSpan <= 320.0f);
+	TestEqual(TEXT("The settled pile conserves the spell's authored sand"),
+		MaterialWorld->GetSimulatedMaterialAmount(TEXT("sand"))
+			- InitialSandAmount,
+		static_cast<int64>(Definition->MaterialAmount) * 255ll);
+
+	TArray<MatterFlux::Material::FCellSnapshot> FinalSand;
+	MaterialWorld->GetSimulatedMaterialCells(TEXT("sand"), FinalSand);
+	FIntRect NewSandBounds;
+	bool bHasNewSand = false;
+	int32 NewSandCellCount = 0;
+	int32 MaximumColumnAmount = 0;
+	FIntPoint MaximumColumnCell = FIntPoint::ZeroValue;
+	double WeightedCenterX = 0.0;
+	double WeightedCenterY = 0.0;
+	double TotalAddedAmount = 0.0;
+	TMap<FIntPoint, int32> AddedSandAmounts;
+	for (const MatterFlux::Material::FCellSnapshot& Cell : FinalSand)
+	{
+		const int32 InitialAmount = InitialSandAmounts.FindRef(Cell.WorldCell);
+		const int32 AddedAmount = FMath::Max(
+			static_cast<int32>(Cell.Amount) - InitialAmount,
+			0);
+		if (AddedAmount <= 0)
+		{
+			continue;
+		}
+		AddedSandAmounts.Add(Cell.WorldCell, AddedAmount);
+		++NewSandCellCount;
+		MaximumColumnAmount = FMath::Max(MaximumColumnAmount, AddedAmount);
+		if (AddedAmount == MaximumColumnAmount)
+		{
+			MaximumColumnCell = Cell.WorldCell;
+		}
+		WeightedCenterX += static_cast<double>(Cell.WorldCell.X) * AddedAmount;
+		WeightedCenterY += static_cast<double>(Cell.WorldCell.Y) * AddedAmount;
+		TotalAddedAmount += AddedAmount;
+		if (!bHasNewSand)
+		{
+			NewSandBounds = FIntRect(
+				Cell.WorldCell,
+				Cell.WorldCell + FIntPoint(1, 1));
+			bHasNewSand = true;
 		}
 		else
 		{
-			TestEqual(TEXT("Powder spray enters one stackable impact column"),
-				DepositedCells,
-				1);
+			NewSandBounds.Min.X = FMath::Min(
+				NewSandBounds.Min.X, Cell.WorldCell.X);
+			NewSandBounds.Min.Y = FMath::Min(
+				NewSandBounds.Min.Y, Cell.WorldCell.Y);
+			NewSandBounds.Max.X = FMath::Max(
+				NewSandBounds.Max.X, Cell.WorldCell.X + 1);
+			NewSandBounds.Max.Y = FMath::Max(
+				NewSandBounds.Max.Y, Cell.WorldCell.Y + 1);
 		}
 	}
+	TestTrue(TEXT("The spell deposits at least one sand column"), bHasNewSand);
+	TestTrue(*FString::Printf(
+		TEXT("The final pile has at least two layers on average instead of becoming a one-cell terrain carpet (cells=%d, bounds=%dx%d, peak=%d)"),
+		NewSandCellCount,
+		bHasNewSand ? NewSandBounds.Width() : 0,
+		bHasNewSand ? NewSandBounds.Height() : 0,
+		MaximumColumnAmount),
+		NewSandCellCount * 2 <= Definition->MaterialAmount);
+	if (bHasNewSand)
+	{
+		TestTrue(TEXT("The final pile stays within a compact horizontal footprint"),
+			NewSandBounds.Width() <= 36 && NewSandBounds.Height() <= 36);
+		TestTrue(TEXT("The pile builds a tall central peak"),
+			MaximumColumnAmount >= 4 * 255);
+		TestTrue(*FString::Printf(
+			TEXT("No transient sand column towers over the settled pile (transient=%d, settled=%d)"),
+			MaximumTransientAddedColumnAmount,
+			MaximumColumnAmount),
+			MaximumTransientAddedColumnAmount
+				<= MaximumColumnAmount + 3 * 255);
+		const FVector2D WeightedCenter(
+			WeightedCenterX / FMath::Max(TotalAddedAmount, 1.0),
+			WeightedCenterY / FMath::Max(TotalAddedAmount, 1.0));
+		const float PeakDistance = FVector2D::Distance(
+			WeightedCenter,
+			FVector2D(MaximumColumnCell.X, MaximumColumnCell.Y));
+		const float MaximumCenteredPeakDistance =
+			FMath::Max(NewSandBounds.Width(), NewSandBounds.Height()) * 0.4f;
+		TestTrue(*FString::Printf(
+			TEXT("The highest sand column remains near the pile center (distance=%.2f, bounds=%dx%d, peak=%d)"),
+			PeakDistance,
+			NewSandBounds.Width(),
+			NewSandBounds.Height(),
+			MaximumColumnAmount),
+			PeakDistance <= MaximumCenteredPeakDistance);
+
+		double InnerAmount = 0.0;
+		double MiddleAmount = 0.0;
+		double OuterAmount = 0.0;
+		int32 InnerCells = 0;
+		int32 MiddleCells = 0;
+		int32 OuterCells = 0;
+		const float MaximumRadius = 0.5f * FMath::Sqrt(
+			FMath::Square(static_cast<float>(NewSandBounds.Width()))
+				+ FMath::Square(static_cast<float>(NewSandBounds.Height())));
+		for (const TPair<FIntPoint, int32>& Pair : AddedSandAmounts)
+		{
+			const float Radius = FVector2D::Distance(
+				WeightedCenter,
+				FVector2D(Pair.Key.X, Pair.Key.Y));
+			if (Radius <= MaximumRadius / 3.0f)
+			{
+				InnerAmount += Pair.Value;
+				++InnerCells;
+			}
+			else if (Radius <= MaximumRadius * 2.0f / 3.0f)
+			{
+				MiddleAmount += Pair.Value;
+				++MiddleCells;
+			}
+			else
+			{
+				OuterAmount += Pair.Value;
+				++OuterCells;
+			}
+		}
+		const double InnerMean = InnerAmount / FMath::Max(InnerCells, 1);
+		const double MiddleMean = MiddleAmount / FMath::Max(MiddleCells, 1);
+		const double OuterMean = OuterAmount / FMath::Max(OuterCells, 1);
+		TestTrue(*FString::Printf(
+			TEXT("Sand thickness decreases from the center toward the edge (inner=%.1f, middle=%.1f, outer=%.1f)"),
+			InnerMean,
+			MiddleMean,
+			OuterMean),
+			InnerCells > 0 && MiddleCells > 0 && OuterCells > 0
+				&& InnerMean > MiddleMean
+				&& MiddleMean > OuterMean);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxAirborneSandCrossesWaterTest,
+	"MatterFlux.Magic.MaterialParticles.AirborneSandCrossesWaterAndSettlesInTheSameColumn",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxAirborneSandCrossesWaterTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(TEXT("Default content pack loads"),
+		Runtime.ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* MaterialWorld = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Material world spawns"), MaterialWorld))
+	{
+		return false;
+	}
+	MaterialWorld->Regenerate(424242);
+	float TerrainZ = 0.0f;
+	if (!TestTrue(TEXT("Test column has terrain"),
+		MaterialWorld->TrySampleTerrainHeightAtWorldLocation(
+			FVector::ZeroVector, TerrainZ)))
+	{
+		return false;
+	}
+	for (int32 Y = -4; Y <= 4; ++Y)
+	{
+		for (int32 X = -4; X <= 4; ++X)
+		{
+			MaterialWorld->SetSimulatedMaterialAtWorldLocation(
+				FVector(X * 8.0f, Y * 8.0f, TerrainZ),
+				TEXT("water"));
+		}
+	}
+	TArray<MatterFlux::Material::FCellSnapshot> InitialSand;
+	MaterialWorld->GetSimulatedMaterialCells(TEXT("sand"), InitialSand);
+	int32 InitialCenterSand = 0;
+	for (const MatterFlux::Material::FCellSnapshot& Cell : InitialSand)
+	{
+		if (Cell.WorldCell == FIntPoint::ZeroValue)
+		{
+			InitialCenterSand += Cell.Amount;
+		}
+	}
+
+	const FVector Start(2.0f, 2.0f, TerrainZ + 200.0f);
+	const FVector Velocity(0.0f, 0.0f, -400.0f);
+	const TArray<FVector> Positions = { Start };
+	const TArray<FVector> Velocities = { Velocity };
+	const FGuid BatchId = MaterialWorld->SpawnAirborneSimulatedMaterial(
+		TEXT("sand"),
+		1,
+		Positions,
+		Velocities,
+		2.0f,
+		0.0f,
+		2.0f,
+		0x57415452);
+	if (!TestTrue(TEXT("Airborne sand batch spawns"), BatchId.IsValid()))
+	{
+		return false;
+	}
+	for (int32 Step = 0; Step < 12; ++Step)
+	{
+		MaterialWorld->Tick(1.0f / 60.0f);
+	}
+	TArray<MatterFlux::Material::FAirborneParticle> MidWaterParticles;
+	MaterialWorld->GetAirborneSimulatedMaterialParticles(
+		BatchId, MidWaterParticles);
+	TestEqual(TEXT("Sand remains an airborne fact while crossing the water column"),
+		MidWaterParticles.Num(), 1);
+	if (!MidWaterParticles.IsEmpty())
+	{
+		TestTrue(TEXT("Water does not push the falling sand sideways"),
+			FVector2D::Distance(
+				FVector2D(MidWaterParticles[0].WorldPosition),
+				FVector2D(Start)) <= 4.0f);
+		TestTrue(TEXT("Sand is below the full water surface before settling"),
+			MidWaterParticles[0].WorldPosition.Z
+				< TerrainZ + 128.0f);
+	}
+	TArray<MatterFlux::Material::FCellSnapshot> MidWaterSand;
+	MaterialWorld->GetSimulatedMaterialCells(TEXT("sand"), MidWaterSand);
+	int32 MidWaterCenterSand = 0;
+	for (const MatterFlux::Material::FCellSnapshot& Cell : MidWaterSand)
+	{
+		if (Cell.WorldCell == FIntPoint::ZeroValue)
+		{
+			MidWaterCenterSand += Cell.Amount;
+		}
+	}
+	TestTrue(TEXT("Sand exchanges into the water column gradually"),
+		MidWaterCenterSand > InitialCenterSand
+			&& MidWaterCenterSand < InitialCenterSand + 255);
+	for (int32 Step = 0; Step < 52; ++Step)
+	{
+		MaterialWorld->Tick(1.0f / 60.0f);
+	}
+	TestEqual(TEXT("Sand finishes settling below the water"),
+		MaterialWorld->GetAirborneSimulatedMaterialParticleCount(TEXT("sand")),
+		0);
+	TArray<MatterFlux::Material::FCellSnapshot> FinalSand;
+	MaterialWorld->GetSimulatedMaterialCells(TEXT("sand"), FinalSand);
+	int32 FinalCenterSand = 0;
+	for (const MatterFlux::Material::FCellSnapshot& Cell : FinalSand)
+	{
+		if (Cell.WorldCell == FIntPoint::ZeroValue)
+		{
+			FinalCenterSand += Cell.Amount;
+		}
+	}
+	TestEqual(TEXT("The sand settles in the original water column"),
+		FinalCenterSand - InitialCenterSand, 255);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxAirborneSandSpherePerformanceTest,
+	"MatterFlux.Magic.MaterialParticles.AirborneSandSphereFrameBudget",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::PerfFilter)
+
+bool FMatterFluxAirborneSandSpherePerformanceTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(TEXT("Default content pack loads"),
+		Runtime.ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* MaterialWorld = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Material world spawns"), MaterialWorld))
+	{
+		return false;
+	}
+	MaterialWorld->Regenerate(515151);
+	TArray<FVector> Positions;
+	TArray<FVector> Velocities;
+	Positions.Reserve(2048);
+	Velocities.Init(FVector(120.0f, 0.0f, 0.0f), 2048);
+	for (int32 Index = 0; Index < 2048; ++Index)
+	{
+		const float Angle = Index * 2.39996323f;
+		const float Radius = FMath::Sqrt(static_cast<float>(Index)) * 1.7f;
+		Positions.Add(FVector(
+			FMath::Cos(Angle) * Radius,
+			FMath::Sin(Angle) * Radius,
+			5000.0f + static_cast<float>(Index % 17)));
+	}
+	TestTrue(TEXT("2048-particle sand sphere spawns"),
+		MaterialWorld->SpawnAirborneSimulatedMaterial(
+			TEXT("sand"),
+			2048,
+			Positions,
+			Velocities,
+			3.0f,
+			0.0f,
+			4.0f,
+			0x50455246).IsValid());
+	MaterialWorld->Tick(1.0f / 60.0f);
+	double TotalMilliseconds = 0.0;
+	double MaximumMilliseconds = 0.0;
+	constexpr int32 MeasuredFrames = 12;
+	for (int32 Frame = 0; Frame < MeasuredFrames; ++Frame)
+	{
+		const double StartSeconds = FPlatformTime::Seconds();
+		MaterialWorld->Tick(1.0f / 60.0f);
+		const double Milliseconds =
+			(FPlatformTime::Seconds() - StartSeconds) * 1000.0;
+		TotalMilliseconds += Milliseconds;
+		MaximumMilliseconds = FMath::Max(MaximumMilliseconds, Milliseconds);
+	}
+	const double AverageMilliseconds =
+		TotalMilliseconds / MeasuredFrames;
+	AddInfo(FString::Printf(
+		TEXT("Airborne 2048-sand frame cost: average=%.2f ms max=%.2f ms"),
+		AverageMilliseconds,
+		MaximumMilliseconds));
+	TestTrue(TEXT("Airborne sand sphere stays below a two-frame hitch"),
+		MaximumMilliseconds < 33.34);
+	TestTrue(TEXT("Airborne sand sphere average stays within one frame"),
+		AverageMilliseconds < 16.67);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxSandSphereLandingFramePerformanceTest,
+	"MatterFlux.Magic.MaterialParticles.SandSphereLandingFrameBudget",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::PerfFilter)
+
+bool FMatterFluxSandSphereLandingFramePerformanceTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(TEXT("Default content pack loads"),
+		Runtime.ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry = Runtime.GetActiveRegistry();
+	const FMatterFluxSpellDefinition* Definition = Registry.IsValid()
+		? Registry->Spells.Find(TEXT("spell.sand_sphere"))
+		: nullptr;
+	if (!TestNotNull(TEXT("Sand sphere is registered"), Definition))
+	{
+		return false;
+	}
+
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* MaterialWorld = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Material world spawns"), MaterialWorld))
+	{
+		return false;
+	}
+	MaterialWorld->Regenerate(808080);
+	float TerrainZ = 0.0f;
+	MaterialWorld->TrySampleTerrainHeightAtWorldLocation(
+		FVector::ZeroVector,
+		TerrainZ);
+	const FTransform SpawnTransform(
+		FRotator::ZeroRotator,
+		FVector(0.0f, 0.0f, TerrainZ + 180.0f));
+	FMatterFluxMagicProjectilePlan Plan;
+	Plan.SpellId = Definition->Id;
+	Plan.Speed = Definition->Speed;
+	Plan.Lifetime = Definition->Lifetime;
+	Plan.Radius = Definition->Radius;
+	Plan.GravityScale = Definition->GravityScale;
+	Plan.BodyMaterial = Definition->BodyMaterial;
+	Plan.MaterialAmount = Definition->MaterialAmount;
+	AMatterFluxMagicProjectile* Projectile =
+		World->SpawnActorDeferred<AMatterFluxMagicProjectile>(
+			AMatterFluxMagicProjectile::StaticClass(),
+			SpawnTransform,
+			nullptr,
+			nullptr,
+			ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+	if (!TestNotNull(TEXT("Sand sphere projectile spawns"), Projectile))
+	{
+		return false;
+	}
+	Projectile->InitializeProjectile(Plan, 0x4c414e44);
+	Projectile->FinishSpawning(SpawnTransform);
+	if (!Projectile->HasActorBegunPlay())
+	{
+		Projectile->DispatchBeginPlay();
+	}
+
+	double MaximumProjectileMilliseconds = 0.0;
+	double MaximumWorldMilliseconds = 0.0;
+	int32 MaximumWorldFrame = INDEX_NONE;
+	constexpr float StepSeconds = 1.0f / 60.0f;
+	for (int32 Frame = 0; Frame < 180; ++Frame)
+	{
+		if (!Projectile->IsActorBeingDestroyed())
+		{
+			const double ProjectileStart = FPlatformTime::Seconds();
+			Projectile->Tick(StepSeconds);
+			MaximumProjectileMilliseconds = FMath::Max(
+				MaximumProjectileMilliseconds,
+				(FPlatformTime::Seconds() - ProjectileStart) * 1000.0);
+		}
+		const double WorldStart = FPlatformTime::Seconds();
+		MaterialWorld->Tick(StepSeconds);
+		const double WorldMilliseconds =
+			(FPlatformTime::Seconds() - WorldStart) * 1000.0;
+		if (WorldMilliseconds > MaximumWorldMilliseconds)
+		{
+			MaximumWorldMilliseconds = WorldMilliseconds;
+			MaximumWorldFrame = Frame;
+		}
+		if (Projectile->IsActorBeingDestroyed())
+		{
+			break;
+		}
+	}
+	AddInfo(FString::Printf(
+		TEXT("Sand-sphere landing cost: world max=%.2f ms at frame %d, projection max=%.2f ms"),
+		MaximumWorldMilliseconds,
+		MaximumWorldFrame,
+		MaximumProjectileMilliseconds));
+	TestTrue(TEXT("Sand sphere finishes settling"),
+		Projectile->IsActorBeingDestroyed());
+	TestTrue(TEXT("Sand-sphere landing world frame stays below two frames"),
+		MaximumWorldMilliseconds < 33.34);
+	TestTrue(TEXT("Sand-sphere projection frame stays below one frame"),
+		MaximumProjectileMilliseconds < 16.67);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxPowderImpactExternalSupportLayerTest,
+	"MatterFlux.Magic.PowderImpactKeepsExternalSupportToOneTransientLayer",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxPowderImpactExternalSupportLayerTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
+	FString Error;
+	if (!TestTrue(TEXT("Default content pack loads"),
+		Runtime.ReloadDefaultContentPack(Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* MaterialWorld = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
+	AFragment2DSourceActor* Support = World
+		? World->SpawnActor<AFragment2DSourceActor>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Material world spawns"), MaterialWorld)
+		|| !TestNotNull(TEXT("External powder support spawns"), Support))
+	{
+		return false;
+	}
+	MaterialWorld->Regenerate(97531);
+	const FVector HorizontalLocation(1600.0f, 800.0f, 0.0f);
+	float TerrainZ = 0.0f;
+	if (!TestTrue(TEXT("Support location has terrain"),
+		MaterialWorld->TrySampleTerrainHeightAtWorldLocation(
+			HorizontalLocation, TerrainZ)))
+	{
+		return false;
+	}
+
+	Support->SetActorLocation(FVector(
+		HorizontalLocation.X,
+		HorizontalLocation.Y,
+		TerrainZ + 80.0f));
+	FFragmentSourceMask SupportMask;
+	SupportMask.Width = 5;
+	SupportMask.Height = 5;
+	SupportMask.CellSize = 20.0f;
+	SupportMask.MinFragmentAreaPixels = 1;
+	SupportMask.MaxFragmentsPerBreak = 4;
+	SupportMask.SolidMask.Init(1, SupportMask.Width * SupportMask.Height);
+	if (!TestTrue(TEXT("External powder support initializes"),
+		Support->InitializeFromProceduralMask(
+			SupportMask,
+			FGuid::NewDeterministicGuid(TEXT("PowderExternalSupport"), 1),
+			FLinearColor::White,
+			TEXT("wood"))))
+	{
+		return false;
+	}
+	const FBox SupportBounds = Support->GetActiveWorldBounds().IsValid
+		? Support->GetActiveWorldBounds()
+		: Support->GetCanonicalWorldBounds();
+	if (!TestTrue(TEXT("External support exposes valid bounds"),
+		SupportBounds.IsValid != 0))
+	{
+		return false;
+	}
+
+	const int64 InitialSandAmount =
+		MaterialWorld->GetSimulatedMaterialAmount(TEXT("sand"));
+	const FVector ImpactLocation(
+		SupportBounds.GetCenter().X,
+		SupportBounds.GetCenter().Y,
+		SupportBounds.Max.Z + 2.0f);
+	TestTrue(TEXT("Bulk powder impact is accepted"),
+		MaterialWorld->DepositSimulatedMaterialFromImpact(
+			ImpactLocation,
+			TEXT("sand"),
+			1,
+			Support,
+			4.0f,
+			4.0f,
+			12,
+			MAX_uint16) > 0);
+	TestTrue(TEXT("Impact registers at least one external support cell"),
+		MaterialWorld->GetExternalMaterialSupportCellCount() > 0);
+
+	TArray<MatterFlux::Material::FCellSnapshot> SandCells;
+	MaterialWorld->GetSimulatedMaterialCells(TEXT("sand"), SandCells);
+	int32 MaximumElevatedColumnAmount = 0;
+	for (const MatterFlux::Material::FCellSnapshot& Cell : SandCells)
+	{
+		if (Cell.SupportHeight > TerrainZ + 20.0f)
+		{
+			MaximumElevatedColumnAmount = FMath::Max(
+				MaximumElevatedColumnAmount,
+				static_cast<int32>(Cell.Amount));
+		}
+	}
+	TestTrue(*FString::Printf(
+		TEXT("External support never receives a transient powder tower (maximum=%d)"),
+		MaximumElevatedColumnAmount),
+		MaximumElevatedColumnAmount <= 255);
+	TestEqual(TEXT("External-support deposit conserves the complete payload"),
+		MaterialWorld->GetSimulatedMaterialAmount(TEXT("sand"))
+			- InitialSandAmount,
+		static_cast<int64>(MAX_uint16));
 	return true;
 }
 
@@ -2608,9 +3275,19 @@ bool FMatterFluxMagicMaterialBodyProjectileTest::RunTest(
 		return false;
 	}
 	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* MaterialWorld = World
+		? World->SpawnActor<AMatterFluxPlayableWorldActor>()
+		: nullptr;
 	AActor* Avatar = World ? World->SpawnActor<AActor>() : nullptr;
-	if (!TestNotNull(TEXT("Authority avatar spawns"), Avatar)
-		|| !TestTrue(TEXT("Flame cast plan spawns"),
+	if (!TestNotNull(TEXT("Material world spawns"), MaterialWorld)
+		|| !TestNotNull(TEXT("Authority avatar spawns"), Avatar))
+	{
+		return false;
+	}
+	MaterialWorld->Regenerate(19091);
+	const int64 FireAmountBefore =
+		MaterialWorld->GetSimulatedMaterialAmount(TEXT("fire"));
+	if (!TestTrue(TEXT("Flame cast plan spawns"),
 			UGA_CastWand::SpawnCastPlan(*Avatar, Plan, 91)))
 	{
 		return false;
@@ -2628,6 +3305,10 @@ bool FMatterFluxMagicMaterialBodyProjectileTest::RunTest(
 	{
 		return false;
 	}
+	if (!FlameProjectile->HasActorBegunPlay())
+	{
+		FlameProjectile->DispatchBeginPlay();
+	}
 	const int32 FlameVoxelCount =
 		FlameProjectile->GetMaterialBodyVoxelCount();
 	TestTrue(*FString::Printf(
@@ -2637,13 +3318,17 @@ bool FMatterFluxMagicMaterialBodyProjectileTest::RunTest(
 	TestEqual(TEXT("Flame body material is replicated presentation data"),
 		FlameProjectile->GetPresentation().BodyMaterial,
 		FName(TEXT("fire")));
-	TestEqual(TEXT("Flame projectile ignores gravity"),
-		FlameProjectile->ProjectileMovement->ProjectileGravityScale,
+	TestEqual(TEXT("Flame particles ignore gravity"),
+		FlameProjectile->GetPresentation().GravityScale,
 		0.0f);
-	TestTrue(TEXT("Flame projectile moves forward"),
-		FVector::DotProduct(
-			FlameProjectile->ProjectileMovement->Velocity,
-			Avatar->GetActorForwardVector()) > 0.0f);
+	TestEqual(TEXT("Flame spell creates real particles on its spawn frame"),
+		MaterialWorld->GetAirborneSimulatedMaterialParticleCount(TEXT("fire")),
+		FlameProjectile->GetPresentation().MaterialAmount);
+	TestTrue(TEXT("Flame particle volume is canonical before impact"),
+		MaterialWorld->GetSimulatedMaterialAmount(TEXT("fire"))
+			> FireAmountBefore);
+	TestFalse(TEXT("The flame visual carrier no longer moves the material"),
+		FlameProjectile->ProjectileMovement->IsActive());
 	return true;
 }
 
@@ -2666,24 +3351,33 @@ bool FMatterFluxMagicProjectileMaterialImpactTest::RunTest(
 	{
 		return false;
 	}
+	USceneComponent* AvatarRoot = NewObject<USceneComponent>(Avatar);
+	Avatar->SetRootComponent(AvatarRoot);
+	AvatarRoot->RegisterComponent();
 	MaterialWorld->Regenerate(13579);
+	const FVector ContactHorizontalLocation(1600.0f, 800.0f, 0.0f);
 	float ContactSurfaceZ = 0.0f;
 	if (!TestTrue(
 		TEXT("Material impact contact has a simulated terrain surface"),
 		MaterialWorld->TrySampleTerrainHeightAtWorldLocation(
-			FVector::ZeroVector,
+			ContactHorizontalLocation,
 			ContactSurfaceZ)))
 	{
 		return false;
 	}
-	const FVector ContactLocation(0.0f, 0.0f, ContactSurfaceZ);
+	const FVector ContactLocation(
+		ContactHorizontalLocation.X,
+		ContactHorizontalLocation.Y,
+		ContactSurfaceZ);
+	const FVector SourceContactLocation =
+		ContactLocation + FVector::UpVector * 1000.0f;
 	AFragment2DSourceActor* ReactiveSource =
 		World->SpawnActor<AFragment2DSourceActor>();
 	if (!TestNotNull(TEXT("Reactive source spawns"), ReactiveSource))
 	{
 		return false;
 	}
-	ReactiveSource->SetActorLocation(ContactLocation);
+	ReactiveSource->SetActorLocation(SourceContactLocation);
 	FFragmentSourceMask ReactiveMask;
 	ReactiveMask.Width = 3;
 	ReactiveMask.Height = 3;
@@ -2703,6 +3397,9 @@ bool FMatterFluxMagicProjectileMaterialImpactTest::RunTest(
 	}
 	const int32 FireCellsBefore =
 		MaterialWorld->GetSimulatedMaterialCount(TEXT("fire"));
+	Avatar->SetActorLocation(
+		SourceContactLocation - FVector(90.0f, 0.0f, 0.0f));
+	Avatar->SetActorRotation(FVector::ForwardVector.Rotation());
 
 	FMatterFluxWandCastPlan Plan;
 	FMatterFluxMagicProjectilePlan& ProjectilePlan =
@@ -2733,25 +3430,32 @@ bool FMatterFluxMagicProjectileMaterialImpactTest::RunTest(
 	{
 		return false;
 	}
-	FHitResult Hit;
-	Hit.ImpactPoint = ContactLocation;
+	if (!Projectile->HasActorBegunPlay())
+	{
+		Projectile->DispatchBeginPlay();
+	}
 	const int32 SourceRevisionBeforeImpact = ReactiveSource->Revision;
-	TestTrue(TEXT("Projectile resolves its material impact"),
-		Projectile->ResolveImpactAuthority(Hit));
+	TestEqual(TEXT("Material exists as an airborne particle on the spawn frame"),
+		MaterialWorld->GetAirborneSimulatedMaterialParticleCount(TEXT("fire")),
+		1);
+	FHitResult SyntheticHit;
+	SyntheticHit.ImpactPoint = SourceContactLocation;
+	TestFalse(TEXT("The visual carrier cannot author a second impact payload"),
+		Projectile->ResolveImpactAuthority(SyntheticHit));
 	TestEqual(
 		TEXT("A conventional damage projectile cannot directly cut world state"),
 		ReactiveSource->Revision,
 		SourceRevisionBeforeImpact);
-	TestTrue(TEXT("Impact material enters the falling-sand world"),
+	for (int32 Step = 0; Step < 12 && !Projectile->IsActorBeingDestroyed(); ++Step)
+	{
+		MaterialWorld->Tick(1.0f / 60.0f);
+		Projectile->Tick(1.0f / 60.0f);
+	}
+	TestTrue(TEXT("The real particle transfers into the surface material world"),
 		MaterialWorld->GetSimulatedMaterialCount(TEXT("fire"))
-			> FireCellsBefore);
-	TestFalse(
-		TEXT("Projectile impact does not mutate a reactive source synchronously"),
-		ReactiveSource->IsReacting());
-	MaterialWorld->Tick(0.06f);
-	TestTrue(
-		TEXT("The material interaction step applies the deposited stimulus"),
-		ReactiveSource->IsReacting());
+			> FireCellsBefore
+		&& MaterialWorld->GetAirborneSimulatedMaterialParticleCount(TEXT("fire"))
+			== 0);
 	return true;
 }
 
@@ -2891,6 +3595,8 @@ bool FMatterFluxMagicProjectileMaterialSweepTest::RunTest(
 		Plan.Radius = 4.0f;
 		Plan.BodyMaterial = TEXT("fire");
 		Plan.MaterialAmount = 1;
+		const int64 FireAmountBefore =
+			MaterialWorld->GetSimulatedMaterialAmount(TEXT("fire"));
 		AMatterFluxMagicProjectile* Projectile =
 			World->SpawnActorDeferred<AMatterFluxMagicProjectile>(
 				AMatterFluxMagicProjectile::StaticClass(),
@@ -2904,16 +3610,17 @@ bool FMatterFluxMagicProjectileMaterialSweepTest::RunTest(
 		}
 		Projectile->InitializeProjectile(Plan, 700 + CaseIndex);
 		Projectile->FinishSpawning(FTransform(Start));
-		TestTrue(TEXT("Physical objects block material projectiles"),
-			Projectile->Collision->GetCollisionResponseToChannel(ECC_WorldDynamic)
-				== ECR_Block);
-
-		const int64 FireAmountBefore =
-			MaterialWorld->GetSimulatedMaterialAmount(TEXT("fire"));
-		Projectile->SetActorLocation(End, false, nullptr, ETeleportType::TeleportPhysics);
+		if (!Projectile->HasActorBegunPlay())
+		{
+			Projectile->DispatchBeginPlay();
+		}
+		TestTrue(TEXT("The material fact, not the visual carrier, owns collision"),
+			Projectile->Collision->GetCollisionEnabled()
+				== ECollisionEnabled::NoCollision);
+		MaterialWorld->Tick(0.05f);
 		Projectile->Tick(0.016f);
 		TestEqual(*FString::Printf(
-			TEXT("%s column has the authored material-projectile blocking state"),
+			TEXT("%s column has the authored airborne-particle blocking state"),
 			*ContactCase.MaterialId.ToString()),
 			Projectile->IsActorBeingDestroyed(),
 			ContactCase.bBlocksProjectiles);

@@ -45,6 +45,28 @@ namespace MatterFluxShellUI
 		const bool bEnabled = true,
 		const float MinWidth = 112.0f)
 	{
+		TSharedRef<SButton> SlateButton =
+			SNew(SButton)
+				.ButtonStyle(&FlatButtonStyle())
+				.ContentPadding(FMargin(10.0f, 0.0f))
+				.HAlign(HAlign_Center)
+				.VAlign(VAlign_Center)
+				.IsEnabled(bEnabled)
+				.OnClicked_Lambda([OnClicked = MoveTemp(OnClicked)]()
+				{
+					return OnClicked ? OnClicked() : FReply::Handled();
+				})
+				[
+					SNew(STextBlock)
+						.Text(FText::FromString(Label))
+						.Font(Font(12, true))
+						.ColorAndOpacity(Ink)
+						.Justification(ETextJustify::Center)
+				];
+		if (!ToolTip.IsEmpty())
+		{
+			SlateButton->SetToolTipText(FText::FromString(ToolTip));
+		}
 		return SNew(SBox)
 			.WidthOverride(MinWidth)
 			.HeightOverride(38.0f)
@@ -54,24 +76,7 @@ namespace MatterFluxShellUI
 				.BorderBackgroundColor(Ink)
 				.Padding(Keyline)
 				[
-					SNew(SButton)
-					.ButtonStyle(&FlatButtonStyle())
-					.ContentPadding(FMargin(10.0f, 0.0f))
-					.HAlign(HAlign_Center)
-					.VAlign(VAlign_Center)
-					.IsEnabled(bEnabled)
-					.ToolTipText(FText::FromString(ToolTip))
-					.OnClicked_Lambda([OnClicked = MoveTemp(OnClicked)]()
-					{
-						return OnClicked ? OnClicked() : FReply::Handled();
-					})
-					[
-						SNew(STextBlock)
-						.Text(FText::FromString(Label))
-						.Font(Font(12, true))
-						.ColorAndOpacity(Ink)
-						.Justification(ETextJustify::Center)
-					]
+					SlateButton
 				]
 			];
 	}
@@ -250,6 +255,7 @@ namespace MatterFluxShellUI
 		TSharedRef<SWidget> BuildTopBar()
 		{
 			UMatterFluxShellWidget* Owner = OwnerWidget.Get();
+			const bool bStartMenuOpen = Owner && Owner->IsStartMenuOpen();
 			int32 Seed = 0;
 			if (UWorld* World = Owner ? Owner->GetWorld() : nullptr)
 			{
@@ -309,7 +315,7 @@ namespace MatterFluxShellUI
 				[Button(TEXT("保存"), [Owner]() { Owner->ShowSaveSlots(); return FReply::Handled(); }, TEXT("保存当前世界"), true, 76.0f)];
 			}
 			Bar->AddSlot().AutoWidth().Padding(4.0f, 0.0f)
-			[Button(TEXT("设置"), [Owner]() { Owner->ShowSettings(); return FReply::Handled(); }, TEXT("画面、声音与窗口设置"), true, 76.0f)];
+			[Button(TEXT("设置"), [Owner]() { Owner->ShowSettings(); return FReply::Handled(); }, bStartMenuOpen ? FString() : FString(TEXT("画面、声音与窗口设置")), true, 76.0f)];
 			Bar->AddSlot().AutoWidth().Padding(4.0f, 0.0f)
 			[
 				Owner && Owner->IsStartMenuOpen()
@@ -317,7 +323,7 @@ namespace MatterFluxShellUI
 					{
 						Owner->RequestQuit();
 						return FReply::Handled();
-					}, TEXT("退出 MatterFlux"), true, 76.0f)
+					}, FString(), true, 76.0f)
 					: Button(Owner && Owner->IsMenuOpen() ? TEXT("关闭") : TEXT("菜单"), [Owner]()
 					{
 						if (Owner)
@@ -371,18 +377,18 @@ namespace MatterFluxShellUI
 				.Font(Font(10)).ColorAndOpacity(Muted)
 			];
 			Content->AddSlot().AutoHeight().Padding(0.0f, 4.0f)
-			[Button(TEXT("故事模式"), [Owner]() { Owner->RequestStoryMode(); return FReply::Handled(); }, TEXT("进入纸境序章，体验任务、商人与战斗流程"), true, 260.0f)];
+			[Button(TEXT("故事模式"), [Owner]() { Owner->RequestStoryMode(); return FReply::Handled(); }, FString(), true, 260.0f)];
 			Content->AddSlot().AutoHeight().Padding(0.0f, 4.0f)
-			[Button(TEXT("自由模式"), [Owner]() { Owner->ShowSinglePlayerMenu(); return FReply::Handled(); }, TEXT("生成随机地图，任务流程不会载入"), true, 260.0f)];
+			[Button(TEXT("自由模式"), [Owner]() { Owner->ShowSinglePlayerMenu(); return FReply::Handled(); }, FString(), true, 260.0f)];
 			if (UMatterFluxShellWidget::IsMultiplayerEntryEnabled())
 			{
 				Content->AddSlot().AutoHeight().Padding(0.0f, 4.0f)
-				[Button(TEXT("多人游戏"), [Owner]() { Owner->ShowMultiplayerMenu(); return FReply::Handled(); }, TEXT("创建 Listen Server 房间或通过地址加入"), true, 260.0f)];
+				[Button(TEXT("多人游戏"), [Owner]() { Owner->ShowMultiplayerMenu(); return FReply::Handled(); }, FString(), true, 260.0f)];
 			}
 			Content->AddSlot().AutoHeight().Padding(0.0f, 4.0f)
-			[Button(TEXT("设置"), [Owner]() { Owner->ShowSettings(); return FReply::Handled(); }, TEXT("调整画面、声音和窗口"), true, 260.0f)];
+			[Button(TEXT("设置"), [Owner]() { Owner->ShowSettings(); return FReply::Handled(); }, FString(), true, 260.0f)];
 			Content->AddSlot().AutoHeight().Padding(0.0f, 4.0f)
-			[Button(TEXT("退出游戏"), [Owner]() { Owner->RequestQuit(); return FReply::Handled(); }, TEXT("退出 MatterFlux"), true, 260.0f)];
+			[Button(TEXT("退出游戏"), [Owner]() { Owner->RequestQuit(); return FReply::Handled(); }, FString(), true, 260.0f)];
 			AddNotice(Content);
 			return SNew(SBox).WidthOverride(420.0f)[Outline(Content, FMargin(34.0f, 28.0f))];
 		}

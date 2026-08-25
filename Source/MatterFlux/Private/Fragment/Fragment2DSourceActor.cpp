@@ -1954,6 +1954,185 @@ FBox AFragment2DSourceActor::GetActiveWorldBounds() const
 	return Bounds;
 }
 
+bool AFragment2DSourceActor::SweepRuntimeMask(
+	const FVector& Start,
+	const FVector& End,
+	const float Radius,
+	FVector& OutImpactLocation,
+	FVector& OutImpactNormal) const
+{
+	OutImpactLocation = End;
+	OutImpactNormal = FVector::ZeroVector;
+	const int32 Width = GetMaskWidth();
+	const int32 Height = GetMaskHeight();
+	const float CellSize = GetCellSize();
+	const FTransform WorldTransform = GetActorTransform();
+	if (bBroken
+		|| RuntimeMask.Num() != Width * Height
+		|| !RuntimeMask.Contains(1)
+		|| Width <= 0
+		|| Height <= 0
+		|| !FMath::IsFinite(CellSize)
+		|| CellSize <= UE_SMALL_NUMBER
+		|| !FMath::IsFinite(Radius)
+		|| Radius < 0.0f
+		|| Start.ContainsNaN()
+		|| End.ContainsNaN()
+		|| Start.Equals(End, UE_SMALL_NUMBER)
+		|| !WorldTransform.IsValid())
+	{
+		return false;
+	}
+
+	const FVector Scale = WorldTransform.GetScale3D().GetAbs();
+	if (Scale.GetMin() <= UE_SMALL_NUMBER)
+	{
+		return false;
+	}
+	const FVector LocalStart =
+		WorldTransform.InverseTransformPosition(Start);
+	const FVector LocalEnd =
+		WorldTransform.InverseTransformPosition(End);
+	const FVector LocalDirection = LocalEnd - LocalStart;
+	const FVector LocalRadius(
+		Radius / Scale.X,
+		Radius / Scale.Y,
+		Radius / Scale.Z);
+	const FVector QueryMinimum = LocalStart.ComponentMin(LocalEnd)
+		- LocalRadius;
+	const FVector QueryMaximum = LocalStart.ComponentMax(LocalEnd)
+		+ LocalRadius;
+	const int32 MinimumX = FMath::Clamp(
+		FMath::FloorToInt(
+			QueryMinimum.X / CellSize
+				+ static_cast<double>(Width) * 0.5),
+		0,
+		Width - 1);
+	const int32 MaximumX = FMath::Clamp(
+		FMath::FloorToInt(
+			QueryMaximum.X / CellSize
+				+ static_cast<double>(Width) * 0.5),
+		0,
+		Width - 1);
+	const int32 MinimumY = FMath::Clamp(
+		FMath::FloorToInt(
+			QueryMinimum.Z / CellSize
+				+ static_cast<double>(Height) * 0.5),
+		0,
+		Height - 1);
+	const int32 MaximumY = FMath::Clamp(
+		FMath::FloorToInt(
+			QueryMaximum.Z / CellSize
+				+ static_cast<double>(Height) * 0.5),
+		0,
+		Height - 1);
+	if (MinimumX > MaximumX || MinimumY > MaximumY)
+	{
+		return false;
+	}
+
+	const auto FindEntry = [
+		&LocalStart,
+		&LocalDirection](
+			const FBox& Box,
+			double& OutEntry,
+			FVector& OutNormal)
+	{
+		double Entry = 0.0;
+		double Exit = 1.0;
+		FVector EntryNormal = FVector::ZeroVector;
+		for (int32 Axis = 0; Axis < 3; ++Axis)
+		{
+			const double Origin = LocalStart[Axis];
+			const double Direction = LocalDirection[Axis];
+			if (FMath::Abs(Direction) <= UE_DOUBLE_SMALL_NUMBER)
+			{
+				if (Origin < Box.Min[Axis] || Origin > Box.Max[Axis])
+				{
+					return false;
+				}
+				continue;
+			}
+			double First = (Box.Min[Axis] - Origin) / Direction;
+			double Last = (Box.Max[Axis] - Origin) / Direction;
+			FVector FirstNormal = FVector::ZeroVector;
+			FirstNormal[Axis] = Direction > 0.0 ? -1.0 : 1.0;
+			if (First > Last)
+			{
+				Swap(First, Last);
+			}
+			if (First > Entry)
+			{
+				Entry = First;
+				EntryNormal = FirstNormal;
+			}
+			Exit = FMath::Min(Exit, Last);
+			if (Entry > Exit)
+			{
+				return false;
+			}
+		}
+		if (Exit < 0.0 || Entry > 1.0)
+		{
+			return false;
+		}
+		OutEntry = FMath::Clamp(Entry, 0.0, 1.0);
+		OutNormal = EntryNormal;
+		return true;
+	};
+
+	double BestEntry = TNumericLimits<double>::Max();
+	FVector BestLocalNormal = FVector::ZeroVector;
+	int32 BestIndex = MAX_int32;
+	for (int32 MaskY = MinimumY; MaskY <= MaximumY; ++MaskY)
+	{
+		for (int32 MaskX = MinimumX; MaskX <= MaximumX; ++MaskX)
+		{
+			const int32 Index = MaskY * Width + MaskX;
+			if (!RuntimeMask.IsValidIndex(Index) || RuntimeMask[Index] == 0)
+			{
+				continue;
+			}
+			const double CellMinimumX =
+				(static_cast<double>(MaskX)
+					- static_cast<double>(Width) * 0.5) * CellSize;
+			const double CellMinimumZ =
+				(static_cast<double>(MaskY)
+					- static_cast<double>(Height) * 0.5) * CellSize;
+			const FBox ExpandedCell(
+				FVector(
+					CellMinimumX,
+					-CellSize * 0.5,
+					CellMinimumZ) - LocalRadius,
+				FVector(
+					CellMinimumX + CellSize,
+					CellSize * 0.5,
+					CellMinimumZ + CellSize) + LocalRadius);
+			double Entry = 0.0;
+			FVector LocalNormal;
+			if (!FindEntry(ExpandedCell, Entry, LocalNormal)
+				|| Entry > BestEntry
+				|| (FMath::IsNearlyEqual(Entry, BestEntry)
+					&& Index >= BestIndex))
+			{
+				continue;
+			}
+			BestEntry = Entry;
+			BestLocalNormal = LocalNormal;
+			BestIndex = Index;
+		}
+	}
+	if (BestIndex == MAX_int32)
+	{
+		return false;
+	}
+	OutImpactLocation = WorldTransform.TransformPosition(
+		LocalStart + LocalDirection * BestEntry);
+	OutImpactNormal = WorldTransform.TransformVectorNoScale(
+		BestLocalNormal).GetSafeNormal();
+	return true;
+}
+
 FName AFragment2DSourceActor::GetReactionStimulusMaterial() const
 {
 	const FMatterFluxReactionDefinition* Rule =

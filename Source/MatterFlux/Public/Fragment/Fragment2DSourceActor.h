@@ -109,6 +109,13 @@ public:
 	/** Stable mask-derived bounds used by world simulation indexes. */
 	FBox GetCanonicalWorldBounds() const;
 	FBox GetActiveWorldBounds() const;
+	/** Sweeps against occupied cells in the current cut/reaction input mask. */
+	bool SweepRuntimeMask(
+		const FVector& Start,
+		const FVector& End,
+		float Radius,
+		FVector& OutImpactLocation,
+		FVector& OutImpactNormal) const;
 	FName GetReactionStimulusMaterial() const;
 	void GatherReactionSmokeAnchors(
 		TArray<MatterFlux::Rendering::FMaterialEmissionAnchor>& OutAnchors,

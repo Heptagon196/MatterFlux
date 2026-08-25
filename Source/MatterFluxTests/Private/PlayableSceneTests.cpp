@@ -33,7 +33,10 @@
 #include "IMatterFluxScriptRuntime.h"
 #include "Materials/MaterialInterface.h"
 #include "Materials/Material.h"
+#include "Materials/MaterialExpressionDepthFade.h"
 #include "Materials/MaterialExpressionCustom.h"
+#include "Materials/MaterialExpressionLinearInterpolate.h"
+#include "Materials/MaterialExpressionVertexColor.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "MaterialDomain.h"
 #include "Material/MatterFluxBuoyancyComponent.h"
@@ -476,8 +479,18 @@ bool FMatterFluxInitialEntryOrderingTest::RunTest(
 	if (!TestTrue(TEXT("Initial river region reaches the complete entry barrier"),
 		WorldActor->IsInitialWorldEntryReady()))
 	{
+		AddInfo(FString::Printf(
+			TEXT("Entry diagnostic: materialStep=%d pendingTerrain=%d pendingPopulation=%d pendingFragments=%d dirtyLiquid=%d rebuiltLiquid=%d"),
+			WorldActor->GetMaterialSimulationStep(),
+			WorldActor->GetPendingTerrainChunkPrefetchCount(),
+			WorldActor->GetPendingProceduralPopulationUpdateCount(),
+			WorldActor->GetPendingFragmentSourceSpawnCount(),
+			WorldActor->GetLastLiquidProjectionDirtyChunkCount(),
+			WorldActor->GetLastLiquidProjectionRebuiltChunkCount()));
 		return false;
 	}
+	TestTrue(TEXT("Initial entry never exposes an unstepped generated material state"),
+		WorldActor->GetMaterialSimulationStep() > 0);
 	MatterFlux::Liquid::FLiquidColumn InitialRiverColumn;
 	TestTrue(TEXT("Initial river water exists before creature spawning"),
 		WorldActor->TrySampleLiquidColumnAtWorldLocation(
@@ -1700,10 +1713,12 @@ bool FMatterFluxFineTerrainChunkMeshTest::RunTest(const FString& Parameters)
 		Chunk.CellBounds.Area(), 32 * 32);
 	TestTrue(TEXT("Chunk carries a dedicated smooth collision surface"),
 		Chunk.CollisionSurface.IsValid());
-	TestEqual(TEXT("Collision surface has two triangles per two-cell patch"),
-		Chunk.CollisionSurface.Triangles.Num() / 3,
-		FMath::DivideAndRoundUp(Chunk.CellBounds.Width() + 2, 2)
-			* FMath::DivideAndRoundUp(Chunk.CellBounds.Height() + 2, 2) * 2);
+	const int32 UnmergedCollisionTriangleCount =
+		(Chunk.CellBounds.Width() + 2)
+			* (Chunk.CellBounds.Height() + 2) * 2;
+	TestTrue(TEXT("Flat one-cell collision patches merge below the exact-grid ceiling"),
+		Chunk.CollisionSurface.Triangles.Num() / 3
+			< UnmergedCollisionTriangleCount);
 	for (int32 TriangleIndex = 0;
 		TriangleIndex < Chunk.CollisionSurface.Triangles.Num();
 		TriangleIndex += 3)
@@ -1911,6 +1926,181 @@ bool FMatterFluxFineTerrainChunkMeshTest::RunTest(const FString& Parameters)
 	TestFalse(
 		TEXT("Non-finite terrain geometry leaves no valid chunk"),
 		InvalidChunk.IsValid());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxShoreCollisionStaysBelowDeepWaterTest,
+	"MatterFlux.Playable.Liquid.ShoreCollisionStaysBelowDeepWater",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxShoreCollisionStaysBelowDeepWaterTest::RunTest(
+	const FString& Parameters)
+{
+	MatterFlux::PlayableLevel::FLevelLayout Layout;
+	if (!TestTrue(TEXT("Seeded shore layout builds"),
+		MatterFlux::PlayableLevel::BuildLevelLayout(1337, Layout)))
+	{
+		return false;
+	}
+
+	TMap<FIntPoint, float> WaterSurfaceByCell;
+	for (const FName LayerName : {FName(TEXT("Stream")), FName(TEXT("Lake"))})
+	{
+		const MatterFlux::PlayableLevel::FLevelLayer* Layer =
+			Layout.FindLayer(LayerName);
+		if (!Layer)
+		{
+			continue;
+		}
+		for (const FTransform& Instance : Layer->Instances)
+		{
+			const FVector Location = Instance.GetLocation();
+			const FIntPoint Cell(
+				FMath::RoundToInt(Location.X / Layout.Terrain.CellSize),
+				FMath::RoundToInt(Location.Y / Layout.Terrain.CellSize));
+			const float SurfaceZ = Location.Z
+				+ Instance.GetScale3D().Z * 50.0f;
+			WaterSurfaceByCell.FindOrAdd(Cell) = FMath::Max(
+				WaterSurfaceByCell.FindRef(Cell), SurfaceZ);
+		}
+	}
+	if (!TestTrue(TEXT("Seeded layout contains water cells"),
+		!WaterSurfaceByCell.IsEmpty()))
+	{
+		return false;
+	}
+
+	constexpr int32 ChunkSize = 32;
+	constexpr float MinimumDeepWaterDepth = 64.0f;
+	constexpr float RequiredCollisionSubmersion = 8.0f;
+	const FIntPoint CardinalDirections[] = {
+		FIntPoint(1, 0), FIntPoint(-1, 0),
+		FIntPoint(0, 1), FIntPoint(0, -1)};
+	TMap<FIntPoint, MatterFlux::TerrainMesh::FChunk> CollisionChunks;
+	int32 DeepShoreSampleCount = 0;
+	int32 UnsupportedSampleCount = 0;
+	int32 ShoreWaterCenterSampleCount = 0;
+	double HighestShoreWaterCenterClearance =
+		-TNumericLimits<double>::Max();
+	double HighestCollisionRelativeToWater =
+		-TNumericLimits<double>::Max();
+	FVector2D HighestCollisionPoint = FVector2D::ZeroVector;
+
+	for (const TPair<FIntPoint, float>& WaterCell : WaterSurfaceByCell)
+	{
+		float GroundZ = 0.0f;
+		uint8 GroundBand = 0;
+		if (!Layout.Terrain.TrySampleWorldCell(
+			WaterCell.Key.X, WaterCell.Key.Y, GroundZ, GroundBand)
+			|| WaterCell.Value - GroundZ < MinimumDeepWaterDepth)
+		{
+			continue;
+		}
+		bool bTouchesDryTerrain = false;
+		for (const FIntPoint Direction : CardinalDirections)
+		{
+			bTouchesDryTerrain |=
+				!WaterSurfaceByCell.Contains(WaterCell.Key + Direction);
+		}
+		if (bTouchesDryTerrain)
+		{
+			const FVector2D WaterCenter(
+				static_cast<double>(WaterCell.Key.X) * Layout.Terrain.CellSize,
+				static_cast<double>(WaterCell.Key.Y) * Layout.Terrain.CellSize);
+			const FIntPoint CenterChunkCoordinate(
+				FMath::FloorToInt(WaterCenter.X
+					/ (Layout.Terrain.CellSize * ChunkSize)),
+				FMath::FloorToInt(WaterCenter.Y
+					/ (Layout.Terrain.CellSize * ChunkSize)));
+			MatterFlux::TerrainMesh::FChunk& CenterChunk =
+				CollisionChunks.FindOrAdd(CenterChunkCoordinate);
+			double CenterCollisionZ = 0.0;
+			if ((!CenterChunk.IsValid()
+					&& !MatterFlux::TerrainMesh::BuildChunk(
+						Layout.Terrain,
+						CenterChunkCoordinate,
+						ChunkSize,
+						CenterChunk))
+				|| !TrySampleSurfaceHeight(
+					CenterChunk.CollisionSurface,
+					WaterCenter,
+					CenterCollisionZ))
+			{
+				++UnsupportedSampleCount;
+			}
+			else
+			{
+				++ShoreWaterCenterSampleCount;
+				HighestShoreWaterCenterClearance = FMath::Max(
+					HighestShoreWaterCenterClearance,
+					CenterCollisionZ - static_cast<double>(GroundZ));
+			}
+		}
+
+		for (const FIntPoint Direction : CardinalDirections)
+		{
+			if (WaterSurfaceByCell.Contains(WaterCell.Key + Direction))
+			{
+				continue;
+			}
+			const FVector2D SamplePoint(
+				(static_cast<double>(WaterCell.Key.X)
+					+ static_cast<double>(Direction.X) * 0.35)
+					* Layout.Terrain.CellSize,
+				(static_cast<double>(WaterCell.Key.Y)
+					+ static_cast<double>(Direction.Y) * 0.35)
+					* Layout.Terrain.CellSize);
+			const FIntPoint ChunkCoordinate(
+				FMath::FloorToInt(SamplePoint.X
+					/ (Layout.Terrain.CellSize * ChunkSize)),
+				FMath::FloorToInt(SamplePoint.Y
+					/ (Layout.Terrain.CellSize * ChunkSize)));
+			MatterFlux::TerrainMesh::FChunk& Chunk =
+				CollisionChunks.FindOrAdd(ChunkCoordinate);
+			if (!Chunk.IsValid()
+				&& !MatterFlux::TerrainMesh::BuildChunk(
+					Layout.Terrain, ChunkCoordinate, ChunkSize, Chunk))
+			{
+				++UnsupportedSampleCount;
+				continue;
+			}
+			double CollisionZ = 0.0;
+			if (!TrySampleSurfaceHeight(
+				Chunk.CollisionSurface, SamplePoint, CollisionZ))
+			{
+				++UnsupportedSampleCount;
+				continue;
+			}
+
+			++DeepShoreSampleCount;
+			const double RelativeHeight =
+				CollisionZ - static_cast<double>(WaterCell.Value);
+			if (RelativeHeight > HighestCollisionRelativeToWater)
+			{
+				HighestCollisionRelativeToWater = RelativeHeight;
+				HighestCollisionPoint = SamplePoint;
+			}
+		}
+	}
+
+	TestEqual(TEXT("Every deep-shore probe has collision geometry"),
+		UnsupportedSampleCount, 0);
+	TestTrue(TEXT("The seeded layout exercises deep shoreline cells"),
+		DeepShoreSampleCount > 0);
+	TestTrue(TEXT("The seeded layout samples water centers beside dry terrain"),
+		ShoreWaterCenterSampleCount > 0);
+	TestTrue(*FString::Printf(
+		TEXT("Shore collision does not form an invisible shelf above water-cell terrain; highest clearance %.2f cm"),
+		HighestShoreWaterCenterClearance),
+		HighestShoreWaterCenterClearance <= KINDA_SMALL_NUMBER);
+	TestTrue(*FString::Printf(
+		TEXT("Shore collision stays %.0f cm below deep water; highest offset %.2f cm at (%.1f, %.1f)"),
+		RequiredCollisionSubmersion,
+		HighestCollisionRelativeToWater,
+		HighestCollisionPoint.X,
+		HighestCollisionPoint.Y),
+		HighestCollisionRelativeToWater <= -RequiredCollisionSubmersion);
 	return true;
 }
 
@@ -2842,6 +3032,108 @@ bool FMatterFluxNaturalWorldOmitsDiagnosticSamplesTest::RunTest(
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxProjectedLiquidTransparencyTest,
+	"MatterFlux.Playable.Liquid.ProjectedSurfaceKeepsConfiguredTransparency",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxProjectedLiquidTransparencyTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxPlayableWorldActor* WorldActor =
+		World ? World->SpawnActor<AMatterFluxPlayableWorldActor>() : nullptr;
+	if (!TestNotNull(TEXT("Playable world actor spawned"), WorldActor))
+	{
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry =
+		IMatterFluxScriptRuntime::Get().GetActiveRegistry();
+	const FMatterFluxMaterialDefinition* Water = Registry.IsValid()
+		? Registry->Materials.Find(TEXT("water"))
+		: nullptr;
+	if (!TestNotNull(TEXT("Water material definition is available"), Water))
+	{
+		return false;
+	}
+	const UMaterial* LiquidBaseMaterial =
+		WorldActor->GetVoxelLiquidMaterialTemplate()
+			? WorldActor->GetVoxelLiquidMaterialTemplate()->GetMaterial()
+			: nullptr;
+	if (TestNotNull(TEXT("Liquid base material is available"), LiquidBaseMaterial))
+	{
+		bool bUsesCanonicalVertexDepth = false;
+		bool bUsesScreenDepthFade = false;
+		for (const UMaterialExpression* Expression
+			: LiquidBaseMaterial->GetExpressionCollection().Expressions)
+		{
+			const UMaterialExpressionLinearInterpolate* OpacityLerp =
+				Cast<UMaterialExpressionLinearInterpolate>(Expression);
+			if (!OpacityLerp || !OpacityLerp->Alpha.Expression)
+			{
+				continue;
+			}
+			bUsesCanonicalVertexDepth |= OpacityLerp->Alpha.Expression
+				->IsA<UMaterialExpressionVertexColor>();
+			bUsesScreenDepthFade |= OpacityLerp->Alpha.Expression
+				->IsA<UMaterialExpressionDepthFade>();
+		}
+		TestTrue(TEXT("Liquid opacity consumes canonical vertex depth"),
+			bUsesCanonicalVertexDepth);
+		TestFalse(TEXT("Liquid opacity no longer consumes screen depth"),
+			bUsesScreenDepthFade);
+	}
+
+	WorldActor->Regenerate(1337);
+	TArray<UProceduralMeshComponent*> Components;
+	WorldActor->GetComponents(Components);
+	int32 LiquidSurfaceCount = 0;
+	for (UProceduralMeshComponent* Component : Components)
+	{
+		if (!Component
+			|| !Component->ComponentHasTag(TEXT("MatterFluxLiquidSurface")))
+		{
+			continue;
+		}
+		++LiquidSurfaceCount;
+		UMaterialInstanceDynamic* Material =
+			Cast<UMaterialInstanceDynamic>(Component->GetMaterial(0));
+		if (!TestNotNull(
+			TEXT("Projected liquid uses a runtime material instance"),
+			Material))
+		{
+			continue;
+		}
+		const float ShallowOpacity =
+			Material->K2_GetScalarParameterValue(TEXT("ShallowOpacity"));
+		const float DeepOpacity =
+			Material->K2_GetScalarParameterValue(TEXT("DeepOpacity"));
+		TestTrue(
+			TEXT("Projected liquid remains visibly translucent"),
+			ShallowOpacity < 0.999f && DeepOpacity < 0.999f);
+		TestTrue(
+			TEXT("Projected water keeps its configured optical range"),
+			FMath::IsNearlyEqual(ShallowOpacity, Water->ShallowOpacity)
+				&& FMath::IsNearlyEqual(DeepOpacity, Water->DeepOpacity));
+		const FProcMeshSection* Section = Component->GetProcMeshSection(0);
+		bool bHasCanonicalDepthWeight = false;
+		if (Section)
+		{
+			for (const FProcMeshVertex& Vertex : Section->ProcVertexBuffer)
+			{
+				bHasCanonicalDepthWeight |=
+					Vertex.Color.A > 0 && Vertex.Color.A < 255;
+			}
+		}
+		TestTrue(TEXT("Projected mesh encodes particle-column depth in vertex alpha"),
+			bHasCanonicalDepthWeight);
+	}
+	TestTrue(TEXT("Natural world creates projected liquid surfaces"),
+		LiquidSurfaceCount > 0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxVoxelDecorationWorldTest,
 	"MatterFlux.Playable.VoxelDecorationsSpawnAsDamageableSources",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
@@ -2896,10 +3188,10 @@ bool FMatterFluxVoxelDecorationWorldTest::RunTest(const FString& Parameters)
 						LiquidMaterial->K2_GetScalarParameterValue(
 							TEXT("DeepOpacity"));
 					TestTrue(
-						TEXT("Projected liquid surface does not reveal stepped terrain as false depth rings"),
-						FMath::IsNearlyEqual(
-							ShallowOpacity,
-							DeepOpacity));
+						TEXT("Projected liquid surface preserves a translucent shallow-to-deep optical range"),
+						ShallowOpacity >= 0.0f
+							&& DeepOpacity > ShallowOpacity
+							&& DeepOpacity < 0.999f);
 				}
 				TestEqual(
 					TEXT("Merged liquid surfaces never create blocking collision"),
@@ -4159,10 +4451,16 @@ bool FMatterFluxCanonicalLiquidSurfaceProjectionTest::RunTest(
 		}
 		for (const FTransform& Transform : Layer->Instances)
 		{
+			const FVector SampleLocation = Transform.GetLocation();
 			if (WorldActor->TrySampleLiquidColumnAtWorldLocation(
-				Transform.GetLocation(), Column))
+					SampleLocation, Column)
+				&& WorldActor->HasLiquidProjectionAtWorldLocation(
+					Column.MaterialId, SampleLocation))
 			{
-				ReportedGap = Transform.GetLocation();
+				// The test promises an active surface cell. Archived facts outside
+				// the local terrain streaming window remain canonically queryable,
+				// but intentionally have no disposable render projection.
+				ReportedGap = SampleLocation;
 				bFoundCanonicalLiquid = true;
 				break;
 			}

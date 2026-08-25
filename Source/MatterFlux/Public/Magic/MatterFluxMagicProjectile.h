@@ -97,12 +97,43 @@ public:
 	TObjectPtr<UProjectileMovementComponent> ProjectileMovement;
 
 private:
+	struct FFallingMaterialPacket
+	{
+		FVector WorldPosition = FVector::ZeroVector;
+		FVector Velocity = FVector::ZeroVector;
+		float LandingZ = 0.0f;
+		float DelaySeconds = 0.0f;
+		float VisualScale = 1.0f;
+		int32 CellCount = 0;
+		int32 ConservedMaterialAmount = 0;
+		int32 VoxelIndex = INDEX_NONE;
+		TWeakObjectPtr<AActor> ImpactActor;
+	};
+
 	void ApplyPresentation();
 	void BuildMaterialBodyPresentation(float Radius);
+	void RefreshMaterialBodyInstances();
+	bool TryBeginAirborneMaterialProjection();
+	void RefreshAirborneMaterialProjection();
+	void FinishAirborneMaterialProjection();
+	bool ShouldReleaseMaterialBodyProgressively() const;
+	bool ShouldBeginGranularMaterialFall() const;
+	void BeginGranularMaterialFall();
+	void BeginProgressiveMaterialRelease(
+		const FHitResult& Hit,
+		AActor* ImpactActor);
+	void TickProgressiveMaterialRelease(float DeltaSeconds);
+	void QueueFallingMaterialPacketsForVoxel(
+		int32 VoxelIndex,
+		int32 VoxelCellCount);
+	void AdvanceFallingMaterialPackets(float DeltaSeconds);
+	void FinishProgressiveMaterialRelease();
 	void ReleaseMaterialBodyAtWorldLocation(
 		const FVector& WorldLocation,
 		AActor* ImpactActor = nullptr);
-	void ApplyWorldImpact(const FHitResult& Hit);
+	void ApplyWorldImpact(
+		const FHitResult& Hit,
+		bool bReleaseMaterialBody = true);
 	void SpawnTriggerPayload(
 		TConstArrayView<FMatterFluxMagicProjectilePlan> Payload,
 		const FVector& Origin,
@@ -123,8 +154,14 @@ private:
 	UFUNCTION()
 	void OnRep_Presentation();
 
+	UFUNCTION()
+	void OnRep_MaterialBodyReleasedVoxelCount();
+
 	UPROPERTY(ReplicatedUsing = OnRep_Presentation)
 	FMatterFluxMagicProjectilePresentation Presentation;
+
+	UPROPERTY(ReplicatedUsing = OnRep_MaterialBodyReleasedVoxelCount)
+	uint16 MaterialBodyReleasedVoxelCount = 0;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> VisualMaterial;
@@ -132,9 +169,26 @@ private:
 	FMatterFluxMagicProjectilePlan ServerPlan;
 	int32 ServerEventSeed = 0;
 	bool bImpactHandled = false;
+	bool bProjectsAirborneMaterialParticles = false;
+	bool bProgressiveMaterialRelease = false;
+	bool bGranularMaterialFall = false;
 	bool bOrbitInitialized = false;
 	bool bHasPreviousMaterialSweepLocation = false;
+	float MaterialBodyVoxelSpacing = 0.0f;
+	float AirborneMaterialProjectionAccumulator = 0.0f;
+	float ProgressiveMaterialReleaseElapsed = 0.0f;
+	float ProgressiveMaterialReleaseDuration = 1.6f;
+	TArray<FVector> MaterialBodyVoxelPositions;
+	FGuid MaterialParticleBatchId;
+	FVector LastMaterialParticleCenter = FVector::ZeroVector;
+	FVector LastMaterialParticleVelocity = FVector::ZeroVector;
+	TArray<FFallingMaterialPacket> FallingMaterialPackets;
 	FVector OrbitCenter = FVector::ZeroVector;
 	FVector MaterialSweepOriginLocation = FVector::ZeroVector;
 	FVector PreviousMaterialSweepLocation = FVector::ZeroVector;
+	FVector ProgressiveReleaseStartLocation = FVector::ZeroVector;
+	FVector ProgressiveReleaseEndLocation = FVector::ZeroVector;
+	FVector ProgressiveReleaseImpactPoint = FVector::ZeroVector;
+	FVector ProgressiveReleaseDirection = FVector::DownVector;
+	TWeakObjectPtr<AActor> ProgressiveReleaseImpactActor;
 };

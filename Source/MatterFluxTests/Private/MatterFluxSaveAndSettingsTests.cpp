@@ -411,6 +411,12 @@ bool FMatterFluxGameUserSettingsTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("Default interface scale"),
 		Settings->GetInterfaceScale(),
 		1.0f);
+	TestEqual(TEXT("Default window mode"),
+		Settings->GetFullscreenMode(),
+		EWindowMode::Windowed);
+	TestEqual(TEXT("Default window resolution"),
+		Settings->GetScreenResolution(),
+		FIntPoint(1920, 1080));
 	TestTrue(TEXT("VSync defaults on"), Settings->IsVSyncEnabled());
 
 	Settings->SetMasterVolume(4.0f);

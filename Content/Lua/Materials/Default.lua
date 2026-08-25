@@ -43,7 +43,7 @@ material.define({ id = "flower_blue", density = 0.12, hardness = 0.05,
     phase = "static", mobility = 0, dispersion = 0 })
 material.define({ id = "sand", density = 1.65, hardness = 0.20,
     color_r = 0.76, color_g = 0.61, color_b = 0.28, color_a = 1.00,
-    phase = "powder", mobility = 64, dispersion = 0, movement_resistance = 1.8 })
+    phase = "powder", mobility = 255, dispersion = 0, movement_resistance = 1.8 })
 material.define({ id = "steam", density = 0.10, hardness = 0.00,
     color_r = 0.82, color_g = 0.88, color_b = 0.92, color_a = 0.52,
     phase = "gas", mobility = 255, dispersion = 255 })

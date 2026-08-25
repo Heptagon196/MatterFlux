@@ -111,6 +111,14 @@ bool FMatterFluxSupportedRemainderTest::RunTest(
 			TEXT("Detached entity has physics collision"),
 			It->MeshComponent->GetCollisionEnabled(),
 			ECollisionEnabled::QueryAndPhysics);
+		TestEqual(
+			TEXT("Detached entity is a physics body"),
+			It->MeshComponent->GetCollisionObjectType(),
+			ECC_PhysicsBody);
+		TestEqual(
+			TEXT("Detached entities block other detached physics bodies"),
+			It->MeshComponent->GetCollisionResponseToChannel(ECC_PhysicsBody),
+			ECR_Block);
 	}
 	TestEqual(
 		TEXT("Only the unsupported upper component detaches"),
@@ -983,6 +991,37 @@ bool FMatterFluxDetachedItemRepeatedCutTest::RunTest(
 		SolidCellsAfter < SolidCellsBefore);
 	TestFalse(TEXT("A partially cut item remains physical"),
 		Item->IsCutFadeActive());
+	TArray<MatterFlux::FragmentGeometry::FFragmentComponent>
+		RemainingComponents;
+	MatterFlux::FragmentGeometry::ExtractConnectedComponents(
+		Item->RootReactionState.SourceMask.SolidMask,
+		Item->RootReactionState.SourceMask.Width,
+		Item->RootReactionState.SourceMask.Height,
+		RemainingComponents);
+	TestTrue(
+		TEXT("The cut leaves multiple disconnected material components"),
+		RemainingComponents.Num() >= 2);
+	int32 MaterialPieceCount = 0;
+	int32 MaterialCellsAcrossPieces = 0;
+	for (TActorIterator<AFragment2DActor> It(World); It; ++It)
+	{
+		const int32 PieceCells = Algo::Count(
+			It->RootReactionState.SourceMask.SolidMask,
+			static_cast<uint8>(1));
+		if (!It->IsActorBeingDestroyed() && PieceCells > 0)
+		{
+			++MaterialPieceCount;
+			MaterialCellsAcrossPieces += PieceCells;
+		}
+	}
+	TestEqual(
+		TEXT("Each disconnected component becomes one detached item"),
+		MaterialPieceCount,
+		RemainingComponents.Num());
+	TestEqual(
+		TEXT("Splitting detached items preserves every remaining material cell"),
+		MaterialCellsAcrossPieces,
+		SolidCellsAfter);
 	return true;
 }
 

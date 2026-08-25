@@ -539,6 +539,13 @@ namespace MatterFluxMagicUI
 		void Construct(const FArguments& Args)
 		{
 			DragPayload = Args._DragPayload;
+			const FLinearColor VisibleFillColor = Args._bSelected
+				? SRGB(234, 234, 234)
+				: FLinearColor::White;
+			DragPayload.Badge = Args._Badge;
+			DragPayload.Subtitle = Args._Subtitle;
+			DragPayload.IconBrush = Args._IconBrush;
+			DragPayload.Tint = VisibleFillColor;
 			OnLeftClick = Args._OnLeftClick;
 			OnRightClick = Args._OnRightClick;
 			OnActivate = Args._OnActivate;
@@ -563,9 +570,7 @@ namespace MatterFluxMagicUI
 					Args._IconBrush,
 					Args._Badge,
 					Args._Subtitle,
-					Args._bSelected
-						? SRGB(234, 234, 234)
-						: FLinearColor::White,
+					VisibleFillColor,
 					&FocusBorder)
 			];
 		}
@@ -2070,6 +2075,7 @@ private:
 	TWeakObjectPtr<UMatterFluxMagicWorkbenchWidget> OwnerWidget;
 	TMap<FString, TSharedPtr<FSlateDynamicImageBrush>> IconBrushes;
 };
+
 }
 
 TSharedRef<SWidget> MatterFluxMagicUI::CreateWorkbench(

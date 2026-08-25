@@ -155,8 +155,8 @@ public:
 	float GetVisualDepthOffset() const { return VisualDepthOffset; }
 	/**
 	 * Applies one world-space cut to this detached logical item. Mask-backed
-	 * material is removed immediately and both render and collision geometry
-	 * are rebuilt from the resulting state.
+	 * material is removed immediately; disconnected remainders become separate
+	 * physical actors, while a connected remainder rebuilds in place.
 	 */
 	bool TryAcceptWorldCut(const FFragmentDamageShape& CutShape);
 	int32 GetAcceptedCutCount() const { return AcceptedCutCount; }
@@ -237,6 +237,12 @@ protected:
 	void ConfigureTransientFade();
 	void SynchronizeCutFadeState();
 	bool DoesCutShapeIntersect(const FFragmentDamageShape& CutShape) const;
+	bool TrySplitDisconnectedRootMaterial(
+		const FTransform& ParentWorldTransform,
+		const FVector& PreservedLinearVelocity,
+		const FVector& PreservedAngularVelocity,
+		int32 NextAcceptedCutCount,
+		bool& bOutSplit);
 	void ApplyTransientFadeAlpha();
 	void InitializeRootReactionState();
 	bool ApplyMaterialStimulusToRootAtWorldLocation(

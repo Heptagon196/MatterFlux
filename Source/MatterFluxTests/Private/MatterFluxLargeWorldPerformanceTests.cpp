@@ -100,7 +100,8 @@ namespace
 				else if (State->WarmupFrames >= MaximumWarmupFrames)
 				{
 					State->Test->AddError(FString::Printf(
-						TEXT("Long traversal warmup did not drain: population=%d terrain=%d fragment=%d"),
+						TEXT("Long traversal warmup did not drain: entry_ready=%d population=%d terrain=%d fragment=%d"),
+						WorldActor->IsInitialWorldEntryReady() ? 1 : 0,
 						WorldActor->GetPendingProceduralPopulationUpdateCount(),
 						WorldActor->GetPendingTerrainChunkPrefetchCount(),
 						WorldActor->GetPendingFragmentSourceSpawnCount()));
@@ -135,7 +136,8 @@ namespace
 		static bool StreamingIsIdle(
 			const AMatterFluxPlayableWorldActor& WorldActor)
 		{
-			return WorldActor.GetPendingFragmentSourceSpawnCount() == 0
+			return WorldActor.IsInitialWorldEntryReady()
+				&& WorldActor.GetPendingFragmentSourceSpawnCount() == 0
 				&& WorldActor.GetPendingProceduralPopulationUpdateCount() == 0
 				&& WorldActor.GetPendingTerrainChunkPrefetchCount() == 0;
 		}

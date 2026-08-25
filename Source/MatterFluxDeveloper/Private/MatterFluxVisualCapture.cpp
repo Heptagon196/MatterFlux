@@ -59,6 +59,7 @@
 namespace
 {
 	bool GVisualCapturePending = false;
+	bool GStartupPerformanceCapturePending = false;
 	bool GOccludedPlayerCapturePending = false;
 	bool GTreeCutCapturePending = false;
 	bool GTreeBatchCutCapturePending = false;
@@ -1335,6 +1336,385 @@ namespace
 		++State->Phase;
 		return true;
 	}
+
+	struct FStartupPerformanceCaptureState
+	{
+		double QueuedAt = 0.0;
+		double MeasurementStartedAt = -1.0;
+		double EntryReadyAt = -1.0;
+		double LastSampleAt = -1.0;
+		double RegenerateMilliseconds = 0.0;
+		int32 RequestedMapSeed = 1337;
+		double PostEntryDurationSeconds = 8.0;
+		bool bQuitAfterCapture = true;
+		bool bRegenerated = false;
+		TWeakObjectPtr<AMatterFluxPlayableWorldActor> PlayableWorld;
+		TArray<float> PreEntryFrameMilliseconds;
+		TArray<float> PostEntryFrameMilliseconds;
+		int32 MaximumPendingTerrainChunks = 0;
+		int32 MaximumPendingPopulationUpdates = 0;
+		int32 MaximumPendingFragmentSpawns = 0;
+		int32 MaximumDirtyLiquidProjectionChunks = 0;
+		int32 MaximumRebuiltLiquidProjectionChunks = 0;
+		int32 MaterialStepAtEntry = INDEX_NONE;
+		int32 LastObservedMaterialStep = INDEX_NONE;
+		int32 PostMaximumPendingTerrainChunks = 0;
+		int32 PostMaximumPendingPopulationUpdates = 0;
+		int32 PostMaximumPendingFragmentSpawns = 0;
+		int32 PostMaximumDirtyLiquidProjectionChunks = 0;
+		int32 PostMaximumRebuiltLiquidProjectionChunks = 0;
+		int32 PostFramesWithMaterialStep = 0;
+		int32 PostHitches100WithMaterialStep = 0;
+		int32 PostHitches100WithStreamingWork = 0;
+		int32 PostHitches100WithLiquidProjectionWork = 0;
+		TArray<float> PostMaterialStepFrameMilliseconds;
+		TArray<float> PostNonMaterialStepFrameMilliseconds;
+	};
+
+	double CalculateStartupFramePercentile(
+		const TArray<float>& Samples,
+		const double Quantile)
+	{
+		if (Samples.IsEmpty())
+		{
+			return 0.0;
+		}
+		TArray<float> SortedSamples = Samples;
+		SortedSamples.Sort();
+		const double Position = FMath::Clamp(Quantile, 0.0, 1.0)
+			* static_cast<double>(SortedSamples.Num() - 1);
+		const int32 LowerIndex = FMath::FloorToInt(Position);
+		const int32 UpperIndex = FMath::CeilToInt(Position);
+		return FMath::Lerp(
+			static_cast<double>(SortedSamples[LowerIndex]),
+			static_cast<double>(SortedSamples[UpperIndex]),
+			Position - static_cast<double>(LowerIndex));
+	}
+
+	double CalculateStartupFrameAverage(const TArray<float>& Samples)
+	{
+		if (Samples.IsEmpty())
+		{
+			return 0.0;
+		}
+		double Total = 0.0;
+		for (const float Sample : Samples)
+		{
+			Total += Sample;
+		}
+		return Total / static_cast<double>(Samples.Num());
+	}
+
+	int32 CountStartupFrameHitches(
+		const TArray<float>& Samples,
+		const float ThresholdMilliseconds)
+	{
+		int32 Count = 0;
+		for (const float Sample : Samples)
+		{
+			Count += Sample >= ThresholdMilliseconds ? 1 : 0;
+		}
+		return Count;
+	}
+
+	void FinishStartupPerformanceCapture(
+		const TSharedRef<FStartupPerformanceCaptureState>& State,
+		const bool bTimedOut)
+	{
+		const double PreAverage = CalculateStartupFrameAverage(
+			State->PreEntryFrameMilliseconds);
+		const double PreP95 = CalculateStartupFramePercentile(
+			State->PreEntryFrameMilliseconds,
+			0.95);
+		const double PreMaximum = CalculateStartupFramePercentile(
+			State->PreEntryFrameMilliseconds,
+			1.0);
+		const double PostAverage = CalculateStartupFrameAverage(
+			State->PostEntryFrameMilliseconds);
+		const double PostP95 = CalculateStartupFramePercentile(
+			State->PostEntryFrameMilliseconds,
+			0.95);
+		const double PostP99 = CalculateStartupFramePercentile(
+			State->PostEntryFrameMilliseconds,
+			0.99);
+		const double PostMaximum = CalculateStartupFramePercentile(
+			State->PostEntryFrameMilliseconds,
+			1.0);
+		const int32 PostHitches33 = CountStartupFrameHitches(
+			State->PostEntryFrameMilliseconds,
+			33.34f);
+		const int32 PostHitches50 = CountStartupFrameHitches(
+			State->PostEntryFrameMilliseconds,
+			50.0f);
+		const int32 PostHitches100 = CountStartupFrameHitches(
+			State->PostEntryFrameMilliseconds,
+			100.0f);
+		const double EntryReadySeconds = State->EntryReadyAt >= 0.0
+			? State->EntryReadyAt - State->MeasurementStartedAt
+			: -1.0;
+		// More than five percent of the first playable window below 25 fps, or
+		// repeated 100 ms stalls, is visible as the reported post-load stutter.
+		const bool bAccepted = !bTimedOut
+			&& State->EntryReadyAt >= 0.0
+			&& State->PostEntryFrameMilliseconds.Num() >= 60
+			&& PostP95 <= 40.0
+			&& PostHitches100 <= 2;
+
+		UE_LOG(
+			LogMatterFlux,
+			Display,
+			TEXT("Startup performance: accepted=%s timedOut=%s seed=%d regenerateMs=%.2f entryReadySeconds=%.2f materialStepAtEntry=%d preSamples=%d preAvgMs=%.2f preP95Ms=%.2f preMaxMs=%.2f postSamples=%d postAvgMs=%.2f postP95Ms=%.2f postP99Ms=%.2f postMaxMs=%.2f postHitch33=%d postHitch50=%d postHitch100=%d pendingTerrainMax=%d pendingPopulationMax=%d pendingFragmentsMax=%d dirtyLiquidMax=%d rebuiltLiquidMax=%d postPendingTerrainMax=%d postPendingPopulationMax=%d postPendingFragmentsMax=%d postDirtyLiquidMax=%d postRebuiltLiquidMax=%d postMaterialStepFrames=%d postMaterialStepAvgMs=%.2f postNonMaterialStepAvgMs=%.2f hitch100WithMaterialStep=%d hitch100WithStreaming=%d hitch100WithLiquidProjection=%d"),
+			bAccepted ? TEXT("true") : TEXT("false"),
+			bTimedOut ? TEXT("true") : TEXT("false"),
+			State->RequestedMapSeed,
+			State->RegenerateMilliseconds,
+			EntryReadySeconds,
+			State->MaterialStepAtEntry,
+			State->PreEntryFrameMilliseconds.Num(),
+			PreAverage,
+			PreP95,
+			PreMaximum,
+			State->PostEntryFrameMilliseconds.Num(),
+			PostAverage,
+			PostP95,
+			PostP99,
+			PostMaximum,
+			PostHitches33,
+			PostHitches50,
+			PostHitches100,
+			State->MaximumPendingTerrainChunks,
+			State->MaximumPendingPopulationUpdates,
+			State->MaximumPendingFragmentSpawns,
+			State->MaximumDirtyLiquidProjectionChunks,
+			State->MaximumRebuiltLiquidProjectionChunks,
+			State->PostMaximumPendingTerrainChunks,
+			State->PostMaximumPendingPopulationUpdates,
+			State->PostMaximumPendingFragmentSpawns,
+			State->PostMaximumDirtyLiquidProjectionChunks,
+			State->PostMaximumRebuiltLiquidProjectionChunks,
+			State->PostFramesWithMaterialStep,
+			CalculateStartupFrameAverage(
+				State->PostMaterialStepFrameMilliseconds),
+			CalculateStartupFrameAverage(
+				State->PostNonMaterialStepFrameMilliseconds),
+			State->PostHitches100WithMaterialStep,
+			State->PostHitches100WithStreamingWork,
+			State->PostHitches100WithLiquidProjectionWork);
+
+		GStartupPerformanceCapturePending = false;
+		if (State->bQuitAfterCapture)
+		{
+			FPlatformMisc::RequestExitWithStatus(
+				false,
+				bAccepted ? 0 : 5);
+		}
+	}
+
+	void QueueStartupPerformanceCapture(
+		const TArray<FString>& Args,
+		UWorld*)
+	{
+		if (GStartupPerformanceCapturePending)
+		{
+			UE_LOG(
+				LogMatterFlux,
+				Warning,
+				TEXT("mf.Visual.StartupPerformance ignored because a capture is already pending."));
+			return;
+		}
+
+		const TSharedRef<FStartupPerformanceCaptureState> State =
+			MakeShared<FStartupPerformanceCaptureState>();
+		State->QueuedAt = FPlatformTime::Seconds();
+		State->RequestedMapSeed = Args.Num() > 0
+			? FMath::Max(FCString::Atoi(*Args[0]), 1)
+			: 1337;
+		State->PostEntryDurationSeconds = Args.Num() > 1
+			? FMath::Clamp(FCString::Atod(*Args[1]), 2.0, 30.0)
+			: 8.0;
+		State->bQuitAfterCapture = Args.Num() <= 2
+			|| FCString::Atoi(*Args[2]) != 0;
+
+		GStartupPerformanceCapturePending = true;
+		FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateLambda(
+				[State](float DeltaSeconds)
+				{
+					UWorld* World = GEngine && GEngine->GameViewport
+						? GEngine->GameViewport->GetWorld()
+						: nullptr;
+					const double Now = FPlatformTime::Seconds();
+					if (!World || !World->IsGameWorld())
+					{
+						if (Now - State->QueuedAt >= 60.0)
+						{
+							FinishStartupPerformanceCapture(State, true);
+							return false;
+						}
+						return true;
+					}
+
+					AMatterFluxPlayableWorldActor* PlayableWorld =
+						State->PlayableWorld.Get();
+					if (!PlayableWorld)
+					{
+						TActorIterator<AMatterFluxPlayableWorldActor> It(World);
+						if (It)
+						{
+							PlayableWorld = *It;
+						}
+						if (!PlayableWorld)
+						{
+							if (Now - State->QueuedAt >= 60.0)
+							{
+								FinishStartupPerformanceCapture(State, true);
+								return false;
+							}
+							return true;
+						}
+						State->PlayableWorld = PlayableWorld;
+					}
+
+					if (!State->bRegenerated)
+					{
+						const double RegenerateStartedAt = FPlatformTime::Seconds();
+						PlayableWorld->Regenerate(State->RequestedMapSeed);
+						State->RegenerateMilliseconds =
+							(FPlatformTime::Seconds() - RegenerateStartedAt) * 1000.0;
+						State->bRegenerated = true;
+						State->MeasurementStartedAt = FPlatformTime::Seconds();
+						State->LastSampleAt = State->MeasurementStartedAt;
+						UE_LOG(
+							LogMatterFlux,
+							Display,
+							TEXT("Startup performance measurement started: seed=%d postEntryDuration=%.2fs regenerateMs=%.2f"),
+							State->RequestedMapSeed,
+							State->PostEntryDurationSeconds,
+							State->RegenerateMilliseconds);
+						return true;
+					}
+
+					const float FrameMilliseconds = DeltaSeconds > 0.0f
+						? DeltaSeconds * 1000.0f
+						: static_cast<float>((Now - State->LastSampleAt) * 1000.0);
+					State->LastSampleAt = Now;
+					const int32 PendingTerrainChunks =
+						PlayableWorld->GetPendingTerrainChunkPrefetchCount();
+					const int32 PendingPopulationUpdates =
+						PlayableWorld->GetPendingProceduralPopulationUpdateCount();
+					const int32 PendingFragmentSpawns =
+						PlayableWorld->GetPendingFragmentSourceSpawnCount();
+					const int32 DirtyLiquidProjectionChunks =
+						PlayableWorld->GetLastLiquidProjectionDirtyChunkCount();
+					const int32 RebuiltLiquidProjectionChunks =
+						PlayableWorld->GetLastLiquidProjectionRebuiltChunkCount();
+					const int32 MaterialStep =
+						PlayableWorld->GetMaterialSimulationStep();
+					State->MaximumPendingTerrainChunks = FMath::Max(
+						State->MaximumPendingTerrainChunks,
+						PendingTerrainChunks);
+					State->MaximumPendingPopulationUpdates = FMath::Max(
+						State->MaximumPendingPopulationUpdates,
+						PendingPopulationUpdates);
+					State->MaximumPendingFragmentSpawns = FMath::Max(
+						State->MaximumPendingFragmentSpawns,
+						PendingFragmentSpawns);
+					State->MaximumDirtyLiquidProjectionChunks = FMath::Max(
+						State->MaximumDirtyLiquidProjectionChunks,
+						DirtyLiquidProjectionChunks);
+					State->MaximumRebuiltLiquidProjectionChunks = FMath::Max(
+						State->MaximumRebuiltLiquidProjectionChunks,
+						RebuiltLiquidProjectionChunks);
+
+					if (State->EntryReadyAt < 0.0)
+					{
+						State->PreEntryFrameMilliseconds.Add(FrameMilliseconds);
+						if (PlayableWorld->IsInitialWorldEntryReady())
+						{
+							State->EntryReadyAt = Now;
+							State->MaterialStepAtEntry =
+								MaterialStep;
+							State->LastObservedMaterialStep = MaterialStep;
+						}
+					}
+					else
+					{
+						State->PostEntryFrameMilliseconds.Add(FrameMilliseconds);
+						State->PostMaximumPendingTerrainChunks = FMath::Max(
+							State->PostMaximumPendingTerrainChunks,
+							PendingTerrainChunks);
+						State->PostMaximumPendingPopulationUpdates = FMath::Max(
+							State->PostMaximumPendingPopulationUpdates,
+							PendingPopulationUpdates);
+						State->PostMaximumPendingFragmentSpawns = FMath::Max(
+							State->PostMaximumPendingFragmentSpawns,
+							PendingFragmentSpawns);
+						State->PostMaximumDirtyLiquidProjectionChunks = FMath::Max(
+							State->PostMaximumDirtyLiquidProjectionChunks,
+							DirtyLiquidProjectionChunks);
+						State->PostMaximumRebuiltLiquidProjectionChunks = FMath::Max(
+							State->PostMaximumRebuiltLiquidProjectionChunks,
+							RebuiltLiquidProjectionChunks);
+						const bool bAdvancedMaterialStep =
+							MaterialStep != State->LastObservedMaterialStep;
+						State->LastObservedMaterialStep = MaterialStep;
+						if (bAdvancedMaterialStep)
+						{
+							++State->PostFramesWithMaterialStep;
+							State->PostMaterialStepFrameMilliseconds.Add(
+								FrameMilliseconds);
+						}
+						else
+						{
+							State->PostNonMaterialStepFrameMilliseconds.Add(
+								FrameMilliseconds);
+						}
+						if (FrameMilliseconds >= 100.0f)
+						{
+							State->PostHitches100WithMaterialStep +=
+								bAdvancedMaterialStep ? 1 : 0;
+							State->PostHitches100WithStreamingWork +=
+								PendingTerrainChunks > 0
+									|| PendingPopulationUpdates > 0
+									|| PendingFragmentSpawns > 0
+									? 1
+									: 0;
+							State->PostHitches100WithLiquidProjectionWork +=
+								DirtyLiquidProjectionChunks > 0
+									|| RebuiltLiquidProjectionChunks > 0
+									? 1
+									: 0;
+						}
+						if (Now - State->EntryReadyAt
+							>= State->PostEntryDurationSeconds)
+						{
+							FinishStartupPerformanceCapture(State, false);
+							return false;
+						}
+					}
+
+					if (Now - State->MeasurementStartedAt >= 90.0)
+					{
+						FinishStartupPerformanceCapture(State, true);
+						return false;
+					}
+					return true;
+				}));
+
+		UE_LOG(
+			LogMatterFlux,
+			Display,
+			TEXT("Queued startup performance measurement: seed=%d postEntryDuration=%.2fs quit=%s"),
+			State->RequestedMapSeed,
+			State->PostEntryDurationSeconds,
+			State->bQuitAfterCapture ? TEXT("true") : TEXT("false"));
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs GStartupPerformanceCaptureCommand(
+		TEXT("mf.Visual.StartupPerformance"),
+		TEXT("Measure fixed-seed loading and the first playable window: mf.Visual.StartupPerformance [map-seed=1337] [post-entry-duration=8] [quit=1]"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+			&QueueStartupPerformanceCapture));
 
 	void QueueVisualCapture(
 		const TArray<FString>& Args,
@@ -5958,6 +6338,7 @@ namespace
 		bool bQuitAfterCapture = true;
 		bool bAcceptanceFailed = false;
 		bool bTraversalMetricsPrimed = false;
+		int32 TraversalWarmupFramesRemaining = 0;
 		bool bBodiesRemovedForSettle = false;
 		bool bPlayerCurrentLiquidAtTraversalEnd = false;
 		bool bCreatureCurrentLiquidAtTraversalEnd = false;
@@ -5969,6 +6350,8 @@ namespace
 		float CreatureTravelDistance = 0.0f;
 		float PlayerSubmergedAtTraversalEnd = 0.0f;
 		float CreatureSubmergedAtTraversalEnd = 0.0f;
+		float WalkSpeed = 140.0f;
+		TArray<float> TraversalFrameTimesMilliseconds;
 		int32 MaximumDirtyProjectionChunks = 0;
 		int32 MaximumRebuiltProjectionChunks = 0;
 		int32 MaximumCheckerboardPasses = 0;
@@ -6090,7 +6473,8 @@ namespace
 	}
 
 	bool TickDeepLiquidWalkCapture(
-		const TSharedRef<FDeepLiquidWalkCaptureState>& State)
+		const TSharedRef<FDeepLiquidWalkCaptureState>& State,
+		const float DeltaSeconds)
 	{
 		UWorld* World = GEngine && GEngine->GameViewport
 			? GEngine->GameViewport->GetWorld()
@@ -6110,6 +6494,21 @@ namespace
 		}
 
 		const double Now = FPlatformTime::Seconds();
+		// Phase 4 contains four sustained traversals and no intermediate screenshot.
+		// Count frames rather than wall time: PNG compression can itself advance the
+		// clock past a time threshold and accidentally include its own 100 ms frame.
+		if (State->Phase == 4
+			&& State->TraversalWarmupFramesRemaining > 0)
+		{
+			--State->TraversalWarmupFramesRemaining;
+		}
+		else if (State->Phase == 4
+			&& FMath::IsFinite(DeltaSeconds)
+			&& DeltaSeconds > 0.0f
+			&& DeltaSeconds <= 1.0f)
+		{
+			State->TraversalFrameTimesMilliseconds.Add(DeltaSeconds * 1000.0f);
+		}
 		if (State->Phase == 0)
 		{
 			AMatterFluxPlayableWorldActor* PlayableWorld = nullptr;
@@ -6128,16 +6527,26 @@ namespace
 				return true;
 			}
 
+			if (PlayableWorld->GetMapSeed() != State->MapSeed)
+			{
+				PlayableWorld->Regenerate(State->MapSeed);
+				return true;
+			}
+			// Match the real player-entry contract. Starting this capture while the
+			// generated river is still consuming four-step loading batches makes the
+			// walk measure pre-entry warmup, grows its world-scope water baseline as
+			// chunks arrive, and reports hitches that gameplay never exposes.
+			if (!PlayableWorld->IsInitialWorldEntryReady())
+			{
+				return true;
+			}
+
 			Controller->EnterGameplayForVisualCapture();
 			Controller->HideUIForVisualCapture();
 			if (GEngine)
 			{
 				GEngine->ClearOnScreenDebugMessages();
 				GEngine->Exec(World, TEXT("DisableAllScreenMessages"));
-			}
-			if (PlayableWorld->GetMapSeed() != State->MapSeed)
-			{
-				PlayableWorld->Regenerate(State->MapSeed);
 			}
 			if (AMatterFluxTwoStoreyHouseActor* House =
 				PlayableWorld->GetGeneratedHouse())
@@ -6236,8 +6645,8 @@ namespace
 				return true;
 			}
 			CreatureMovement->bRunPhysicsWithNoController = true;
-			PlayerMovement->MaxWalkSpeed = 140.0f;
-			CreatureMovement->MaxWalkSpeed = 140.0f;
+			PlayerMovement->MaxWalkSpeed = State->WalkSpeed;
+			CreatureMovement->MaxWalkSpeed = State->WalkSpeed;
 			PlayerMovement->StopMovementImmediately();
 			CreatureMovement->StopMovementImmediately();
 
@@ -6367,7 +6776,15 @@ namespace
 					*State->PlayableWorld, CreatureLocation);
 		}
 
-		if (State->Phase == 1 && Now - State->PhaseStartedAt >= 1.2)
+		const bool bLakeStreamingReady =
+			State->PlayableWorld->GetPendingTerrainChunkPrefetchCount() == 0
+			&& State->PlayableWorld
+				->GetPendingProceduralPopulationUpdateCount() == 0
+			&& State->PlayableWorld
+				->GetPendingFragmentSourceSpawnCount() == 0;
+		if (State->Phase == 1
+			&& Now - State->PhaseStartedAt >= 1.2
+			&& bLakeStreamingReady)
 		{
 			MatterFlux::Liquid::FLiquidColumn PlayerAmbientColumn;
 			MatterFlux::Liquid::FLiquidColumn CreatureAmbientColumn;
@@ -6417,6 +6834,7 @@ namespace
 					*State, TEXT("03_EndWalk_NewVolumes.png"));
 				State->Phase = 4;
 				State->PhaseStartedAt = Now;
+				State->TraversalWarmupFramesRemaining = 3;
 			}
 			return true;
 		}
@@ -6433,6 +6851,7 @@ namespace
 			{
 				++State->RepeatedTraversalIndex;
 				State->PhaseStartedAt = Now;
+				State->TraversalWarmupFramesRemaining = 3;
 				if (State->RepeatedTraversalIndex >= 4)
 				{
 					State->Character->GetCharacterMovement()
@@ -6576,6 +6995,48 @@ namespace
 				State->InitialWaterAmount / 200);
 			const float PlayerSubmerged = State->PlayerSubmergedAtTraversalEnd;
 			const float CreatureSubmerged = State->CreatureSubmergedAtTraversalEnd;
+			TArray<float> SortedFrameTimes =
+				State->TraversalFrameTimesMilliseconds;
+			SortedFrameTimes.Sort();
+			double TotalFrameMilliseconds = 0.0;
+			for (const float FrameMilliseconds : SortedFrameTimes)
+			{
+				TotalFrameMilliseconds += FrameMilliseconds;
+			}
+			const float AverageFrameMilliseconds = SortedFrameTimes.IsEmpty()
+				? 0.0f
+				: static_cast<float>(
+					TotalFrameMilliseconds / SortedFrameTimes.Num());
+			const auto PercentileFrameMilliseconds = [&SortedFrameTimes](
+				const float Percentile)
+			{
+				if (SortedFrameTimes.IsEmpty())
+				{
+					return 0.0f;
+				}
+				const int32 Index = FMath::Clamp(
+					FMath::CeilToInt(Percentile * SortedFrameTimes.Num()) - 1,
+					0,
+					SortedFrameTimes.Num() - 1);
+				return SortedFrameTimes[Index];
+			};
+			const float P95FrameMilliseconds =
+				PercentileFrameMilliseconds(0.95f);
+			const float P99FrameMilliseconds =
+				PercentileFrameMilliseconds(0.99f);
+			const float MaximumFrameMilliseconds = SortedFrameTimes.IsEmpty()
+				? 0.0f
+				: SortedFrameTimes.Last();
+			UE_LOG(LogMatterFlux, Display,
+				TEXT("Deep-liquid traversal performance: samples=%d averageMs=%.2f p95Ms=%.2f p99Ms=%.2f maxMs=%.2f averageFps=%.1f"),
+				SortedFrameTimes.Num(),
+				AverageFrameMilliseconds,
+				P95FrameMilliseconds,
+				P99FrameMilliseconds,
+				MaximumFrameMilliseconds,
+				AverageFrameMilliseconds > UE_SMALL_NUMBER
+					? 1000.0f / AverageFrameMilliseconds
+					: 0.0f);
 			FMatterFluxLiquidProjectionHeightAudit FinalProjectionAudit;
 			const bool bHasFinalProjectionAudit =
 				PlayableWorld->TryGetLiquidProjectionHeightAudit(
@@ -6682,20 +7143,23 @@ namespace
 			: 1337;
 		State->bQuitAfterCapture = Args.Num() <= 1
 			|| FCString::Atoi(*Args[1]) != 0;
+		State->WalkSpeed = Args.Num() > 2
+			? FMath::Clamp(FCString::Atof(*Args[2]), 100.0f, 500.0f)
+			: 140.0f;
 		State->OutputDirectory = FPaths::Combine(
 			FPaths::ScreenShotDir(),
 			TEXT("MatterFluxDeepLiquidWalk"),
 			FDateTime::Now().ToString(TEXT("%Y%m%d-%H%M%S")));
 		FTSTicker::GetCoreTicker().AddTicker(
-			FTickerDelegate::CreateLambda([State](float)
+			FTickerDelegate::CreateLambda([State](const float DeltaSeconds)
 			{
-				return TickDeepLiquidWalkCapture(State);
+				return TickDeepLiquidWalkCapture(State, DeltaSeconds);
 			}));
 	}
 
 	FAutoConsoleCommandWithWorldAndArgs GDeepLiquidWalkCaptureCommand(
 		TEXT("mf.Visual.DeepLiquidWalk"),
-		TEXT("Capture real player and creature locomotion through a 90+ cm depth-transparent lake: mf.Visual.DeepLiquidWalk [map-seed=1337] [quit=1]"),
+		TEXT("Capture real player and creature locomotion through a 90+ cm depth-transparent lake: mf.Visual.DeepLiquidWalk [map-seed=1337] [quit=1] [walk-speed=140]"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
 			&QueueDeepLiquidWalkCapture));
 
@@ -8849,7 +9313,8 @@ namespace
 				return true;
 			}
 			if (PlayableWorld->IsGenerationInProgress()
-				|| PlayableWorld->GetCachedFragmentSourceCount() <= 0)
+				|| PlayableWorld->GetCachedFragmentSourceCount() <= 0
+				|| !PlayableWorld->IsInitialWorldEntryReady())
 			{
 				return true;
 			}
@@ -9252,11 +9717,21 @@ namespace
 		bool bQuitAfterCapture = true;
 		bool bRegenerationRequested = false;
 		int32 BodyVoxelCount = 0;
+		int32 FallingScreenshotCount = 0;
+		float InitialProjectileZ = 0.0f;
+		float LastFallingProjectileZ = 0.0f;
+		float FallingDropDistance = 0.0f;
+		bool bFallingHeightMonotonic = true;
 		int64 BaselineSandAmount = 0;
+		int64 PreviousAddedSandAmount = 0;
+		int64 MaximumSingleFrameReleasedAmount = 0;
+		int32 PartialReleaseObservationCount = 0;
 		int64 PeakSupportedAmount = 0;
 		int64 MidSupportedAmount = 0;
 		int64 FinalSupportedAmount = 0;
 		bool bSawSupportedDecline = false;
+		int32 FirstSupportedMaterialStep = INDEX_NONE;
+		int32 MidMaterialStep = INDEX_NONE;
 		FVector Focus = FVector::ZeroVector;
 		FString OutputDirectory;
 		TWeakObjectPtr<AMatterFluxPlayableWorldActor> PlayableWorld;
@@ -9284,23 +9759,71 @@ namespace
 			? PlayableWorld->GetSimulatedMaterialAmount(TEXT("sand"))
 			: 0;
 		const int64 AddedSandAmount = FinalSandAmount - State->BaselineSandAmount;
+		int32 MaximumSettledCellAmount = 0;
+		int32 TallSettledCellCount = 0;
+		if (PlayableWorld)
+		{
+			TArray<MatterFlux::Material::FCellSnapshot> SandCells;
+			PlayableWorld->GetSimulatedMaterialCells(TEXT("sand"), SandCells);
+			for (const MatterFlux::Material::FCellSnapshot& Cell : SandCells)
+			{
+				MaximumSettledCellAmount = FMath::Max(
+					MaximumSettledCellAmount,
+					static_cast<int32>(Cell.Amount));
+				TallSettledCellCount += Cell.Amount > 255 ? 1 : 0;
+			}
+		}
 		const bool bAmountMatches = AddedSandAmount == 2048ll * 255ll;
-		const bool bBallMatchesPayload = State->BodyVoxelCount >= 20;
+		const bool bBallMatchesPayload = State->BodyVoxelCount == 2048;
+		// Airborne particles are already canonical material facts, so total material
+		// appears atomically when the batch is spawned. Progressive release was an
+		// assertion from the old projectile-owned payload model and rejects the
+		// state-as-fact architecture even while the particles visibly fall.
+		const bool bCanonicalPayloadRegistered =
+			State->MaximumSingleFrameReleasedAmount == 2048ll * 255ll;
+		const bool bFellVisibly = State->bFallingHeightMonotonic
+			&& State->FallingDropDistance >= 40.0f;
 		const bool bLandedOnTree = State->PeakSupportedAmount > 0;
-		const bool bSlidFromTree = State->bSawSupportedDecline
-			&& State->FinalSupportedAmount < State->PeakSupportedAmount;
+		const bool bAdvancedPromptly = State->FirstSupportedMaterialStep != INDEX_NONE
+			&& State->MidMaterialStep > State->FirstSupportedMaterialStep;
+		const bool bStartedSlidingPromptly = State->MidSupportedAmount
+			< State->PeakSupportedAmount;
+		const bool bRetainedOnTree = State->FinalSupportedAmount >= 255
+			&& State->FinalSupportedAmount <= 2048ll * 255ll * 3ll / 4ll;
 		const bool bAccepted = !bTimedOut && bAmountMatches
-			&& bBallMatchesPayload && bLandedOnTree && bSlidFromTree;
+			&& bBallMatchesPayload && bCanonicalPayloadRegistered
+			&& State->FallingScreenshotCount >= 5
+			&& bFellVisibly
+			&& bLandedOnTree && bAdvancedPromptly
+			&& bStartedSlidingPromptly && bRetainedOnTree;
 		UE_LOG(LogMatterFlux, Display,
-			TEXT("Sand-sphere tree capture complete: accepted=%s timeout=%s visualVoxels=%d addedAmount=%lld expectedAmount=%lld peakTreeAmount=%lld midTreeAmount=%lld finalTreeAmount=%lld declined=%s output=%s"),
+			TEXT("Sand-sphere tree capture complete: accepted=%s timeout=%s visualVoxels=%d fallingFrames=%d fallingDrop=%.2f monotonic=%s addedAmount=%lld expectedAmount=%lld maxFrameRelease=%lld partialReleaseFrames=%d canonicalRegistered=%s peakTreeAmount=%lld midTreeAmount=%lld finalTreeAmount=%lld landingStep=%d midStep=%d stepDelta=%d supportCells=%d maxCellAmount=%d tallCells=%d retentionBounded=%s declined=%s output=%s"),
 			bAccepted ? TEXT("true") : TEXT("false"),
 			bTimedOut ? TEXT("true") : TEXT("false"),
 			State->BodyVoxelCount,
+			State->FallingScreenshotCount,
+			State->FallingDropDistance,
+			State->bFallingHeightMonotonic ? TEXT("true") : TEXT("false"),
 			AddedSandAmount,
 			2048ll * 255ll,
+			State->MaximumSingleFrameReleasedAmount,
+			State->PartialReleaseObservationCount,
+			bCanonicalPayloadRegistered ? TEXT("true") : TEXT("false"),
 			State->PeakSupportedAmount,
 			State->MidSupportedAmount,
 			State->FinalSupportedAmount,
+			State->FirstSupportedMaterialStep,
+			State->MidMaterialStep,
+			State->FirstSupportedMaterialStep != INDEX_NONE
+				&& State->MidMaterialStep != INDEX_NONE
+				? State->MidMaterialStep - State->FirstSupportedMaterialStep
+				: INDEX_NONE,
+			PlayableWorld
+				? PlayableWorld->GetExternalMaterialSupportCellCount()
+				: 0,
+			MaximumSettledCellAmount,
+			TallSettledCellCount,
+			bRetainedOnTree ? TEXT("true") : TEXT("false"),
 			State->bSawSupportedDecline ? TEXT("true") : TEXT("false"),
 			*State->OutputDirectory);
 		if (PlayableWorld)
@@ -9368,7 +9891,8 @@ namespace
 				return true;
 			}
 			if (PlayableWorld->IsGenerationInProgress()
-				|| PlayableWorld->GetCachedFragmentSourceCount() <= 0)
+				|| PlayableWorld->GetCachedFragmentSourceCount() <= 0
+				|| !PlayableWorld->IsInitialWorldEntryReady())
 			{
 				return true;
 			}
@@ -9421,7 +9945,9 @@ namespace
 
 			FMatterFluxMagicProjectilePlan Plan;
 			Plan.SpellId = TEXT("spell.sand_sphere");
-			Plan.Speed = 1.0f;
+			// Match spawn_stationary=true from the Lua spell. MaxSpeed=0 means
+			// unlimited gravity-driven fall in UProjectileMovementComponent.
+			Plan.Speed = 0.0f;
 			Plan.Lifetime = 5.0f;
 			Plan.Radius = 100.0f;
 			Plan.GravityScale = 1.0f;
@@ -9431,6 +9957,8 @@ namespace
 				State->Focus.X,
 				State->Focus.Y,
 				TreeBounds.Max.Z + 270.0f);
+			State->BaselineSandAmount =
+				PlayableWorld->GetSimulatedMaterialAmount(TEXT("sand"));
 			const FTransform SpawnTransform(FRotator::ZeroRotator, SpawnLocation);
 			AMatterFluxMagicProjectile* Projectile =
 				World->SpawnActorDeferred<AMatterFluxMagicProjectile>(
@@ -9445,8 +9973,8 @@ namespace
 			Projectile->FinishSpawning(SpawnTransform);
 			State->Projectile = Projectile;
 			State->BodyVoxelCount = Projectile->GetMaterialBodyVoxelCount();
-			State->BaselineSandAmount =
-				PlayableWorld->GetSimulatedMaterialAmount(TEXT("sand"));
+			State->InitialProjectileZ = Projectile->GetActorLocation().Z;
+			State->LastFallingProjectileZ = State->InitialProjectileZ;
 			State->PlayableWorld = PlayableWorld;
 			State->OutputDirectory = FPaths::Combine(
 				FPaths::ScreenShotDir(), TEXT("MatterFluxSandSphereTree"),
@@ -9463,6 +9991,18 @@ namespace
 		}
 		const int64 SupportedAmount =
 			PlayableWorld->GetExternalMaterialSupportedAmount(TEXT("sand"));
+		const int64 AddedSandAmount = FMath::Max<int64>(
+			PlayableWorld->GetSimulatedMaterialAmount(TEXT("sand"))
+				- State->BaselineSandAmount,
+			0);
+		State->MaximumSingleFrameReleasedAmount = FMath::Max(
+			State->MaximumSingleFrameReleasedAmount,
+			AddedSandAmount - State->PreviousAddedSandAmount);
+		if (AddedSandAmount > 0 && AddedSandAmount < 2048ll * 255ll)
+		{
+			++State->PartialReleaseObservationCount;
+		}
+		State->PreviousAddedSandAmount = AddedSandAmount;
 		if (SupportedAmount > State->PeakSupportedAmount)
 		{
 			State->PeakSupportedAmount = SupportedAmount;
@@ -9477,19 +10017,45 @@ namespace
 			return FinishSandSphereTreeCapture(State, true);
 		}
 
-		if (State->Phase == 1 && Now - State->PhaseStartedAt >= 0.15
+		static constexpr double FallingScreenshotTimes[] = {
+			0.08, 0.18, 0.28, 0.38, 0.48 };
+		if (State->Phase == 1
+			&& State->FallingScreenshotCount
+				< UE_ARRAY_COUNT(FallingScreenshotTimes)
+			&& Now - State->PhaseStartedAt
+				>= FallingScreenshotTimes[State->FallingScreenshotCount]
 			&& !FScreenshotRequest::IsScreenshotRequested())
 		{
+			if (const AMatterFluxMagicProjectile* Projectile =
+				State->Projectile.Get())
+			{
+				const float CurrentZ = Projectile->GetActorLocation().Z;
+				State->bFallingHeightMonotonic &=
+					CurrentZ <= State->LastFallingProjectileZ + 1.0f;
+				State->FallingDropDistance = FMath::Max(
+					State->FallingDropDistance,
+					State->InitialProjectileZ - CurrentZ);
+				State->LastFallingProjectileZ = CurrentZ;
+			}
+			const int32 FrameNumber = State->FallingScreenshotCount + 1;
+			const int32 Milliseconds = FMath::RoundToInt(
+				FallingScreenshotTimes[State->FallingScreenshotCount] * 1000.0);
 			RequestSandSphereTreeScreenshot(
-				*State, TEXT("01_LargeSandBall_AboveTree.png"));
-			State->Phase = 2;
-			State->PhaseStartedAt = Now;
+				*State,
+				*FString::Printf(
+					TEXT("%02d_FallingSphere_%03dms.png"),
+					FrameNumber,
+					Milliseconds));
+			++State->FallingScreenshotCount;
 			return true;
 		}
-		if (State->Phase == 2 && SupportedAmount > 0
+		if (State->Phase == 1 && SupportedAmount > 0
 			&& State->FirstSupportedAt <= 0.0)
 		{
 			State->FirstSupportedAt = Now;
+			State->FirstSupportedMaterialStep =
+				PlayableWorld->GetMaterialSimulationStep();
+			State->Phase = 2;
 			return true;
 		}
 		if (State->Phase == 2 && State->FirstSupportedAt > 0.0
@@ -9497,7 +10063,7 @@ namespace
 			&& !FScreenshotRequest::IsScreenshotRequested())
 		{
 			RequestSandSphereTreeScreenshot(
-				*State, TEXT("02_Sand_LandedOnTree.png"));
+				*State, TEXT("06_Sand_PartiallyLandingOnTree.png"));
 			State->Phase = 3;
 			State->PhaseStartedAt = Now;
 			return true;
@@ -9507,18 +10073,19 @@ namespace
 			&& !FScreenshotRequest::IsScreenshotRequested())
 		{
 			State->MidSupportedAmount = SupportedAmount;
+			State->MidMaterialStep = PlayableWorld->GetMaterialSimulationStep();
 			RequestSandSphereTreeScreenshot(
-				*State, TEXT("03_Sand_SlidingFromTree.png"));
+				*State, TEXT("07_Sand_SlidingFromTree.png"));
 			State->Phase = 4;
 			State->PhaseStartedAt = Now;
 			return true;
 		}
-		if (State->Phase == 4 && Now - State->PhaseStartedAt >= 2.5
+		if (State->Phase == 4 && Now - State->PhaseStartedAt >= 8.0
 			&& !FScreenshotRequest::IsScreenshotRequested())
 		{
 			State->FinalSupportedAmount = SupportedAmount;
 			RequestSandSphereTreeScreenshot(
-				*State, TEXT("04_Sand_AfterTreeSlide.png"));
+				*State, TEXT("08_Sand_AfterTreeSlide.png"));
 			State->Phase = 5;
 			State->PhaseStartedAt = Now;
 			return true;

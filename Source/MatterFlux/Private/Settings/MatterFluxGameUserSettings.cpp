@@ -15,6 +15,9 @@ UMatterFluxGameUserSettings* UMatterFluxGameUserSettings::Get()
 void UMatterFluxGameUserSettings::SetToDefaults()
 {
 	Super::SetToDefaults();
+	SetFullscreenMode(EWindowMode::Windowed);
+	SetScreenResolution(FIntPoint(1920, 1080));
+	ConfirmVideoMode();
 	MasterVolume = 0.8f;
 	InterfaceScale = 1.0f;
 	SetVSyncEnabled(true);

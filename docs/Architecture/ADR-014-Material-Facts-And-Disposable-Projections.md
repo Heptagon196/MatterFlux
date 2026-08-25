@@ -13,7 +13,9 @@ Actor 或渲染缓存也当成状态，就会出现同一物体的两份事实�
 
 逻辑材质状态是唯一事实；具体事实容器按材料类别区分，但渲染表示永远不是事实：
 
-- 流动材料（液体、粉末、气体）以 `FChunkedMaterialWorld` 的格子快照为事实。
+- 流动材料（液体、粉末、气体）以 `FSimulationRuntime` 为唯一事实容器：空中阶段是
+  `FAirborneParticle`，接触后原子转移为 `FChunkedMaterialWorld` 格子；法术 Actor 和体素实例
+  只投影粒子位置，不得暂存或在命中时补造材质量。
 - 可切割固体物品以 `SourceId + Revision + MaterialId + RuntimeMask` 为事实。静态 Source、
   SourceProxy、WholeObject 和动态 Fragment/aggregate carrier 只取得这份 mask 的投影权。
 - 静态到动态的切换必须在同一事务内先从静态 mask 移除分离部分，再把同一部分交给动态
@@ -43,6 +45,12 @@ FChunkedMaterialWorld snapshot
     -> body-volume constraint -> conserved particle transfer / restitution
     -> gameplay sampling / reactions / replication
     -> disposable liquid surface projection
+
+spell material amount
+    -> FSimulationRuntime airborne particles (spawn frame)
+    -> swept world/material/source contact
+    -> atomic transfer into FChunkedMaterialWorld cells
+    -> disposable projectile/ISM projection only
 ```
 
 `MatterFluxVoxelMaterialStyle` 是所有固体投影的统一材质适配器；调用者不能为静态和动态表示
@@ -51,6 +59,7 @@ FChunkedMaterialWorld snapshot
 ## 必须保持的不变量
 
 - 一个逻辑单元在同一时刻只有一个事实容器和一个可见投影所有者。
+- 物质法术生成当帧，其全部守恒量必须已存在于空中粒子事实中；碰撞只能转移，不能生成第二份。
 - 表示切换不修改 `MaterialId`、基础颜色、mask 坐标约定或切面方向。
 - 横向世界切割在动态刚体中仍产生水平切面，宽高不转置。
 - 房屋未切墙面在 WholeObject 重建前后保持相同规范材质投影。

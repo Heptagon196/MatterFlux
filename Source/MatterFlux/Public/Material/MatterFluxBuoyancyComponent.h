@@ -85,6 +85,16 @@ private:
 	bool ShouldSimulateCharacter() const;
 	void ApplyToCharacter(float DeltaTime);
 	void ApplyToPhysicsBody(float DeltaTime);
+	void UpdatePowderCollisionInteraction(
+		AMatterFluxPlayableWorldActor& PlayableWorld,
+		const FVector& Center,
+		const FVector& HorizontalExtent,
+		float BottomZ,
+		float TopZ,
+		const FVector& Velocity,
+		bool bEnableFootsteps,
+		bool bMovingOnGround,
+		float DeltaTime);
 
 	UPROPERTY(Transient)
 	TObjectPtr<UPrimitiveComponent> TargetPrimitive;
@@ -95,4 +105,10 @@ private:
 	float LastLiquidDensity = 0.0f;
 	float LastMovementMediumFraction = 0.0f;
 	float LastMovementResistance = 0.0f;
+	FVector LastPowderInteractionLocation = FVector::ZeroVector;
+	FVector LastPowderInteractionVelocity = FVector::ZeroVector;
+	float PowderGroundTravel = 0.0f;
+	float PowderImpactCooldown = 0.0f;
+	bool bHasPowderInteractionSample = false;
+	bool bWasTouchingPowder = false;
 };

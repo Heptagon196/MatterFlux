@@ -61,7 +61,7 @@ bool FMatterFluxLiquidSurfaceUsesConnectedShapeTest::RunTest(
 
 	TestEqual(TEXT("Adjacent liquid facts form one external shape"),
 		Projection.SurfacePatchCount, 1);
-	TestTrue(TEXT("Two adjacent cells share top vertices and add only envelope vertices"),
+	TestTrue(TEXT("Two adjacent particle columns retain their top vertices"),
 		Projection.Vertices.Num() >= 6);
 	TestEqual(TEXT("The connected shape retains both top faces"),
 		Projection.TopTriangleIndexCount, 12);
@@ -76,25 +76,63 @@ bool FMatterFluxLiquidSurfaceUsesConnectedShapeTest::RunTest(
 	TestEqual(TEXT("The shared surface spans one cell in Y"),
 		Bounds.GetSize().Y, 10.0);
 
-	int32 SharedEdgeVertexCount = 0;
+	TArray<float> SharedEdgeHeights;
 	for (int32 VertexIndex = 0; VertexIndex < Projection.Vertices.Num();
 		++VertexIndex)
 	{
 		const FVector Vertex = Projection.Vertices[VertexIndex];
 		if (FMath::IsNearlyEqual(Vertex.X, 10.0f))
 		{
-			if (!Projection.Normals[VertexIndex].Equals(FVector::UpVector))
+			if (VertexIndex >= Projection.TopVertexCount)
 			{
 				continue;
 			}
-			++SharedEdgeVertexCount;
-			TestTrue(
-				TEXT("Shared corners blend both column heights without a crack"),
-				Vertex.Z > 70.0f && Vertex.Z < 100.0f);
+			SharedEdgeHeights.Add(Vertex.Z);
 		}
 	}
-	TestEqual(TEXT("The common edge exists exactly once"),
-		SharedEdgeVertexCount, 2);
+	TestEqual(TEXT("Each particle column owns the common-edge corners"),
+		SharedEdgeHeights.Num(), 4);
+	SharedEdgeHeights.Sort();
+	if (SharedEdgeHeights.Num() == 4)
+	{
+		const float LowerSurface = 20.0f + 100.0f * (179.0f / 255.0f);
+		TestEqual(TEXT("Lower column keeps both common-edge corners"),
+			SharedEdgeHeights[0], LowerSurface, 0.01f);
+		TestEqual(TEXT("Lower column keeps its second common-edge corner"),
+			SharedEdgeHeights[1], LowerSurface, 0.01f);
+		TestEqual(TEXT("Full column keeps both common-edge corners"),
+			SharedEdgeHeights[2], 100.0f, 0.01f);
+		TestEqual(TEXT("Full column keeps its second common-edge corner"),
+			SharedEdgeHeights[3], 100.0f, 0.01f);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxLiquidSurfaceKeepsEqualHeightParticlesDiscreteTest,
+	"MatterFlux.Playable.Liquid.SurfaceProjectionKeepsEqualHeightParticlesDiscrete",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxLiquidSurfaceKeepsEqualHeightParticlesDiscreteTest::RunTest(
+	const FString& Parameters)
+{
+	using MatterFlux::Material::FCellSnapshot;
+	const TArray<FCellSnapshot> Cells = {
+		{ FIntPoint(0, 0), TEXT("water"), 0, 255 },
+		{ FIntPoint(1, 0), TEXT("water"), 0, 255 }
+	};
+
+	MatterFlux::Rendering::FLiquidSurfaceProjection Projection;
+	MatterFlux::Rendering::BuildLiquidSurfaceProjection(
+		Cells,
+		10.0f,
+		100.0f,
+		Projection);
+
+	TestEqual(TEXT("Each equal-height liquid particle owns four top vertices"),
+		Projection.TopVertexCount, 8);
+	TestEqual(TEXT("Each liquid particle still owns exactly two top triangles"),
+		Projection.TopTriangleIndexCount, 12);
 	return true;
 }
 
@@ -308,12 +346,18 @@ bool FMatterFluxLiquidSurfaceChunkUsesHaloWithoutBoundaryWallsTest::RunTest(
 	TestEqual(TEXT("Only the core cell emits a top face"),
 		LeftChunk.TopTriangleIndexCount, 6);
 	bool bHasFalseEastBoundaryWall = false;
-	for (int32 VertexIndex = 0; VertexIndex < LeftChunk.Vertices.Num();
-		++VertexIndex)
+	for (int32 VertexIndex = LeftChunk.TopVertexCount;
+		VertexIndex + 3 < LeftChunk.Vertices.Num();
+		VertexIndex += 4)
 	{
 		bHasFalseEastBoundaryWall |=
 			FMath::IsNearlyEqual(LeftChunk.Vertices[VertexIndex].X, 40.0f)
-			&& LeftChunk.Normals[VertexIndex].Equals(FVector::XAxisVector);
+			&& FMath::IsNearlyEqual(
+				LeftChunk.Vertices[VertexIndex + 1].X, 40.0f)
+			&& FMath::IsNearlyEqual(
+				LeftChunk.Vertices[VertexIndex + 2].X, 40.0f)
+			&& FMath::IsNearlyEqual(
+				LeftChunk.Vertices[VertexIndex + 3].X, 40.0f);
 	}
 	TestFalse(TEXT("A same-liquid halo cell suppresses the chunk seam wall"),
 		bHasFalseEastBoundaryWall);
@@ -362,6 +406,60 @@ bool FMatterFluxLiquidChunksPartitionDeterministicallyTest::RunTest(
 			}
 		}
 	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxLiquidProjectionBacklogUsesAdaptiveBudgetTest,
+	"MatterFlux.Playable.Liquid.ProjectionBacklogUsesAdaptiveBudget",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxLiquidProjectionBacklogUsesAdaptiveBudgetTest::RunTest(
+	const FString& Parameters)
+{
+	TArray<FIntPoint> PendingChunks;
+	for (int32 X = -7; X <= 7; ++X)
+	{
+		PendingChunks.Add(FIntPoint(X, 0));
+	}
+	TArray<FIntPoint> SelectedChunks;
+	MatterFlux::Rendering::SelectLiquidProjectionChunksForRebuild(
+		PendingChunks, FIntPoint::ZeroValue, SelectedChunks);
+	TestTrue(TEXT("A traversal backlog drains in a small number of render passes"),
+		SelectedChunks.Num() >= 6);
+	TestTrue(TEXT("Projection work remains bounded to protect frame time"),
+		SelectedChunks.Num() <= 8);
+
+	MatterFlux::Rendering::SelectLiquidProjectionChunksForRebuild(
+		PendingChunks, FIntPoint::ZeroValue, SelectedChunks, nullptr, 4);
+	TestEqual(TEXT("Runtime projection budget can spread commits across frames"),
+		SelectedChunks.Num(), 4);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxLiquidProjectionBacklogCannotStarveWakeTest,
+	"MatterFlux.Playable.Liquid.ProjectionBacklogCannotStarveWake",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxLiquidProjectionBacklogCannotStarveWakeTest::RunTest(
+	const FString& Parameters)
+{
+	const TArray<FIntPoint> PendingChunks = {
+		FIntPoint(-8, 0), FIntPoint(-7, 0), FIntPoint(-6, 0),
+		FIntPoint(7, 0), FIntPoint(8, 0), FIntPoint(9, 0) };
+	TMap<FIntPoint, uint64> EnqueueOrders;
+	for (int32 Index = 0; Index < PendingChunks.Num(); ++Index)
+	{
+		EnqueueOrders.Add(PendingChunks[Index], Index + 1);
+	}
+	TArray<FIntPoint> SelectedChunks;
+	MatterFlux::Rendering::SelectLiquidProjectionChunksForRebuild(
+		PendingChunks, FIntPoint(9, 0), SelectedChunks, &EnqueueOrders);
+	TestTrue(TEXT("The oldest trailing wake survives focus-distance priority"),
+		SelectedChunks.Contains(FIntPoint(-8, 0)));
+	TestTrue(TEXT("Near-player projection work still shares the same pass"),
+		SelectedChunks.Contains(FIntPoint(9, 0)));
 	return true;
 }
 
@@ -471,7 +569,7 @@ bool FMatterFluxLiquidSurfacePreservesLocalCanonicalHeightsTest::RunTest(
 	for (int32 VertexIndex = 0; VertexIndex < Projection.Vertices.Num();
 		++VertexIndex)
 	{
-		if (!Projection.Normals[VertexIndex].Equals(FVector::UpVector))
+		if (VertexIndex >= Projection.TopVertexCount)
 		{
 			continue;
 		}
@@ -491,8 +589,8 @@ bool FMatterFluxLiquidSurfacePreservesLocalCanonicalHeightsTest::RunTest(
 	}
 	TestEqual(TEXT("Left shoreline owns two corners"),
 		LeftOuterHeights.Num(), 2);
-	TestEqual(TEXT("Shared edge owns two corners"),
-		SharedEdgeHeights.Num(), 2);
+	TestEqual(TEXT("Each particle column owns its two shared-edge corners"),
+		SharedEdgeHeights.Num(), 4);
 	TestEqual(TEXT("Right shoreline owns two corners"),
 		RightOuterHeights.Num(), 2);
 	for (const float Height : LeftOuterHeights)
@@ -500,10 +598,17 @@ bool FMatterFluxLiquidSurfacePreservesLocalCanonicalHeightsTest::RunTest(
 		TestEqual(TEXT("Lower column stays at its canonical surface"),
 			Height, 100.0f, 0.01f);
 	}
-	for (const float Height : SharedEdgeHeights)
+	SharedEdgeHeights.Sort();
+	if (SharedEdgeHeights.Num() == 4)
 	{
-		TestEqual(TEXT("Shared corners interpolate adjacent material facts"),
-			Height, 104.0f, 0.01f);
+		TestEqual(TEXT("Lower particle column keeps its first shared corner"),
+			SharedEdgeHeights[0], 100.0f, 0.01f);
+		TestEqual(TEXT("Lower particle column keeps its second shared corner"),
+			SharedEdgeHeights[1], 100.0f, 0.01f);
+		TestEqual(TEXT("Higher particle column keeps its first shared corner"),
+			SharedEdgeHeights[2], 108.0f, 0.01f);
+		TestEqual(TEXT("Higher particle column keeps its second shared corner"),
+			SharedEdgeHeights[3], 108.0f, 0.01f);
 	}
 	for (const float Height : RightOuterHeights)
 	{
@@ -676,6 +781,44 @@ bool FMatterFluxLiquidSurfaceDoesNotLiftLakeToConnectedRiverTest::RunTest(
 		Projection.SurfaceHeights.FindChecked(FIntPoint(10, 20)), 100.0f, 0.01f);
 	TestEqual(TEXT("Connected high channel keeps its own level"),
 		Projection.SurfaceHeights.FindChecked(FIntPoint(40, 20)), 180.0f, 0.01f);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxLiquidProjectionCarriesCanonicalColumnDepthTest,
+	"MatterFlux.Playable.Liquid.ProjectionCarriesCanonicalColumnDepth",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxLiquidProjectionCarriesCanonicalColumnDepthTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	using MatterFlux::Material::FCellSnapshot;
+	const TArray<FCellSnapshot> Cells = {
+		{ FIntPoint(0, 0), TEXT("water"), 0, 32 },
+		{ FIntPoint(1, 0), TEXT("water"), 0, 255 }
+	};
+	MatterFlux::Rendering::FLiquidSurfaceProjection Projection;
+	MatterFlux::Rendering::BuildLiquidSurfaceProjection(
+		Cells, 16.0f, 128.0f, Projection);
+
+	TestEqual(TEXT("Every projected vertex carries canonical column depth"),
+		Projection.ColumnDepths.Num(), Projection.Vertices.Num());
+	if (Projection.ColumnDepths.Num() >= 8)
+	{
+		for (int32 VertexIndex = 0; VertexIndex < 4; ++VertexIndex)
+		{
+			TestEqual(TEXT("Partial particle column keeps its shallow depth"),
+				Projection.ColumnDepths[VertexIndex],
+				128.0f * 32.0f / 255.0f,
+				0.01f);
+		}
+		for (int32 VertexIndex = 4; VertexIndex < 8; ++VertexIndex)
+		{
+			TestEqual(TEXT("Full particle column keeps its deep depth"),
+				Projection.ColumnDepths[VertexIndex], 128.0f, 0.01f);
+		}
+	}
 	return true;
 }
 

@@ -66,10 +66,12 @@ namespace MatterFlux::Material
 		MaterialWorld.Reset();
 		RuntimeSettings = FRuntimeSettings();
 		CurrentFocuses.Reset();
+		AirborneParticles.Reset();
 		StepAccumulator = 0.0f;
 		LogicalStep = 0;
 		AppliedStateRevision = INDEX_NONE;
 		RejectedStateRevision = INDEX_NONE;
+		NextAirborneBatchSerial = 1;
 		bReplicationDirty = false;
 	}
 
@@ -83,7 +85,8 @@ namespace MatterFlux::Material
 
 	FRuntimeAdvanceResult FSimulationRuntime::AdvanceAuthority(
 		const float DeltaSeconds,
-		const TConstArrayView<FIntPoint> Focuses)
+		const TConstArrayView<FIntPoint> Focuses,
+		const int32 MaxStepsThisAdvance)
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(MatterFlux_MaterialRuntime_AdvanceAuthority);
 		FRuntimeAdvanceResult Result;
@@ -111,13 +114,19 @@ namespace MatterFlux::Material
 		}
 
 		StepAccumulator += FMath::Clamp(DeltaSeconds, 0.0f, 0.25f);
-		if (Result.bFocusChanged)
-		{
-			return Result;
-		}
+		// Focus reconciliation changes which chunks are resident; it must not pause
+		// canonical material time. Airborne grains and moving actors can change the
+		// focus set every frame for several seconds. Returning here used to starve
+		// powder/liquid motion throughout that interval, then make it begin suddenly
+		// once the focuses happened to stop changing. The caller already caps normal
+		// play to one material step per frame, so continuing remains bounded.
 
+		const int32 EffectiveMaxSteps = FMath::Clamp(
+			MaxStepsThisAdvance,
+			1,
+			RuntimeSettings.MaxStepsPerAdvance);
 		while (StepAccumulator >= RuntimeSettings.StepSeconds
-			&& Result.Steps < RuntimeSettings.MaxStepsPerAdvance)
+			&& Result.Steps < EffectiveMaxSteps)
 		{
 			StepAccumulator -= RuntimeSettings.StepSeconds;
 			FStepStats Stats;
@@ -131,7 +140,7 @@ namespace MatterFlux::Material
 				|| Stats.CulledCells > 0;
 			++Result.Steps;
 		}
-		if (Result.Steps == RuntimeSettings.MaxStepsPerAdvance
+		if (Result.Steps == EffectiveMaxSteps
 			&& StepAccumulator >= RuntimeSettings.StepSeconds)
 		{
 			StepAccumulator = FMath::Fmod(
@@ -332,6 +341,199 @@ namespace MatterFlux::Material
 		}
 	}
 
+	FGuid FSimulationRuntime::SpawnAirborneParticles(
+		const FName MaterialId,
+		const TConstArrayView<FVector> WorldPositions,
+		const TConstArrayView<FVector> InitialVelocities,
+		const int32 CellCount,
+		const int32 ConservedAmountPerCell,
+		const float Radius,
+		const float GravityScale,
+		const float Lifetime,
+		const int32 EventSeed)
+	{
+		if (!MaterialWorld
+			|| MaterialId.IsNone()
+			|| WorldPositions.IsEmpty()
+			|| CellCount <= 0
+			|| ConservedAmountPerCell <= 0
+			|| !FMath::IsFinite(Radius)
+			|| Radius <= 0.0f
+			|| !FMath::IsFinite(GravityScale)
+			|| !FMath::IsFinite(Lifetime)
+			|| Lifetime <= 0.0f)
+		{
+			return FGuid();
+		}
+
+		const uint32 Serial = NextAirborneBatchSerial++;
+		const FGuid BatchId(
+			static_cast<uint32>(EventSeed),
+			Serial,
+			static_cast<uint32>(LogicalStep),
+			GetTypeHash(MaterialId));
+		const int32 ParticleCount = FMath::Min(
+			WorldPositions.Num(),
+			CellCount);
+		AirborneParticles.Reserve(
+			AirborneParticles.Num() + ParticleCount);
+		const int32 BaseCellsPerParticle = CellCount / ParticleCount;
+		const int32 Remainder = CellCount % ParticleCount;
+		for (int32 Index = 0; Index < ParticleCount; ++Index)
+		{
+			if (WorldPositions[Index].ContainsNaN())
+			{
+				continue;
+			}
+			FAirborneParticle& Particle =
+				AirborneParticles.AddDefaulted_GetRef();
+			Particle.BatchId = BatchId;
+			Particle.MaterialId = MaterialId;
+			Particle.WorldPosition = WorldPositions[Index];
+			Particle.Velocity = InitialVelocities.IsValidIndex(Index)
+				&& !InitialVelocities[Index].ContainsNaN()
+				? InitialVelocities[Index]
+				: FVector::ZeroVector;
+			Particle.Radius = Radius;
+			Particle.GravityScale = FMath::Clamp(GravityScale, 0.0f, 4.0f);
+			Particle.RemainingLifetime = FMath::Clamp(Lifetime, 0.05f, 30.0f);
+			Particle.CellCount = BaseCellsPerParticle
+				+ (Index < Remainder ? 1 : 0);
+			Particle.ConservedMaterialAmount =
+				Particle.CellCount * ConservedAmountPerCell;
+			Particle.EventSeed = EventSeed;
+			Particle.ParticleIndex = Index;
+		}
+		bReplicationDirty |= HasAirborneParticleBatch(BatchId);
+		return HasAirborneParticleBatch(BatchId) ? BatchId : FGuid();
+	}
+
+	int32 FSimulationRuntime::AdvanceAirborneParticles(
+		const float DeltaSeconds,
+		const TFunctionRef<bool(FAirborneParticle&, float)> AdvanceParticle)
+	{
+		if (AirborneParticles.IsEmpty())
+		{
+			return 0;
+		}
+		const float StepSeconds = FMath::Clamp(DeltaSeconds, 0.0f, 0.10f);
+		int32 TransferredCount = 0;
+		for (int32 Index = AirborneParticles.Num() - 1; Index >= 0; --Index)
+		{
+			if (!AdvanceParticle(AirborneParticles[Index], StepSeconds))
+			{
+				continue;
+			}
+			AirborneParticles.RemoveAtSwap(Index, 1, EAllowShrinking::No);
+			++TransferredCount;
+		}
+		bReplicationDirty |= TransferredCount > 0;
+		return TransferredCount;
+	}
+
+	void FSimulationRuntime::GetAirborneParticlesForBatch(
+		const FGuid& BatchId,
+		TArray<FAirborneParticle>& OutParticles) const
+	{
+		OutParticles.Reset();
+		if (!BatchId.IsValid())
+		{
+			return;
+		}
+		for (const FAirborneParticle& Particle : AirborneParticles)
+		{
+			if (Particle.BatchId == BatchId)
+			{
+				OutParticles.Add(Particle);
+			}
+		}
+	}
+
+	bool FSimulationRuntime::GetAirborneParticleBounds(
+		FBox& OutBounds,
+		float& OutMaximumRadius,
+		float& OutMaximumSpeed,
+		float& OutMaximumGravityScale) const
+	{
+		OutBounds = FBox(ForceInit);
+		OutMaximumRadius = 0.0f;
+		OutMaximumSpeed = 0.0f;
+		OutMaximumGravityScale = 0.0f;
+		for (const FAirborneParticle& Particle : AirborneParticles)
+		{
+			if (Particle.WorldPosition.ContainsNaN())
+			{
+				continue;
+			}
+			OutBounds += Particle.WorldPosition;
+			OutMaximumRadius = FMath::Max(
+				OutMaximumRadius,
+				Particle.Radius);
+			OutMaximumSpeed = FMath::Max(
+				OutMaximumSpeed,
+				Particle.Velocity.Size());
+			OutMaximumGravityScale = FMath::Max(
+				OutMaximumGravityScale,
+				FMath::Abs(Particle.GravityScale));
+		}
+		return OutBounds.IsValid != 0;
+	}
+
+	bool FSimulationRuntime::HasAirborneParticleBatch(
+		const FGuid& BatchId) const
+	{
+		return BatchId.IsValid()
+			&& AirborneParticles.ContainsByPredicate(
+				[&BatchId](const FAirborneParticle& Particle)
+				{
+					return Particle.BatchId == BatchId;
+				});
+	}
+
+	int32 FSimulationRuntime::CountAirborneParticles(
+		const FName MaterialId) const
+	{
+		int32 Count = 0;
+		for (const FAirborneParticle& Particle : AirborneParticles)
+		{
+			Count += MaterialId.IsNone()
+				|| Particle.MaterialId == MaterialId;
+		}
+		return Count;
+	}
+
+	int64 FSimulationRuntime::SumAirborneMaterialAmount(
+		const FName MaterialId) const
+	{
+		int64 Amount = 0;
+		for (const FAirborneParticle& Particle : AirborneParticles)
+		{
+			if (Particle.MaterialId == MaterialId)
+			{
+				Amount += Particle.ConservedMaterialAmount;
+			}
+		}
+		return Amount;
+	}
+
+	int64 FSimulationRuntime::RemoveAirborneParticles(
+		const TFunctionRef<bool(const FAirborneParticle&)> ShouldRemove)
+	{
+		int64 RemovedAmount = 0;
+		for (int32 Index = AirborneParticles.Num() - 1; Index >= 0; --Index)
+		{
+			const FAirborneParticle& Particle = AirborneParticles[Index];
+			if (!ShouldRemove(Particle))
+			{
+				continue;
+			}
+			RemovedAmount += Particle.ConservedMaterialAmount;
+			AirborneParticles.RemoveAtSwap(Index, 1, EAllowShrinking::No);
+		}
+		bReplicationDirty |= RemovedAmount > 0;
+		return RemovedAmount;
+	}
+
 	bool FSimulationRuntime::SetCell(
 		const FIntPoint& WorldCell,
 		const FName MaterialId)
@@ -354,6 +556,37 @@ namespace MatterFlux::Material
 				Amount);
 		bReplicationDirty |= bChanged;
 		return bChanged;
+	}
+
+	int32 FSimulationRuntime::AddCellAmount(
+		const FIntPoint& WorldCell,
+		const FName MaterialId,
+		const uint16 Amount)
+	{
+		const int32 Accepted = MaterialWorld
+			? MaterialWorld->AddCellAmount(WorldCell, MaterialId, Amount)
+			: 0;
+		bReplicationDirty |= Accepted > 0;
+		return Accepted;
+	}
+
+	int32 FSimulationRuntime::AddPowderAmountAtStableSurface(
+		const FIntPoint& ImpactCell,
+		const FName MaterialId,
+		const uint16 Amount,
+		const int32 MaximumTravelCells,
+		FIntPoint& OutDestinationCell)
+	{
+		const int32 Accepted = MaterialWorld
+			? MaterialWorld->AddPowderAmountAtStableSurface(
+				ImpactCell,
+				MaterialId,
+				Amount,
+				MaximumTravelCells,
+				OutDestinationCell)
+			: 0;
+		bReplicationDirty |= Accepted > 0;
+		return Accepted;
 	}
 
 	bool FSimulationRuntime::SetExternalSupportHeight(
@@ -383,6 +616,15 @@ namespace MatterFlux::Material
 			: NAME_None;
 	}
 
+	uint16 FSimulationRuntime::GetMaterialAmountAt(
+		const FIntPoint& WorldCell,
+		const FName MaterialId) const
+	{
+		return MaterialWorld
+			? MaterialWorld->GetMaterialAmountAt(WorldCell, MaterialId)
+			: 0;
+	}
+
 	bool FSimulationRuntime::TryGetCellSnapshot(
 		const FIntPoint& WorldCell,
 		FCellSnapshot& OutSnapshot) const
@@ -394,6 +636,9 @@ namespace MatterFlux::Material
 
 	int32 FSimulationRuntime::CountMaterial(const FName MaterialId) const
 	{
+		// Preserve the established meaning of this query: occupied settled cells.
+		// Airborne facts have an explicit particle-count query, while total amount
+		// intentionally spans both states for conservation audits.
 		return MaterialWorld ? MaterialWorld->CountMaterial(MaterialId) : 0;
 	}
 
@@ -401,6 +646,7 @@ namespace MatterFlux::Material
 	{
 		return MaterialWorld
 			? MaterialWorld->SumMaterialAmount(MaterialId)
+				+ SumAirborneMaterialAmount(MaterialId)
 			: 0;
 	}
 
@@ -436,6 +682,27 @@ namespace MatterFlux::Material
 		if (MaterialWorld)
 		{
 			MaterialWorld->GetAllCells(OutCells);
+		}
+	}
+
+	void FSimulationRuntime::GetResidentCells(
+		TArray<FCellSnapshot>& OutCells) const
+	{
+		OutCells.Reset();
+		if (MaterialWorld)
+		{
+			MaterialWorld->GetResidentCells(OutCells);
+		}
+	}
+
+	void FSimulationRuntime::GetCellsInChunks(
+		const TConstArrayView<FIntPoint> Chunks,
+		TArray<FCellSnapshot>& OutCells) const
+	{
+		OutCells.Reset();
+		if (MaterialWorld)
+		{
+			MaterialWorld->GetCellsInChunks(Chunks, OutCells);
 		}
 	}
 

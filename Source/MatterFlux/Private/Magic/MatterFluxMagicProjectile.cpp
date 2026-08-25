@@ -19,6 +19,7 @@
 #include "Misc/Crc.h"
 #include "Net/UnrealNetwork.h"
 #include "ProceduralMeshComponent.h"
+#include "Rendering/MatterFluxInstanceVisuals.h"
 #include "UObject/ConstructorHelpers.h"
 
 AMatterFluxMagicProjectile::AMatterFluxMagicProjectile()
@@ -103,6 +104,10 @@ void AMatterFluxMagicProjectile::BeginPlay()
 		Collision->IgnoreActorWhenMoving(InstigatorPawn, true);
 	}
 	ApplyPresentation();
+	if (HasAuthority() && !Presentation.BodyMaterial.IsNone())
+	{
+		TryBeginAirborneMaterialProjection();
+	}
 	MaterialSweepOriginLocation = GetActorLocation();
 	PreviousMaterialSweepLocation = GetActorLocation();
 	bHasPreviousMaterialSweepLocation = true;
@@ -117,6 +122,32 @@ void AMatterFluxMagicProjectile::Tick(const float DeltaSeconds)
 	Super::Tick(DeltaSeconds);
 	if (!HasAuthority() || bImpactHandled)
 	{
+		return;
+	}
+	if (!Presentation.BodyMaterial.IsNone()
+		&& !bProjectsAirborneMaterialParticles
+		&& TryBeginAirborneMaterialProjection())
+	{
+		return;
+	}
+	if (bProjectsAirborneMaterialParticles)
+	{
+		AirborneMaterialProjectionAccumulator += DeltaSeconds;
+		const float ProjectionInterval = Presentation.MaterialAmount > 256
+			? 1.0f / 30.0f
+			: 0.0f;
+		if (ProjectionInterval > 0.0f
+			&& AirborneMaterialProjectionAccumulator < ProjectionInterval)
+		{
+			return;
+		}
+		AirborneMaterialProjectionAccumulator = 0.0f;
+		RefreshAirborneMaterialProjection();
+		return;
+	}
+	if (bProgressiveMaterialRelease)
+	{
+		TickProgressiveMaterialRelease(DeltaSeconds);
 		return;
 	}
 
@@ -182,6 +213,19 @@ void AMatterFluxMagicProjectile::Tick(const float DeltaSeconds)
 
 void AMatterFluxMagicProjectile::LifeSpanExpired()
 {
+	if (bProjectsAirborneMaterialParticles)
+	{
+		SetLifeSpan(0.0f);
+		return;
+	}
+	if (HasAuthority() && !Presentation.BodyMaterial.IsNone())
+	{
+		if (!TryBeginAirborneMaterialProjection())
+		{
+			SetLifeSpan(0.05f);
+		}
+		return;
+	}
 	if (HasAuthority() && !bImpactHandled)
 	{
 		bImpactHandled = true;
@@ -205,6 +249,9 @@ void AMatterFluxMagicProjectile::GetLifetimeReplicatedProps(
 		AMatterFluxMagicProjectile,
 		Presentation,
 		COND_InitialOnly);
+	DOREPLIFETIME(
+		AMatterFluxMagicProjectile,
+		MaterialBodyReleasedVoxelCount);
 }
 
 void AMatterFluxMagicProjectile::InitializeProjectile(
@@ -241,6 +288,10 @@ void AMatterFluxMagicProjectile::InitializeProjectile(
 	// editor worlds), but their immutable material body is already complete.
 	BuildMaterialBodyPresentation(
 		FMath::Clamp(Presentation.Radius, 2.0f, 100.0f));
+	if (HasActorBegunPlay() && !Presentation.BodyMaterial.IsNone())
+	{
+		TryBeginAirborneMaterialProjection();
+	}
 }
 
 void AMatterFluxMagicProjectile::ApplyPresentation()
@@ -337,79 +388,722 @@ void AMatterFluxMagicProjectile::ApplyPresentation()
 void AMatterFluxMagicProjectile::BuildMaterialBodyPresentation(
 	const float Radius)
 {
-	MaterialBody->ClearInstances();
+	MaterialBodyVoxelPositions.Reset();
+	MaterialBodyVoxelSpacing = 0.0f;
 	if (Presentation.BodyMaterial.IsNone())
+	{
+		MaterialBody->ClearInstances();
+		return;
+	}
+
+	// One visible point is one canonical material particle. A deterministic
+	// low-discrepancy volume fill keeps both five-particle sprays and the 2048
+	// particle sand sphere free of lattice spikes or hidden aggregate payloads.
+	const int32 ParticleCount = FMath::Clamp(
+		Presentation.MaterialAmount,
+		1,
+		4096);
+	const float BodyRadius = Radius * 0.92f;
+	MaterialBodyVoxelSpacing = FMath::Clamp(
+		BodyRadius * 1.45f
+			/ FMath::Max(FMath::Pow(static_cast<float>(ParticleCount), 1.0f / 3.0f), 1.0f),
+		3.0f,
+		12.0f);
+	MaterialBodyVoxelPositions.Reserve(ParticleCount);
+	constexpr double GoldenRatioConjugate = 0.6180339887498948482;
+	constexpr double PlasticConjugate = 0.7548776662466927600;
+	for (int32 Index = 0; Index < ParticleCount; ++Index)
+	{
+		const double RadialFraction =
+			(static_cast<double>(Index) + 0.5) / ParticleCount;
+		const double RadiusFraction = FMath::Pow(RadialFraction, 1.0 / 3.0);
+		const double Z = 1.0 - 2.0 * FMath::Frac(
+			(static_cast<double>(Index) + 0.5) * GoldenRatioConjugate);
+		const double Azimuth = 2.0 * PI * FMath::Frac(
+			(static_cast<double>(Index) + 0.5) * PlasticConjugate);
+		const double Ring = FMath::Sqrt(FMath::Max(1.0 - Z * Z, 0.0));
+		MaterialBodyVoxelPositions.Add(
+			FVector(
+				Ring * FMath::Cos(Azimuth),
+				Ring * FMath::Sin(Azimuth),
+				Z)
+			* BodyRadius * RadiusFraction);
+	}
+	RefreshMaterialBodyInstances();
+}
+
+void AMatterFluxMagicProjectile::RefreshMaterialBodyInstances()
+{
+	if (!MaterialBody)
+	{
+		return;
+	}
+	TArray<FTransform> Transforms;
+	Transforms.Reserve(
+		MaterialBodyVoxelPositions.Num() + FallingMaterialPackets.Num());
+	const float VoxelScale = MaterialBodyVoxelSpacing * 0.72f / 100.0f;
+	const int32 FirstBodyVoxel = bGranularMaterialFall
+		? MaterialBodyVoxelPositions.Num()
+		: MaterialBodyReleasedVoxelCount;
+	for (int32 Index = FirstBodyVoxel;
+		Index < MaterialBodyVoxelPositions.Num();
+		++Index)
+	{
+		Transforms.Add(FTransform(
+			FQuat::Identity,
+			MaterialBodyVoxelPositions[Index],
+			FVector(VoxelScale)));
+	}
+	const float GrainScale = FMath::Clamp(
+		MaterialBodyVoxelSpacing * 0.18f,
+		4.0f,
+		7.0f) / 100.0f;
+	const FTransform ActorTransform = GetActorTransform();
+	for (const FFallingMaterialPacket& Packet : FallingMaterialPackets)
+	{
+		Transforms.Add(FTransform(
+			FQuat::Identity,
+			ActorTransform.InverseTransformPosition(Packet.WorldPosition),
+			FVector(GrainScale * Packet.VisualScale)));
+	}
+	MatterFlux::Rendering::SynchronizeInstancesWithoutClearing(
+		*MaterialBody,
+		Transforms);
+}
+
+bool AMatterFluxMagicProjectile::TryBeginAirborneMaterialProjection()
+{
+	if (!HasAuthority()
+		|| bProjectsAirborneMaterialParticles
+		|| Presentation.BodyMaterial.IsNone()
+		|| MaterialBodyVoxelPositions.IsEmpty())
+	{
+		return bProjectsAirborneMaterialParticles;
+	}
+	AMatterFluxPlayableWorldActor* PlayableWorld = nullptr;
+	if (UWorld* World = GetWorld())
+	{
+		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
+		{
+			PlayableWorld = *It;
+			break;
+		}
+	}
+	if (!PlayableWorld)
+	{
+		return false;
+	}
+
+	TArray<FVector> WorldPositions;
+	TArray<FVector> InitialVelocities;
+	WorldPositions.Reserve(MaterialBodyVoxelPositions.Num());
+	InitialVelocities.Reserve(MaterialBodyVoxelPositions.Num());
+	const FTransform ProjectionTransform = GetActorTransform();
+	const FVector BaseVelocity = ProjectileMovement
+		? ProjectileMovement->Velocity
+		: GetActorForwardVector() * Presentation.Speed;
+	const float VelocityJitter = Presentation.Speed > UE_SMALL_NUMBER
+		? FMath::Clamp(Presentation.Speed * 0.035f, 4.0f, 45.0f)
+		: 3.0f;
+	FRandomStream Random(ServerEventSeed ^ 0x4d415454);
+	for (const FVector& LocalPosition : MaterialBodyVoxelPositions)
+	{
+		WorldPositions.Add(ProjectionTransform.TransformPosition(LocalPosition));
+		InitialVelocities.Add(
+			BaseVelocity + Random.VRand() * VelocityJitter);
+	}
+	MaterialParticleBatchId = PlayableWorld->SpawnAirborneSimulatedMaterial(
+		Presentation.BodyMaterial,
+		Presentation.MaterialAmount,
+		WorldPositions,
+		InitialVelocities,
+		FMath::Clamp(MaterialBodyVoxelSpacing * 0.28f, 1.5f, 5.0f),
+		Presentation.GravityScale,
+		Presentation.Lifetime,
+		ServerEventSeed);
+	if (!MaterialParticleBatchId.IsValid())
+	{
+		return false;
+	}
+
+	bProjectsAirborneMaterialParticles = true;
+	AirborneMaterialProjectionAccumulator = 0.0f;
+	bProgressiveMaterialRelease = false;
+	bGranularMaterialFall = false;
+	FallingMaterialPackets.Reset();
+	Collision->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	Collision->SetGenerateOverlapEvents(false);
+	if (ProjectileMovement)
+	{
+		ProjectileMovement->StopMovementImmediately();
+		ProjectileMovement->Deactivate();
+	}
+	SetLifeSpan(0.0f);
+	LastMaterialParticleCenter = GetActorLocation();
+	LastMaterialParticleVelocity = BaseVelocity;
+	RefreshAirborneMaterialProjection();
+	ForceNetUpdate();
+	return true;
+}
+
+void AMatterFluxMagicProjectile::RefreshAirborneMaterialProjection()
+{
+	if (!bProjectsAirborneMaterialParticles || !MaterialParticleBatchId.IsValid())
+	{
+		return;
+	}
+	AMatterFluxPlayableWorldActor* PlayableWorld = nullptr;
+	if (UWorld* World = GetWorld())
+	{
+		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
+		{
+			PlayableWorld = *It;
+			break;
+		}
+	}
+	if (!PlayableWorld)
+	{
+		return;
+	}
+	TArray<MatterFlux::Material::FAirborneParticle> Particles;
+	PlayableWorld->GetAirborneSimulatedMaterialParticles(
+		MaterialParticleBatchId,
+		Particles);
+	if (Particles.IsEmpty())
+	{
+		FinishAirborneMaterialProjection();
+		return;
+	}
+
+	FVector Center = FVector::ZeroVector;
+	FVector AverageVelocity = FVector::ZeroVector;
+	for (const MatterFlux::Material::FAirborneParticle& Particle : Particles)
+	{
+		Center += Particle.WorldPosition;
+		AverageVelocity += Particle.Velocity;
+	}
+	Center /= static_cast<double>(Particles.Num());
+	AverageVelocity /= static_cast<double>(Particles.Num());
+	SetActorLocation(Center, false, nullptr, ETeleportType::TeleportPhysics);
+	LastMaterialParticleCenter = Center;
+	LastMaterialParticleVelocity = AverageVelocity;
+
+	TArray<FTransform> Transforms;
+	Transforms.Reserve(Particles.Num());
+	const FTransform ActorTransform = GetActorTransform();
+	for (const MatterFlux::Material::FAirborneParticle& Particle : Particles)
+	{
+		const float Scale = Particle.Radius * 1.5f / 100.0f;
+		Transforms.Add(FTransform(
+			FQuat::Identity,
+			ActorTransform.InverseTransformPosition(Particle.WorldPosition),
+			FVector(Scale)));
+	}
+	MatterFlux::Rendering::SynchronizeInstancesWithoutClearing(
+		*MaterialBody,
+		Transforms);
+}
+
+void AMatterFluxMagicProjectile::FinishAirborneMaterialProjection()
+{
+	if (bImpactHandled)
+	{
+		return;
+	}
+	bImpactHandled = true;
+	SpawnTriggerPayload(
+		ServerPlan.OnImpactProjectiles,
+		LastMaterialParticleCenter,
+		LastMaterialParticleVelocity.GetSafeNormal(
+			UE_SMALL_NUMBER,
+			GetActorForwardVector()),
+		ServerPlan.bTriggerRandomDirection);
+	Destroy();
+}
+
+bool AMatterFluxMagicProjectile::ShouldReleaseMaterialBodyProgressively() const
+{
+	// A large material-bodied projectile must not depend on the script runtime
+	// still being available at impact time. Its authoritative plan already says
+	// that the payload is a material body; releasing that body over multiple
+	// frames preserves the visible shape until it has actually entered the
+	// material simulation. Small spray particles keep their immediate handoff.
+	return !ServerPlan.BodyMaterial.IsNone()
+		&& ServerPlan.MaterialAmount > 64
+		&& MaterialBodyVoxelPositions.Num() >= 4;
+}
+
+bool AMatterFluxMagicProjectile::ShouldBeginGranularMaterialFall() const
+{
+	if (!ShouldReleaseMaterialBodyProgressively()
+		|| !IMatterFluxScriptRuntime::IsAvailable())
+	{
+		return false;
+	}
+	const FMatterFluxContentRegistryPtr Registry =
+		IMatterFluxScriptRuntime::Get().GetActiveRegistry();
+	const FMatterFluxMaterialDefinition* Material = Registry.IsValid()
+		? Registry->Materials.Find(ServerPlan.BodyMaterial)
+		: nullptr;
+	return Material
+		&& Material->Phase == EMatterFluxMaterialPhase::Powder;
+}
+
+void AMatterFluxMagicProjectile::BeginGranularMaterialFall()
+{
+	bProgressiveMaterialRelease = true;
+	bGranularMaterialFall = true;
+	ProgressiveMaterialReleaseElapsed = 0.0f;
+	MaterialBodyReleasedVoxelCount = 0;
+	FallingMaterialPackets.Reset();
+	ProgressiveReleaseStartLocation = GetActorLocation();
+	ProgressiveReleaseEndLocation = ProgressiveReleaseStartLocation;
+	ProgressiveReleaseImpactPoint = ProgressiveReleaseStartLocation;
+	ProgressiveReleaseDirection = GetVelocity().GetSafeNormal(
+		UE_SMALL_NUMBER,
+		FVector::DownVector);
+	ProgressiveReleaseImpactActor.Reset();
+	for (int32 VoxelIndex = 0;
+		VoxelIndex < MaterialBodyVoxelPositions.Num();
+		++VoxelIndex)
+	{
+		const int32 VoxelCount = MaterialBodyVoxelPositions.Num();
+		const int32 BaseCellCount = ServerPlan.MaterialAmount / VoxelCount;
+		const int32 Remainder = ServerPlan.MaterialAmount % VoxelCount;
+		QueueFallingMaterialPacketsForVoxel(
+			VoxelIndex,
+			BaseCellCount + (VoxelIndex < Remainder ? 1 : 0));
+	}
+	if (FallingMaterialPackets.IsEmpty())
+	{
+		bProgressiveMaterialRelease = false;
+		bGranularMaterialFall = false;
+		return;
+	}
+	if (ProjectileMovement)
+	{
+		ProjectileMovement->StopMovementImmediately();
+		ProjectileMovement->Deactivate();
+	}
+	Collision->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	Collision->SetGenerateOverlapEvents(false);
+	SetLifeSpan(0.0f);
+	RefreshMaterialBodyInstances();
+	ForceNetUpdate();
+}
+
+void AMatterFluxMagicProjectile::BeginProgressiveMaterialRelease(
+	const FHitResult& Hit,
+	AActor* ImpactActor)
+{
+	bProgressiveMaterialRelease = true;
+	ProgressiveMaterialReleaseElapsed = 0.0f;
+	MaterialBodyReleasedVoxelCount = 0;
+	FallingMaterialPackets.Reset();
+	ProgressiveReleaseStartLocation = GetActorLocation();
+	ProgressiveReleaseEndLocation = ProgressiveReleaseStartLocation
+		- FVector::UpVector * FMath::Max(Presentation.Radius * 2.10f, 30.0f);
+	ProgressiveReleaseImpactPoint = Hit.ImpactPoint;
+	ProgressiveReleaseDirection = GetVelocity().GetSafeNormal(
+		UE_SMALL_NUMBER,
+		FVector::DownVector);
+	ProgressiveReleaseImpactActor = ImpactActor;
+	if (ProjectileMovement)
+	{
+		ProjectileMovement->StopMovementImmediately();
+		ProjectileMovement->Deactivate();
+	}
+	Collision->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	Collision->SetGenerateOverlapEvents(false);
+	SetLifeSpan(0.0f);
+	ForceNetUpdate();
+}
+
+void AMatterFluxMagicProjectile::QueueFallingMaterialPacketsForVoxel(
+	const int32 VoxelIndex,
+	const int32 VoxelCellCount)
+{
+	if (!MaterialBodyVoxelPositions.IsValidIndex(VoxelIndex)
+		|| VoxelCellCount <= 0)
 	{
 		return;
 	}
 
-	// Keep one compact deterministic material body per projectile. The body is
-	// an in-flight projection; collision is still owned by the single sphere,
-	// and collision or lifetime expiry hands its conserved payload back to the
-	// falling-sand world.
-	const float Spacing = FMath::Max(5.0f, Radius * 0.45f);
-	const float BodyRadius = Radius * 0.92f;
-	const int32 StepCount = FMath::Max(
-		1,
-		FMath::CeilToInt(BodyRadius / Spacing));
-	const float VoxelScale = Spacing * 0.72f / 100.0f;
-	struct FBodyVoxel
+	AMatterFluxPlayableWorldActor* PlayableWorld = nullptr;
+	if (UWorld* World = GetWorld())
 	{
-		FVector Position = FVector::ZeroVector;
-		float DistanceSquared = 0.0f;
-	};
-	TArray<FBodyVoxel> Voxels;
-	for (int32 X = -StepCount; X <= StepCount; ++X)
-	{
-		for (int32 Y = -StepCount; Y <= StepCount; ++Y)
+		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
 		{
-			for (int32 Z = -StepCount; Z <= StepCount; ++Z)
+			PlayableWorld = *It;
+			break;
+		}
+	}
+	if (!PlayableWorld)
+	{
+		return;
+	}
+
+	FRandomStream Random(ServerEventSeed
+		^ VoxelIndex * 0x45d9f3b
+		^ VoxelCellCount * 0x27d4eb2d);
+	AFragment2DSourceActor* CandidateSource =
+		Cast<AFragment2DSourceActor>(ProgressiveReleaseImpactActor.Get());
+	const float JitterRadius = MaterialBodyVoxelSpacing * 0.34f;
+	const float GrainRadius = FMath::Clamp(
+		MaterialBodyVoxelSpacing * 0.09f,
+		2.0f,
+		4.0f);
+	const FVector LocalVoxel = MaterialBodyVoxelPositions[VoxelIndex];
+	const FVector InheritedVelocity = ProjectileMovement
+		? ProjectileMovement->Velocity
+		: FVector::ZeroVector;
+	// Keep the presentation one-to-one with the authored payload. Partial
+	// visual grains used to double a 2048-unit body into 4096 instances while
+	// the canonical material amount remained unchanged, so the falling body no
+	// longer represented what would actually be deposited.
+	const int32 SubGrainsPerCell = 1;
+	const int32 PacketCount = VoxelCellCount * SubGrainsPerCell;
+	const int32 BaseCellCount = VoxelCellCount / PacketCount;
+	const int32 Remainder = VoxelCellCount % PacketCount;
+	const int32 TotalConservedAmount = VoxelCellCount * 255;
+	const int32 BaseConservedAmount = TotalConservedAmount / PacketCount;
+	const int32 ConservedRemainder = TotalConservedAmount % PacketCount;
+	for (int32 PacketIndex = 0; PacketIndex < PacketCount; ++PacketIndex)
+	{
+		const FVector LocalJitter(
+			Random.FRandRange(-JitterRadius, JitterRadius),
+			Random.FRandRange(-JitterRadius, JitterRadius),
+			Random.FRandRange(-MaterialBodyVoxelSpacing * 0.48f,
+				MaterialBodyVoxelSpacing * 0.48f));
+		FVector WorldPosition = GetActorTransform().TransformPosition(
+			LocalVoxel + LocalJitter);
+		float LandingZ = ProgressiveReleaseImpactPoint.Z;
+		PlayableWorld->TrySampleTerrainHeightAtWorldLocation(
+			WorldPosition,
+			LandingZ);
+		AActor* PacketImpactActor = nullptr;
+		if (IsValid(CandidateSource) && !CandidateSource->bBroken)
+		{
+			const FVector TraceStart =
+				WorldPosition + FVector::UpVector * 12.0f;
+			const FVector TraceEnd(
+				WorldPosition.X,
+				WorldPosition.Y,
+				LandingZ - 12.0f);
+			FVector SupportLocation;
+			FVector SupportNormal;
+			if (CandidateSource->SweepRuntimeMask(
+				TraceStart,
+				TraceEnd,
+				GrainRadius,
+				SupportLocation,
+				SupportNormal))
 			{
-				const FVector LocalPosition = FVector(X, Y, Z) * Spacing;
-				if (LocalPosition.SizeSquared()
-					> FMath::Square(BodyRadius))
-				{
-					continue;
-				}
-				Voxels.Add({
-					LocalPosition,
-					static_cast<float>(LocalPosition.SizeSquared()) });
+				LandingZ = FMath::Max(LandingZ, SupportLocation.Z);
+				PacketImpactActor = CandidateSource;
 			}
 		}
+		WorldPosition.Z = FMath::Max(
+			WorldPosition.Z,
+			LandingZ + GrainRadius * 2.0f);
+
+		FFallingMaterialPacket& Packet =
+			FallingMaterialPackets.AddDefaulted_GetRef();
+		Packet.WorldPosition = WorldPosition;
+		Packet.Velocity = bGranularMaterialFall
+			? InheritedVelocity + FVector(
+				Random.FRandRange(-12.0f, 12.0f),
+				Random.FRandRange(-12.0f, 12.0f),
+				Random.FRandRange(-9.0f, 9.0f))
+			: FVector(
+				Random.FRandRange(-28.0f, 28.0f),
+				Random.FRandRange(-28.0f, 28.0f),
+				-Random.FRandRange(35.0f, 95.0f));
+		Packet.LandingZ = LandingZ + GrainRadius;
+		Packet.DelaySeconds = bGranularMaterialFall
+			? 0.0f
+			: Random.FRandRange(0.0f, 0.12f);
+		Packet.CellCount = FMath::Max(
+			BaseCellCount + (PacketIndex < Remainder ? 1 : 0),
+			1);
+		Packet.ConservedMaterialAmount = BaseConservedAmount
+			+ (PacketIndex < ConservedRemainder ? 1 : 0);
+		Packet.VisualScale = FMath::Pow(
+			static_cast<float>(Packet.ConservedMaterialAmount) / 255.0f,
+			1.0f / 3.0f);
+		Packet.VoxelIndex = VoxelIndex;
+		Packet.ImpactActor = PacketImpactActor;
 	}
-	Voxels.Sort([](const FBodyVoxel& Left, const FBodyVoxel& Right)
+}
+
+void AMatterFluxMagicProjectile::AdvanceFallingMaterialPackets(
+	const float DeltaSeconds)
+{
+	if (FallingMaterialPackets.IsEmpty())
 	{
-		if (!FMath::IsNearlyEqual(
-			Left.DistanceSquared, Right.DistanceSquared))
+		return;
+	}
+	AMatterFluxPlayableWorldActor* PlayableWorld = nullptr;
+	if (UWorld* World = GetWorld())
+	{
+		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
 		{
-			return Left.DistanceSquared < Right.DistanceSquared;
+			PlayableWorld = *It;
+			break;
 		}
-		if (!FMath::IsNearlyEqual(Left.Position.Z, Right.Position.Z))
-		{
-			return Left.Position.Z < Right.Position.Z;
-		}
-		if (!FMath::IsNearlyEqual(Left.Position.Y, Right.Position.Y))
-		{
-			return Left.Position.Y < Right.Position.Y;
-		}
-		return Left.Position.X < Right.Position.X;
-	});
-	// One presentation cube stands for several conserved powder/liquid units.
-	// Small spray payloads therefore no longer masquerade as large material balls.
-	const int32 MaximumVisibleVoxels = FMath::Clamp(
-		FMath::CeilToInt(
-			static_cast<float>(FMath::Max(Presentation.MaterialAmount, 1)) / 8.0f),
+	}
+	if (!PlayableWorld)
+	{
+		return;
+	}
+
+	const float StepSeconds = FMath::Clamp(DeltaSeconds, 0.0f, 0.10f);
+	// Keep the handoff into the canonical 2.5D simulation granular as well as
+	// the visible fall. Without a time-based budget, many independently falling
+	// grains can cross their support plane during the same frame and still turn
+	// into one large, visibly stepped material update.
+	const int32 MaximumDepositedCellsThisFrame = FMath::Max(
 		1,
-		96);
-	for (int32 Index = 0;
-		Index < FMath::Min(Voxels.Num(), MaximumVisibleVoxels);
+		FMath::FloorToInt(12000.0f * StepSeconds));
+	int32 DepositedCellsThisFrame = 0;
+	bool bReplicatedReleaseChanged = false;
+	for (int32 Index = FallingMaterialPackets.Num() - 1; Index >= 0; --Index)
+	{
+		FFallingMaterialPacket& Packet = FallingMaterialPackets[Index];
+		if (Packet.DelaySeconds > 0.0f)
+		{
+			Packet.DelaySeconds -= StepSeconds;
+			continue;
+		}
+		const FVector PreviousPosition = Packet.WorldPosition;
+		const FVector Gravity(0.0f, 0.0f, -720.0f);
+		const FVector NextPosition = Packet.WorldPosition
+			+ Packet.Velocity * StepSeconds
+			+ Gravity * (0.5f * StepSeconds * StepSeconds);
+		Packet.Velocity += Gravity * StepSeconds;
+		const float HorizontalDamping = FMath::Exp(-0.8f * StepSeconds);
+		Packet.Velocity.X *= HorizontalDamping;
+		Packet.Velocity.Y *= HorizontalDamping;
+
+		const float GrainRadius = FMath::Clamp(
+			MaterialBodyVoxelSpacing * 0.09f,
+			2.0f,
+			4.0f);
+		bool bHasImpact = false;
+		float BestImpactDistanceSquared = MAX_flt;
+		FVector DepositLocation = NextPosition;
+		AActor* DepositImpactActor = nullptr;
+		const auto ConsiderImpact = [
+			&bHasImpact,
+			&BestImpactDistanceSquared,
+			&DepositLocation,
+			&DepositImpactActor,
+			&PreviousPosition](
+				const FVector& CandidateLocation,
+				AActor* CandidateActor)
+		{
+			const float DistanceSquared = FVector::DistSquared(
+				PreviousPosition,
+				CandidateLocation);
+			if (!bHasImpact || DistanceSquared < BestImpactDistanceSquared)
+			{
+				bHasImpact = true;
+				BestImpactDistanceSquared = DistanceSquared;
+				DepositLocation = CandidateLocation;
+				DepositImpactActor = CandidateActor;
+			}
+		};
+
+		FVector FixedImpactLocation;
+		FVector FixedImpactNormal;
+		AFragment2DSourceActor* FixedImpactSource = nullptr;
+		if (PlayableWorld->SweepFixedFragmentSource(
+				PreviousPosition,
+				NextPosition,
+				GrainRadius,
+				FixedImpactLocation,
+				FixedImpactNormal,
+				FixedImpactSource))
+		{
+			ConsiderImpact(FixedImpactLocation, FixedImpactSource);
+		}
+		FVector MaterialImpactLocation;
+		FName ContactMaterial;
+		if (PlayableWorld->SweepSimulatedMaterial(
+				PreviousPosition,
+				NextPosition,
+				GrainRadius,
+				MaterialImpactLocation,
+				ContactMaterial))
+		{
+			ConsiderImpact(MaterialImpactLocation, nullptr);
+		}
+		float TerrainZ = Packet.LandingZ - GrainRadius;
+		PlayableWorld->TrySampleTerrainHeightAtWorldLocation(
+			NextPosition,
+			TerrainZ);
+		if (NextPosition.Z <= TerrainZ + GrainRadius)
+		{
+			ConsiderImpact(
+				FVector(NextPosition.X, NextPosition.Y, TerrainZ),
+				nullptr);
+		}
+		if (!bHasImpact)
+		{
+			Packet.WorldPosition = NextPosition;
+			continue;
+		}
+		if (DepositedCellsThisFrame + Packet.CellCount
+			> MaximumDepositedCellsThisFrame)
+		{
+			Packet.WorldPosition = DepositLocation
+				+ FVector::UpVector * GrainRadius * 2.0f;
+			Packet.Velocity = FVector::ZeroVector;
+			Packet.DelaySeconds = 0.01f;
+			continue;
+		}
+
+		const int32 Deposited = PlayableWorld->DepositSimulatedMaterialFromImpact(
+			DepositLocation,
+			ServerPlan.BodyMaterial,
+			Packet.CellCount,
+			DepositImpactActor
+				? DepositImpactActor
+				: Packet.ImpactActor.Get(),
+			GrainRadius,
+			GrainRadius,
+			64,
+			Packet.ConservedMaterialAmount);
+		if (Deposited > 0)
+		{
+			DepositedCellsThisFrame += Packet.CellCount;
+			ProgressiveReleaseImpactPoint = DepositLocation;
+			ProgressiveReleaseImpactActor = DepositImpactActor;
+			const int32 LandedVoxelIndex = Packet.VoxelIndex;
+			FallingMaterialPackets.RemoveAtSwap(
+				Index,
+				1,
+				EAllowShrinking::No);
+			if (bGranularMaterialFall
+				&& !FallingMaterialPackets.ContainsByPredicate(
+					[LandedVoxelIndex](const FFallingMaterialPacket& Candidate)
+					{
+						return Candidate.VoxelIndex == LandedVoxelIndex;
+					}))
+			{
+				MaterialBodyReleasedVoxelCount = FMath::Min<uint16>(
+					static_cast<uint16>(MaterialBodyReleasedVoxelCount + 1),
+					static_cast<uint16>(MaterialBodyVoxelPositions.Num()));
+				bReplicatedReleaseChanged = true;
+			}
+		}
+		else
+		{
+			Packet.WorldPosition = DepositLocation
+				+ FVector::UpVector * GrainRadius * 2.0f;
+			Packet.WorldPosition.X += 4.0f;
+			Packet.DelaySeconds = 0.03f;
+		}
+	}
+	if (bReplicatedReleaseChanged)
+	{
+		ForceNetUpdate();
+	}
+	if (bGranularMaterialFall && !FallingMaterialPackets.IsEmpty())
+	{
+		FVector Center = FVector::ZeroVector;
+		for (const FFallingMaterialPacket& Packet : FallingMaterialPackets)
+		{
+			Center += Packet.WorldPosition;
+		}
+		Center /= static_cast<double>(FallingMaterialPackets.Num());
+		Center.Z = FMath::Min(Center.Z, GetActorLocation().Z);
+		SetActorLocation(
+			Center,
+			false,
+			nullptr,
+			ETeleportType::TeleportPhysics);
+	}
+}
+
+void AMatterFluxMagicProjectile::FinishProgressiveMaterialRelease()
+{
+	bImpactHandled = true;
+	SpawnTriggerPayload(
+		ServerPlan.OnImpactProjectiles,
+		ProgressiveReleaseImpactPoint,
+		ProgressiveReleaseDirection,
+		ServerPlan.bTriggerRandomDirection);
+	Destroy();
+}
+
+void AMatterFluxMagicProjectile::TickProgressiveMaterialRelease(
+	const float DeltaSeconds)
+{
+	if (MaterialBodyVoxelPositions.IsEmpty())
+	{
+		bImpactHandled = true;
+		Destroy();
+		return;
+	}
+	if (bGranularMaterialFall)
+	{
+		AdvanceFallingMaterialPackets(DeltaSeconds);
+		RefreshMaterialBodyInstances();
+		if (FallingMaterialPackets.IsEmpty())
+		{
+			FinishProgressiveMaterialRelease();
+		}
+		return;
+	}
+	ProgressiveMaterialReleaseElapsed += FMath::Max(DeltaSeconds, 0.0f);
+	const float Alpha = FMath::Clamp(
+		ProgressiveMaterialReleaseElapsed
+			/ FMath::Max(ProgressiveMaterialReleaseDuration, 0.05f),
+		0.0f,
+		1.0f);
+	SetActorLocation(
+		FMath::Lerp(
+			ProgressiveReleaseStartLocation,
+			ProgressiveReleaseEndLocation,
+			FMath::InterpEaseInOut(0.0f, 1.0f, Alpha, 1.5f)),
+		false,
+		nullptr,
+		ETeleportType::TeleportPhysics);
+
+	const int32 VoxelCount = MaterialBodyVoxelPositions.Num();
+	const int32 TargetReleasedCount = FMath::Clamp(
+		FMath::FloorToInt(Alpha * static_cast<float>(VoxelCount)),
+		0,
+		VoxelCount);
+	const int32 BaseCellCount = ServerPlan.MaterialAmount / VoxelCount;
+	const int32 Remainder = ServerPlan.MaterialAmount % VoxelCount;
+	for (int32 Index = MaterialBodyReleasedVoxelCount;
+		Index < TargetReleasedCount;
 		++Index)
 	{
-		MaterialBody->AddInstance(FTransform(
-			FQuat::Identity,
-			Voxels[Index].Position,
-			FVector(VoxelScale)));
+		const int32 VoxelCellCount = BaseCellCount
+			+ (Index < Remainder ? 1 : 0);
+		if (VoxelCellCount <= 0)
+		{
+			continue;
+		}
+		QueueFallingMaterialPacketsForVoxel(Index, VoxelCellCount);
 	}
+	if (TargetReleasedCount != MaterialBodyReleasedVoxelCount)
+	{
+		MaterialBodyReleasedVoxelCount = static_cast<uint16>(
+			TargetReleasedCount);
+		ForceNetUpdate();
+	}
+	AdvanceFallingMaterialPackets(DeltaSeconds);
+	RefreshMaterialBodyInstances();
+	if (TargetReleasedCount < VoxelCount
+		|| !FallingMaterialPackets.IsEmpty())
+	{
+		return;
+	}
+	FinishProgressiveMaterialRelease();
 }
 
 int32 AMatterFluxMagicProjectile::GetMaterialBodyVoxelCount() const
@@ -439,28 +1133,42 @@ void AMatterFluxMagicProjectile::ReleaseMaterialBodyAtWorldLocation(
 	}
 }
 
-void AMatterFluxMagicProjectile::ApplyWorldImpact(const FHitResult& Hit)
+void AMatterFluxMagicProjectile::ApplyWorldImpact(
+	const FHitResult& Hit,
+	const bool bReleaseMaterialBody)
 {
 	UWorld* World = GetWorld();
 	if (!World)
 	{
 		return;
 	}
-	UFragmentSimulationSubsystem* Subsystem =
-		World->GetSubsystem<UFragmentSimulationSubsystem>();
-	if (Subsystem
-		&& ServerPlan.bUsePlaneVisual
-		&& ServerPlan.Damage > 0.0f)
+	if (ServerPlan.bUsePlaneVisual && ServerPlan.Damage > 0.0f)
 	{
-		FFragmentWorldCutRequest Request;
-		Request.CutShape = BuildImpactCutShape(
+		const FFragmentDamageShape CutShape = BuildImpactCutShape(
 			ServerPlan,
 			GetActorForwardVector(),
 			Hit.ImpactPoint);
+		FFragmentWorldCutRequest Request;
+		Request.CutShape = CutShape;
 		Request.DamagePower = ServerPlan.Damage * 100.0f;
 		Request.EventSeed = ServerEventSeed;
 		Request.TargetPadding = ServerPlan.Radius;
-		Subsystem->RequestWorldCut(Request);
+		if (UFragmentSimulationSubsystem* Subsystem =
+			World->GetSubsystem<UFragmentSimulationSubsystem>())
+		{
+			Subsystem->RequestWorldCut(Request);
+		}
+
+		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
+		{
+			const float CutHalfThickness = CutShape.Thickness * 0.5f;
+			It->RemoveSimulatedMaterialInOrientedBox(
+				CutShape.WorldTransform,
+				FVector(
+					CutShape.Extents.X * 0.5f,
+					CutHalfThickness,
+					CutHalfThickness));
+		}
 	}
 
 	AActor* ImpactActor = Hit.GetActor();
@@ -471,7 +1179,10 @@ void AMatterFluxMagicProjectile::ApplyWorldImpact(const FHitResult& Hit)
 			ImpactActor = ImpactComponent->GetOwner();
 		}
 	}
-	ReleaseMaterialBodyAtWorldLocation(Hit.ImpactPoint, ImpactActor);
+	if (bReleaseMaterialBody)
+	{
+		ReleaseMaterialBodyAtWorldLocation(Hit.ImpactPoint, ImpactActor);
+	}
 }
 
 FFragmentDamageShape AMatterFluxMagicProjectile::BuildImpactCutShape(
@@ -596,13 +1307,29 @@ void AMatterFluxMagicProjectile::OnProjectileStopped(
 bool AMatterFluxMagicProjectile::ResolveImpactAuthority(
 	const FHitResult& Hit)
 {
-	if (!HasAuthority() || bImpactHandled)
+	if (!HasAuthority()
+		|| bImpactHandled
+		|| bProgressiveMaterialRelease
+		|| bProjectsAirborneMaterialParticles)
 	{
 		return false;
 	}
 	FHitResult ResolvedHit = Hit;
 	AFragment2DSourceActor* FixedSourceHit = nullptr;
-	if (!ServerPlan.BodyMaterial.IsNone())
+	AActor* DirectHitActor = Hit.GetActor();
+	if (!IsValid(DirectHitActor))
+	{
+		if (const UPrimitiveComponent* HitComponent = Hit.GetComponent())
+		{
+			DirectHitActor = HitComponent->GetOwner();
+		}
+	}
+	// A blocking hit that already identifies its target is authoritative. The
+	// fixed-source sweep exists only for synthetic material-column contacts that
+	// have no actor identity. Re-sweeping the entire flight path after a real hit
+	// can select an unrelated earlier tree and move the payload back toward the
+	// caster.
+	if (!ServerPlan.BodyMaterial.IsNone() && !IsValid(DirectHitActor))
 	{
 		if (UWorld* World = GetWorld())
 		{
@@ -633,7 +1360,6 @@ bool AMatterFluxMagicProjectile::ResolveImpactAuthority(
 			}
 		}
 	}
-	bImpactHandled = true;
 	AActor* HitActor = FixedSourceHit
 		? FixedSourceHit
 		: ResolvedHit.GetActor();
@@ -661,6 +1387,14 @@ bool AMatterFluxMagicProjectile::ResolveImpactAuthority(
 			}
 		}
 	}
+	if (ShouldReleaseMaterialBodyProgressively())
+	{
+		ApplyWorldImpact(ResolvedHit, false);
+		BeginProgressiveMaterialRelease(ResolvedHit, HitActor);
+		return true;
+	}
+
+	bImpactHandled = true;
 	ApplyWorldImpact(ResolvedHit);
 	SpawnTriggerPayload(
 		ServerPlan.OnImpactProjectiles,
@@ -676,4 +1410,9 @@ bool AMatterFluxMagicProjectile::ResolveImpactAuthority(
 void AMatterFluxMagicProjectile::OnRep_Presentation()
 {
 	ApplyPresentation();
+}
+
+void AMatterFluxMagicProjectile::OnRep_MaterialBodyReleasedVoxelCount()
+{
+	RefreshMaterialBodyInstances();
 }

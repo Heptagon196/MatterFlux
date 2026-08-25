@@ -101,8 +101,8 @@
 ---@field lifetime? number 投射物最大存在时间，单位为秒。
 ---@field radius? number 投射物碰撞半径，单位为 UE 单位。
 ---@field gravity_scale? number 飞行阶段承受的世界重力比例；命中并转入材质世界后不再生效。
----@field body_material? MatterFluxContentId 飞行中组成投射物体素球的材质 ID；留空使用普通投射物外观。
----@field material_amount? integer 投射物携带、并在碰撞或寿命结束时交给物质模拟的材质格数量，范围 1～4096，默认 1。
+---@field body_material? MatterFluxContentId 从生成首帧起进入物质模拟的真实粒子材质 ID；留空时使用普通非物质投射物。
+---@field material_amount? integer 生成的守恒物质粒子数量，范围 1～4096，默认 1；粒子独立运动并在接触后转入地表模拟。
 ---@field visual_shape? MatterFluxProjectileVisualShape 投射物外形；默认 orb。
 ---@field spawn_forward_offset? number 沿本次施法方向追加的生成距离，单位为 UE 单位。
 ---@field spawn_height_offset? number 相对施法者向上追加的生成高度，单位为 UE 单位。

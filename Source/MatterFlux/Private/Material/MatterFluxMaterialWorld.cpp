@@ -11,17 +11,13 @@ namespace MatterFlux::Material
 		constexpr uint16 PreviousActiveStateVersion = 2;
 		constexpr uint16 CompactActiveStateVersion = 3;
 		constexpr uint16 BaselineDeltaActiveStateVersion = 4;
-		constexpr uint16 ActiveStateVersion = 7;
+		constexpr uint16 ActiveStateVersion = 8;
 		constexpr int32 MaximumActiveStateBytes = 1024 * 1024;
 		constexpr uint16 FullCellAmount = 255;
 		/** World-space pile height represented by one full powder unit. */
 		constexpr int32 PowderFullColumnHeight = SurfacePowderFullColumnHeight;
 		constexpr uint8 MinimumLiquidEdgeAmount = 24;
 		constexpr int32 MaximumLiquidTransferPerStep = 72;
-		// A body wake is not an ordinary free-surface imbalance. Keeping its
-		// conserved refill below one fifth of a typical 120-unit lake column makes
-		// the material visibly flow through the trail over several fixed steps.
-		constexpr int32 MaximumBodyWakeTransferPerStep = 24;
 		constexpr uint8 FreeFlowTransitionStart = 210;
 		constexpr uint8 FreeFlowTransitionEnd = 220;
 
@@ -73,6 +69,27 @@ namespace MatterFlux::Material
 		// columns on uneven terrain. This remains bounded, but spans a complete
 		// long traversal and its restitution window.
 		constexpr uint32 MaximumBodyDisplacementRefillTicks = 512;
+
+		int32 GetBodyWakeTransferBudget(
+			const int32 Deficit,
+			const int32 ReferenceAmount,
+			const int32 RefillDurationSteps)
+		{
+			if (Deficit <= 0 || ReferenceAmount <= 0)
+			{
+				return 0;
+			}
+			// Delay and duration are separate facts. Once the hold interval ends,
+			// divide the reference column across the authored duration rather than
+			// front-loading most of the refill into the first pressure response.
+			return FMath::Min(
+				Deficit,
+				FMath::Max(
+					FMath::DivideAndRoundUp(
+						ReferenceAmount,
+						FMath::Max(RefillDurationSteps, 1)),
+					1));
+		}
 		constexpr uint16 MaterialIndexMask = 0x7fffu;
 
 		void AppendUint8(TArray<uint8>& Bytes, const uint8 Value)
@@ -287,6 +304,70 @@ namespace MatterFlux::Material
 			Value ^= Value >> 16u;
 			return Value;
 		}
+
+		int64 GetPowderMaximumStableSlope255(
+			const FWorldSettings& Settings,
+			const uint32 Seed,
+			const FIntPoint& A,
+			const FIntPoint& B)
+		{
+			// The authored repose value is the allowed height change across one
+			// orthogonal cell. A diagonal edge is sqrt(2) times longer, so applying
+			// the same threshold there makes powder leak unrealistically through the
+			// corners and produces overly regular rings.
+			int64 MaximumSlope255 =
+				static_cast<int64>(PowderFullColumnHeight)
+					* Settings.PowderMaximumStableSlopeAmount;
+			if (A.X != B.X && A.Y != B.Y)
+			{
+				MaximumSlope255 = (MaximumSlope255 * 1414 + 500) / 1000;
+			}
+
+			// Real granular piles do not have an identical repose threshold at
+			// every grain contact. Give each undirected cell edge a small, stable
+			// variation. It is seeded and independent of Tick, so a settled pile
+			// remains settled and deterministic instead of visibly crawling.
+			FIntPoint First = A;
+			FIntPoint Second = B;
+			if (Second.X < First.X
+				|| (Second.X == First.X && Second.Y < First.Y))
+			{
+				Swap(First, Second);
+			}
+			const uint32 EdgeHash = MixBits(
+				Seed
+					^ static_cast<uint32>(First.X) * 0x9e3779b9u
+					^ static_cast<uint32>(First.Y) * 0x85ebca6bu
+					^ static_cast<uint32>(Second.X) * 0xc2b2ae35u
+					^ static_cast<uint32>(Second.Y) * 0x27d4eb2fu);
+			constexpr int32 ReposeVariationPercent = 30;
+			const int32 VariationPercent =
+				static_cast<int32>(EdgeHash % (ReposeVariationPercent * 2 + 1))
+					- ReposeVariationPercent;
+			return FMath::Max<int64>(
+				1,
+				MaximumSlope255 * (100 + VariationPercent) / 100);
+		}
+
+		int64 GetPowderPackingOffset255(
+			const uint32 Seed,
+			const FIntPoint& Cell)
+		{
+			// Coarse surface cells stand for many grains. Their local packing density
+			// is not identical, so give each cell a stable sub-layer height offset.
+			// This changes canonical flow equilibrium (and therefore occupancy), not
+			// only the mesh. The hash is independent of Tick: settled sand stays still.
+			const uint32 PackingHash = MixBits(
+				Seed ^ static_cast<uint32>(Cell.X) * 0x9e3779b9u
+					^ static_cast<uint32>(Cell.Y) * 0x85ebca6bu
+					^ 0x68bc21ebu);
+			constexpr int64 MaximumOffset255 =
+				static_cast<int64>(PowderFullColumnHeight)
+					* FullCellAmount * 40 / 100;
+			return static_cast<int64>(
+				PackingHash % static_cast<uint32>(MaximumOffset255 * 2 + 1))
+				- MaximumOffset255;
+		}
 	}
 
 	struct FChunkedMaterialWorld::FImpl
@@ -311,11 +392,21 @@ namespace MatterFlux::Material
 
 		struct FCell
 		{
+			struct FLayer
+			{
+				uint16 MaterialIndex = 0;
+				uint16 Amount = 0;
+				uint8 RemainingLifetime = 0;
+				uint32 LastUpdatedTick = 0;
+			};
+
 			uint16 MaterialIndex = 0;
 			int16 SupportHeight = 0;
 			uint16 Amount = 0;
 			uint8 RemainingLifetime = 0;
 			uint32 LastUpdatedTick = 0;
+			/** Dense bottom-to-top layers below the primary/top material. */
+			TArray<FLayer> Underlayers;
 			// A transient body displaced volume from this world column. This is
 			// location state, not material state: it must not travel with liquid.
 			// The hydraulic solver uses it briefly to refill across uneven terrain
@@ -333,29 +424,52 @@ namespace MatterFlux::Material
 
 		struct FChunk
 		{
-			explicit FChunk(const int32 CellCount)
+			explicit FChunk(const int32 InChunkSize)
+				: ChunkSize(InChunkSize)
 			{
-				Cells.SetNumZeroed(CellCount);
+				Cells.SetNum(ChunkSize * ChunkSize);
+				DirtyCellFlags.Init(false, Cells.Num());
 			}
 
 			TArray<FCell> Cells;
-			FIntPoint DirtyMin = FIntPoint(MAX_int32, MAX_int32);
-			FIntPoint DirtyMax = FIntPoint(MIN_int32, MIN_int32);
-			bool bHasDirtyCells = false;
+			int32 ChunkSize = 0;
+			TBitArray<> DirtyCellFlags;
+			TArray<int32> DirtyCellIndices;
 
 			void MarkDirty(const FIntPoint& LocalCell)
 			{
-				if (!bHasDirtyCells)
+				const int32 CellIndex = LocalCell.Y * ChunkSize + LocalCell.X;
+				if (!DirtyCellFlags.IsValidIndex(CellIndex)
+					|| DirtyCellFlags[CellIndex])
 				{
-					DirtyMin = LocalCell;
-					DirtyMax = LocalCell;
-					bHasDirtyCells = true;
 					return;
 				}
-				DirtyMin.X = FMath::Min(DirtyMin.X, LocalCell.X);
-				DirtyMin.Y = FMath::Min(DirtyMin.Y, LocalCell.Y);
-				DirtyMax.X = FMath::Max(DirtyMax.X, LocalCell.X);
-				DirtyMax.Y = FMath::Max(DirtyMax.Y, LocalCell.Y);
+				DirtyCellFlags[CellIndex] = true;
+				DirtyCellIndices.Add(CellIndex);
+			}
+
+			void MarkAllDirty()
+			{
+				DirtyCellFlags.Init(true, Cells.Num());
+				DirtyCellIndices.SetNumUninitialized(Cells.Num());
+				for (int32 CellIndex = 0; CellIndex < Cells.Num(); ++CellIndex)
+				{
+					DirtyCellIndices[CellIndex] = CellIndex;
+				}
+			}
+
+			void ResetDirty()
+			{
+				for (const int32 CellIndex : DirtyCellIndices)
+				{
+					DirtyCellFlags[CellIndex] = false;
+				}
+				DirtyCellIndices.Reset();
+			}
+
+			bool HasDirtyCells() const
+			{
+				return !DirtyCellIndices.IsEmpty();
 			}
 		};
 
@@ -370,6 +484,7 @@ namespace MatterFlux::Material
 		struct FArchivedChunk
 		{
 			TArray<FArchivedRun> Runs;
+			TMap<uint16, TArray<FCell::FLayer>> UnderlayersByCell;
 		};
 
 		FWorldSettings Settings;
@@ -578,8 +693,14 @@ namespace MatterFlux::Material
 			int16 CurrentSupport = Chunk.Cells[0].SupportHeight;
 			uint16 CurrentAmount = Chunk.Cells[0].Amount;
 			uint16 CurrentLength = 0;
-			for (const FCell& Cell : Chunk.Cells)
+			for (int32 CellIndex = 0; CellIndex < Chunk.Cells.Num(); ++CellIndex)
 			{
+				const FCell& Cell = Chunk.Cells[CellIndex];
+				if (!Cell.Underlayers.IsEmpty())
+				{
+					Archive.UnderlayersByCell.Add(
+						static_cast<uint16>(CellIndex), Cell.Underlayers);
+				}
 				if (Cell.MaterialIndex != CurrentMaterial
 					|| Cell.SupportHeight != CurrentSupport
 					|| Cell.Amount != CurrentAmount
@@ -610,6 +731,7 @@ namespace MatterFlux::Material
 			return Chunk.Cells.ContainsByPredicate([](const FCell& Cell)
 			{
 				return Cell.MaterialIndex != 0
+					|| !Cell.Underlayers.IsEmpty()
 					|| Cell.SupportHeight != 0;
 			});
 		}
@@ -640,6 +762,19 @@ namespace MatterFlux::Material
 					++CellIndex;
 				}
 			}
+			for (const TPair<uint16, TArray<FCell::FLayer>>& Pair
+				: Archive.UnderlayersByCell)
+			{
+				if (OutChunk.Cells.IsValidIndex(Pair.Key))
+				{
+					OutChunk.Cells[Pair.Key].Underlayers = Pair.Value;
+					for (FCell::FLayer& Layer
+						: OutChunk.Cells[Pair.Key].Underlayers)
+					{
+						Layer.LastUpdatedTick = 0;
+					}
+				}
+			}
 		}
 
 		void ArchiveChunk(const FIntPoint& ChunkCoordinate)
@@ -652,6 +787,13 @@ namespace MatterFlux::Material
 			bool bDiscardedTransientMaterial = false;
 			for (FCell& Cell : (*Chunk)->Cells)
 			{
+				const int32 LayerCountBefore = Cell.Underlayers.Num();
+				Cell.Underlayers.RemoveAllSwap([](const FCell::FLayer& Layer)
+				{
+					return Layer.RemainingLifetime != 0;
+				}, EAllowShrinking::No);
+				bDiscardedTransientMaterial |=
+					Cell.Underlayers.Num() != LayerCountBefore;
 				if (Cell.RemainingLifetime == 0)
 				{
 					continue;
@@ -659,6 +801,7 @@ namespace MatterFlux::Material
 				Cell.MaterialIndex = 0;
 				Cell.Amount = 0;
 				Cell.RemainingLifetime = 0;
+				PromoteTopUnderlayer(Cell);
 				bDiscardedTransientMaterial = true;
 			}
 			if (bDiscardedTransientMaterial)
@@ -683,8 +826,7 @@ namespace MatterFlux::Material
 			TUniquePtr<FChunk>& Chunk = Chunks.FindOrAdd(ChunkCoordinate);
 			if (!Chunk)
 			{
-				Chunk = MakeUnique<FChunk>(
-					Settings.ChunkSize * Settings.ChunkSize);
+				Chunk = MakeUnique<FChunk>(Settings.ChunkSize);
 				if (FArchivedChunk* Archive =
 					ArchivedChunks.Find(ChunkCoordinate))
 				{
@@ -788,7 +930,7 @@ namespace MatterFlux::Material
 			return false;
 		}
 
-		bool FindSupportHeight(
+		bool FindBaseSupportHeight(
 			const FIntPoint& WorldCell,
 			int16& OutSupportHeight) const
 		{
@@ -820,6 +962,93 @@ namespace MatterFlux::Material
 				RemainingIndex -= Run.Length;
 			}
 			return false;
+		}
+
+		int32 GetLayerHeight(
+			const uint16 MaterialIndex,
+			const uint16 Amount) const
+		{
+			if (MaterialIndex == 0 || MaterialIndex >= Materials.Num())
+			{
+				return 0;
+			}
+			switch (Materials[MaterialIndex].Phase)
+			{
+			case EMatterFluxMaterialPhase::Powder:
+				return FMath::Max(1, FMath::RoundToInt(
+					static_cast<double>(PowderFullColumnHeight) * Amount
+						/ FullCellAmount));
+			case EMatterFluxMaterialPhase::Liquid:
+				return FMath::Max(1, FMath::RoundToInt(
+					static_cast<double>(Settings.LiquidFullColumnHeight)
+						* FMath::Min<uint16>(Amount, FullCellAmount)
+						/ FullCellAmount));
+			default:
+				return 0;
+			}
+		}
+
+		int32 GetUnderlayerHeight(
+			TConstArrayView<FCell::FLayer> Underlayers) const
+		{
+			int32 Height = 0;
+			for (const FCell::FLayer& Layer : Underlayers)
+			{
+				Height += GetLayerHeight(Layer.MaterialIndex, Layer.Amount);
+			}
+			return Height;
+		}
+
+		bool FindSupportHeight(
+			const FIntPoint& WorldCell,
+			int16& OutSupportHeight) const
+		{
+			if (!FindBaseSupportHeight(WorldCell, OutSupportHeight))
+			{
+				return false;
+			}
+			int32 Height = OutSupportHeight;
+			if (const FCell* Cell = FindCell(WorldCell))
+			{
+				Height += GetUnderlayerHeight(Cell->Underlayers);
+			}
+			else if (const FArchivedChunk* Archive =
+				ArchivedChunks.Find(ToChunkCoordinate(WorldCell)))
+			{
+				const uint16 CellIndex = static_cast<uint16>(
+					ToIndex(ToLocalCoordinate(WorldCell)));
+				if (const TArray<FCell::FLayer>* Layers =
+					Archive->UnderlayersByCell.Find(CellIndex))
+				{
+					Height += GetUnderlayerHeight(*Layers);
+				}
+			}
+			OutSupportHeight = static_cast<int16>(FMath::Clamp(
+				Height,
+				static_cast<int32>(MIN_int16),
+				static_cast<int32>(MAX_int16)));
+			return true;
+		}
+
+		void PromoteTopUnderlayer(FCell& Cell)
+		{
+			if (Cell.MaterialIndex != 0
+				&& Cell.Amount != 0)
+			{
+				return;
+			}
+			if (Cell.Underlayers.IsEmpty())
+			{
+				Cell.MaterialIndex = 0;
+				Cell.Amount = 0;
+				Cell.RemainingLifetime = 0;
+				return;
+			}
+			const FCell::FLayer Top = Cell.Underlayers.Pop(EAllowShrinking::No);
+			Cell.MaterialIndex = Top.MaterialIndex;
+			Cell.Amount = Top.Amount;
+			Cell.RemainingLifetime = Top.RemainingLifetime;
+			Cell.LastUpdatedTick = Top.LastUpdatedTick;
 		}
 
 		bool HasConfiguredReactionPair(
@@ -854,16 +1083,10 @@ namespace MatterFlux::Material
 				return;
 			}
 			FChunk& Chunk = **FoundChunk;
-			Chunk.bHasDirtyCells = false;
-			Chunk.DirtyMin = FIntPoint(MAX_int32, MAX_int32);
-			Chunk.DirtyMax = FIntPoint(MIN_int32, MIN_int32);
+			Chunk.ResetDirty();
 			if (BaselineChunks.IsEmpty())
 			{
-				Chunk.DirtyMin = FIntPoint::ZeroValue;
-				Chunk.DirtyMax = FIntPoint(
-					Settings.ChunkSize - 1,
-					Settings.ChunkSize - 1);
-				Chunk.bHasDirtyCells = true;
+				Chunk.MarkAllDirty();
 				return;
 			}
 
@@ -975,6 +1198,39 @@ namespace MatterFlux::Material
 			}
 		}
 
+		void MarkChunkFlowMaterialsDirty(
+			const FIntPoint& ChunkCoordinate)
+		{
+			FChunk& Chunk = FindOrAddChunk(ChunkCoordinate);
+			TArray<FIntPoint> FlowCells;
+			for (int32 CellIndex = 0; CellIndex < Chunk.Cells.Num(); ++CellIndex)
+			{
+				const FCell& Cell = Chunk.Cells[CellIndex];
+				if (Cell.MaterialIndex == 0
+					|| Cell.MaterialIndex >= Materials.Num())
+				{
+					continue;
+				}
+				const EMatterFluxMaterialPhase Phase =
+					Materials[Cell.MaterialIndex].Phase;
+				if (Phase != EMatterFluxMaterialPhase::Liquid
+					&& Phase != EMatterFluxMaterialPhase::Powder
+					&& Phase != EMatterFluxMaterialPhase::Gas)
+				{
+					continue;
+				}
+				FlowCells.Add(FIntPoint(
+					ChunkCoordinate.X * Settings.ChunkSize
+						+ CellIndex % Settings.ChunkSize,
+					ChunkCoordinate.Y * Settings.ChunkSize
+						+ CellIndex / Settings.ChunkSize));
+			}
+			for (const FIntPoint FlowCell : FlowCells)
+			{
+				MarkDirtyNeighborhood(FlowCell);
+			}
+		}
+
 		bool PassesMobilityCheck(
 			const FIntPoint& WorldCell,
 			const FResolvedMaterial& Material) const
@@ -989,6 +1245,223 @@ namespace MatterFlux::Material
 				^ static_cast<uint32>(WorldCell.Y) * 0x85ebca6bu
 				^ Tick * 0xc2b2ae35u);
 			return static_cast<uint8>(Hash & 0xffu) < Material.Mobility;
+		}
+
+		bool TryMoveSurfaceUnderlayerPowder(
+			const FIntPoint& Source,
+			FStepStats& Stats)
+		{
+			FCell* SourceCell = FindCell(Source);
+			if (!SourceCell || SourceCell->Underlayers.IsEmpty())
+			{
+				return false;
+			}
+			int32 SourceLayerIndex = INDEX_NONE;
+			for (int32 Index = 0; Index < SourceCell->Underlayers.Num(); ++Index)
+			{
+				const uint16 IndexMaterial =
+					SourceCell->Underlayers[Index].MaterialIndex;
+				if (IndexMaterial < Materials.Num()
+					&& Materials[IndexMaterial].Phase
+						== EMatterFluxMaterialPhase::Powder)
+				{
+					SourceLayerIndex = Index;
+					break;
+				}
+			}
+			if (SourceLayerIndex == INDEX_NONE)
+			{
+				return false;
+			}
+			const FCell::FLayer SourceLayer =
+				SourceCell->Underlayers[SourceLayerIndex];
+			const FResolvedMaterial& Powder = Materials[SourceLayer.MaterialIndex];
+			if (!PassesMobilityCheck(Source, Powder))
+			{
+				return false;
+			}
+
+			int16 SourceSupport = 0;
+			if (!FindBaseSupportHeight(Source, SourceSupport))
+			{
+				return false;
+			}
+			int32 SourceBase = SourceSupport;
+			for (int32 Index = 0; Index < SourceLayerIndex; ++Index)
+			{
+				const FCell::FLayer& Layer = SourceCell->Underlayers[Index];
+				SourceBase += GetLayerHeight(Layer.MaterialIndex, Layer.Amount);
+			}
+			const int64 SourceSurface255 =
+				static_cast<int64>(SourceBase) * FullCellAmount
+					+ static_cast<int64>(PowderFullColumnHeight)
+						* SourceLayer.Amount
+					+ GetPowderPackingOffset255(Seed, Source);
+			static const FIntPoint Directions[] = {
+				FIntPoint(1, 0), FIntPoint(0, 1), FIntPoint(-1, 0),
+				FIntPoint(0, -1), FIntPoint(1, 1), FIntPoint(-1, 1),
+				FIntPoint(-1, -1), FIntPoint(1, -1) };
+			const uint32 DirectionHash = MixBits(
+				Seed ^ static_cast<uint32>(Source.X) * 0x9e3779b9u
+					^ static_cast<uint32>(Source.Y) * 0x85ebca6bu ^ Tick);
+			const int32 FirstDirection =
+				static_cast<int32>(DirectionHash % UE_ARRAY_COUNT(Directions));
+
+			FIntPoint BestDestination = Source;
+			int64 BestExcessSurface255 = 0;
+			int64 BestFlowScore = 0;
+			uint16 DestinationAmount = 0;
+			for (int32 Offset = 0; Offset < UE_ARRAY_COUNT(Directions); ++Offset)
+			{
+				FIntPoint Destination;
+				if (!TryOffsetCell(
+						Source,
+						Directions[(FirstDirection + Offset)
+							% UE_ARRAY_COUNT(Directions)],
+						Destination)
+					|| (Settings.bCullOutsideSurfaceBounds
+						&& !IsInsideSurfaceBounds(Destination)))
+				{
+					continue;
+				}
+				int16 DestinationSupport = 0;
+				if (!FindBaseSupportHeight(Destination, DestinationSupport))
+				{
+					continue;
+				}
+				const FCell* DestinationCell = FindCell(Destination);
+				if (!DestinationCell || DestinationCell->MaterialIndex == 0
+					|| DestinationCell->MaterialIndex >= Materials.Num()
+					|| Materials[DestinationCell->MaterialIndex].Phase
+						== EMatterFluxMaterialPhase::StaticSolid
+					|| Materials[DestinationCell->MaterialIndex].Density
+						>= Powder.Density)
+				{
+					continue;
+				}
+				int32 DestinationBase = DestinationSupport;
+				uint16 ExistingPowderAmount = 0;
+				for (const FCell::FLayer& Layer : DestinationCell->Underlayers)
+				{
+					if (Layer.MaterialIndex == SourceLayer.MaterialIndex)
+					{
+						ExistingPowderAmount = Layer.Amount;
+						break;
+					}
+					if (Layer.MaterialIndex < Materials.Num()
+						&& Materials[Layer.MaterialIndex].Density >= Powder.Density)
+					{
+						DestinationBase += GetLayerHeight(
+							Layer.MaterialIndex, Layer.Amount);
+					}
+				}
+				const int64 CandidateSurface255 =
+					static_cast<int64>(DestinationBase) * FullCellAmount
+						+ static_cast<int64>(PowderFullColumnHeight)
+							* ExistingPowderAmount
+						+ GetPowderPackingOffset255(Seed, Destination);
+				// A lower neighboring support is a spill drop, not a continuous
+				// downhill plane through empty air. Compare the granular surface at
+				// least against this layer's source-side lip. Material above the lip
+				// can fall over it; a supported coating below the repose threshold
+				// remains on the platform. This is generic height-field geometry for
+				// cliffs, roofs, leaves, and furniture rather than an object rule.
+				const int64 SpillSurface255 = FMath::Max(
+					CandidateSurface255,
+					static_cast<int64>(SourceBase) * FullCellAmount);
+				const int64 ExcessSurface255 =
+					SourceSurface255 - SpillSurface255
+						- GetPowderMaximumStableSlope255(
+							Settings, Seed, Source, Destination);
+				const uint32 FlowHash = MixBits(
+					Seed ^ Tick * 0x27d4eb2fu
+						^ static_cast<uint32>(Source.X) * 0x9e3779b9u
+						^ static_cast<uint32>(Source.Y) * 0x85ebca6bu
+						^ static_cast<uint32>(Destination.X) * 0xc2b2ae35u
+						^ static_cast<uint32>(Destination.Y) * 0x165667b1u);
+				const int64 FlowScore = ExcessSurface255 > 0
+					? ExcessSurface255 * (70 + FlowHash % 61)
+					: 0;
+				if (FlowScore > BestFlowScore)
+				{
+					BestFlowScore = FlowScore;
+					BestExcessSurface255 = ExcessSurface255;
+					BestDestination = Destination;
+					DestinationAmount = ExistingPowderAmount;
+				}
+			}
+			if (BestDestination == Source || BestExcessSurface255 <= 0)
+			{
+				return false;
+			}
+			const uint32 TransferHash = MixBits(
+				Seed ^ Tick * 0x9e3779b9u
+					^ static_cast<uint32>(Source.X) * 0x85ebca6bu
+					^ static_cast<uint32>(Source.Y) * 0xc2b2ae35u
+					^ static_cast<uint32>(BestDestination.X) * 0x27d4eb2fu
+					^ static_cast<uint32>(BestDestination.Y) * 0x165667b1u);
+			const int32 EqualizingTransfer = FMath::Max<int32>(
+				static_cast<int32>(
+					BestExcessSurface255 / (2 * PowderFullColumnHeight)), 1);
+			const int32 RequestedTransfer = FMath::Max(
+				EqualizingTransfer * (55 + static_cast<int32>(TransferHash % 46))
+					/ 100,
+				1);
+			const int32 MovableAmount = SourceLayer.Amount;
+			const int32 Transfer = FMath::Min(
+				FMath::Min3(
+					RequestedTransfer,
+					MovableAmount,
+					static_cast<int32>(MAX_uint16 - DestinationAmount)),
+				static_cast<int32>(FullCellAmount));
+			if (Transfer <= 0)
+			{
+				return false;
+			}
+
+			WakeSurfaceFlow(BestDestination);
+			FCell& MutableDestination = FindOrAddCell(BestDestination);
+			FCell::FLayer* DestinationLayer =
+				MutableDestination.Underlayers.FindByPredicate(
+					[&SourceLayer](const FCell::FLayer& Layer)
+					{
+						return Layer.MaterialIndex == SourceLayer.MaterialIndex;
+					});
+			if (!DestinationLayer)
+			{
+				DestinationLayer = &MutableDestination.Underlayers.AddDefaulted_GetRef();
+				DestinationLayer->MaterialIndex = SourceLayer.MaterialIndex;
+				DestinationLayer->RemainingLifetime = SourceLayer.RemainingLifetime;
+				MutableDestination.Underlayers.Sort([this](
+					const FCell::FLayer& A, const FCell::FLayer& B)
+				{
+					return Materials[A.MaterialIndex].Density
+						> Materials[B.MaterialIndex].Density;
+				});
+				DestinationLayer = MutableDestination.Underlayers.FindByPredicate(
+					[&SourceLayer](const FCell::FLayer& Layer)
+					{
+						return Layer.MaterialIndex == SourceLayer.MaterialIndex;
+					});
+			}
+			DestinationLayer->Amount = static_cast<uint16>(
+				DestinationLayer->Amount + Transfer);
+			DestinationLayer->LastUpdatedTick = Tick;
+			SourceCell = FindCell(Source);
+			FCell::FLayer& MutableSourceLayer =
+				SourceCell->Underlayers[SourceLayerIndex];
+			MutableSourceLayer.Amount = static_cast<uint16>(
+				MutableSourceLayer.Amount - Transfer);
+			MutableSourceLayer.LastUpdatedTick = Tick;
+			if (MutableSourceLayer.Amount == 0)
+			{
+				SourceCell->Underlayers.RemoveAt(
+					SourceLayerIndex, 1, EAllowShrinking::No);
+			}
+			MarkDirtyNeighborhood(Source);
+			MarkDirtyNeighborhood(BestDestination);
+			++Stats.MovedCells;
+			return true;
 		}
 
 		bool TryMoveSurfaceCell(
@@ -1085,9 +1558,11 @@ namespace MatterFlux::Material
 				const int64 SourceSurface255 =
 					static_cast<int64>(SourceSupport) * FullCellAmount
 						+ static_cast<int64>(PowderFullColumnHeight)
-							* SourceCell->Amount;
-				int64 LowestSurface255 = SourceSurface255;
+							* SourceCell->Amount
+						+ GetPowderPackingOffset255(Seed, Source);
 				FIntPoint LowestDestination = Source;
+				int64 GreatestExcessSurface255 = 0;
+				int64 GreatestFlowScore = 0;
 				uint16 LowestAmount = 0;
 				for (int32 Offset = 0;
 					Offset < UE_ARRAY_COUNT(Directions);
@@ -1125,35 +1600,64 @@ namespace MatterFlux::Material
 					const int64 DestinationSurface255 =
 						static_cast<int64>(DestinationSupport) * FullCellAmount
 							+ static_cast<int64>(PowderFullColumnHeight)
-								* DestinationAmount;
-					if (DestinationSurface255 < LowestSurface255)
+								* DestinationAmount
+							+ GetPowderPackingOffset255(Seed, Destination);
+					// Do not interpret a vertical support discontinuity as an
+					// infinitely steep terrain ramp. The source support is the spill
+					// lip: excess powder crosses it and falls, while a repose-stable
+					// layer with full support remains on the upper platform.
+					const int64 SpillSurface255 = FMath::Max(
+						DestinationSurface255,
+						static_cast<int64>(SourceSupport) * FullCellAmount);
+					const int64 ExcessSurface255 =
+						SourceSurface255 - SpillSurface255
+							- GetPowderMaximumStableSlope255(
+								Settings, Seed, Source, Destination);
+					const uint32 FlowHash = MixBits(
+						Seed ^ Tick * 0x27d4eb2fu
+							^ static_cast<uint32>(Source.X) * 0x9e3779b9u
+							^ static_cast<uint32>(Source.Y) * 0x85ebca6bu
+							^ static_cast<uint32>(Destination.X) * 0xc2b2ae35u
+							^ static_cast<uint32>(Destination.Y) * 0x165667b1u);
+					const int64 FlowScore = ExcessSurface255 > 0
+						? ExcessSurface255 * (70 + FlowHash % 61)
+						: 0;
+					if (FlowScore > GreatestFlowScore)
 					{
-						LowestSurface255 = DestinationSurface255;
+						GreatestFlowScore = FlowScore;
+						GreatestExcessSurface255 = ExcessSurface255;
 						LowestDestination = Destination;
 						LowestAmount = DestinationAmount;
 					}
 				}
 
-				constexpr int64 MaximumStableSlope255 =
-					static_cast<int64>(PowderFullColumnHeight)
-						* FullCellAmount;
-				const int64 ExcessSurface255 =
-					SourceSurface255 - LowestSurface255
-						- MaximumStableSlope255;
-				if (LowestDestination == Source || ExcessSurface255 <= 0)
+				if (LowestDestination == Source || GreatestExcessSurface255 <= 0)
 				{
 					return false;
 				}
 
-				const int32 RequestedTransfer = FMath::Max<int32>(
+				const int32 EqualizingTransfer = FMath::Max<int32>(
 					static_cast<int32>(
-						ExcessSurface255
+						GreatestExcessSurface255
 							/ (2 * PowderFullColumnHeight)),
 					1);
-				const int32 TransferAmount = FMath::Min3(
-					RequestedTransfer,
-					static_cast<int32>(SourceCell->Amount),
-					static_cast<int32>(MAX_uint16 - LowestAmount));
+				const uint32 TransferHash = MixBits(
+					Seed ^ Tick * 0x9e3779b9u
+						^ static_cast<uint32>(Source.X) * 0x85ebca6bu
+						^ static_cast<uint32>(Source.Y) * 0xc2b2ae35u
+						^ static_cast<uint32>(LowestDestination.X) * 0x27d4eb2fu
+						^ static_cast<uint32>(LowestDestination.Y) * 0x165667b1u);
+				const int32 RequestedTransfer = FMath::Max(
+					EqualizingTransfer
+						* (55 + static_cast<int32>(TransferHash % 46)) / 100,
+					1);
+				const int32 MovableAmount = SourceCell->Amount;
+				const int32 TransferAmount = FMath::Min(
+					FMath::Min3(
+						RequestedTransfer,
+						MovableAmount,
+						static_cast<int32>(MAX_uint16 - LowestAmount)),
+					static_cast<int32>(FullCellAmount));
 				if (TransferAmount <= 0)
 				{
 					return false;
@@ -1173,6 +1677,7 @@ namespace MatterFlux::Material
 				{
 					SourceCell->MaterialIndex = 0;
 					SourceCell->RemainingLifetime = 0;
+					PromoteTopUnderlayer(*SourceCell);
 				}
 				DestinationCell.LastUpdatedTick = Tick;
 				SourceCell->LastUpdatedTick = Tick;
@@ -1412,6 +1917,7 @@ namespace MatterFlux::Material
 						{
 							MutableSourceCell.MaterialIndex = 0;
 							MutableSourceCell.RemainingLifetime = 0;
+							PromoteTopUnderlayer(MutableSourceCell);
 						}
 						DestinationCell.LastUpdatedTick = Tick;
 						MutableSourceCell.LastUpdatedTick = Tick;
@@ -1476,6 +1982,7 @@ namespace MatterFlux::Material
 					MutableSourceCell.MaterialIndex = 0;
 					MutableSourceCell.Amount = 0;
 					MutableSourceCell.RemainingLifetime = 0;
+					PromoteTopUnderlayer(MutableSourceCell);
 					NeighborCell.LastUpdatedTick = Tick;
 					MutableSourceCell.LastUpdatedTick = Tick;
 					MarkDirtyNeighborhood(Source);
@@ -1551,6 +2058,18 @@ namespace MatterFlux::Material
 					&& DestinationCell->bHasBodyDisplacementVacancy
 					&& DestinationCell->BodyDisplacedMaterialIndex
 						== SourceCell->MaterialIndex;
+				const bool bBodyWakeWaitingForRefill = bRecentBodyVacancy
+					&& DestinationCell->BodyDisplacedTick <= Tick
+					&& Tick - DestinationCell->BodyDisplacedTick
+						<= static_cast<uint32>(
+							Settings.BodyWakeRefillDelaySteps);
+				// During the authored hold interval the vacancy is still a material
+				// transaction fact. Ordinary lateral pressure may not bypass it and
+				// start the wake before the restitution clock permits.
+				if (bBodyWakeWaitingForRefill)
+				{
+					continue;
+				}
 				// Restitution already spent this wake column's bounded transfer
 				// budget for the fixed step. Do not let the ordinary lateral solver
 				// add another transfer and collapse a visible trail in one update.
@@ -1803,6 +2322,7 @@ namespace MatterFlux::Material
 			{
 				MutableSourceCell.MaterialIndex = 0;
 				MutableSourceCell.RemainingLifetime = 0;
+				PromoteTopUnderlayer(MutableSourceCell);
 			}
 			DestinationCell.LastUpdatedTick = Tick;
 			MutableSourceCell.LastUpdatedTick = Tick;
@@ -1830,6 +2350,7 @@ namespace MatterFlux::Material
 				SourceCell.MaterialIndex = 0;
 				SourceCell.Amount = 0;
 				SourceCell.RemainingLifetime = 0;
+				PromoteTopUnderlayer(SourceCell);
 				SourceCell.LastUpdatedTick = Tick;
 				MarkDirtyNeighborhood(Source);
 				++Stats.CulledCells;
@@ -1879,6 +2400,7 @@ namespace MatterFlux::Material
 				SourceCell.MaterialIndex = 0;
 				SourceCell.Amount = 0;
 				SourceCell.RemainingLifetime = 0;
+				PromoteTopUnderlayer(SourceCell);
 				SourceCell.LastUpdatedTick = Tick;
 			}
 
@@ -1975,6 +2497,12 @@ namespace MatterFlux::Material
 			&& MinWorldHeightCells < MaxWorldHeightCells
 			&& LiquidFullColumnHeight > 0
 			&& LiquidFullColumnHeight <= MAX_int16
+			&& PowderMaximumStableSlopeAmount > 0
+			&& PowderMaximumStableSlopeAmount <= FullCellAmount
+			&& BodyWakeRefillDelaySteps >= 0
+			&& BodyWakeRefillDelaySteps <= 256
+			&& BodyWakeRefillDurationSteps >= 1
+			&& BodyWakeRefillDurationSteps <= 256
 			&& (!bUseSurfaceTopology
 				|| (MinSurfaceCell.X < MaxSurfaceCellExclusive.X
 					&& MinSurfaceCell.Y < MaxSurfaceCellExclusive.Y));
@@ -2158,6 +2686,7 @@ namespace MatterFlux::Material
 		FImpl::FCell& Cell = Impl->FindOrAddCell(WorldCell);
 		Cell.MaterialIndex = MaterialIndex;
 		Cell.Amount = MaterialIndex == 0 ? 0 : FullCellAmount;
+		Cell.Underlayers.Reset();
 		Cell.RemainingLifetime = MaterialIndex == 0
 			? 0
 			: Impl->Materials[MaterialIndex].LifetimeSteps;
@@ -2204,6 +2733,7 @@ namespace MatterFlux::Material
 		FImpl::FCell& Cell = Impl->FindOrAddCell(WorldCell);
 		Cell.MaterialIndex = *MaterialIndex;
 		Cell.Amount = Amount;
+		Cell.Underlayers.Reset();
 		Cell.RemainingLifetime =
 			Impl->Materials[*MaterialIndex].LifetimeSteps;
 		Cell.LastUpdatedTick = 0;
@@ -2220,6 +2750,273 @@ namespace MatterFlux::Material
 			Impl->ArchiveChunk(ChunkCoordinate);
 		}
 		return true;
+	}
+
+	int32 FChunkedMaterialWorld::AddCellAmount(
+		const FIntPoint& WorldCell,
+		const FName MaterialId,
+		const uint16 Amount)
+	{
+		if (!Impl->bInitialized
+			|| MaterialId.IsNone()
+			|| Amount == 0
+			|| (Impl->Settings.bUseSurfaceTopology
+				? Impl->Settings.bCullOutsideSurfaceBounds
+					&& !Impl->IsInsideSurfaceBounds(WorldCell)
+				: Impl->Settings.bCullOutsideVerticalBounds
+					&& !Impl->IsInsideVerticalBounds(WorldCell.Y)))
+		{
+			return 0;
+		}
+
+		const uint16* AddedMaterialIndex =
+			Impl->MaterialIndices.Find(MaterialId);
+		if (!AddedMaterialIndex || *AddedMaterialIndex == 0)
+		{
+			return 0;
+		}
+		FImpl::FCell& Cell = Impl->FindOrAddCell(WorldCell);
+		if (Cell.MaterialIndex == 0)
+		{
+			return SetCellAmount(WorldCell, MaterialId, Amount)
+				? static_cast<int32>(Amount)
+				: 0;
+		}
+
+		const FImpl::FResolvedMaterial& AddedMaterial =
+			Impl->Materials[*AddedMaterialIndex];
+		const FImpl::FResolvedMaterial& TopMaterial =
+			Impl->Materials[Cell.MaterialIndex];
+		if (AddedMaterial.Phase == EMatterFluxMaterialPhase::StaticSolid
+			|| TopMaterial.Phase == EMatterFluxMaterialPhase::StaticSolid)
+		{
+			return 0;
+		}
+
+		auto AddToLayer = [Amount](uint16& LayerAmount)
+		{
+			const uint16 Capacity = MAX_uint16 - LayerAmount;
+			const uint16 Accepted = FMath::Min(Amount, Capacity);
+			LayerAmount = static_cast<uint16>(LayerAmount + Accepted);
+			return Accepted;
+		};
+
+		uint16 Accepted = 0;
+		if (Cell.MaterialIndex == *AddedMaterialIndex)
+		{
+			Accepted = AddToLayer(Cell.Amount);
+			Cell.RemainingLifetime = AddedMaterial.LifetimeSteps;
+			Cell.LastUpdatedTick = 0;
+		}
+		else if (FImpl::FCell::FLayer* ExistingLayer =
+			Cell.Underlayers.FindByPredicate(
+				[AddedMaterialIndex](const FImpl::FCell::FLayer& Layer)
+				{
+					return Layer.MaterialIndex == *AddedMaterialIndex;
+				}))
+		{
+			Accepted = AddToLayer(ExistingLayer->Amount);
+			ExistingLayer->RemainingLifetime = AddedMaterial.LifetimeSteps;
+			ExistingLayer->LastUpdatedTick = 0;
+		}
+		else
+		{
+			FImpl::FCell::FLayer AddedLayer;
+			AddedLayer.MaterialIndex = *AddedMaterialIndex;
+			AddedLayer.Amount = Amount;
+			AddedLayer.RemainingLifetime = AddedMaterial.LifetimeSteps;
+			Cell.Underlayers.Add(AddedLayer);
+			Accepted = Amount;
+
+			// A newly introduced material can change which phase is physically on
+			// top. Existing top/underlayer additions keep their identity and must not
+			// enter this path: copying an already-updated top into Underlayers duplicates
+			// conserved matter and makes every later deposit raise its own support.
+			FImpl::FCell::FLayer PreviousTop;
+			PreviousTop.MaterialIndex = Cell.MaterialIndex;
+			PreviousTop.Amount = Cell.Amount;
+			PreviousTop.RemainingLifetime = Cell.RemainingLifetime;
+			PreviousTop.LastUpdatedTick = Cell.LastUpdatedTick;
+			Cell.Underlayers.Add(PreviousTop);
+			Cell.Underlayers.Sort([this](
+				const FImpl::FCell::FLayer& A,
+				const FImpl::FCell::FLayer& B)
+			{
+				const uint16 DensityA = Impl->Materials[A.MaterialIndex].Density;
+				const uint16 DensityB = Impl->Materials[B.MaterialIndex].Density;
+				return DensityA != DensityB
+					? DensityA > DensityB
+					: A.MaterialIndex < B.MaterialIndex;
+			});
+			const FImpl::FCell::FLayer NewTop = Cell.Underlayers.Pop(
+				EAllowShrinking::No);
+			Cell.MaterialIndex = NewTop.MaterialIndex;
+			Cell.Amount = NewTop.Amount;
+			Cell.RemainingLifetime = NewTop.RemainingLifetime;
+			Cell.LastUpdatedTick = NewTop.LastUpdatedTick;
+		}
+		Cell.BodyDisplacedTick = 0;
+		Cell.BodyDisplacedMaterialIndex = 0;
+		Cell.BodyDisplacedReferenceAmount = 0;
+		Cell.bHasBodyDisplacementVacancy = false;
+		Impl->BodyDisplacementVacancies.Remove(WorldCell);
+		Impl->WakeSurfaceFlow(WorldCell);
+		Impl->MarkDirtyNeighborhood(WorldCell);
+		const FIntPoint ChunkCoordinate = Impl->ToChunkCoordinate(WorldCell);
+		if (!Impl->IsChunkSimulated(ChunkCoordinate))
+		{
+			Impl->ArchiveChunk(ChunkCoordinate);
+		}
+		return Accepted;
+	}
+
+	int32 FChunkedMaterialWorld::AddPowderAmountAtStableSurface(
+		const FIntPoint& ImpactCell,
+		const FName MaterialId,
+		const uint16 Amount,
+		const int32 MaximumTravelCells,
+		FIntPoint& OutDestinationCell)
+	{
+		OutDestinationCell = ImpactCell;
+		if (!Impl->bInitialized
+			|| MaterialId.IsNone()
+			|| Amount == 0
+			|| MaximumTravelCells < 0)
+		{
+			return 0;
+		}
+		const uint16* MaterialIndex = Impl->MaterialIndices.Find(MaterialId);
+		if (!MaterialIndex
+			|| *MaterialIndex == 0
+			|| Impl->Materials[*MaterialIndex].Phase
+				!= EMatterFluxMaterialPhase::Powder)
+		{
+			return 0;
+		}
+
+		const auto TryGetPowderSurface255 = [this, MaterialId](
+			const FIntPoint& Cell,
+			const int32 IncomingAmount,
+			int64& OutSurface255)
+		{
+			const FName ExistingMaterial = GetMaterialAt(Cell);
+			if (!ExistingMaterial.IsNone() && ExistingMaterial != MaterialId)
+			{
+				return false;
+			}
+			int16 SupportHeight = 0;
+			if (!Impl->FindSupportHeight(Cell, SupportHeight))
+			{
+				return false;
+			}
+			const int32 ExistingAmount = GetMaterialAmountAt(Cell, MaterialId);
+			OutSurface255 = static_cast<int64>(SupportHeight) * FullCellAmount
+				+ static_cast<int64>(PowderFullColumnHeight)
+					* (ExistingAmount + IncomingAmount);
+			return true;
+		};
+
+		static const FIntPoint Directions[] = {
+			FIntPoint(1, 0), FIntPoint(0, 1), FIntPoint(-1, 0),
+			FIntPoint(0, -1), FIntPoint(1, 1), FIntPoint(-1, 1),
+			FIntPoint(-1, -1), FIntPoint(1, -1) };
+		FIntPoint Current = ImpactCell;
+		for (int32 StepIndex = 0;
+			StepIndex < MaximumTravelCells;
+			++StepIndex)
+		{
+			int64 CurrentSurfaceAfterDeposit = 0;
+			if (!TryGetPowderSurface255(
+				Current, Amount, CurrentSurfaceAfterDeposit))
+			{
+				return 0;
+			}
+
+			FIntPoint LowestCell = Current;
+			int64 GreatestExcessSurface = 0;
+			const uint32 DirectionHash = MixBits(
+				Impl->Seed
+					^ static_cast<uint32>(ImpactCell.X) * 0x9e3779b9u
+					^ static_cast<uint32>(ImpactCell.Y) * 0x85ebca6bu
+					^ static_cast<uint32>(StepIndex) * 0xc2b2ae35u
+					^ Impl->Tick);
+			const int32 FirstDirection = static_cast<int32>(
+				DirectionHash % UE_ARRAY_COUNT(Directions));
+			for (int32 Offset = 0;
+				Offset < UE_ARRAY_COUNT(Directions);
+				++Offset)
+			{
+				FIntPoint Candidate;
+				if (!TryOffsetCell(
+						Current,
+						Directions[(FirstDirection + Offset)
+							% UE_ARRAY_COUNT(Directions)],
+						Candidate))
+				{
+					continue;
+				}
+				int64 CandidateSurface = 0;
+				if (!TryGetPowderSurface255(Candidate, 0, CandidateSurface))
+				{
+					continue;
+				}
+				const int64 ExcessSurface =
+					CurrentSurfaceAfterDeposit - CandidateSurface
+						- GetPowderMaximumStableSlope255(
+							Impl->Settings, Impl->Seed, Current, Candidate);
+				if (ExcessSurface > GreatestExcessSurface)
+				{
+					GreatestExcessSurface = ExcessSurface;
+					LowestCell = Candidate;
+				}
+			}
+
+			if (LowestCell == Current
+				|| GreatestExcessSurface <= 0)
+			{
+				break;
+			}
+			Current = LowestCell;
+		}
+
+		// Reaching the search budget does not make an unstable powder packet
+		// stationary. Commit only if its final surface satisfies the material's
+		// repose slope; otherwise the caller keeps the grain airborne.
+		int64 FinalSurfaceAfterDeposit = 0;
+		if (!TryGetPowderSurface255(Current, Amount, FinalSurfaceAfterDeposit))
+		{
+			return 0;
+		}
+		int64 GreatestNeighborExcess = 0;
+		for (const FIntPoint Direction : Directions)
+		{
+			FIntPoint Candidate;
+			if (!TryOffsetCell(Current, Direction, Candidate))
+			{
+				continue;
+			}
+			int64 CandidateSurface = 0;
+			if (TryGetPowderSurface255(Candidate, 0, CandidateSurface))
+			{
+				GreatestNeighborExcess = FMath::Max(
+					GreatestNeighborExcess,
+					FinalSurfaceAfterDeposit - CandidateSurface
+						- GetPowderMaximumStableSlope255(
+							Impl->Settings, Impl->Seed, Current, Candidate));
+			}
+		}
+		if (GreatestNeighborExcess > 0)
+		{
+			OutDestinationCell = Current;
+			return 0;
+		}
+
+		const int32 Accepted = AddCellAmount(Current, MaterialId, Amount);
+		if (Accepted > 0)
+		{
+			OutDestinationCell = Current;
+		}
+		return Accepted;
 	}
 
 	bool FChunkedMaterialWorld::SetSupportHeight(
@@ -2331,6 +3128,8 @@ namespace MatterFlux::Material
 		{
 			FImpl::FCell& Cell =
 				Impl->FindOrAddCell(SeedCell.WorldCell);
+			const bool bReplacedMaterial = Cell.MaterialIndex != 0
+				|| !Cell.Underlayers.IsEmpty();
 			Cell.MaterialIndex =
 				SeedCell.MaterialId.IsNone()
 					? 0
@@ -2344,6 +3143,7 @@ namespace MatterFlux::Material
 			Cell.Amount = Cell.MaterialIndex == 0
 				? 0
 				: SeedCell.Amount;
+			Cell.Underlayers.Reset();
 			Cell.RemainingLifetime = Cell.MaterialIndex == 0
 				? 0
 				: Impl->Materials[Cell.MaterialIndex].LifetimeSteps;
@@ -2353,7 +3153,17 @@ namespace MatterFlux::Material
 			Cell.BodyDisplacedReferenceAmount = 0;
 			Cell.bHasBodyDisplacementVacancy = false;
 			Impl->BodyDisplacementVacancies.Remove(SeedCell.WorldCell);
-			Impl->MarkDirtyNeighborhood(SeedCell.WorldCell);
+			// Terrain topology is a support fact, not active falling-sand work.
+			// The generated map seeds every terrain coordinate, most of which has
+			// no material at all. Waking those empty cells expanded each active
+			// chunk's sparse dirty rectangle to the full 64x64 area and made the
+			// first playable material steps scan the landscape. A material cell
+			// wakes its own halo; an empty-to-empty support seed has nothing for
+			// the solver or liquid projection to update.
+			if (bReplacedMaterial || Cell.MaterialIndex != 0)
+			{
+				Impl->MarkDirtyNeighborhood(SeedCell.WorldCell);
+			}
 			TouchedChunks.Add(
 				Impl->ToChunkCoordinate(SeedCell.WorldCell));
 		}
@@ -2398,16 +3208,7 @@ namespace MatterFlux::Material
 			}
 			if (Impl->SurfaceFlowChunks.Contains(ChunkCoordinate))
 			{
-				if (TUniquePtr<FImpl::FChunk>* Chunk =
-					Impl->Chunks.Find(ChunkCoordinate);
-					Chunk && Chunk->IsValid())
-				{
-					(**Chunk).DirtyMin = FIntPoint::ZeroValue;
-					(**Chunk).DirtyMax = FIntPoint(
-						Impl->Settings.ChunkSize - 1,
-						Impl->Settings.ChunkSize - 1);
-					(**Chunk).bHasDirtyCells = true;
-				}
+				Impl->MarkChunkFlowMaterialsDirty(ChunkCoordinate);
 			}
 			else if (Impl->IsChunkActive(ChunkCoordinate))
 			{
@@ -2445,15 +3246,12 @@ namespace MatterFlux::Material
 		for (const FIntPoint ChunkCoordinate : OrderedChunks)
 		{
 			Impl->SurfaceFlowChunks.Add(ChunkCoordinate);
-			FImpl::FChunk& Chunk = Impl->FindOrAddChunk(ChunkCoordinate);
+			Impl->FindOrAddChunk(ChunkCoordinate);
 			// Generated baseline liquids are intentionally dormant when restored
 			// through ordinary player focus. An explicit visibility wake means the
-			// caller wants one real settling solve, including pristine water.
-			Chunk.DirtyMin = FIntPoint::ZeroValue;
-			Chunk.DirtyMax = FIntPoint(
-				Impl->Settings.ChunkSize - 1,
-				Impl->Settings.ChunkSize - 1);
-			Chunk.bHasDirtyCells = true;
+			// caller wants one real settling solve, including pristine water. Keep
+			// that wake sparse: terrain support and empty cells are facts, not work.
+			Impl->MarkChunkFlowMaterialsDirty(ChunkCoordinate);
 		}
 	}
 
@@ -2507,6 +3305,17 @@ namespace MatterFlux::Material
 		{
 			return A.Y != B.Y ? A.Y < B.Y : A.X < B.X;
 		});
+		// The vacancy timestamp means "last physically occupied", not "first
+		// displaced". Reasserting an idempotent constraint over an already empty
+		// cell must refresh it even though no additional amount moves.
+		for (const FIntPoint OccupiedCell : StableOccupiedCells)
+		{
+			FImpl::FCell* Cell = Impl->FindCell(OccupiedCell);
+			if (Cell && Cell->bHasBodyDisplacementVacancy)
+			{
+				Cell->BodyDisplacedTick = Impl->Tick;
+			}
+		}
 
 		// Constraints from every buoyancy component arrive in one sparse map.
 		// Split them into connected body footprints so nearby columns share one
@@ -3072,6 +3881,7 @@ namespace MatterFlux::Material
 					{
 						SourceCell->MaterialIndex = 0;
 						SourceCell->RemainingLifetime = 0;
+						Impl->PromoteTopUnderlayer(*SourceCell);
 					}
 					SourceCell->LastUpdatedTick = Impl->Tick;
 					SourceCell->BodyDisplacedTick = Impl->Tick;
@@ -3468,6 +4278,7 @@ namespace MatterFlux::Material
 					{
 						SourceCell->MaterialIndex = 0;
 						SourceCell->RemainingLifetime = 0;
+						Impl->PromoteTopUnderlayer(*SourceCell);
 					}
 					SourceCell->LastUpdatedTick = Impl->Tick;
 					TouchedChunks.Add(Impl->ToChunkCoordinate(Source.WorldCell));
@@ -3511,6 +4322,61 @@ namespace MatterFlux::Material
 		return MaterialIndex < Impl->Materials.Num()
 			? Impl->Materials[MaterialIndex].Id
 			: NAME_None;
+	}
+
+	uint16 FChunkedMaterialWorld::GetMaterialAmountAt(
+		const FIntPoint& WorldCell,
+		const FName MaterialId) const
+	{
+		if (!Impl->bInitialized)
+		{
+			return 0;
+		}
+		const uint16* MaterialIndex = Impl->MaterialIndices.Find(MaterialId);
+		if (!MaterialIndex)
+		{
+			return 0;
+		}
+		if (const FImpl::FCell* Cell = Impl->FindCell(WorldCell))
+		{
+			if (Cell->MaterialIndex == *MaterialIndex)
+			{
+				return Cell->Amount;
+			}
+			if (const FImpl::FCell::FLayer* Layer =
+				Cell->Underlayers.FindByPredicate(
+					[MaterialIndex](const FImpl::FCell::FLayer& Candidate)
+					{
+						return Candidate.MaterialIndex == *MaterialIndex;
+					}))
+			{
+				return Layer->Amount;
+			}
+			return 0;
+		}
+		const FImpl::FArchivedChunk* Archive =
+			Impl->ArchivedChunks.Find(Impl->ToChunkCoordinate(WorldCell));
+		if (!Archive)
+		{
+			return 0;
+		}
+		const uint16 CellIndex = static_cast<uint16>(
+			Impl->ToIndex(Impl->ToLocalCoordinate(WorldCell)));
+		if (const TArray<FImpl::FCell::FLayer>* Layers =
+			Archive->UnderlayersByCell.Find(CellIndex))
+		{
+			if (const FImpl::FCell::FLayer* Layer = Layers->FindByPredicate(
+				[MaterialIndex](const FImpl::FCell::FLayer& Candidate)
+				{
+					return Candidate.MaterialIndex == *MaterialIndex;
+				}))
+			{
+				return Layer->Amount;
+			}
+		}
+		return Impl->FindArchivedMaterialIndex(WorldCell) == *MaterialIndex
+			? Impl->FindArchivedAmount(WorldCell)
+			: 0;
 	}
 
 	bool FChunkedMaterialWorld::TryGetCellSnapshot(
@@ -3566,6 +4432,11 @@ namespace MatterFlux::Material
 			for (const FImpl::FCell& Cell : Pair.Value->Cells)
 			{
 				Count += Cell.MaterialIndex == *MaterialIndex ? 1 : 0;
+				Count += Cell.Underlayers.ContainsByPredicate(
+					[MaterialIndex](const FImpl::FCell::FLayer& Layer)
+					{
+						return Layer.MaterialIndex == *MaterialIndex;
+					}) ? 1 : 0;
 			}
 		}
 		for (const TPair<FIntPoint, FImpl::FArchivedChunk>& Pair
@@ -3577,6 +4448,15 @@ namespace MatterFlux::Material
 				{
 					Count += Run.Length;
 				}
+			}
+			for (const TPair<uint16, TArray<FImpl::FCell::FLayer>>& Layers
+				: Pair.Value.UnderlayersByCell)
+			{
+				Count += Layers.Value.ContainsByPredicate(
+					[MaterialIndex](const FImpl::FCell::FLayer& Layer)
+					{
+						return Layer.MaterialIndex == *MaterialIndex;
+					}) ? 1 : 0;
 			}
 		}
 		return Count;
@@ -3602,6 +4482,13 @@ namespace MatterFlux::Material
 				{
 					Total += Cell.Amount;
 				}
+				for (const FImpl::FCell::FLayer& Layer : Cell.Underlayers)
+				{
+					if (Layer.MaterialIndex == *MaterialIndex)
+					{
+						Total += Layer.Amount;
+					}
+				}
 			}
 		}
 		for (const TPair<FIntPoint, FImpl::FArchivedChunk>& Pair
@@ -3612,6 +4499,17 @@ namespace MatterFlux::Material
 				if (Run.MaterialIndex == *MaterialIndex)
 				{
 					Total += static_cast<int64>(Run.Amount) * Run.Length;
+				}
+			}
+			for (const TPair<uint16, TArray<FImpl::FCell::FLayer>>& Layers
+				: Pair.Value.UnderlayersByCell)
+			{
+				for (const FImpl::FCell::FLayer& Layer : Layers.Value)
+				{
+					if (Layer.MaterialIndex == *MaterialIndex)
+					{
+						Total += Layer.Amount;
+					}
 				}
 			}
 		}
@@ -3660,23 +4558,43 @@ namespace MatterFlux::Material
 				{
 					continue;
 				}
-				FCellSnapshot& Snapshot =
-					OutCells.AddDefaulted_GetRef();
-				Snapshot.WorldCell = FIntPoint(
+				const FIntPoint WorldCell(
 					Pair.Key.X * Impl->Settings.ChunkSize
 						+ CellIndex % Impl->Settings.ChunkSize,
 					Pair.Key.Y * Impl->Settings.ChunkSize
 						+ CellIndex / Impl->Settings.ChunkSize);
-				Snapshot.MaterialId =
-					Impl->Materials[MaterialIndex].Id;
 				int16 EffectiveSupport =
 					Pair.Value->Cells[CellIndex].SupportHeight;
-				Impl->FindSupportHeight(
-					Snapshot.WorldCell, EffectiveSupport);
+				Impl->FindBaseSupportHeight(WorldCell, EffectiveSupport);
+				const FImpl::FCell& Cell = Pair.Value->Cells[CellIndex];
+				for (const FImpl::FCell::FLayer& Layer : Cell.Underlayers)
+				{
+					if (Layer.MaterialIndex == 0
+						|| Layer.MaterialIndex >= Impl->Materials.Num())
+					{
+						continue;
+					}
+					FCellSnapshot& LayerSnapshot =
+						OutCells.AddDefaulted_GetRef();
+					LayerSnapshot.WorldCell = WorldCell;
+					LayerSnapshot.MaterialId =
+						Impl->Materials[Layer.MaterialIndex].Id;
+					LayerSnapshot.SupportHeight = EffectiveSupport;
+					LayerSnapshot.Amount = Layer.Amount;
+					LayerSnapshot.RemainingLifetime = Layer.RemainingLifetime;
+					EffectiveSupport = static_cast<int16>(FMath::Clamp(
+						static_cast<int32>(EffectiveSupport)
+							+ Impl->GetLayerHeight(
+								Layer.MaterialIndex, Layer.Amount),
+						static_cast<int32>(MIN_int16),
+						static_cast<int32>(MAX_int16)));
+				}
+				FCellSnapshot& Snapshot = OutCells.AddDefaulted_GetRef();
+				Snapshot.WorldCell = WorldCell;
+				Snapshot.MaterialId = Impl->Materials[MaterialIndex].Id;
 				Snapshot.SupportHeight = EffectiveSupport;
-				Snapshot.Amount = Pair.Value->Cells[CellIndex].Amount;
-				Snapshot.RemainingLifetime =
-					Pair.Value->Cells[CellIndex].RemainingLifetime;
+				Snapshot.Amount = Cell.Amount;
+				Snapshot.RemainingLifetime = Cell.RemainingLifetime;
 			}
 		}
 		OutCells.Sort([](
@@ -3714,16 +4632,38 @@ namespace MatterFlux::Material
 					continue;
 				}
 
-				FCellSnapshot& Snapshot = OutCells.AddDefaulted_GetRef();
-				Snapshot.WorldCell = FIntPoint(
+				const FIntPoint WorldCell(
 					Pair.Key.X * Impl->Settings.ChunkSize
 						+ CellIndex % Impl->Settings.ChunkSize,
 					Pair.Key.Y * Impl->Settings.ChunkSize
 						+ CellIndex / Impl->Settings.ChunkSize);
-				Snapshot.MaterialId = Impl->Materials[Cell.MaterialIndex].Id;
 				int16 EffectiveSupport = Cell.SupportHeight;
-				Impl->FindSupportHeight(
-					Snapshot.WorldCell, EffectiveSupport);
+				Impl->FindBaseSupportHeight(WorldCell, EffectiveSupport);
+				for (const FImpl::FCell::FLayer& Layer : Cell.Underlayers)
+				{
+					if (Layer.MaterialIndex == 0
+						|| Layer.MaterialIndex >= Impl->Materials.Num())
+					{
+						continue;
+					}
+					FCellSnapshot& LayerSnapshot =
+						OutCells.AddDefaulted_GetRef();
+					LayerSnapshot.WorldCell = WorldCell;
+					LayerSnapshot.MaterialId =
+						Impl->Materials[Layer.MaterialIndex].Id;
+					LayerSnapshot.SupportHeight = EffectiveSupport;
+					LayerSnapshot.Amount = Layer.Amount;
+					LayerSnapshot.RemainingLifetime = Layer.RemainingLifetime;
+					EffectiveSupport = static_cast<int16>(FMath::Clamp(
+						static_cast<int32>(EffectiveSupport)
+							+ Impl->GetLayerHeight(
+								Layer.MaterialIndex, Layer.Amount),
+						static_cast<int32>(MIN_int16),
+						static_cast<int32>(MAX_int16)));
+				}
+				FCellSnapshot& Snapshot = OutCells.AddDefaulted_GetRef();
+				Snapshot.WorldCell = WorldCell;
+				Snapshot.MaterialId = Impl->Materials[Cell.MaterialIndex].Id;
 				Snapshot.SupportHeight = EffectiveSupport;
 				Snapshot.Amount = Cell.Amount;
 				Snapshot.RemainingLifetime = Cell.RemainingLifetime;
@@ -3745,16 +4685,43 @@ namespace MatterFlux::Material
 						continue;
 					}
 
-					FCellSnapshot& Snapshot = OutCells.AddDefaulted_GetRef();
-					Snapshot.WorldCell = FIntPoint(
+					const FIntPoint WorldCell(
 						Pair.Key.X * Impl->Settings.ChunkSize
 							+ CellIndex % Impl->Settings.ChunkSize,
 						Pair.Key.Y * Impl->Settings.ChunkSize
 							+ CellIndex / Impl->Settings.ChunkSize);
-					Snapshot.MaterialId = Impl->Materials[Run.MaterialIndex].Id;
 					int16 EffectiveSupport = Run.SupportHeight;
-					Impl->FindSupportHeight(
-						Snapshot.WorldCell, EffectiveSupport);
+					Impl->FindBaseSupportHeight(WorldCell, EffectiveSupport);
+					if (const TArray<FImpl::FCell::FLayer>* Layers =
+						Pair.Value.UnderlayersByCell.Find(
+							static_cast<uint16>(CellIndex)))
+					{
+						for (const FImpl::FCell::FLayer& Layer : *Layers)
+						{
+							if (Layer.MaterialIndex == 0
+								|| Layer.MaterialIndex >= Impl->Materials.Num())
+							{
+								continue;
+							}
+							FCellSnapshot& LayerSnapshot =
+								OutCells.AddDefaulted_GetRef();
+							LayerSnapshot.WorldCell = WorldCell;
+							LayerSnapshot.MaterialId =
+								Impl->Materials[Layer.MaterialIndex].Id;
+							LayerSnapshot.SupportHeight = EffectiveSupport;
+							LayerSnapshot.Amount = Layer.Amount;
+							LayerSnapshot.RemainingLifetime = 0;
+							EffectiveSupport = static_cast<int16>(FMath::Clamp(
+								static_cast<int32>(EffectiveSupport)
+									+ Impl->GetLayerHeight(
+										Layer.MaterialIndex, Layer.Amount),
+								static_cast<int32>(MIN_int16),
+								static_cast<int32>(MAX_int16)));
+						}
+					}
+					FCellSnapshot& Snapshot = OutCells.AddDefaulted_GetRef();
+					Snapshot.WorldCell = WorldCell;
+					Snapshot.MaterialId = Impl->Materials[Run.MaterialIndex].Id;
 					Snapshot.SupportHeight = EffectiveSupport;
 					Snapshot.Amount = Run.Amount;
 					Snapshot.RemainingLifetime = 0;
@@ -3771,6 +4738,218 @@ namespace MatterFlux::Material
 				return A.WorldCell.Y < B.WorldCell.Y;
 			}
 			return A.WorldCell.X < B.WorldCell.X;
+		});
+	}
+
+	void FChunkedMaterialWorld::GetResidentCells(
+		TArray<FCellSnapshot>& OutCells) const
+	{
+		OutCells.Reset();
+		if (!Impl->bInitialized)
+		{
+			return;
+		}
+
+		for (const TPair<FIntPoint, TUniquePtr<FImpl::FChunk>>& Pair
+			: Impl->Chunks)
+		{
+			for (int32 CellIndex = 0;
+				CellIndex < Pair.Value->Cells.Num();
+				++CellIndex)
+			{
+				const FImpl::FCell& Cell = Pair.Value->Cells[CellIndex];
+				if (Cell.MaterialIndex == 0
+					|| Cell.MaterialIndex >= Impl->Materials.Num())
+				{
+					continue;
+				}
+
+				const FIntPoint WorldCell(
+					Pair.Key.X * Impl->Settings.ChunkSize
+						+ CellIndex % Impl->Settings.ChunkSize,
+					Pair.Key.Y * Impl->Settings.ChunkSize
+						+ CellIndex / Impl->Settings.ChunkSize);
+				int16 EffectiveSupport = Cell.SupportHeight;
+				Impl->FindBaseSupportHeight(WorldCell, EffectiveSupport);
+				for (const FImpl::FCell::FLayer& Layer : Cell.Underlayers)
+				{
+					if (Layer.MaterialIndex == 0
+						|| Layer.MaterialIndex >= Impl->Materials.Num())
+					{
+						continue;
+					}
+					FCellSnapshot& LayerSnapshot =
+						OutCells.AddDefaulted_GetRef();
+					LayerSnapshot.WorldCell = WorldCell;
+					LayerSnapshot.MaterialId =
+						Impl->Materials[Layer.MaterialIndex].Id;
+					LayerSnapshot.SupportHeight = EffectiveSupport;
+					LayerSnapshot.Amount = Layer.Amount;
+					LayerSnapshot.RemainingLifetime = Layer.RemainingLifetime;
+					EffectiveSupport = static_cast<int16>(FMath::Clamp(
+						static_cast<int32>(EffectiveSupport)
+							+ Impl->GetLayerHeight(
+								Layer.MaterialIndex, Layer.Amount),
+						static_cast<int32>(MIN_int16),
+						static_cast<int32>(MAX_int16)));
+				}
+				FCellSnapshot& Snapshot = OutCells.AddDefaulted_GetRef();
+				Snapshot.WorldCell = WorldCell;
+				Snapshot.MaterialId = Impl->Materials[Cell.MaterialIndex].Id;
+				Snapshot.SupportHeight = EffectiveSupport;
+				Snapshot.Amount = Cell.Amount;
+				Snapshot.RemainingLifetime = Cell.RemainingLifetime;
+			}
+		}
+
+		OutCells.Sort([](
+			const FCellSnapshot& A,
+			const FCellSnapshot& B)
+		{
+			return A.WorldCell.Y != B.WorldCell.Y
+				? A.WorldCell.Y < B.WorldCell.Y
+				: A.WorldCell.X < B.WorldCell.X;
+		});
+	}
+
+	void FChunkedMaterialWorld::GetCellsInChunks(
+		const TConstArrayView<FIntPoint> Chunks,
+		TArray<FCellSnapshot>& OutCells) const
+	{
+		OutCells.Reset();
+		if (!Impl->bInitialized || Chunks.IsEmpty())
+		{
+			return;
+		}
+
+		TSet<FIntPoint> UniqueChunks;
+		UniqueChunks.Reserve(Chunks.Num());
+		UniqueChunks.Append(Chunks);
+		for (const FIntPoint ChunkCoordinate : UniqueChunks)
+		{
+			if (const TUniquePtr<FImpl::FChunk>* ResidentChunk =
+				Impl->Chunks.Find(ChunkCoordinate))
+			{
+				for (int32 CellIndex = 0;
+					CellIndex < (*ResidentChunk)->Cells.Num();
+					++CellIndex)
+				{
+					const FImpl::FCell& Cell = (*ResidentChunk)->Cells[CellIndex];
+					if (Cell.MaterialIndex == 0
+						|| Cell.MaterialIndex >= Impl->Materials.Num())
+					{
+						continue;
+					}
+					const FIntPoint WorldCell(
+						ChunkCoordinate.X * Impl->Settings.ChunkSize
+							+ CellIndex % Impl->Settings.ChunkSize,
+						ChunkCoordinate.Y * Impl->Settings.ChunkSize
+							+ CellIndex / Impl->Settings.ChunkSize);
+					int16 EffectiveSupport = Cell.SupportHeight;
+					Impl->FindBaseSupportHeight(WorldCell, EffectiveSupport);
+					for (const FImpl::FCell::FLayer& Layer : Cell.Underlayers)
+					{
+						if (Layer.MaterialIndex == 0
+							|| Layer.MaterialIndex >= Impl->Materials.Num())
+						{
+							continue;
+						}
+						FCellSnapshot& LayerSnapshot =
+							OutCells.AddDefaulted_GetRef();
+						LayerSnapshot.WorldCell = WorldCell;
+						LayerSnapshot.MaterialId =
+							Impl->Materials[Layer.MaterialIndex].Id;
+						LayerSnapshot.SupportHeight = EffectiveSupport;
+						LayerSnapshot.Amount = Layer.Amount;
+						LayerSnapshot.RemainingLifetime =
+							Layer.RemainingLifetime;
+						EffectiveSupport = static_cast<int16>(FMath::Clamp(
+							static_cast<int32>(EffectiveSupport)
+								+ Impl->GetLayerHeight(
+									Layer.MaterialIndex, Layer.Amount),
+							static_cast<int32>(MIN_int16),
+							static_cast<int32>(MAX_int16)));
+					}
+					FCellSnapshot& Snapshot = OutCells.AddDefaulted_GetRef();
+					Snapshot.WorldCell = WorldCell;
+					Snapshot.MaterialId =
+						Impl->Materials[Cell.MaterialIndex].Id;
+					Snapshot.SupportHeight = EffectiveSupport;
+					Snapshot.Amount = Cell.Amount;
+					Snapshot.RemainingLifetime = Cell.RemainingLifetime;
+				}
+				continue;
+			}
+
+			const FImpl::FArchivedChunk* ArchivedChunk =
+				Impl->ArchivedChunks.Find(ChunkCoordinate);
+			if (!ArchivedChunk)
+			{
+				continue;
+			}
+			int32 CellIndex = 0;
+			for (const FImpl::FArchivedRun& Run : ArchivedChunk->Runs)
+			{
+				for (int32 RunIndex = 0; RunIndex < Run.Length;
+					++RunIndex, ++CellIndex)
+				{
+					if (Run.MaterialIndex == 0
+						|| Run.MaterialIndex >= Impl->Materials.Num())
+					{
+						continue;
+					}
+					const FIntPoint WorldCell(
+						ChunkCoordinate.X * Impl->Settings.ChunkSize
+							+ CellIndex % Impl->Settings.ChunkSize,
+						ChunkCoordinate.Y * Impl->Settings.ChunkSize
+							+ CellIndex / Impl->Settings.ChunkSize);
+					int16 EffectiveSupport = Run.SupportHeight;
+					Impl->FindBaseSupportHeight(WorldCell, EffectiveSupport);
+					if (const TArray<FImpl::FCell::FLayer>* Layers =
+						ArchivedChunk->UnderlayersByCell.Find(
+							static_cast<uint16>(CellIndex)))
+					{
+						for (const FImpl::FCell::FLayer& Layer : *Layers)
+						{
+							if (Layer.MaterialIndex == 0
+								|| Layer.MaterialIndex >= Impl->Materials.Num())
+							{
+								continue;
+							}
+							FCellSnapshot& LayerSnapshot =
+								OutCells.AddDefaulted_GetRef();
+							LayerSnapshot.WorldCell = WorldCell;
+							LayerSnapshot.MaterialId =
+								Impl->Materials[Layer.MaterialIndex].Id;
+							LayerSnapshot.SupportHeight = EffectiveSupport;
+							LayerSnapshot.Amount = Layer.Amount;
+							LayerSnapshot.RemainingLifetime = 0;
+							EffectiveSupport = static_cast<int16>(FMath::Clamp(
+								static_cast<int32>(EffectiveSupport)
+									+ Impl->GetLayerHeight(
+										Layer.MaterialIndex, Layer.Amount),
+								static_cast<int32>(MIN_int16),
+								static_cast<int32>(MAX_int16)));
+						}
+					}
+					FCellSnapshot& Snapshot = OutCells.AddDefaulted_GetRef();
+					Snapshot.WorldCell = WorldCell;
+					Snapshot.MaterialId =
+						Impl->Materials[Run.MaterialIndex].Id;
+					Snapshot.SupportHeight = EffectiveSupport;
+					Snapshot.Amount = Run.Amount;
+					Snapshot.RemainingLifetime = 0;
+				}
+			}
+		}
+
+		OutCells.Sort([](
+			const FCellSnapshot& A,
+			const FCellSnapshot& B)
+		{
+			return A.WorldCell.Y != B.WorldCell.Y
+				? A.WorldCell.Y < B.WorldCell.Y
+				: A.WorldCell.X < B.WorldCell.X;
 		});
 	}
 
@@ -3812,6 +4991,7 @@ namespace MatterFlux::Material
 			int16 BaselineSupportHeight = 0;
 			uint16 Amount = FullCellAmount;
 			uint8 RemainingLifetime = 0;
+			TArray<FImpl::FCell::FLayer> Underlayers;
 		};
 		struct FActiveChunk
 		{
@@ -3856,7 +5036,8 @@ namespace MatterFlux::Material
 				if (Cell.MaterialIndex == BaselineMaterialIndex
 					&& Cell.SupportHeight == BaselineSupportHeight
 					&& CurrentAmount == BaselineAmount
-					&& Cell.RemainingLifetime == 0)
+					&& Cell.RemainingLifetime == 0
+					&& Cell.Underlayers.IsEmpty())
 				{
 					continue;
 				}
@@ -3866,7 +5047,8 @@ namespace MatterFlux::Material
 					Cell.SupportHeight,
 					BaselineSupportHeight,
 					CurrentAmount,
-					Cell.RemainingLifetime });
+					Cell.RemainingLifetime,
+					Cell.Underlayers });
 			}
 			if (!Chunk.Cells.IsEmpty())
 			{
@@ -4032,6 +5214,15 @@ namespace MatterFlux::Material
 				{
 					AppendUint8(OutState, Cell.RemainingLifetime);
 				}
+				AppendVarUint32(
+					OutState,
+					static_cast<uint32>(Cell.Underlayers.Num()));
+				for (const FImpl::FCell::FLayer& Layer : Cell.Underlayers)
+				{
+					AppendVarUint32(OutState, Layer.MaterialIndex);
+					AppendVarUint32(OutState, Layer.Amount);
+					AppendUint8(OutState, Layer.RemainingLifetime);
+				}
 			}
 			if (OutState.Num() > MaximumActiveStateBytes)
 			{
@@ -4070,6 +5261,7 @@ namespace MatterFlux::Material
 			int16 SupportHeight = 0;
 			uint16 Amount = FullCellAmount;
 			uint8 RemainingLifetime = 0;
+			TArray<FImpl::FCell::FLayer> Underlayers;
 		};
 		struct FImportedChunk
 		{
@@ -4489,6 +5681,38 @@ namespace MatterFlux::Material
 						Cell.RemainingLifetime)
 						&& Cell.RemainingLifetime != 0;
 				}
+				uint32 UnderlayerCount = 0;
+				if (bCellEncodingValid)
+				{
+					bCellEncodingValid = ReadVarUint32(
+						State, Offset, UnderlayerCount)
+						&& UnderlayerCount <= 16;
+				}
+				Cell.Underlayers.Reserve(static_cast<int32>(UnderlayerCount));
+				for (uint32 LayerIndex = 0;
+					bCellEncodingValid && LayerIndex < UnderlayerCount;
+					++LayerIndex)
+				{
+					uint32 EncodedMaterial = 0;
+					uint32 EncodedAmount = 0;
+					uint8 EncodedLifetime = 0;
+					bCellEncodingValid = ReadVarUint32(
+							State, Offset, EncodedMaterial)
+						&& ReadVarUint32(State, Offset, EncodedAmount)
+						&& ReadUint8(State, Offset, EncodedLifetime)
+						&& EncodedMaterial > 0
+						&& EncodedMaterial < static_cast<uint32>(Impl->Materials.Num())
+						&& EncodedAmount > 0
+						&& EncodedAmount <= MAX_uint16;
+					if (bCellEncodingValid)
+					{
+						FImpl::FCell::FLayer& Layer =
+							Cell.Underlayers.AddDefaulted_GetRef();
+						Layer.MaterialIndex = static_cast<uint16>(EncodedMaterial);
+						Layer.Amount = static_cast<uint16>(EncodedAmount);
+						Layer.RemainingLifetime = EncodedLifetime;
+					}
+				}
 				if (!bCellEncodingValid
 					|| Cell.CellIndex >= static_cast<uint32>(CellCount)
 					|| (CellNumber > 0
@@ -4570,6 +5794,7 @@ namespace MatterFlux::Material
 				}
 				Cell.Amount = 0;
 				Cell.RemainingLifetime = 0;
+				Cell.Underlayers.Reset();
 				Cell.LastUpdatedTick = 0;
 				Cell.BodyDisplacedTick = 0;
 				Cell.BodyDisplacedMaterialIndex = 0;
@@ -4584,11 +5809,7 @@ namespace MatterFlux::Material
 					Impl->DecodeChunk(*Baseline, *Pair.Value);
 				}
 			}
-			Pair.Value->DirtyMin = FIntPoint(0, 0);
-			Pair.Value->DirtyMax = FIntPoint(
-				Impl->Settings.ChunkSize - 1,
-				Impl->Settings.ChunkSize - 1);
-			Pair.Value->bHasDirtyCells = true;
+			Pair.Value->MarkAllDirty();
 			Impl->ProjectionDirtyChunks.Add(Pair.Key);
 		}
 		for (const FImportedChunk& ImportedChunk
@@ -4610,17 +5831,14 @@ namespace MatterFlux::Material
 					ImportedCell.SupportHeight;
 				Cell.Amount = ImportedCell.Amount;
 				Cell.RemainingLifetime = ImportedCell.RemainingLifetime;
+				Cell.Underlayers = ImportedCell.Underlayers;
 				Cell.LastUpdatedTick = 0;
 				Cell.BodyDisplacedTick = 0;
 				Cell.BodyDisplacedMaterialIndex = 0;
 				Cell.BodyDisplacedReferenceAmount = 0;
 				Cell.bHasBodyDisplacementVacancy = false;
 			}
-			Chunk.DirtyMin = FIntPoint(0, 0);
-			Chunk.DirtyMax = FIntPoint(
-				Impl->Settings.ChunkSize - 1,
-				Impl->Settings.ChunkSize - 1);
-			Chunk.bHasDirtyCells = true;
+			Chunk.MarkAllDirty();
 			Impl->ProjectionDirtyChunks.Add(ImportedChunk.Coordinate);
 		}
 		Impl->Tick = SimulationTick;
@@ -4791,25 +6009,21 @@ namespace MatterFlux::Material
 				: Impl->Chunks)
 			{
 				FImpl::FChunk& Chunk = *Pair.Value;
-				if (!Impl->IsChunkSimulated(Pair.Key) || !Chunk.bHasDirtyCells)
+				if (!Impl->IsChunkSimulated(Pair.Key)
+					|| !Chunk.HasDirtyCells())
 				{
 					continue;
 				}
 
-				const FIntPoint DirtyMin = Chunk.DirtyMin;
-				const FIntPoint DirtyMax = Chunk.DirtyMax;
-				Chunk.bHasDirtyCells = false;
-				Chunk.DirtyMin = FIntPoint(MAX_int32, MAX_int32);
-				Chunk.DirtyMax = FIntPoint(MIN_int32, MIN_int32);
-				for (int32 LocalY = DirtyMin.Y; LocalY <= DirtyMax.Y; ++LocalY)
+				for (const int32 CellIndex : Chunk.DirtyCellIndices)
 				{
-					for (int32 LocalX = DirtyMin.X; LocalX <= DirtyMax.X; ++LocalX)
-					{
-						CellsToVisit.Add(FIntPoint(
-							Pair.Key.X * Impl->Settings.ChunkSize + LocalX,
-							Pair.Key.Y * Impl->Settings.ChunkSize + LocalY));
-					}
+					CellsToVisit.Add(FIntPoint(
+						Pair.Key.X * Impl->Settings.ChunkSize
+							+ CellIndex % Impl->Settings.ChunkSize,
+						Pair.Key.Y * Impl->Settings.ChunkSize
+							+ CellIndex / Impl->Settings.ChunkSize));
 				}
+				Chunk.ResetDirty();
 			}
 			CellsToVisit.Sort([Tick = Impl->Tick](
 				const FIntPoint& A,
@@ -4821,6 +6035,7 @@ namespace MatterFlux::Material
 				}
 				return (Tick & 1u) == 0 ? A.X < B.X : A.X > B.X;
 			});
+			Stats.CandidateCells = CellsToVisit.Num();
 		}
 
 		// Lifetime is a material property, independent of phase and reaction kind.
@@ -4840,6 +6055,7 @@ namespace MatterFlux::Material
 			{
 				Cell->MaterialIndex = 0;
 				Cell->Amount = 0;
+				Impl->PromoteTopUnderlayer(*Cell);
 				Impl->MarkDirtyNeighborhood(WorldCell);
 				++Stats.CulledCells;
 			}
@@ -4934,6 +6150,12 @@ namespace MatterFlux::Material
 					DestinationCell->MaterialIndex != 0
 						? DestinationCell->MaterialIndex
 						: DestinationCell->BodyDisplacedMaterialIndex;
+				if (Impl->Tick - DestinationCell->BodyDisplacedTick
+					<= static_cast<uint32>(
+						Impl->Settings.BodyWakeRefillDelaySteps))
+				{
+					continue;
+				}
 				if (DestinationCell->BodyDisplacedReferenceAmount == 0)
 				{
 					if (DestinationCell->Amount >= FullCellAmount
@@ -5022,6 +6244,7 @@ namespace MatterFlux::Material
 					{
 						SourceCell->MaterialIndex = 0;
 						SourceCell->RemainingLifetime = 0;
+						Impl->PromoteTopUnderlayer(*SourceCell);
 					}
 					DestinationCell->LastUpdatedTick = Impl->Tick;
 					SourceCell->LastUpdatedTick = Impl->Tick;
@@ -5045,11 +6268,12 @@ namespace MatterFlux::Material
 				RestitutionVacancies.Add({
 					Vacancy,
 					DisplacedMaterialIndex,
-					FMath::Min(
+					GetBodyWakeTransferBudget(
 						static_cast<int32>(
 							DestinationCell->BodyDisplacedReferenceAmount)
-								- static_cast<int32>(DestinationCell->Amount),
-							MaximumBodyWakeTransferPerStep) });
+							- static_cast<int32>(DestinationCell->Amount),
+						DestinationCell->BodyDisplacedReferenceAmount,
+						Impl->Settings.BodyWakeRefillDurationSteps) });
 			}
 
 			// Noita's falling-material update visits a dirty region once rather than
@@ -5202,86 +6426,103 @@ namespace MatterFlux::Material
 					{
 						FRestitutionVacancy& Destination =
 							RestitutionVacancies[VacancyIndex];
-						int32 BestDonorIndex = INDEX_NONE;
-						int64 BestDistance = MAX_int64;
-						int64 BestSurfaceHeight255 = MIN_int64;
-						for (int32 DonorIndex = 0;
-							DonorIndex < ComponentDonors.Num();
-							++DonorIndex)
-						{
-							const FRestitutionDonor& Donor =
-								ComponentDonors[DonorIndex];
-							if (Donor.AvailableAmount <= 0)
-							{
-								continue;
-							}
-							const int64 Distance =
-								FMath::Abs(
-									static_cast<int64>(Donor.WorldCell.X)
-										- Destination.WorldCell.X)
-								+ FMath::Abs(
-									static_cast<int64>(Donor.WorldCell.Y)
-										- Destination.WorldCell.Y);
-							if (Distance < BestDistance
-								|| (Distance == BestDistance
-									&& Donor.SurfaceHeight255
-										> BestSurfaceHeight255))
-							{
-								BestDonorIndex = DonorIndex;
-								BestDistance = Distance;
-								BestSurfaceHeight255 = Donor.SurfaceHeight255;
-							}
-						}
-						if (BestDonorIndex == INDEX_NONE)
+						FImpl::FCell* DestinationCell =
+							Impl->FindCell(Destination.WorldCell);
+						if (!DestinationCell)
 						{
 							continue;
 						}
 
-						FRestitutionDonor& Donor =
-							ComponentDonors[BestDonorIndex];
-						FImpl::FCell* DestinationCell =
-							Impl->FindCell(Destination.WorldCell);
-						FImpl::FCell* SourceCell =
-							Impl->FindCell(Donor.WorldCell);
-						if (!DestinationCell || !SourceCell)
+						// Body displacement distributes one column across several
+						// nearby surplus columns. Consume as many nearest donors as
+						// needed to satisfy this step's pressure budget; limiting a
+						// vacancy to one donor made refill speed depend on the
+						// accidental per-donor split and felt unresponsive.
+						while (Destination.RemainingTransfer > 0)
 						{
-							continue;
+							int32 BestDonorIndex = INDEX_NONE;
+							int64 BestDistance = MAX_int64;
+							int64 BestSurfaceHeight255 = MIN_int64;
+							for (int32 DonorIndex = 0;
+								DonorIndex < ComponentDonors.Num();
+								++DonorIndex)
+							{
+								const FRestitutionDonor& Donor =
+									ComponentDonors[DonorIndex];
+								if (Donor.AvailableAmount <= 0)
+								{
+									continue;
+								}
+								const int64 Distance =
+									FMath::Abs(
+										static_cast<int64>(Donor.WorldCell.X)
+											- Destination.WorldCell.X)
+									+ FMath::Abs(
+										static_cast<int64>(Donor.WorldCell.Y)
+											- Destination.WorldCell.Y);
+								if (Distance < BestDistance
+									|| (Distance == BestDistance
+										&& Donor.SurfaceHeight255
+											> BestSurfaceHeight255))
+								{
+									BestDonorIndex = DonorIndex;
+									BestDistance = Distance;
+									BestSurfaceHeight255 = Donor.SurfaceHeight255;
+								}
+							}
+							if (BestDonorIndex == INDEX_NONE)
+							{
+								break;
+							}
+
+							FRestitutionDonor& Donor =
+								ComponentDonors[BestDonorIndex];
+							FImpl::FCell* SourceCell =
+								Impl->FindCell(Donor.WorldCell);
+							if (!SourceCell)
+							{
+								Donor.AvailableAmount = 0;
+								continue;
+							}
+							const int32 TransferAmount = FMath::Min(
+								Destination.RemainingTransfer,
+								Donor.AvailableAmount);
+							if (TransferAmount <= 0)
+							{
+								Donor.AvailableAmount = 0;
+								continue;
+							}
+							DestinationCell->MaterialIndex =
+								RestitutionMaterialIndex;
+							if (SourceCell->RemainingLifetime != 0)
+							{
+								DestinationCell->RemainingLifetime =
+									DestinationCell->RemainingLifetime == 0
+									? SourceCell->RemainingLifetime
+									: FMath::Min(
+										DestinationCell->RemainingLifetime,
+										SourceCell->RemainingLifetime);
+							}
+							DestinationCell->Amount = static_cast<uint8>(
+								static_cast<int32>(DestinationCell->Amount)
+									+ TransferAmount);
+							SourceCell->Amount = static_cast<uint8>(
+								static_cast<int32>(SourceCell->Amount)
+									- TransferAmount);
+							if (SourceCell->Amount == 0)
+							{
+								SourceCell->MaterialIndex = 0;
+								SourceCell->RemainingLifetime = 0;
+								Impl->PromoteTopUnderlayer(*SourceCell);
+							}
+							Destination.RemainingTransfer -= TransferAmount;
+							Donor.AvailableAmount -= TransferAmount;
+							DestinationCell->LastUpdatedTick = Impl->Tick;
+							SourceCell->LastUpdatedTick = Impl->Tick;
+							Impl->MarkDirtyNeighborhood(Destination.WorldCell);
+							Impl->MarkDirtyNeighborhood(Donor.WorldCell);
+							++Stats.MovedCells;
 						}
-						const int32 TransferAmount = FMath::Min(
-							Destination.RemainingTransfer,
-							Donor.AvailableAmount);
-						if (TransferAmount <= 0)
-						{
-							continue;
-						}
-						DestinationCell->MaterialIndex = RestitutionMaterialIndex;
-						if (SourceCell->RemainingLifetime != 0)
-						{
-							DestinationCell->RemainingLifetime =
-								DestinationCell->RemainingLifetime == 0
-								? SourceCell->RemainingLifetime
-								: FMath::Min(
-									DestinationCell->RemainingLifetime,
-									SourceCell->RemainingLifetime);
-						}
-						DestinationCell->Amount = static_cast<uint8>(
-							static_cast<int32>(DestinationCell->Amount)
-								+ TransferAmount);
-						SourceCell->Amount = static_cast<uint8>(
-							static_cast<int32>(SourceCell->Amount)
-								- TransferAmount);
-						if (SourceCell->Amount == 0)
-						{
-							SourceCell->MaterialIndex = 0;
-							SourceCell->RemainingLifetime = 0;
-						}
-						Destination.RemainingTransfer -= TransferAmount;
-						Donor.AvailableAmount -= TransferAmount;
-						DestinationCell->LastUpdatedTick = Impl->Tick;
-						SourceCell->LastUpdatedTick = Impl->Tick;
-						Impl->MarkDirtyNeighborhood(Destination.WorldCell);
-						Impl->MarkDirtyNeighborhood(Donor.WorldCell);
-						++Stats.MovedCells;
 					}
 				}
 				Stats.RestitutionVisitedCells += SearchVisited.Num();
@@ -5393,6 +6634,7 @@ namespace MatterFlux::Material
 			}
 		}
 
+		bool bMovedSurfacePowder = false;
 		{
 			TRACE_CPUPROFILER_EVENT_SCOPE(MatterFlux_MaterialStep_MoveCells);
 			for (const FIntPoint& WorldCell : CellsToVisit)
@@ -5424,11 +6666,20 @@ namespace MatterFlux::Material
 				}
 				if (Impl->Settings.bUseSurfaceTopology)
 				{
+					const int32 MovedBefore = Stats.MovedCells;
+					if (Impl->TryMoveSurfaceUnderlayerPowder(
+							WorldCell, Stats))
+					{
+						bMovedSurfacePowder = true;
+						continue;
+					}
 					Impl->TryMoveSurfaceCell(
 						WorldCell,
 						Material,
 						Stats,
 						SurfaceLiquidShapes.Find(WorldCell));
+					bMovedSurfacePowder |= bIsPowder
+						&& Stats.MovedCells > MovedBefore;
 					continue;
 				}
 
@@ -5517,6 +6768,93 @@ namespace MatterFlux::Material
 					FIntPoint(-FirstDirection, 0));
 			}
 		}
+
+		// Surface topology stores a vertical powder column in one coarse world
+		// cell. Limiting it to one lateral neighbor per 30 Hz fixed step made a
+		// spell-sized pile take several seconds merely to cross a tree crown. Run a
+		// few powder-only local substeps so granular velocity matches the world-cell
+		// scale. Every substep still transfers solely between adjacent cells; this is
+		// falling-sand relaxation, not a search for or teleport to the final surface.
+		if (Impl->Settings.bUseSurfaceTopology && bMovedSurfacePowder)
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE(
+				MatterFlux_MaterialStep_RelaxSurfacePowder);
+			constexpr int32 ExtraPowderRelaxationPasses = 3;
+			for (int32 Pass = 0; Pass < ExtraPowderRelaxationPasses; ++Pass)
+			{
+				TArray<FIntPoint> PowderCells;
+				for (const TPair<FIntPoint, TUniquePtr<FImpl::FChunk>>& Pair
+					: Impl->Chunks)
+				{
+					if (!Impl->IsChunkSimulated(Pair.Key)
+						|| !Pair.Value->HasDirtyCells())
+					{
+						continue;
+					}
+					for (const int32 CellIndex : Pair.Value->DirtyCellIndices)
+					{
+						FImpl::FCell& Cell = Pair.Value->Cells[CellIndex];
+						if (Cell.MaterialIndex == 0
+							|| Cell.MaterialIndex >= Impl->Materials.Num()
+							|| Impl->Materials[Cell.MaterialIndex].Phase
+								!= EMatterFluxMaterialPhase::Powder)
+						{
+							continue;
+						}
+						// LastUpdatedTick is the per-substep collision guard. Reset it for
+						// candidates, then a moved source and destination are each barred
+						// from moving again until the following pass.
+						Cell.LastUpdatedTick = 0;
+						PowderCells.Add(FIntPoint(
+							Pair.Key.X * Impl->Settings.ChunkSize
+								+ CellIndex % Impl->Settings.ChunkSize,
+							Pair.Key.Y * Impl->Settings.ChunkSize
+								+ CellIndex / Impl->Settings.ChunkSize));
+					}
+				}
+				if (PowderCells.IsEmpty())
+				{
+					break;
+				}
+				PowderCells.Sort([Order = Impl->Tick + Pass + 1](
+					const FIntPoint& A,
+					const FIntPoint& B)
+				{
+					if (A.Y != B.Y)
+					{
+						return A.Y < B.Y;
+					}
+					return (Order & 1u) == 0 ? A.X < B.X : A.X > B.X;
+				});
+
+				bool bMovedThisPass = false;
+				for (const FIntPoint WorldCell : PowderCells)
+				{
+					FImpl::FCell* Cell = Impl->FindCell(WorldCell);
+					if (!Cell || Cell->MaterialIndex == 0
+						|| Cell->MaterialIndex >= Impl->Materials.Num()
+						|| Cell->LastUpdatedTick == Impl->Tick)
+					{
+						continue;
+					}
+					const FImpl::FResolvedMaterial Material =
+						Impl->Materials[Cell->MaterialIndex];
+					if (Material.Phase != EMatterFluxMaterialPhase::Powder
+						|| !Impl->PassesMobilityCheck(WorldCell, Material))
+					{
+						continue;
+					}
+					const int32 MovedBefore = Stats.MovedCells;
+					++Stats.VisitedCells;
+					Impl->TryMoveSurfaceCell(WorldCell, Material, Stats, nullptr);
+					bMovedThisPass |= Stats.MovedCells > MovedBefore;
+				}
+				if (!bMovedThisPass)
+				{
+					break;
+				}
+			}
+		}
 		if (Impl->Settings.bUseSurfaceTopology
 			&& !Impl->SurfaceFlowChunks.IsEmpty())
 		{
@@ -5530,7 +6868,7 @@ namespace MatterFlux::Material
 				const TUniquePtr<FImpl::FChunk>* Chunk =
 					Impl->Chunks.Find(ChunkCoordinate);
 				if (!Chunk || !Chunk->IsValid()
-					|| !(**Chunk).bHasDirtyCells)
+					|| !(**Chunk).HasDirtyCells())
 				{
 					SettledFlowChunks.Add(ChunkCoordinate);
 				}

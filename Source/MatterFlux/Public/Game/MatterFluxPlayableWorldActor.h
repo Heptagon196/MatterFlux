@@ -262,7 +262,17 @@ public:
 		float BottomZ,
 		float TopZ,
 		bool bCapsuleShape = false,
-		bool bDeferMaterialSolve = false);
+		bool bDeferMaterialSolve = false,
+		bool bDisplacePowders = true);
+	/**
+	 * Conservatively moves a small, bounded amount of powder near one footfall.
+	 * This is an impulse into the existing falling-sand world, not a replacement
+	 * for its settling or angle-of-repose simulation.
+	 */
+	int32 DisturbPowderAtWorldLocation(
+		const FVector& WorldLocation,
+		int32 MaximumAmountToMove,
+		int32 SearchRadiusCells = 3);
 	/** Read-only visual acceptance data; never participates in material simulation. */
 	bool TryGetLiquidProjectionHeightAudit(
 		FName MaterialId,
@@ -464,6 +474,27 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Playable World|Material Simulation")
 	int32 GetSimulatedMaterialCount(FName MaterialId) const;
 	int64 GetSimulatedMaterialAmount(FName MaterialId) const;
+	/** Registers spell-created material as canonical moving particles immediately. */
+	FGuid SpawnAirborneSimulatedMaterial(
+		FName MaterialId,
+		int32 CellCount,
+		TConstArrayView<FVector> WorldPositions,
+		TConstArrayView<FVector> InitialVelocities,
+		float ParticleRadius,
+		float GravityScale,
+		float Lifetime,
+		int32 EventSeed);
+	void GetAirborneSimulatedMaterialParticles(
+		const FGuid& BatchId,
+		TArray<MatterFlux::Material::FAirborneParticle>& OutParticles) const;
+	bool HasAirborneSimulatedMaterialBatch(const FGuid& BatchId) const;
+	int32 GetAirborneSimulatedMaterialParticleCount(
+		FName MaterialId = NAME_None) const;
+	int64 GetAirborneSimulatedMaterialAmount(FName MaterialId) const;
+	/** Enumerates canonical cells for one material for diagnostics and regression tests. */
+	void GetSimulatedMaterialCells(
+		FName MaterialId,
+		TArray<MatterFlux::Material::FCellSnapshot>& OutCells) const;
 
 	/**
 	 * 在权威端把 Lua 材质写入对应的地表模拟格。法术、容器和测试场景
@@ -473,6 +504,13 @@ public:
 	bool SetSimulatedMaterialAtWorldLocation(
 		const FVector& WorldLocation,
 		FName MaterialId);
+	/**
+	 * Removes canonical material intersecting a world-space oriented box. Both
+	 * resident columns and airborne particles pass through this one transaction.
+	 */
+	int64 RemoveSimulatedMaterialInOrientedBox(
+		const FTransform& BoxTransform,
+		const FVector& BoxHalfExtent);
 
 	/** Finds the first occupied 2.5D material column touched by a swept sphere. */
 	bool SweepSimulatedMaterial(
@@ -481,7 +519,6 @@ public:
 		float Radius,
 		FVector& OutImpactLocation,
 		FName& OutMaterialId) const;
-
 	/** Deposits a compact deterministic patch without overwriting its neighbors. */
 	int32 DepositSimulatedMaterialAtWorldLocation(
 		const FVector& WorldLocation,
@@ -493,7 +530,11 @@ public:
 		FName MaterialId,
 		int32 CellCount,
 		AActor* ImpactActor,
-		float ImpactRadius = 0.0f);
+		float ImpactRadius = 0.0f,
+		float SupportSearchRadius = 0.0f,
+		int32 PreferredPowderColumnLayers = 0,
+		int32 ExplicitMaterialAmount = 0,
+		int32* OutAcceptedMaterialAmount = nullptr);
 	/** Read-only proof that powder is currently carried by object support. */
 	int32 GetExternalMaterialSupportCellCount() const
 	{
@@ -635,7 +676,15 @@ protected:
 	FName ActiveCustomMapId = NAME_None;
 
 	UPROPERTY(EditAnywhere, Category = "Playable World|Material Simulation", meta = (ClampMin = "0.01", ClampMax = "0.25"))
-	float MaterialSimulationStepSeconds = 0.05f;
+	float MaterialSimulationStepSeconds = 1.0f / 30.0f;
+
+	/** Time after a body leaves a liquid cell before conserved refill starts. */
+	UPROPERTY(EditAnywhere, Category = "Playable World|Material Simulation", meta = (ClampMin = "0.0", ClampMax = "2.0"))
+	float MaterialBodyWakeRefillDelaySeconds = 0.25f;
+
+	/** Time spent progressively returning displaced particles after the delay. */
+	UPROPERTY(EditAnywhere, Category = "Playable World|Material Simulation", meta = (ClampMin = "0.05", ClampMax = "4.0"))
+	float MaterialBodyWakeRefillDurationSeconds = 0.55f;
 
 	UPROPERTY(EditAnywhere, Category = "Playable World|Material Simulation", meta = (ClampMin = "4", ClampMax = "256"))
 	int32 MaterialSimulationChunkSize = 64;
@@ -690,8 +739,12 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "Playable World|Material Simulation", meta = (ClampMin = "1.0", ClampMax = "32.0"))
 	float MaterialLiquidVisualThickness = 8.0f;
 
-	UPROPERTY(EditAnywhere, Category = "Playable World|Material Simulation", meta = (ClampMin = "0.05", ClampMax = "1.0"))
-	float MaterialVisualizationInterval = 0.10f;
+	UPROPERTY(EditAnywhere, Category = "Playable World|Material Simulation", meta = (ClampMin = "0.016", ClampMax = "1.0"))
+	float MaterialVisualizationInterval = 1.0f / 30.0f;
+
+	/** Bounded local mesh commits per presentation frame; canonical facts are unaffected. */
+	UPROPERTY(EditAnywhere, Category = "Playable World|Material Simulation", meta = (ClampMin = "1", ClampMax = "8"))
+	int32 MaxLiquidProjectionChunksPerVisualization = 3;
 
 	UPROPERTY(EditAnywhere, Category = "Playable World|Material Simulation")
 	bool bEnableMaterialSimulationCollision = false;
@@ -777,8 +830,11 @@ private:
 	void UpdateMaterialVisualization(
 		float DeltaSeconds,
 		bool bAllowRebuild = true);
+	/** Entry prerequisites excluding the bounded initial material warm-up. */
+	bool IsInitialWorldStreamingReady() const;
 	void RebuildMaterialVisualization(
 		const FMatterFluxContentRegistry& Registry);
+	void AdvanceAirborneMaterialParticles(float DeltaSeconds);
 	/** 执行动态材料格与可切割 Source 之间由 Lua contact 规则定义的接触反应。 */
 	void ResolveMaterialInteractions(
 		const FMatterFluxContentRegistry& Registry);
@@ -898,6 +954,10 @@ private:
 	// water can dirty the same chunks forever and is not finite initialization work.
 	TSet<FIntPoint> PendingInitialLiquidProjectionChunks;
 	TSet<FIntPoint> PendingLiquidProjectionDirtyChunks;
+	// First-enqueue age prevents rapidly moving focus from starving the wake
+	// chunks behind the player while nearby chunks still receive half the budget.
+	TMap<FIntPoint, uint64> LiquidProjectionDirtyEnqueueOrders;
+	uint64 NextLiquidProjectionDirtyEnqueueOrder = 1;
 	bool bCaptureInitialLiquidProjectionRequirements = false;
 	TMap<FName, FLayerStreamingCache> LayerStreamingCaches;
 	TMap<FName, MatterFlux::PlayableLevel::FLevelLayer>
@@ -1095,6 +1155,15 @@ private:
 
 	TUniquePtr<MatterFlux::Material::FSimulationRuntime>
 		MaterialSimulation;
+	/**
+	 * Generated material facts are settled while the loading/entry gate owns the
+	 * world. Static/dynamic projections are not exposed until the final warm-up
+	 * projection has committed.
+	 */
+	int32 InitialMaterialWarmupStepCount = 0;
+	int32 InitialMaterialWarmupQuietStepCount = 0;
+	bool bInitialMaterialWarmupStepsComplete = false;
+	bool bInitialMaterialWarmupComplete = false;
 	struct FRecentMaterialWake
 	{
 		FIntPoint SampleCell = FIntPoint::ZeroValue;
@@ -1127,6 +1196,7 @@ private:
 	struct FMovementMediumDefinition
 	{
 		EMatterFluxMaterialPhase Phase = EMatterFluxMaterialPhase::StaticSolid;
+		float Density = 1.0f;
 		float MovementResistance = 0.0f;
 		float FullColumnHeight = 0.0f;
 	};

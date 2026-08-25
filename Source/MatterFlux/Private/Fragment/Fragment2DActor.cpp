@@ -132,6 +132,58 @@ namespace
 		return Count;
 	}
 
+	bool CopyMaskToChildFrame(
+		const FFragmentSourceMask& ParentMask,
+		const FFragmentSourceMask& ChildTemplate,
+		const FTransform& ChildToParent,
+		FFragmentSourceMask& OutChildMask)
+	{
+		if (!ParentMask.HasValidLayout()
+			|| !ChildTemplate.HasValidLayout()
+			|| !ChildToParent.IsValid())
+		{
+			return false;
+		}
+		OutChildMask = ChildTemplate;
+		OutChildMask.SolidMask.Init(
+			0,
+			ChildTemplate.Width * ChildTemplate.Height);
+		for (int32 ChildY = 0; ChildY < ChildTemplate.Height; ++ChildY)
+		{
+			for (int32 ChildX = 0; ChildX < ChildTemplate.Width; ++ChildX)
+			{
+				const FVector ChildCellCenter(
+					(static_cast<float>(ChildX) + 0.5f
+						- static_cast<float>(ChildTemplate.Width) * 0.5f)
+						* ChildTemplate.CellSize,
+					0.0f,
+					(static_cast<float>(ChildY) + 0.5f
+						- static_cast<float>(ChildTemplate.Height) * 0.5f)
+						* ChildTemplate.CellSize);
+				const FVector ParentCellCenter =
+					ChildToParent.TransformPosition(ChildCellCenter);
+				const int32 ParentX = FMath::RoundToInt(
+					ParentCellCenter.X / ParentMask.CellSize
+						+ static_cast<float>(ParentMask.Width) * 0.5f
+						- 0.5f);
+				const int32 ParentY = FMath::RoundToInt(
+					ParentCellCenter.Z / ParentMask.CellSize
+						+ static_cast<float>(ParentMask.Height) * 0.5f
+						- 0.5f);
+				if (ParentX < 0 || ParentX >= ParentMask.Width
+					|| ParentY < 0 || ParentY >= ParentMask.Height)
+				{
+					return false;
+				}
+				OutChildMask.SolidMask[
+					ChildY * ChildTemplate.Width + ChildX] =
+					ParentMask.SolidMask[
+						ParentY * ParentMask.Width + ParentX];
+			}
+		}
+		return true;
+	}
+
 	double Cross2D(
 		const FVector2D& A,
 		const FVector2D& B,
@@ -330,7 +382,9 @@ AFragment2DActor::AFragment2DActor()
 	MeshComponent->SetCollisionObjectType(ECC_PhysicsBody);
 	MeshComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 	MeshComponent->SetCollisionResponseToAllChannels(ECR_Block);
-	MeshComponent->SetCollisionResponseToChannel(ECC_PhysicsBody, ECR_Ignore);
+	// Detached bodies must participate in Chaos contacts with one another. Ignoring
+	// PhysicsBody lets independently cut items be pushed into the same space.
+	MeshComponent->SetCollisionResponseToChannel(ECC_PhysicsBody, ECR_Block);
 	// Detached material is a movable body, not a terrain step. Allowing
 	// CharacterMovement to StepUp makes tall creatures climb over a voxel hull
 	// after one contact frame instead of continuously pushing it sideways.
@@ -733,6 +787,26 @@ bool AFragment2DActor::TryAcceptWorldCut(
 		return true;
 	}
 
+	bool bSplitIntoIndependentActors = false;
+	if (!TrySplitDisconnectedRootMaterial(
+		PreservedBodyTransform,
+		PreservedLinearVelocity,
+		PreservedAngularVelocity,
+		FMath::Min(AcceptedCutCount + 1, MAX_int32),
+		bSplitIntoIndependentActors))
+	{
+		RootReactionState = PreviousRootState;
+		AggregateSources = PreviousAggregateSources;
+		SpawnPayload.DetachedVoxelMask = PreviousDetachedMask;
+		RefreshBuoyancyDensity();
+		RebuildMeshFromPayload();
+		return false;
+	}
+	if (bSplitIntoIndependentActors)
+	{
+		return true;
+	}
+
 	RefreshBuoyancyDensity();
 	if (!RebuildMeshFromPayload())
 	{
@@ -763,6 +837,189 @@ bool AFragment2DActor::TryAcceptWorldCut(
 			PreservedAngularVelocity);
 	}
 	ForceNetUpdate();
+	return true;
+}
+
+bool AFragment2DActor::TrySplitDisconnectedRootMaterial(
+	const FTransform& ParentWorldTransform,
+	const FVector& PreservedLinearVelocity,
+	const FVector& PreservedAngularVelocity,
+	const int32 NextAcceptedCutCount,
+	bool& bOutSplit)
+{
+	bOutSplit = false;
+	if (!AggregateSources.IsEmpty()
+		|| !RootReactionState.IsValid()
+		|| !ParentWorldTransform.IsValid())
+	{
+		return true;
+	}
+
+	const FFragmentSourceMask& RootMask = RootReactionState.SourceMask;
+	TArray<MatterFlux::FragmentGeometry::FFragmentComponent> Components;
+	MatterFlux::FragmentGeometry::ExtractConnectedComponents(
+		RootMask.SolidMask,
+		RootMask.Width,
+		RootMask.Height,
+		Components);
+	if (Components.Num() <= 1)
+	{
+		return true;
+	}
+
+	const FGuid SplitSourceId = RootReactionState.SourceId.IsValid()
+		? RootReactionState.SourceId
+		: SpawnPayload.FragmentId;
+	const int32 SplitSeed = static_cast<int32>(HashCombineFast(
+		GetTypeHash(SplitSourceId),
+		static_cast<uint32>(NextAcceptedCutCount)));
+	TArray<FFragmentSpawnPayload> ChildPayloads;
+	if (!MatterFlux::FragmentGeometry::BuildSpawnPayloadsFromComponents(
+		Components,
+		SplitSourceId,
+		ParentWorldTransform,
+		RootMask.Width,
+		RootMask.Height,
+		RootReactionState.Revision,
+		RootMask.CellSize,
+		RootMask.MinFragmentAreaPixels,
+		RootMask.MaxFragmentsPerBreak,
+		ParentWorldTransform.GetLocation(),
+		0.0f,
+		SplitSeed,
+		ChildPayloads,
+		RootMask.GeometryStyle))
+	{
+		return false;
+	}
+	if (ChildPayloads.Num() <= 1)
+	{
+		return true;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return false;
+	}
+	TArray<AFragment2DActor*> SpawnedChildren;
+	SpawnedChildren.Reserve(ChildPayloads.Num());
+	const auto RollBackChildren = [&SpawnedChildren, World]()
+	{
+		for (AFragment2DActor* Child : SpawnedChildren)
+		{
+			if (IsValid(Child))
+			{
+				World->DestroyActor(Child);
+			}
+		}
+		SpawnedChildren.Reset();
+	};
+
+	for (FFragmentSpawnPayload& Payload : ChildPayloads)
+	{
+		Payload.MaterialId = RootReactionState.MaterialId.IsNone()
+			? SpawnPayload.MaterialId
+			: RootReactionState.MaterialId;
+		Payload.bEnableCollision = RootReactionState.bEnableCollision;
+		Payload.FadeOutDuration = 0.0f;
+		Payload.InitialLinearVelocity = PreservedLinearVelocity;
+		Payload.InitialAngularVelocity = PreservedAngularVelocity;
+
+		AFragment2DActor* Child =
+			World->SpawnActorDeferred<AFragment2DActor>(
+				GetClass(),
+				Payload.InitialTransform,
+				GetOwner(),
+				GetInstigator(),
+				ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+		if (!Child)
+		{
+			RollBackChildren();
+			return false;
+		}
+		Child->SpawnPayload = Payload;
+		Child->FragmentMaterial = FragmentMaterial;
+		Child->FragmentColor = FragmentColor;
+		Child->CutsBeforeFade = CutsBeforeFade;
+		Child->CutExhaustionFadeDuration = CutExhaustionFadeDuration;
+		Child->Tags = Tags;
+		Child->Tags.AddUnique(TEXT("MatterFluxFragment"));
+		Child->FinishSpawning(Payload.InitialTransform);
+		SpawnedChildren.Add(Child);
+		if (!IsValid(Child) || !Child->InitializeFromPayload(Payload))
+		{
+			RollBackChildren();
+			return false;
+		}
+
+		FFragmentAggregateSourceState ChildState = RootReactionState;
+		ChildState.SourceId = Payload.FragmentId;
+		ChildState.bOwnsLogicalSource = false;
+		ChildState.LocalTransform = FTransform::Identity;
+		ChildState.SourceMask = Payload.DetachedVoxelMask;
+		const FTransform ChildToParent =
+			Payload.InitialTransform.GetRelativeTransform(
+				ParentWorldTransform);
+		if (RootReactionState.OutputMask.HasValidLayout())
+		{
+			if (!CopyMaskToChildFrame(
+					RootReactionState.OutputMask,
+					Payload.DetachedVoxelMask,
+					ChildToParent,
+					ChildState.OutputMask))
+			{
+				RollBackChildren();
+				return false;
+			}
+		}
+		else
+		{
+			ChildState.OutputMask = Payload.DetachedVoxelMask;
+			ChildState.OutputMask.SolidMask.Init(
+				0,
+				ChildState.OutputMask.Width
+					* ChildState.OutputMask.Height);
+		}
+		if (RootReactionState.ActiveMask.HasValidLayout())
+		{
+			if (!CopyMaskToChildFrame(
+					RootReactionState.ActiveMask,
+					Payload.DetachedVoxelMask,
+					ChildToParent,
+					ChildState.ActiveMask))
+			{
+				RollBackChildren();
+				return false;
+			}
+		}
+		else
+		{
+			ChildState.ActiveMask = Payload.DetachedVoxelMask;
+			ChildState.ActiveMask.SolidMask.Init(
+				0,
+				ChildState.ActiveMask.Width
+					* ChildState.ActiveMask.Height);
+		}
+
+		Child->RootReactionState = MoveTemp(ChildState);
+		Child->AcceptedCutCount = NextAcceptedCutCount;
+		Child->RefreshBuoyancyDensity();
+		if (!Child->RebuildMeshFromPayload())
+		{
+			RollBackChildren();
+			return false;
+		}
+		Child->SetActorTickEnabled(
+			Child->SpawnPayload.FadeOutDuration > 0.0f
+				|| Child->IsRootReacting());
+		Child->ForceNetUpdate();
+	}
+
+	MeshComponent->SetSimulatePhysics(false);
+	MeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	bOutSplit = true;
+	Destroy();
 	return true;
 }
 

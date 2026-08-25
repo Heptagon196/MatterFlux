@@ -22,12 +22,20 @@ namespace MatterFlux::Material
 		bool bCullOutsideSurfaceBounds = true;
 		/** Physical height represented by Amount=255 in surface-topology worlds. */
 		int32 LiquidFullColumnHeight = 255;
+		/** Maximum adjacent powder-height delta, in conserved amount units. */
+		int32 PowderMaximumStableSlopeAmount = 96;
+		/** Fixed steps after the final body constraint before wake refill begins. */
+		int32 BodyWakeRefillDelaySteps = 8;
+		/** Target fixed-step duration of the progressive body-wake refill. */
+		int32 BodyWakeRefillDurationSteps = 16;
 
 		bool IsValid() const;
 	};
 
 	struct FStepStats
 	{
+		/** Dirty candidates scheduled before phase/material filtering. */
+		int32 CandidateCells = 0;
 		int32 MovedCells = 0;
 		int32 ReactedPairs = 0;
 		int32 CulledCells = 0;
@@ -97,6 +105,30 @@ namespace MatterFlux::Material
 			const FIntPoint& WorldCell,
 			FName MaterialId,
 			uint16 Amount);
+		/**
+		 * Adds conserved material to a surface column without discarding another
+		 * flowing material already occupying that column. Layers are ordered by
+		 * density, so powder can settle below liquid at the same terrain cell.
+		 * Returns the amount accepted by the column.
+		 */
+		int32 AddCellAmount(
+			const FIntPoint& WorldCell,
+			FName MaterialId,
+			uint16 Amount);
+		/**
+		 * Atomically rolls an incoming powder packet across the current canonical
+		 * surface until adding it preserves the material's angle of repose.
+		 * Returns the conserved amount accepted and reports the actual destination.
+		 */
+		int32 AddPowderAmountAtStableSurface(
+			const FIntPoint& ImpactCell,
+			FName MaterialId,
+			uint16 Amount,
+			int32 MaximumTravelCells,
+			FIntPoint& OutDestinationCell);
+		uint16 GetMaterialAmountAt(
+			const FIntPoint& WorldCell,
+			FName MaterialId) const;
 		bool SetSupportHeight(const FIntPoint& WorldCell, int32 Height);
 		/**
 		 * Adds a non-serialized physical support supplied by a world object such as
@@ -147,7 +179,17 @@ namespace MatterFlux::Material
 		int32 GetArchivedChunkCount() const;
 		int32 GetSimulationFocusCount() const;
 		void GetActiveCells(TArray<FCellSnapshot>& OutCells) const;
-		/** Enumerates resident and archived facts for complete visual projection. */
+		/** Enumerates resident facts only for local disposable projections. */
+		void GetResidentCells(TArray<FCellSnapshot>& OutCells) const;
+		/**
+		 * Enumerates only the requested material chunks, reading either their live
+		 * resident state or compact archived state. This is the bounded query used
+		 * by disposable local projections such as the visible liquid surface.
+		 */
+		void GetCellsInChunks(
+			TConstArrayView<FIntPoint> Chunks,
+			TArray<FCellSnapshot>& OutCells) const;
+		/** Enumerates every fact for persistence and diagnostic inspection. */
 		void GetAllCells(TArray<FCellSnapshot>& OutCells) const;
 		/**
 		 * Moves the render-dirty material chunk set to the caller. Simulation dirty

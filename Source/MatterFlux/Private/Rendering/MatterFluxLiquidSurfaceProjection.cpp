@@ -4,25 +4,6 @@ namespace MatterFlux::Rendering
 {
 	namespace
 	{
-		struct FPatchCornerKey
-		{
-			FIntPoint Corner = FIntPoint::ZeroValue;
-			int32 Patch = 0;
-
-			friend bool operator==(
-				const FPatchCornerKey& Left,
-				const FPatchCornerKey& Right)
-			{
-				return Left.Patch == Right.Patch
-					&& Left.Corner == Right.Corner;
-			}
-
-			friend uint32 GetTypeHash(const FPatchCornerKey& Key)
-			{
-				return HashCombine(GetTypeHash(Key.Corner), GetTypeHash(Key.Patch));
-			}
-		};
-
 		float Median(TArray<float>& Values)
 		{
 			if (Values.IsEmpty())
@@ -54,7 +35,8 @@ namespace MatterFlux::Rendering
 			const float BottomStartZ,
 			const float BottomEndZ,
 			const FVector& Normal,
-			const float CellSize)
+			const float CellSize,
+			const float ColumnDepth)
 		{
 			if (TopStart.Z <= BottomStartZ + KINDA_SMALL_NUMBER
 				&& TopEnd.Z <= BottomEndZ + KINDA_SMALL_NUMBER)
@@ -68,6 +50,8 @@ namespace MatterFlux::Rendering
 			const int32 FirstVertex = Projection.Vertices.Num();
 			Projection.Vertices.Append({ TopStart, TopEnd, BottomEnd, BottomStart });
 			Projection.Normals.Append({ Normal, Normal, Normal, Normal });
+			Projection.ColumnDepths.Append({
+				ColumnDepth, ColumnDepth, ColumnDepth, ColumnDepth });
 			const float EdgeLength = FVector::Distance(TopStart, TopEnd)
 				/ FMath::Max(CellSize, 1.0f);
 			const float StartDepth = (TopStart.Z - BottomStart.Z)
@@ -103,8 +87,10 @@ namespace MatterFlux::Rendering
 
 			TMap<FIntPoint, float> CurrentHeights;
 			TMap<FIntPoint, float> CurrentSupports;
+			TMap<FIntPoint, float> CurrentDepths;
 			CurrentHeights.Reserve(Cells.Num());
 			CurrentSupports.Reserve(Cells.Num());
+			CurrentDepths.Reserve(Cells.Num());
 			for (const Material::FCellSnapshot& Cell : Cells)
 			{
 				const float SurfaceHeight = static_cast<float>(Cell.SupportHeight)
@@ -123,6 +109,14 @@ namespace MatterFlux::Rendering
 					CurrentSupports.Add(Cell.WorldCell,
 						static_cast<float>(Cell.SupportHeight));
 				}
+			}
+			for (const TPair<FIntPoint, float>& Pair : CurrentHeights)
+			{
+				CurrentDepths.Add(
+					Pair.Key,
+					FMath::Max(
+						Pair.Value - CurrentSupports.FindChecked(Pair.Key),
+						0.0f));
 			}
 
 			TArray<float> CurrentSurfaceValues;
@@ -147,18 +141,14 @@ namespace MatterFlux::Rendering
 			});
 
 			TSet<FIntPoint> Visited;
-			TMap<FIntPoint, int32> CellPatches;
-			TMap<FPatchCornerKey, float> PatchCornerHeights;
 			const float MaximumContinuousSurfaceStep = FMath::Max(
 				4.0f, FMath::Min(CellSize * 2.0f, FullColumnHeight * 0.25f));
-			int32 NextPatch = 0;
 			for (const FIntPoint Root : CurrentCells)
 			{
 				if (Visited.Contains(Root))
 				{
 					continue;
 				}
-				const int32 Patch = NextPatch++;
 				TArray<FIntPoint> ShapeCells{ Root };
 				Visited.Add(Root);
 				for (int32 QueueIndex = 0; QueueIndex < ShapeCells.Num(); ++QueueIndex)
@@ -192,34 +182,12 @@ namespace MatterFlux::Rendering
 					return Left.Y != Right.Y ? Left.Y < Right.Y : Left.X < Right.X;
 				});
 				bool bPatchIsOwned = false;
-				TMap<FIntPoint, TArray<float, TInlineAllocator<4>>> CornerContributions;
 				for (const FIntPoint Cell : ShapeCells)
 				{
-					CellPatches.Add(Cell, Patch);
 					bPatchIsOwned |= IsOwnedCell(Cell, OwnedBounds);
-					const float Height = CurrentHeights.FindChecked(Cell);
-					const FIntPoint Corners[] = {
-						Cell, Cell + FIntPoint(1, 0),
-						Cell + FIntPoint(1, 1), Cell + FIntPoint(0, 1) };
-					for (const FIntPoint Corner : Corners)
-					{
-						CornerContributions.FindOrAdd(Corner).Add(Height);
-					}
 				}
 				OutProjection.SurfacePatchCount += bPatchIsOwned ? 1 : 0;
-				for (const TPair<FIntPoint, TArray<float, TInlineAllocator<4>>>& Pair
-					: CornerContributions)
-				{
-					float Height = 0.0f;
-					for (const float Contribution : Pair.Value)
-					{
-						Height += Contribution;
-					}
-					PatchCornerHeights.Add({ Pair.Key, Patch },
-						Height / static_cast<float>(Pair.Value.Num()));
-				}
 
-				TMap<FIntPoint, int32> CornerIndices;
 				for (const FIntPoint Cell : ShapeCells)
 				{
 					if (!IsOwnedCell(Cell, OwnedBounds))
@@ -229,23 +197,24 @@ namespace MatterFlux::Rendering
 					const FIntPoint Corners[] = {
 						Cell, Cell + FIntPoint(1, 0),
 						Cell + FIntPoint(1, 1), Cell + FIntPoint(0, 1) };
+					const float Height = CurrentHeights.FindChecked(Cell);
+					const float ColumnDepth = CurrentDepths.FindChecked(Cell);
 					int32 CellCornerIndices[4];
 					for (int32 CornerIndex = 0; CornerIndex < 4; ++CornerIndex)
 					{
 						const FIntPoint Corner = Corners[CornerIndex];
-						if (const int32* ExistingIndex = CornerIndices.Find(Corner))
-						{
-							CellCornerIndices[CornerIndex] = *ExistingIndex;
-							continue;
-						}
 						const int32 VertexIndex = OutProjection.Vertices.Num();
-						CornerIndices.Add(Corner, VertexIndex);
 						CellCornerIndices[CornerIndex] = VertexIndex;
 						OutProjection.Vertices.Add(FVector(
 							static_cast<float>(Corner.X) * CellSize,
 							static_cast<float>(Corner.Y) * CellSize,
-							PatchCornerHeights.FindChecked({ Corner, Patch })));
+							Height));
 						OutProjection.Normals.Add(FVector::UpVector);
+						OutProjection.ColumnDepths.Add(ColumnDepth);
+						// World-continuous UVs let equal-height particles read as
+						// one flat body. Their vertices remain independent, so an
+						// unequal neighbor produces a hard voxel step, never a
+						// curved interpolation between particle heights.
 						OutProjection.UVs.Add(FVector2D(
 							static_cast<float>(Corner.X),
 							static_cast<float>(Corner.Y)));
@@ -256,20 +225,17 @@ namespace MatterFlux::Rendering
 				}
 			}
 
+			OutProjection.TopVertexCount = OutProjection.Vertices.Num();
 			OutProjection.TopTriangleIndexCount = OutProjection.Triangles.Num();
 			const FIntPoint EdgeOffsets[] = {
 				FIntPoint(0, -1), FIntPoint(1, 0),
 				FIntPoint(0, 1), FIntPoint(-1, 0) };
-			const FVector EdgeNormals[] = {
-				-FVector::YAxisVector, FVector::XAxisVector,
-				FVector::YAxisVector, -FVector::XAxisVector };
 			for (const FIntPoint Cell : CurrentCells)
 			{
 				if (!IsOwnedCell(Cell, OwnedBounds))
 				{
 					continue;
 				}
-				const int32 Patch = CellPatches.FindChecked(Cell);
 				const float Surface = CurrentHeights.FindChecked(Cell);
 				const float Support = CurrentSupports.FindChecked(Cell);
 				const FIntPoint EdgeCorners[4][2] = {
@@ -281,8 +247,8 @@ namespace MatterFlux::Rendering
 				{
 					const FIntPoint Neighbor = Cell + EdgeOffsets[Edge];
 					const float* NeighborSurface = CurrentHeights.Find(Neighbor);
-					const int32* NeighborPatch = CellPatches.Find(Neighbor);
-					if (NeighborSurface && NeighborPatch && *NeighborPatch == Patch)
+					if (NeighborSurface
+						&& FMath::IsNearlyEqual(*NeighborSurface, Surface))
 					{
 						continue;
 					}
@@ -298,13 +264,19 @@ namespace MatterFlux::Rendering
 					AddSideQuad(
 						OutProjection,
 						FVector(StartCorner.X * CellSize, StartCorner.Y * CellSize,
-							PatchCornerHeights.FindChecked({ StartCorner, Patch })),
+							Surface),
 						FVector(EndCorner.X * CellSize, EndCorner.Y * CellSize,
-							PatchCornerHeights.FindChecked({ EndCorner, Patch })),
+							Surface),
 						Bottom,
 						Bottom,
-						EdgeNormals[Edge],
-						CellSize);
+						// The voxel-liquid material uses the supplied normal for
+						// strong face contrast. Horizontal normals turn short
+						// refill skirts nearly black and read as detached debris;
+						// the disposable liquid shell keeps one uniform top-lit
+						// response while its geometry still carries the step.
+						FVector::UpVector,
+						CellSize,
+						CurrentDepths.FindChecked(Cell));
 				}
 			}
 		}
@@ -316,7 +288,9 @@ namespace MatterFlux::Rendering
 		Triangles.Reset();
 		Normals.Reset();
 		UVs.Reset();
+		ColumnDepths.Reset();
 		SurfaceHeights.Reset();
+		TopVertexCount = 0;
 		TopTriangleIndexCount = 0;
 		SurfacePatchCount = 0;
 		ProjectedCellCount = 0;
@@ -378,6 +352,89 @@ namespace MatterFlux::Rendering
 				((static_cast<uint32>(Chunk.X) + static_cast<uint32>(Chunk.Y)) & 1u)
 				!= 0u;
 			(bOdd ? OutOddChunks : OutEvenChunks).Add(Chunk);
+		}
+	}
+
+	void SelectLiquidProjectionChunksForRebuild(
+		const TConstArrayView<FIntPoint> PendingChunks,
+		const FIntPoint FocusChunk,
+		TArray<FIntPoint>& OutSelectedChunks,
+		const TMap<FIntPoint, uint64>* EnqueueOrders,
+		const int32 MaximumChunksPerPass)
+	{
+		TSet<FIntPoint> UniqueChunks;
+		UniqueChunks.Append(PendingChunks);
+		TArray<FIntPoint> OldestChunks = UniqueChunks.Array();
+		OldestChunks.Sort([EnqueueOrders](
+			const FIntPoint A,
+			const FIntPoint B)
+		{
+			const uint64 OrderA = EnqueueOrders
+				? EnqueueOrders->FindRef(A)
+				: 0;
+			const uint64 OrderB = EnqueueOrders
+				? EnqueueOrders->FindRef(B)
+				: 0;
+			if (OrderA != OrderB)
+			{
+				return OrderA < OrderB;
+			}
+			return A.Y != B.Y ? A.Y < B.Y : A.X < B.X;
+		});
+		const int32 MaximumBudget = FMath::Clamp(
+			MaximumChunksPerPass, 1, 8);
+		const int32 Budget = FMath::Min(
+			OldestChunks.Num(),
+			FMath::Clamp(
+				FMath::DivideAndRoundUp(OldestChunks.Num(), 2),
+				FMath::Min(2, MaximumBudget),
+				MaximumBudget));
+		OutSelectedChunks.Reset(Budget);
+		// Reserve a bounded share for old trailing wakes so they cannot starve,
+		// while keeping most commits near the current gameplay focus. A half/half
+		// split visibly delayed the chunks underneath two simultaneously moving
+		// bodies when the frame budget was reduced below eight.
+		const int32 OldestQuota = FMath::Max(
+			FMath::DivideAndRoundUp(Budget, 3), 1);
+		for (int32 Index = 0;
+			Index < OldestChunks.Num() && OutSelectedChunks.Num() < OldestQuota;
+			++Index)
+		{
+			OutSelectedChunks.Add(OldestChunks[Index]);
+		}
+
+		TArray<FIntPoint> NearestChunks = OldestChunks;
+		NearestChunks.Sort([FocusChunk, EnqueueOrders](
+			const FIntPoint A,
+			const FIntPoint B)
+		{
+			const int32 DistanceA = FMath::Abs(A.X - FocusChunk.X)
+				+ FMath::Abs(A.Y - FocusChunk.Y);
+			const int32 DistanceB = FMath::Abs(B.X - FocusChunk.X)
+				+ FMath::Abs(B.Y - FocusChunk.Y);
+			if (DistanceA != DistanceB)
+			{
+				return DistanceA < DistanceB;
+			}
+			const uint64 OrderA = EnqueueOrders
+				? EnqueueOrders->FindRef(A)
+				: 0;
+			const uint64 OrderB = EnqueueOrders
+				? EnqueueOrders->FindRef(B)
+				: 0;
+			if (OrderA != OrderB)
+			{
+				return OrderA < OrderB;
+			}
+			return A.Y != B.Y ? A.Y < B.Y : A.X < B.X;
+		});
+		for (const FIntPoint Chunk : NearestChunks)
+		{
+			if (OutSelectedChunks.Num() >= Budget)
+			{
+				break;
+			}
+			OutSelectedChunks.AddUnique(Chunk);
 		}
 	}
 }
