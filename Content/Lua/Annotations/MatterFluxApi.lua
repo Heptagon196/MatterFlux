@@ -28,6 +28,16 @@
 ---@field shallow_opacity? number 浅水不透明度，范围 0～1。
 ---@field deep_opacity? number 深水不透明度，范围 0～1，且不小于 shallow_opacity。
 ---@field opacity_depth? number 达到深水不透明度所需的视线内液体深度，单位厘米。
+---@field default_energy? integer 默认比能，范围 0～65535。
+---@field conductivity_permille? integer 接触导热千分比，范围 0～1000。
+---@field cooling_per_step? integer 每个固定步向环境散失的比能，范围 0～65535。
+---@field ignition_threshold? integer 点燃阈值，0 表示不可燃。
+---@field combustion_product? MatterFluxContentId 燃烧后的普通材料；可燃材料必须指定。
+---@field combustion_energy? integer 燃烧产物获得的比能；0 表示保留点燃瞬间能量。
+---@field combustion_emission_material? MatterFluxContentId 燃烧时排放的普通材料。
+---@field combustion_emission_amount? integer 每次点燃产生的显式普通材料排放量；不从满格固体 Amount 扣除。
+---@field combustion_secondary_emission_material? MatterFluxContentId 燃烧时同时排放的第二种普通材料。
+---@field combustion_secondary_emission_amount? integer 第二种燃烧排放量；0 表示不排放。
 
 ---@class MatterFluxMaterialNamespace
 ---@field define fun(definition: MatterFluxMaterialDefinition) 注册物质；命名字段在加载时编译和校验。
@@ -143,7 +153,7 @@
 
 ---@class MatterFluxSpellBuilder
 ---@field projectile fun(parameters: MatterFluxProjectileParameters) 声明一个基础投射物动作。
----@field modify_projectile fun(parameters: MatterFluxProjectileModifierParameters) 修改随后读取到的投射物法术。
+---@field modify_projectile fun(parameters: MatterFluxProjectileModifierParameters) 修改该修正节点整棵子树中的所有投射物法术；嵌套修正继续叠加。
 ---@field draw fun(count: integer, parameters?: MatterFluxDrawParameters) 同时读取指定数量的后续法术。
 ---@field trigger fun(parameters: MatterFluxTriggerParameters) 为投射物或后续法术声明触发器。
 ---@field impulse fun(parameters: MatterFluxImpulseParameters) 声明一次作用于施法者的冲量动作。
@@ -414,22 +424,21 @@ content = {}
 ---@diagnostic disable-next-line: missing-fields
 material = {}
 
----@class MatterFluxReactionPropagation
----@field chance number 每个固定步向四邻域传播的概率，范围 0～1。
-
 ---@class MatterFluxReactionEmission
----@field material MatterFluxContentId 反应活跃时产生的物质。
----@field chance number 每个固定步产生该物质事件的概率，范围 0～1。
+---@field material MatterFluxContentId 接触提交时排放的普通材料。
+---@field amount integer 从 source 一方守恒扣除的材料量。
+---@field energy? integer 排放材料的比能，范围 0～65535。
+---@field source? 'a'|'b' 从哪一方扣除 amount，默认 a。
 
 ---@class MatterFluxReactionDefinition
 ---@field id MatterFluxContentId 稳定规则 ID。
----@field trigger 'contact'|'propagating' 接触立即变换，或在格子上持续并向邻域传播。
----@field inputs MatterFluxContentId[] 两个输入；传播反应中依次为反应物和激活物。
+---@field trigger? 'contact' 仅支持局部接触；默认 contact。
+---@field inputs MatterFluxContentId[] 两个接触输入。
 ---@field outputs MatterFluxContentId[] 两个输出；可使用 empty 表示清空。
 ---@field chance? number 触发概率，范围 0～1，默认 1。
----@field duration_steps? integer 传播反应持续的固定步数。
----@field propagation? MatterFluxReactionPropagation 传播参数。
----@field emission? MatterFluxReactionEmission 活跃期间产生的副产物。
+---@field energy_delta_a? integer 对 A 的比能变化，范围 -65535～65535。
+---@field energy_delta_b? integer 对 B 的比能变化，范围 -65535～65535。
+---@field emissions? MatterFluxReactionEmission[] 至多两个守恒排放结果。
 
 ---@class MatterFluxReactionNamespace
 ---@field define fun(definition: MatterFluxReactionDefinition) 将易读规则编译为本地确定性反应数据。

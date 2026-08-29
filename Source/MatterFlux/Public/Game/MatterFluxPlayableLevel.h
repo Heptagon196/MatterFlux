@@ -111,6 +111,12 @@ namespace MatterFlux::PlayableLevel
 			int64 WorldCellY,
 			float& OutHeight,
 			uint8& OutColorBand) const;
+		/** Samples only the immutable generated baseline, ignoring sparse edits. */
+		bool TrySampleGeneratedWorldCell(
+			int64 WorldCellX,
+			int64 WorldCellY,
+			float& OutHeight,
+			uint8& OutColorBand) const;
 
 		/** True when the global cell belongs to the eagerly generated seed area. */
 		bool ContainsCachedWorldCell(int64 WorldCellX, int64 WorldCellY) const;

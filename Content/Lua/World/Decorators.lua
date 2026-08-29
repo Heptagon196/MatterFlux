@@ -2,5 +2,5 @@ content.register_decorator("forest.tree",        "tree",            "wood",     
 content.register_decorator("forest.rock",        "rock",            "stone",       0.85, 55, 80, false)
 content.register_decorator("forest.grass",       "surface_scatter", "grass",       1.00, 700, 900, false)
 content.register_decorator("forest.flower.pink", "surface_scatter", "flower_pink", 0.30, 180, 280, false)
-content.register_decorator("forest.flower.gold", "surface_scatter", "flower_gold", 0.24, 180, 280, false)
+content.register_decorator("forest.flower.gold", "surface_scatter", "flower_gold", 0.12, 80, 120, false)
 content.register_decorator("forest.flower.blue", "surface_scatter", "flower_blue", 0.20, 160, 240, false)

@@ -30,7 +30,7 @@ bool FMatterFluxReplicatedMaterialState::EncodeActiveState(
 
 	// Active regions are small, latency-sensitive network snapshots. Most
 	// compact canonical states fit with Optimal3; only retry the rare oversized
-	// frame at Optimal5. This keeps the 4096-byte actor-channel guarantee
+	// frame at Optimal5. This keeps the bounded actor-channel guarantee
 	// without charging every stable streaming frame the stronger level's cost.
 	// The compressor id is embedded in the Oodle stream, so decode compatibility
 	// is unchanged.
@@ -131,9 +131,9 @@ bool FMatterFluxReplicatedMaterialState::NetSerialize(
 			0,
 			MaximumCompressedMaterialSnapshotBytes))
 		: 0;
-	// Thirteen bits cover the application budget. Serializing size and bytes as
+	// Fourteen bits cover the application budget. Serializing size and bytes as
 	// one property update prevents adjacent revisions from being combined.
-	Ar.SerializeBits(&PayloadBytes, 13);
+	Ar.SerializeBits(&PayloadBytes, 14);
 	if (PayloadBytes > MaximumCompressedMaterialSnapshotBytes
 		|| (Ar.IsSaving() && PayloadBytes != CompressedState.Num()))
 	{

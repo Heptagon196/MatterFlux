@@ -57,14 +57,14 @@ public:
 	bool HasActiveGhosting() const { return !GhostedSourceIds.IsEmpty(); }
 	/** Visual-QA only: when valid, merged rendering is restricted to one aggregate. */
 	void SetDebugIsolatedAggregate(const FGuid& AggregateId);
-	void FlushDeferredReactionChanges();
+	void FlushDeferredMaterialChanges();
 	EMatterFluxFragmentSourceProxyApplyResult ApplySourceState(
 		const FGuid& SourceId,
 		const TArray<uint8>& RuntimeMask,
-		const TArray<uint8>& OutputMask,
-		FName OutputMaterialId,
-		const FLinearColor& OutputColor,
-		bool bReactionActive);
+		const TArray<uint8>& MaterialOverrideMask,
+		FName OverrideMaterialId,
+		const FLinearColor& OverrideColor,
+		bool bMaterialHot);
 	void FlushPendingChanges();
 	void ResetSources();
 
@@ -75,9 +75,9 @@ public:
 	 * Visual invariant audit: canonical input and reaction output must never
 	 * occupy the same rendered source cell.
 	 */
-	int32 GetInputOutputOverlapCellCount() const;
+	int32 GetBaseOverrideOverlapCellCount() const;
 	/** Tree residue must be compiled into the unified voxel object, not overlaid. */
-	int32 GetStandaloneTreeOutputProjectionCount() const;
+	int32 GetStandaloneTreeMaterialOverrideProjectionCount() const;
 
 private:
 	struct FCachedSourceMesh
@@ -88,7 +88,7 @@ private:
 		TArray<FVector2D> UVs;
 		int32 FaceIndexCount = 0;
 	};
-	struct FSourceOutputState
+	struct FSourceMaterialOverrideState
 	{
 		TArray<uint8> Mask;
 		FName MaterialId = NAME_None;
@@ -103,12 +103,12 @@ private:
 	void RebuildChunk(FIntPoint Chunk);
 	void DestroyChunk(FIntPoint Chunk);
 	void RemoveSourceChunk(FIntPoint Chunk);
-	void SetSourceReactionActive(const FGuid& SourceId, bool bActive);
+	void SetSourceMaterialHot(const FGuid& SourceId, bool bActive);
 	const FCachedSourceMesh* FindOrBuildSourceMesh(
 		const MatterFlux::PlayableLevel::FLevelFragmentSource& Source);
-	const FCachedSourceMesh* FindOrBuildOutputMesh(
+	const FCachedSourceMesh* FindOrBuildMaterialOverrideMesh(
 		const MatterFlux::PlayableLevel::FLevelFragmentSource& Source,
-		const FSourceOutputState& Output);
+		const FSourceMaterialOverrideState& Output);
 	UMaterialInstanceDynamic* FindOrCreateMaterial(
 		FName MaterialId,
 		const FLinearColor& Color,
@@ -131,13 +131,13 @@ private:
 	TSet<FGuid> GhostedSourceIds;
 	TMap<FGuid, float> GhostOpacityBySourceId;
 	FGuid DebugIsolatedAggregateId;
-	TSet<FGuid> ReactingSourceIds;
+	TSet<FGuid> HotSourceIds;
 	TSet<FIntPoint> DirtyChunks;
-	TSet<FIntPoint> DeferredReactionChunks;
+	TSet<FIntPoint> DeferredMaterialChunks;
 	TMap<FGuid, FCachedSourceMesh> CachedSourceMeshes;
-	TMap<FGuid, FSourceOutputState> SourceOutputs;
-	TMap<FGuid, FCachedSourceMesh> CachedOutputMeshes;
-	TMap<FIntPoint, int32> StandaloneTreeOutputProjectionCounts;
+	TMap<FGuid, FSourceMaterialOverrideState> SourceMaterialOverrides;
+	TMap<FGuid, FCachedSourceMesh> CachedMaterialOverrideMeshes;
+	TMap<FIntPoint, int32> StandaloneTreeMaterialOverrideProjectionCounts;
 
 	UPROPERTY(Transient)
 	TMap<FIntPoint, TObjectPtr<UProceduralMeshComponent>> ChunkMeshes;

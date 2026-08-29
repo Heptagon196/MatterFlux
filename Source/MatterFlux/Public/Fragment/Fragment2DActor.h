@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "Fragment/FragmentTypes.h"
+#include "Material/MatterFluxLocalMaterialReaction.h"
 #include "Rendering/MatterFluxSmokeVisualPool.h"
 #include "Fragment2DActor.generated.h"
 
@@ -13,10 +14,34 @@ class UPhysicalMaterial;
 class UMatterFluxBuoyancyComponent;
 class AFragment2DSourceActor;
 struct FFragment2DSourceStreamingState;
-namespace MatterFlux::Reaction
+
+USTRUCT(BlueprintType)
+struct MATTERFLUX_API FFragmentCarrierVolumeCellState
 {
-	class FSourceReactionRuntime;
-}
+	GENERATED_BODY()
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Volume")
+	FIntVector Cell = FIntVector::ZeroValue;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Volume")
+	FName MaterialId = NAME_None;
+
+	UPROPERTY()
+	uint16 Energy = 0;
+
+	bool operator==(const FFragmentCarrierVolumeCellState& Other) const = default;
+};
+
+/** Immutable carrier element projection used to discover cross-body contacts. */
+struct MATTERFLUX_API FFragmentCarrierMaterialElement
+{
+	FMaterialElementAddress Address;
+	FMaterialElementState State;
+	uint16 DefaultEnergy = 0;
+	FVector WorldCenter = FVector::ZeroVector;
+	float CellSize = 0.0f;
+	bool bNonEnvironmentEnergy = false;
+};
 
 /**
  * One independently addressable logical source carried by a detached rigid
@@ -60,36 +85,18 @@ struct MATTERFLUX_API FFragmentAggregateSourceState
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate")
 	bool bEnableCollision = false;
 
-	/** Bit-packed by FFragmentSourceMask::NetSerialize. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Reaction")
-	FFragmentSourceMask OutputMask;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Volume")
+	int32 VolumeTopologyRevision = 0;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Reaction")
-	FFragmentSourceMask ActiveMask;
-
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Reaction")
-	bool bHasReactionState = false;
-
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Reaction")
-	FName ReactionRuleId = NAME_None;
-
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Reaction")
-	FName OutputMaterialId = NAME_None;
-
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Reaction")
-	FLinearColor OutputColor = FLinearColor(0.08f, 0.07f, 0.06f);
-
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Reaction")
-	int32 ReactionSeed = 0;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Volume")
+	int32 VolumeFieldRevision = 0;
 
 	UPROPERTY()
-	uint32 ReactionTick = 0;
+	uint16 VolumeEnvironmentEnergy = 0;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Reaction")
-	float ReactionAccumulator = 0.0f;
-
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Reaction")
-	int32 TotalMaterialEmissionCount = 0;
+	/** Sparse material/energy overrides carried with the rigid body. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate|Volume")
+	TArray<FFragmentCarrierVolumeCellState> VolumeCellStates;
 
 	bool IsValid() const;
 };
@@ -116,15 +123,63 @@ public:
 	FName GetAggregateSourceMaterialId(const FGuid& SourceId) const;
 	bool ApplyAggregateSourceStreamingState(
 		const FGuid& SourceId,
-		const FFragment2DSourceStreamingState& State,
-		FName OutputMaterialId,
-		const FLinearColor& OutputColor);
+		const FFragment2DSourceStreamingState& State);
 	bool GetAggregateSourceWorldTransform(
 		const FGuid& SourceId,
 		FTransform& OutWorldTransform) const;
 	bool GetAggregateSourceState(
 		const FGuid& SourceId,
 		FFragmentAggregateSourceState& OutState) const;
+	/** Resolves the nearest occupied carrier cell as one stable Volume element. */
+	bool TryGetMaterialVolumeElementAtWorldLocation(
+		const FVector& WorldLocation,
+		const FLocalMaterialReactionProgram& Program,
+		FMaterialElementAddress& OutAddress,
+		FMaterialElementState& OutState,
+		uint16& OutDefaultEnergy,
+		FVector& OutWorldCellCenter) const;
+	/** Atomically validates and commits one local-kernel result to the carrier. */
+	bool CommitMaterialVolumeCellState(
+		const FMaterialElementAddress& Address,
+		uint16 DefaultEnergy,
+		const FMaterialElementState& ExpectedBefore,
+		const FMaterialElementState& After,
+		const FLocalMaterialReactionProgram& Program,
+		FString& OutError);
+	/** Validates every touched carrier cell before publishing one replicated state. */
+	bool CommitMaterialVolumeElementBatch(
+		const FMaterialDeltaBatch& Batch,
+		const FLocalMaterialReactionProgram& Program,
+		FString& OutError);
+	/** Atomically commits one kernel batch spanning two independent rigid carriers. */
+	static bool CommitMaterialVolumePairBatch(
+		AFragment2DActor& CarrierA,
+		AFragment2DActor& CarrierB,
+		const FMaterialDeltaBatch& Batch,
+		const FLocalMaterialReactionProgram& Program,
+		FString& OutError);
+	/** Returns a stable immutable projection of every occupied carrier cell. */
+	bool GatherMaterialVolumeElements(
+		const FLocalMaterialReactionProgram& Program,
+		TArray<FFragmentCarrierMaterialElement>& OutElements,
+		FString& OutError) const;
+	/** Runs one bounded fixed step over occupied neighbouring carrier cells. */
+	bool AdvanceLocalMaterialVolumeReactions(
+		const FLocalMaterialReactionProgram& Program,
+		uint32 Seed,
+		int32 LogicalStep,
+		int32 MaxContacts,
+		TArray<FMaterialParticleEmission>& OutEmissions,
+		int32& OutProcessedContacts,
+		FString& OutError);
+	/** True while sparse carrier cells still contain non-ambient energy. */
+	bool HasLocalMaterialVolumeReactionWork() const;
+	/** Scheduler query that also retains isolated hot cells for cross-body contact. */
+	bool HasNonEnvironmentMaterialVolumeEnergy() const;
+	/** Resolves a stable carrier address without a nearest-cell search. */
+	bool TryGetMaterialVolumeElementWorldLocation(
+		const FMaterialElementAddress& Address,
+		FVector& OutWorldLocation) const;
 	bool ApplyMaterialStimulusAtWorldLocation(
 		const FVector& WorldLocation,
 		FName StimulusMaterial,
@@ -142,12 +197,12 @@ public:
 		float EndRadius,
 		FName StimulusMaterial,
 		int32 EventSeed);
-	bool IsRootReacting() const;
-	bool IsAggregateSourceReacting(const FGuid& SourceId) const;
-	bool IsAnyAggregateMaterialReacting(FName MaterialId) const;
-	int32 GetRootReactionOutputCellCount() const;
+	bool IsRootMaterialHot() const;
+	bool IsAggregateSourceMaterialHot(const FGuid& SourceId) const;
+	bool IsAnyAggregateMaterialHot(FName MaterialId) const;
+	int32 GetRootMaterialOverrideCellCount() const;
 	FBox GetReactiveWorldBounds() const;
-	void GatherRootReactionVisualTransforms(
+	void GatherRootMaterialVisualTransforms(
 		TArray<FTransform>& OutFlameTransforms,
 		TArray<MatterFlux::Rendering::FMaterialEmissionAnchor>& OutSmokeAnchors,
 		int32 MaxVisualInstances) const;
@@ -189,9 +244,9 @@ public:
 	UPROPERTY(ReplicatedUsing = OnRep_AggregateSources, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Aggregate")
 	TArray<FFragmentAggregateSourceState> AggregateSources;
 
-	/** Reaction state for the detached payload itself (for example the cut trunk). */
-	UPROPERTY(ReplicatedUsing = OnRep_RootReactionState, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Reaction")
-	FFragmentAggregateSourceState RootReactionState;
+	/** Material Volume state for the detached payload itself (for example the cut trunk). */
+	UPROPERTY(ReplicatedUsing = OnRep_RootMaterialState, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Volume")
+	FFragmentAggregateSourceState RootMaterialState;
 
 	/** Telemetry: number of world cuts that changed this detached item. */
 	UPROPERTY(ReplicatedUsing = OnRep_CutState, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Cut")
@@ -220,7 +275,7 @@ protected:
 	void OnRep_AggregateSources();
 
 	UFUNCTION()
-	void OnRep_RootReactionState();
+	void OnRep_RootMaterialState();
 
 	UFUNCTION()
 	void OnRep_CutState();
@@ -244,23 +299,14 @@ protected:
 		int32 NextAcceptedCutCount,
 		bool& bOutSplit);
 	void ApplyTransientFadeAlpha();
-	void InitializeRootReactionState();
+	void InitializeRootMaterialState();
 	bool ApplyMaterialStimulusToRootAtWorldLocation(
 		const FVector& WorldLocation,
 		FName StimulusMaterial,
 		int32 EventSeed);
-	bool SynchronizeRootReactionState();
-	void AdvanceRootReaction(float DeltaSeconds);
 	bool ApplyMaterialStimulusToDetachedAggregateAtWorldLocation(
 		const FGuid& SourceId,
 		const FVector& WorldLocation,
-		FName StimulusMaterial,
-		int32 EventSeed);
-	bool SynchronizeDetachedAggregateReactionState(const FGuid& SourceId);
-	void AdvanceDetachedAggregateReaction(float DeltaSeconds);
-	bool EmitReactionParticleToAdjacentLayer(
-		const FFragmentAggregateSourceState& ActiveSource,
-		const FTransform& ActiveWorldTransform,
 		FName StimulusMaterial,
 		int32 EventSeed);
 	void MarkReactionVisualizationDirty() const;
@@ -281,10 +327,4 @@ protected:
 	float TransientFadeElapsed = 0.0f;
 	float TransientFadeAlpha = 1.0f;
 	float VisualDepthOffset = 0.0f;
-	float RootReactionPropagationAccumulator = 0.0f;
-	float DetachedAggregateReactionPropagationAccumulator = 0.0f;
-	TUniquePtr<MatterFlux::Reaction::FSourceReactionRuntime>
-		RootReactionRuntime;
-	TMap<FGuid, TUniquePtr<MatterFlux::Reaction::FSourceReactionRuntime>>
-		DetachedAggregateReactionRuntimes;
 };

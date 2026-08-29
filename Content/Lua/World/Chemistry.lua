@@ -38,25 +38,5 @@ corrodible("acid_soil_corrosion", "soil")
 corrodible("acid_stone_corrosion", "stone")
 corrodible("acid_sand_corrosion", "sand")
 
-local function combustible(id, fuel, residue, spread, duration, smoke)
-    reaction.define {
-        id = id,
-        trigger = "propagating",
-        inputs = { fuel, "fire" },
-        outputs = { residue, "fire" },
-        chance = 1.0,
-        duration_steps = duration,
-        propagation = { chance = spread },
-        emission = { material = "smoke", chance = smoke },
-    }
-end
-
--- 单格燃烧时间应短于整棵树的传播时间：火沿相邻格推进形成火线，已经
--- 烧过的格及时熄灭，避免树烧完后还长期罩着一层红色火焰体素。
-combustible("wood_burn", "wood", "charcoal", 0.72, 3, 0.68)
-combustible("leaf_burn", "leaf", "ash", 1.0, 3, 0.82)
-combustible("grass_burn", "grass", "ash", 0.18, 5, 0.76)
-combustible("grassland_burn", "grassland", "ash", 0.025, 8, 0.42)
-combustible("pink_flower_burn", "flower_pink", "ash", 0.88, 6, 0.72)
-combustible("gold_flower_burn", "flower_gold", "ash", 0.88, 6, 0.72)
-combustible("blue_flower_burn", "flower_blue", "ash", 0.88, 6, 0.72)
+-- 燃烧不再是规则状态。Default.lua 中的可燃材料通过接触导热达到点燃
+-- 阈值，随后转化为炭/灰并排放普通 smoke 材料元素。

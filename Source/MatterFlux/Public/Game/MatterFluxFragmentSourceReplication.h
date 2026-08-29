@@ -8,6 +8,21 @@
 class AMatterFluxPlayableWorldActor;
 
 USTRUCT()
+struct MATTERFLUX_API FMatterFluxReplicatedVolumeCellState
+{
+	GENERATED_BODY()
+
+	UPROPERTY()
+	FIntVector Cell = FIntVector::ZeroValue;
+
+	UPROPERTY()
+	FName MaterialId = NAME_None;
+
+	UPROPERTY()
+	uint16 Energy = 0;
+};
+
+USTRUCT()
 struct MATTERFLUX_API FMatterFluxReplicatedFragmentSourceState
 	: public FFastArraySerializerItem
 {
@@ -20,31 +35,19 @@ struct MATTERFLUX_API FMatterFluxReplicatedFragmentSourceState
 	int32 Revision = 0;
 
 	UPROPERTY()
+	int32 VolumeTopologyRevision = 0;
+
+	UPROPERTY()
+	int32 VolumeFieldRevision = 0;
+
+	UPROPERTY()
+	uint16 VolumeEnvironmentEnergy = 0;
+
+	UPROPERTY()
+	TArray<FMatterFluxReplicatedVolumeCellState> VolumeCellStates;
+
+	UPROPERTY()
 	TArray<uint8> PackedRuntimeMask;
-
-	UPROPERTY()
-	bool bHasReactionState = false;
-
-	UPROPERTY()
-	FName ReactionRuleId = NAME_None;
-
-	UPROPERTY()
-	int32 ReactionSeed = 0;
-
-	UPROPERTY()
-	uint32 ReactionTick = 0;
-
-	UPROPERTY()
-	TArray<uint8> PackedOutputMask;
-
-	UPROPERTY()
-	TArray<uint8> PackedActiveMask;
-
-	UPROPERTY()
-	float ReactionAccumulator = 0.0f;
-
-	UPROPERTY()
-	int32 TotalMaterialEmissionCount = 0;
 
 };
 

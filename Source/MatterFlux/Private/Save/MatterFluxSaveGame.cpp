@@ -72,20 +72,34 @@ bool UMatterFluxSaveGame::ValidateAndMigrate(FString& OutError)
 {
 	using namespace MatterFluxSaveValidation;
 	OutError.Reset();
+	const int32 SourceVersion = SaveVersion;
 	if (SaveVersion < 0 || SaveVersion > CurrentVersion)
 	{
 		OutError = FString::Printf(
 			TEXT("unsupported save version %d"), SaveVersion);
 		return false;
 	}
-	if (SaveVersion <= 1)
+	const bool bHasSourceReactionState =
+		WorldState.FragmentSources.ContainsByPredicate(
+			[](const FMatterFluxSavedFragmentSourceState& State)
+			{
+				return State.bHasReactionState;
+			});
+	if (bHasSourceReactionState || WorldState.bHasGroundReactionState)
+	{
+		OutError = SourceVersion == 5
+			? TEXT("Version 5 save contains incompatible object-level ReactionState; the world was not modified")
+			: TEXT("save contains deprecated object-level ReactionState");
+		return false;
+	}
+	if (SourceVersion <= 1)
 	{
 		// Versions 0-1 predate item/quest persistence. Revision zero tells the
 		// authoritative component to rebuild Lua-defined starter progression.
 		Progression = FMatterFluxProgressionSaveState();
 		Progression.Revision = 0;
 	}
-	if (SaveVersion <= 3)
+	if (SourceVersion <= 3)
 	{
 		// Version 4 turns Space from a hard-coded jump input into the fifth
 		// equipment key. Older valid inventories gain an empty slot; their owned
@@ -95,13 +109,12 @@ bool UMatterFluxSaveGame::ValidateAndMigrate(FString& OutError)
 			MagicInventory.EquippedWands.SetNum(EquipmentSlotCount);
 		}
 	}
-	if (SaveVersion <= 4)
+	if (SourceVersion <= 4)
 	{
 		// Version 5 records whether a save belongs to the procedural free mode
 		// or to a Lua-authored story map. Older saves are all free-mode worlds.
 		CustomMapId = NAME_None;
 	}
-	SaveVersion = CurrentVersion;
 	if (MapSeed <= 0 || !PlayerTransform.IsValid())
 	{
 		OutError = TEXT("save has an invalid map seed or player transform");
@@ -217,6 +230,8 @@ bool UMatterFluxSaveGame::ValidateAndMigrate(FString& OutError)
 		return false;
 	}
 	if (WorldState.MaterialActiveState.Num() > MaximumMaterialStateBytes
+		|| WorldState.TerrainHeightOverrides.Num() > MaximumMaskCells
+		|| WorldState.TerrainSpanOverrides.Num() > MaximumMaskCells
 		|| WorldState.FragmentSources.Num() > MaximumFragmentStates
 		|| WorldState.RemovedFragmentSourceIds.Num() > MaximumFragmentStates
 		|| !FMath::IsFinite(WorldState.GroundReactionAccumulator)
@@ -226,6 +241,57 @@ bool UMatterFluxSaveGame::ValidateAndMigrate(FString& OutError)
 		OutError = TEXT("save exceeds the supported world-state budget");
 		return false;
 	}
+	TSet<FIntPoint> SeenTerrainSpanCells;
+	int64 TerrainSpanCount = 0;
+	for (const FMatterFluxTerrainSpanOverride& Column
+		: WorldState.TerrainSpanOverrides)
+	{
+		if (SeenTerrainSpanCells.Contains(Column.WorldCell))
+		{
+			OutError = TEXT("save contains duplicate terrain span columns");
+			return false;
+		}
+		int32 PreviousEndN = MIN_int32;
+		FName PreviousMaterial = NAME_None;
+		for (const FMatterFluxTerrainSpanState& Span : Column.Spans)
+		{
+			++TerrainSpanCount;
+			if (TerrainSpanCount > MaximumMaskCells
+				|| Span.BeginN >= Span.EndNExclusive
+				|| Span.BeginN < PreviousEndN
+				|| Span.MaterialId.IsNone()
+				|| (Span.BeginN == PreviousEndN
+					&& Span.MaterialId == PreviousMaterial))
+			{
+				OutError = TEXT("save contains an invalid terrain span column");
+				return false;
+			}
+			PreviousEndN = Span.EndNExclusive;
+			PreviousMaterial = Span.MaterialId;
+		}
+		TSet<int32> SeenEnergyCells;
+		for (const FMatterFluxTerrainEnergyState& Energy
+			: Column.EnergyOverrides)
+		{
+			++TerrainSpanCount;
+			if (TerrainSpanCount > MaximumMaskCells
+				|| Energy.N < 0
+				|| SeenEnergyCells.Contains(Energy.N))
+			{
+				OutError = TEXT("save contains an invalid terrain energy field");
+				return false;
+			}
+			SeenEnergyCells.Add(Energy.N);
+		}
+		if (Column.bHasSettledSurface
+			&& (Column.SettledSurfaceN < 0
+				|| Column.SettledSurfaceFace > 5))
+		{
+			OutError = TEXT("save contains an invalid settled terrain surface");
+			return false;
+		}
+		SeenTerrainSpanCells.Add(Column.WorldCell);
+	}
 	TSet<FGuid> SeenSourceIds;
 	for (const FMatterFluxSavedFragmentSourceState& State
 		: WorldState.FragmentSources)
@@ -233,6 +299,9 @@ bool UMatterFluxSaveGame::ValidateAndMigrate(FString& OutError)
 		if (!State.SourceId.IsValid()
 			|| SeenSourceIds.Contains(State.SourceId)
 			|| State.Revision < 0
+			|| State.VolumeTopologyRevision < 0
+			|| State.VolumeFieldRevision < 0
+			|| State.VolumeCellStates.Num() > MaximumMaskCells
 			|| !IsBinaryMask(State.RuntimeMask)
 			|| !FMath::IsFinite(State.ReactionAccumulator)
 			|| State.ReactionAccumulator < 0.0f
@@ -243,6 +312,22 @@ bool UMatterFluxSaveGame::ValidateAndMigrate(FString& OutError)
 		{
 			OutError = TEXT("save contains an invalid fragment-source state");
 			return false;
+		}
+		TSet<FIntVector> SeenVolumeCells;
+		for (const FMatterFluxSavedVolumeCellState& Cell
+			: State.VolumeCellStates)
+		{
+			if (Cell.Cell.X < 0 || Cell.Cell.Y < 0 || Cell.Cell.Z != 0
+				|| Cell.Cell.X >= MaximumMaskCells
+				|| Cell.Cell.Y >= MaximumMaskCells
+				|| Cell.MaterialId.IsNone()
+				|| Cell.MaterialId == TEXT("empty")
+				|| SeenVolumeCells.Contains(Cell.Cell))
+			{
+				OutError = TEXT("save contains an invalid fragment Volume cell state");
+				return false;
+			}
+			SeenVolumeCells.Add(Cell.Cell);
 		}
 		SeenSourceIds.Add(State.SourceId);
 	}
@@ -275,6 +360,23 @@ bool UMatterFluxSaveGame::ValidateAndMigrate(FString& OutError)
 			return false;
 		}
 		SeenIgnitionSourceIds.Add(SourceId);
+	}
+	if (SourceVersion <= 5)
+	{
+		// Deprecated fields survive one reader version only to detect incompatible
+		// ReactionState above. A reaction-free V5 save carries no runtime reaction
+		// fact into V6.
+		for (FMatterFluxSavedFragmentSourceState& State
+			: WorldState.FragmentSources)
+		{
+			State.ReactionState = FMatterFluxSavedReactionState();
+			State.ReactionAccumulator = 0.0f;
+			State.TotalMaterialEmissionCount = 0;
+		}
+		WorldState.GroundReactionState = FMatterFluxSavedReactionState();
+		WorldState.GroundReactionAccumulator = 0.0f;
+		WorldState.GroundReactionRevision = 0;
+		WorldState.SourcesThatActivatedGround.Reset();
 	}
 	SaveVersion = CurrentVersion;
 	return true;

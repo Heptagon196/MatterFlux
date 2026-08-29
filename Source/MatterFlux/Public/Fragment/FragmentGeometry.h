@@ -122,12 +122,12 @@ namespace MatterFlux::FragmentGeometry
 		TArray<FVector2D>& OutUVs,
 		int32& OutPrimaryIndexCount);
 	/**
-	 * Selects active mask cells that are exposed on the top of a voxel column.
+	 * Selects marked mask cells that are exposed on the top of a voxel column.
 	 * The output uses stable mask-index order and is cleared on invalid input.
 	 */
-	MATTERFLUX_API bool GatherTopExposedActiveMaskCells(
+	MATTERFLUX_API bool GatherTopExposedMarkedMaskCells(
 		const TArray<uint8>& OccupiedMask,
-		const TArray<uint8>& ActiveMask,
+		const TArray<uint8>& MarkedMask,
 		int32 Width,
 		int32 Height,
 		TArray<int32>& OutCellIndices);

@@ -32,6 +32,8 @@ namespace MatterFlux::Material
 	 */
 	struct MATTERFLUX_API FAirborneParticle
 	{
+		/** Stable material-element identity; never derived from current array position. */
+		FGuid ParticleId;
 		FGuid BatchId;
 		FName MaterialId = NAME_None;
 		FVector WorldPosition = FVector::ZeroVector;
@@ -41,8 +43,9 @@ namespace MatterFlux::Material
 		float RemainingLifetime = 1.0f;
 		int32 CellCount = 1;
 		int32 ConservedMaterialAmount = 0;
+		/** Deterministic specific energy carried with the conserved amount. */
+		uint16 Energy = 0;
 		int32 EventSeed = 0;
-		int32 ParticleIndex = INDEX_NONE;
 	};
 
 	enum class EReplicatedStateApplyResult : uint8
@@ -126,7 +129,8 @@ namespace MatterFlux::Material
 			float Radius,
 			float GravityScale,
 			float Lifetime,
-			int32 EventSeed);
+			int32 EventSeed,
+			int32 SpecificEnergy = INDEX_NONE);
 		/**
 		 * Advances canonical particles through the geometry adapter. Returning true
 		 * means the callback atomically transferred that particle into another
@@ -149,22 +153,57 @@ namespace MatterFlux::Material
 		/** Removes every canonical airborne particle accepted by the predicate. */
 		int64 RemoveAirborneParticles(
 			TFunctionRef<bool(const FAirborneParticle&)> ShouldRemove);
+		/**
+		 * Converts every committed kernel emission into a canonical airborne
+		 * element while preserving the kernel-assigned stable ParticleId.
+		 */
+		int32 MaterializePendingReactionEmissions(
+			TFunctionRef<FVector(const FIntVector&)> ResolveWorldPosition);
+		/** Materializes an already validated external Volume reaction batch. */
+		int32 MaterializeReactionEmissions(
+			TConstArrayView<FReactionEmission> Emissions,
+			TFunctionRef<FVector(const FIntVector&)> ResolveWorldPosition);
+		/** Atomically reacts the stable particle identity with one world cell. */
+		bool ReactAirborneParticleAt(
+			const FIntPoint& WorldCell,
+			const FGuid& ParticleId,
+			FString& OutError);
+		/**
+		 * Callback-safe overload: mutates the current canonical particle but never
+		 * changes the owning particle array. The advance loop removes empty output.
+		 */
+		bool ReactAirborneParticleAt(
+			const FIntPoint& WorldCell,
+			FAirborneParticle& Particle,
+			FString& OutError);
 
 		bool SetCell(const FIntPoint& WorldCell, FName MaterialId);
 		bool SetCellAmount(
 			const FIntPoint& WorldCell,
 			FName MaterialId,
 			uint16 Amount);
+		bool SetCellAmount(
+			const FIntPoint& WorldCell,
+			FName MaterialId,
+			uint16 Amount,
+			uint16 Energy);
 		int32 AddCellAmount(
 			const FIntPoint& WorldCell,
 			FName MaterialId,
 			uint16 Amount);
+		int32 AddCellAmount(
+			const FIntPoint& WorldCell,
+			FName MaterialId,
+			uint16 Amount,
+			uint16 Energy);
 		int32 AddPowderAmountAtStableSurface(
 			const FIntPoint& ImpactCell,
 			FName MaterialId,
 			uint16 Amount,
 			int32 MaximumTravelCells,
 			FIntPoint& OutDestinationCell);
+		/** Updates the serialized support selected for a stable terrain surface. */
+		bool SetSupportHeight(const FIntPoint& WorldCell, int32 Height);
 		bool SetExternalSupportHeight(
 			const FIntPoint& WorldCell,
 			int32 Height);
@@ -202,6 +241,7 @@ namespace MatterFlux::Material
 		FRuntimeSettings RuntimeSettings;
 		TArray<FIntPoint> CurrentFocuses;
 		TArray<FAirborneParticle> AirborneParticles;
+		TMap<FName, uint16> DefaultMaterialEnergies;
 		float StepAccumulator = 0.0f;
 		int32 LogicalStep = 0;
 		int32 AppliedStateRevision = INDEX_NONE;

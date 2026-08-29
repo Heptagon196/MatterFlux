@@ -6,7 +6,7 @@
 #include "Game/MatterFluxPlayableWorldActor.h"
 #include "IMatterFluxScriptRuntime.h"
 #include "MatterFluxLog.h"
-#include "Material/MatterFluxSourceReactionRuntime.h"
+#include "Material/MatterFluxLocalMaterialReaction.h"
 #include "Material/MatterFluxBuoyancyComponent.h"
 #include "UObject/ConstructorHelpers.h"
 #include "EngineUtils.h"
@@ -112,16 +112,6 @@ namespace
 		return BestDistanceSquared;
 	}
 
-	const FMatterFluxReactionDefinition* FindReactionRule(
-		const FMatterFluxContentRegistry& Registry,
-		const FName InputMaterial,
-		const FName StimulusMaterial)
-	{
-		return MatterFlux::Reaction::FMaterialReactionEngine::
-			FindPropagatingRule(
-				Registry, InputMaterial, StimulusMaterial);
-	}
-
 	int32 CountSetCells(const TArray<uint8>& Mask)
 	{
 		int32 Count = 0;
@@ -132,56 +122,26 @@ namespace
 		return Count;
 	}
 
-	bool CopyMaskToChildFrame(
-		const FFragmentSourceMask& ParentMask,
-		const FFragmentSourceMask& ChildTemplate,
-		const FTransform& ChildToParent,
-		FFragmentSourceMask& OutChildMask)
+	bool HasNonEnvironmentEnergy(
+		const FFragmentAggregateSourceState& State)
 	{
-		if (!ParentMask.HasValidLayout()
-			|| !ChildTemplate.HasValidLayout()
-			|| !ChildToParent.IsValid())
-		{
-			return false;
-		}
-		OutChildMask = ChildTemplate;
-		OutChildMask.SolidMask.Init(
-			0,
-			ChildTemplate.Width * ChildTemplate.Height);
-		for (int32 ChildY = 0; ChildY < ChildTemplate.Height; ++ChildY)
-		{
-			for (int32 ChildX = 0; ChildX < ChildTemplate.Width; ++ChildX)
+		return State.VolumeCellStates.ContainsByPredicate(
+			[&State](const FFragmentCarrierVolumeCellState& Cell)
 			{
-				const FVector ChildCellCenter(
-					(static_cast<float>(ChildX) + 0.5f
-						- static_cast<float>(ChildTemplate.Width) * 0.5f)
-						* ChildTemplate.CellSize,
-					0.0f,
-					(static_cast<float>(ChildY) + 0.5f
-						- static_cast<float>(ChildTemplate.Height) * 0.5f)
-						* ChildTemplate.CellSize);
-				const FVector ParentCellCenter =
-					ChildToParent.TransformPosition(ChildCellCenter);
-				const int32 ParentX = FMath::RoundToInt(
-					ParentCellCenter.X / ParentMask.CellSize
-						+ static_cast<float>(ParentMask.Width) * 0.5f
-						- 0.5f);
-				const int32 ParentY = FMath::RoundToInt(
-					ParentCellCenter.Z / ParentMask.CellSize
-						+ static_cast<float>(ParentMask.Height) * 0.5f
-						- 0.5f);
-				if (ParentX < 0 || ParentX >= ParentMask.Width
-					|| ParentY < 0 || ParentY >= ParentMask.Height)
-				{
-					return false;
-				}
-				OutChildMask.SolidMask[
-					ChildY * ChildTemplate.Width + ChildX] =
-					ParentMask.SolidMask[
-						ParentY * ParentMask.Width + ParentX];
-			}
+				return Cell.Energy != State.VolumeEnvironmentEnergy;
+			});
+	}
+
+	int32 CountMaterialOverrideCells(
+		const FFragmentAggregateSourceState& State)
+	{
+		int32 Count = 0;
+		for (const FFragmentCarrierVolumeCellState& Cell
+			: State.VolumeCellStates)
+		{
+			Count += Cell.MaterialId != State.MaterialId ? 1 : 0;
 		}
-		return true;
+		return Count;
 	}
 
 	double Cross2D(
@@ -333,34 +293,39 @@ namespace
 
 bool FFragmentAggregateSourceState::IsValid() const
 {
-	return SourceId.IsValid()
+	TSet<FIntVector> SeenVolumeCells;
+	const bool bVolumeStateValid = VolumeTopologyRevision >= 0
+		&& VolumeFieldRevision >= 0
+		&& !VolumeCellStates.ContainsByPredicate(
+			[this, &SeenVolumeCells](
+				const FFragmentCarrierVolumeCellState& CellState)
+			{
+				const int32 Index = CellState.Cell.Y * SourceMask.Width
+					+ CellState.Cell.X;
+				const bool bInvalid = CellState.Cell.Z != 0
+					|| CellState.Cell.X < 0 || CellState.Cell.Y < 0
+					|| CellState.Cell.X >= SourceMask.Width
+					|| CellState.Cell.Y >= SourceMask.Height
+					|| !SourceMask.SolidMask.IsValidIndex(Index)
+					|| SourceMask.SolidMask[Index] == 0
+					|| CellState.MaterialId.IsNone()
+					|| CellState.MaterialId == TEXT("empty")
+					|| SeenVolumeCells.Contains(CellState.Cell);
+				SeenVolumeCells.Add(CellState.Cell);
+				return bInvalid;
+			});
+	return bVolumeStateValid
+		&& SourceId.IsValid()
 		&& (DefinitionSourceId.IsValid() || bOwnsLogicalSource)
 		&& Revision >= 0
 		&& SourceMask.HasValidLayout()
-		&& (SourceMask.SolidMask.Contains(1)
-			|| (bHasReactionState
-				&& OutputMask.SolidMask.Contains(1)))
+		&& SourceMask.SolidMask.Contains(1)
 		&& LocalTransform.IsValid()
 		&& !MaterialId.IsNone()
 		&& FMath::IsFinite(Color.R)
 		&& FMath::IsFinite(Color.G)
 		&& FMath::IsFinite(Color.B)
-		&& FMath::IsFinite(Color.A)
-		&& OutputMask.HasValidLayout()
-		&& ActiveMask.HasValidLayout()
-		&& OutputMask.Width == SourceMask.Width
-		&& OutputMask.Height == SourceMask.Height
-		&& ActiveMask.Width == SourceMask.Width
-		&& ActiveMask.Height == SourceMask.Height
-		&& (!bHasReactionState
-			|| (!ReactionRuleId.IsNone()
-				&& FMath::IsFinite(ReactionAccumulator)
-				&& ReactionAccumulator >= 0.0f
-				&& TotalMaterialEmissionCount >= 0
-				&& FMath::IsFinite(OutputColor.R)
-				&& FMath::IsFinite(OutputColor.G)
-				&& FMath::IsFinite(OutputColor.B)
-				&& FMath::IsFinite(OutputColor.A)));
+		&& FMath::IsFinite(Color.A);
 }
 
 AFragment2DActor::AFragment2DActor()
@@ -441,13 +406,9 @@ void AFragment2DActor::BeginPlay()
 void AFragment2DActor::Tick(const float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
-	AdvanceRootReaction(DeltaSeconds);
-	AdvanceDetachedAggregateReaction(DeltaSeconds);
 	if (SpawnPayload.FadeOutDuration <= 0.0f)
 	{
-		SetActorTickEnabled(
-			IsRootReacting()
-			|| !DetachedAggregateReactionRuntimes.IsEmpty());
+		SetActorTickEnabled(false);
 		return;
 	}
 
@@ -484,7 +445,7 @@ bool AFragment2DActor::InitializeFromPayload(const FFragmentSpawnPayload& Payloa
 	SpawnPayload = Payload;
 	AcceptedCutCount = 0;
 	ActiveCutFadeDuration = 0.0f;
-	InitializeRootReactionState();
+	InitializeRootMaterialState();
 	RefreshBuoyancyDensity();
 	const bool bReady = RebuildMeshFromPayload();
 	if (bReady)
@@ -519,7 +480,7 @@ void AFragment2DActor::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out
 	DOREPLIFETIME_CONDITION(AFragment2DActor, FragmentMaterial, COND_InitialOnly);
 	DOREPLIFETIME_CONDITION(AFragment2DActor, FragmentColor, COND_InitialOnly);
 	DOREPLIFETIME(AFragment2DActor, AggregateSources);
-	DOREPLIFETIME(AFragment2DActor, RootReactionState);
+	DOREPLIFETIME(AFragment2DActor, RootMaterialState);
 	DOREPLIFETIME(AFragment2DActor, AcceptedCutCount);
 	DOREPLIFETIME_CONDITION(
 		AFragment2DActor,
@@ -534,7 +495,7 @@ void AFragment2DActor::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out
 
 void AFragment2DActor::OnRep_SpawnPayload()
 {
-	InitializeRootReactionState();
+	InitializeRootMaterialState();
 	RefreshBuoyancyDensity();
 	RebuildMeshFromPayload();
 	SynchronizeCutFadeState();
@@ -546,10 +507,10 @@ void AFragment2DActor::OnRep_SpawnPayload()
 
 void AFragment2DActor::OnRep_FragmentMaterial()
 {
-	if (RootReactionState.SourceId == SpawnPayload.FragmentId)
+	if (RootMaterialState.SourceId == SpawnPayload.FragmentId)
 	{
-		RootReactionState.Material = FragmentMaterial;
-		RootReactionState.Color = FragmentColor;
+		RootMaterialState.Material = FragmentMaterial;
+		RootMaterialState.Color = FragmentColor;
 	}
 	RebuildMeshFromPayload();
 }
@@ -562,11 +523,10 @@ void AFragment2DActor::OnRep_AggregateSources()
 	MarkReactionVisualizationDirty();
 }
 
-void AFragment2DActor::OnRep_RootReactionState()
+void AFragment2DActor::OnRep_RootMaterialState()
 {
 	RebuildMeshFromPayload();
-	SetActorTickEnabled(
-		SpawnPayload.FadeOutDuration > 0.0f || IsRootReacting());
+	SetActorTickEnabled(SpawnPayload.FadeOutDuration > 0.0f);
 	MarkReactionVisualizationDirty();
 }
 
@@ -599,9 +559,9 @@ bool AFragment2DActor::DoesCutShapeIntersect(
 	};
 
 	const FFragmentSourceMask* RootMask = nullptr;
-	if (RootReactionState.IsValid())
+	if (RootMaterialState.IsValid())
 	{
-		RootMask = &RootReactionState.SourceMask;
+		RootMask = &RootMaterialState.SourceMask;
 	}
 	else if (SpawnPayload.DetachedVoxelMask.IsValid())
 	{
@@ -687,7 +647,7 @@ bool AFragment2DActor::TryAcceptWorldCut(
 		: SpawnPayload.InitialAngularVelocity;
 
 	const FFragmentAggregateSourceState PreviousRootState =
-		RootReactionState;
+		RootMaterialState;
 	const TArray<FFragmentAggregateSourceState> PreviousAggregateSources =
 		AggregateSources;
 	const FFragmentSourceMask PreviousDetachedMask =
@@ -720,17 +680,25 @@ bool AFragment2DActor::TryAcceptWorldCut(
 		{
 			return false;
 		}
-		ApplyCutToMask(State.OutputMask, StateWorldTransform);
-		ApplyCutToMask(State.ActiveMask, StateWorldTransform);
+		State.VolumeCellStates.RemoveAll(
+			[&State](const FFragmentCarrierVolumeCellState& Cell)
+			{
+				const int32 Index = Cell.Cell.Y * State.SourceMask.Width
+					+ Cell.Cell.X;
+				return Cell.Cell.Z != 0
+					|| !State.SourceMask.SolidMask.IsValidIndex(Index)
+					|| State.SourceMask.SolidMask[Index] == 0;
+			});
 		++State.Revision;
+		++State.VolumeTopologyRevision;
 		return true;
 	};
 
 	bool bChanged = false;
-	if (RootReactionState.IsValid())
+	if (RootMaterialState.IsValid())
 	{
 		bChanged |= ApplyCutToState(
-			RootReactionState,
+			RootMaterialState,
 			GetActorTransform());
 	}
 	else if (SpawnPayload.DetachedVoxelMask.IsValid())
@@ -750,7 +718,7 @@ bool AFragment2DActor::TryAcceptWorldCut(
 		// Legacy triangulated debris has no retained material mask to edit.
 		// It must still react on the first exact hit instead of silently
 		// accumulating invisible durability counters.
-		if (!RootReactionState.SourceMask.HasValidLayout()
+		if (!RootMaterialState.SourceMask.HasValidLayout()
 			&& !SpawnPayload.DetachedVoxelMask.HasValidLayout()
 			&& AggregateSources.IsEmpty())
 		{
@@ -768,14 +736,12 @@ bool AFragment2DActor::TryAcceptWorldCut(
 	const auto StateHasMaterial = [](
 		const FFragmentAggregateSourceState& State)
 	{
-		return State.SourceMask.SolidMask.Contains(1)
-			|| (State.bHasReactionState
-				&& State.OutputMask.SolidMask.Contains(1));
+		return State.SourceMask.SolidMask.Contains(1);
 	};
 	const bool bHasRemainingMaterial =
-		StateHasMaterial(RootReactionState)
+		StateHasMaterial(RootMaterialState)
 		|| AggregateSources.ContainsByPredicate(StateHasMaterial)
-		|| (!RootReactionState.SourceMask.HasValidLayout()
+		|| (!RootMaterialState.SourceMask.HasValidLayout()
 			&& SpawnPayload.DetachedVoxelMask.SolidMask.Contains(1));
 	if (!bHasRemainingMaterial)
 	{
@@ -795,7 +761,7 @@ bool AFragment2DActor::TryAcceptWorldCut(
 		FMath::Min(AcceptedCutCount + 1, MAX_int32),
 		bSplitIntoIndependentActors))
 	{
-		RootReactionState = PreviousRootState;
+		RootMaterialState = PreviousRootState;
 		AggregateSources = PreviousAggregateSources;
 		SpawnPayload.DetachedVoxelMask = PreviousDetachedMask;
 		RefreshBuoyancyDensity();
@@ -810,7 +776,7 @@ bool AFragment2DActor::TryAcceptWorldCut(
 	RefreshBuoyancyDensity();
 	if (!RebuildMeshFromPayload())
 	{
-		RootReactionState = PreviousRootState;
+		RootMaterialState = PreviousRootState;
 		AggregateSources = PreviousAggregateSources;
 		SpawnPayload.DetachedVoxelMask = PreviousDetachedMask;
 		RefreshBuoyancyDensity();
@@ -849,13 +815,13 @@ bool AFragment2DActor::TrySplitDisconnectedRootMaterial(
 {
 	bOutSplit = false;
 	if (!AggregateSources.IsEmpty()
-		|| !RootReactionState.IsValid()
+		|| !RootMaterialState.IsValid()
 		|| !ParentWorldTransform.IsValid())
 	{
 		return true;
 	}
 
-	const FFragmentSourceMask& RootMask = RootReactionState.SourceMask;
+	const FFragmentSourceMask& RootMask = RootMaterialState.SourceMask;
 	TArray<MatterFlux::FragmentGeometry::FFragmentComponent> Components;
 	MatterFlux::FragmentGeometry::ExtractConnectedComponents(
 		RootMask.SolidMask,
@@ -867,8 +833,8 @@ bool AFragment2DActor::TrySplitDisconnectedRootMaterial(
 		return true;
 	}
 
-	const FGuid SplitSourceId = RootReactionState.SourceId.IsValid()
-		? RootReactionState.SourceId
+	const FGuid SplitSourceId = RootMaterialState.SourceId.IsValid()
+		? RootMaterialState.SourceId
 		: SpawnPayload.FragmentId;
 	const int32 SplitSeed = static_cast<int32>(HashCombineFast(
 		GetTypeHash(SplitSourceId),
@@ -880,7 +846,7 @@ bool AFragment2DActor::TrySplitDisconnectedRootMaterial(
 		ParentWorldTransform,
 		RootMask.Width,
 		RootMask.Height,
-		RootReactionState.Revision,
+		RootMaterialState.Revision,
 		RootMask.CellSize,
 		RootMask.MinFragmentAreaPixels,
 		RootMask.MaxFragmentsPerBreak,
@@ -918,10 +884,10 @@ bool AFragment2DActor::TrySplitDisconnectedRootMaterial(
 
 	for (FFragmentSpawnPayload& Payload : ChildPayloads)
 	{
-		Payload.MaterialId = RootReactionState.MaterialId.IsNone()
+		Payload.MaterialId = RootMaterialState.MaterialId.IsNone()
 			? SpawnPayload.MaterialId
-			: RootReactionState.MaterialId;
-		Payload.bEnableCollision = RootReactionState.bEnableCollision;
+			: RootMaterialState.MaterialId;
+		Payload.bEnableCollision = RootMaterialState.bEnableCollision;
 		Payload.FadeOutDuration = 0.0f;
 		Payload.InitialLinearVelocity = PreservedLinearVelocity;
 		Payload.InitialAngularVelocity = PreservedAngularVelocity;
@@ -953,56 +919,66 @@ bool AFragment2DActor::TrySplitDisconnectedRootMaterial(
 			return false;
 		}
 
-		FFragmentAggregateSourceState ChildState = RootReactionState;
+		FFragmentAggregateSourceState ChildState = RootMaterialState;
 		ChildState.SourceId = Payload.FragmentId;
 		ChildState.bOwnsLogicalSource = false;
 		ChildState.LocalTransform = FTransform::Identity;
 		ChildState.SourceMask = Payload.DetachedVoxelMask;
+		ChildState.VolumeTopologyRevision =
+			RootMaterialState.VolumeTopologyRevision + 1;
 		const FTransform ChildToParent =
 			Payload.InitialTransform.GetRelativeTransform(
 				ParentWorldTransform);
-		if (RootReactionState.OutputMask.HasValidLayout())
+		ChildState.VolumeCellStates.Reset();
+		for (int32 ChildY = 0;
+			ChildY < ChildState.SourceMask.Height;
+			++ChildY)
 		{
-			if (!CopyMaskToChildFrame(
-					RootReactionState.OutputMask,
-					Payload.DetachedVoxelMask,
-					ChildToParent,
-					ChildState.OutputMask))
+			for (int32 ChildX = 0;
+				ChildX < ChildState.SourceMask.Width;
+				++ChildX)
 			{
-				RollBackChildren();
-				return false;
+				const int32 ChildIndex = ChildY
+					* ChildState.SourceMask.Width + ChildX;
+				if (ChildState.SourceMask.SolidMask[ChildIndex] == 0)
+				{
+					continue;
+				}
+				const FVector ChildCellCenter(
+					(static_cast<float>(ChildX) + 0.5f
+						- ChildState.SourceMask.Width * 0.5f)
+						* ChildState.SourceMask.CellSize,
+					0.0f,
+					(static_cast<float>(ChildY) + 0.5f
+						- ChildState.SourceMask.Height * 0.5f)
+						* ChildState.SourceMask.CellSize);
+				const FVector ParentCellCenter =
+					ChildToParent.TransformPosition(ChildCellCenter);
+				const FIntVector ParentCell(
+					FMath::RoundToInt(
+						ParentCellCenter.X / RootMask.CellSize
+							+ RootMask.Width * 0.5f - 0.5f),
+					FMath::RoundToInt(
+						ParentCellCenter.Z / RootMask.CellSize
+							+ RootMask.Height * 0.5f - 0.5f),
+					0);
+				if (const FFragmentCarrierVolumeCellState* ParentState =
+					RootMaterialState.VolumeCellStates.FindByPredicate(
+						[&ParentCell](
+							const FFragmentCarrierVolumeCellState& Cell)
+						{
+							return Cell.Cell == ParentCell;
+						}))
+				{
+					ChildState.VolumeCellStates.Add({
+						FIntVector(ChildX, ChildY, 0),
+						ParentState->MaterialId,
+						ParentState->Energy});
+				}
 			}
-		}
-		else
-		{
-			ChildState.OutputMask = Payload.DetachedVoxelMask;
-			ChildState.OutputMask.SolidMask.Init(
-				0,
-				ChildState.OutputMask.Width
-					* ChildState.OutputMask.Height);
-		}
-		if (RootReactionState.ActiveMask.HasValidLayout())
-		{
-			if (!CopyMaskToChildFrame(
-					RootReactionState.ActiveMask,
-					Payload.DetachedVoxelMask,
-					ChildToParent,
-					ChildState.ActiveMask))
-			{
-				RollBackChildren();
-				return false;
-			}
-		}
-		else
-		{
-			ChildState.ActiveMask = Payload.DetachedVoxelMask;
-			ChildState.ActiveMask.SolidMask.Init(
-				0,
-				ChildState.ActiveMask.Width
-					* ChildState.ActiveMask.Height);
 		}
 
-		Child->RootReactionState = MoveTemp(ChildState);
+		Child->RootMaterialState = MoveTemp(ChildState);
 		Child->AcceptedCutCount = NextAcceptedCutCount;
 		Child->RefreshBuoyancyDensity();
 		if (!Child->RebuildMeshFromPayload())
@@ -1011,8 +987,7 @@ bool AFragment2DActor::TrySplitDisconnectedRootMaterial(
 			return false;
 		}
 		Child->SetActorTickEnabled(
-			Child->SpawnPayload.FadeOutDuration > 0.0f
-				|| Child->IsRootReacting());
+			Child->SpawnPayload.FadeOutDuration > 0.0f);
 		Child->ForceNetUpdate();
 	}
 
@@ -1080,13 +1055,964 @@ bool AFragment2DActor::GetAggregateSourceState(
 	return true;
 }
 
-bool AFragment2DActor::IsRootReacting() const
+bool AFragment2DActor::TryGetMaterialVolumeElementAtWorldLocation(
+	const FVector& WorldLocation,
+	const FLocalMaterialReactionProgram& Program,
+	FMaterialElementAddress& OutAddress,
+	FMaterialElementState& OutState,
+	uint16& OutDefaultEnergy,
+	FVector& OutWorldCellCenter) const
 {
-	return RootReactionState.bHasReactionState
-		&& RootReactionState.ActiveMask.SolidMask.Contains(1);
+	OutAddress = FMaterialElementAddress();
+	OutState = FMaterialElementState();
+	OutDefaultEnergy = 0;
+	OutWorldCellCenter = FVector::ZeroVector;
+	if (WorldLocation.ContainsNaN() || !Program.IsCompiled())
+	{
+		return false;
+	}
+
+	struct FCandidate
+	{
+		const FFragmentAggregateSourceState* Source = nullptr;
+		FIntVector Cell = FIntVector::ZeroValue;
+		FVector WorldCenter = FVector::ZeroVector;
+		double DistanceSquared = TNumericLimits<double>::Max();
+		bool bRoot = false;
+	};
+	FCandidate Best;
+	const auto ConsiderSource = [this, &WorldLocation, &Best](
+		const FFragmentAggregateSourceState& Source,
+		const FTransform& WorldTransform,
+		const bool bRoot)
+	{
+		if (!Source.IsValid() || !WorldTransform.IsValid())
+		{
+			return;
+		}
+		for (int32 Index = 0; Index < Source.SourceMask.SolidMask.Num(); ++Index)
+		{
+			if (Source.SourceMask.SolidMask[Index] == 0)
+			{
+				continue;
+			}
+			const int32 U = Index % Source.SourceMask.Width;
+			const int32 V = Index / Source.SourceMask.Width;
+			const FVector LocalCenter(
+				(static_cast<double>(U) + 0.5
+					- static_cast<double>(Source.SourceMask.Width) * 0.5)
+					* Source.SourceMask.CellSize,
+				0.0,
+				(static_cast<double>(V) + 0.5
+					- static_cast<double>(Source.SourceMask.Height) * 0.5)
+					* Source.SourceMask.CellSize);
+			const FVector WorldCenter =
+				WorldTransform.TransformPosition(LocalCenter);
+			const double DistanceSquared =
+				FVector::DistSquared(WorldCenter, WorldLocation);
+			const bool bStableTie = FMath::IsNearlyEqual(
+				DistanceSquared, Best.DistanceSquared)
+				&& (bRoot != Best.bRoot
+					? bRoot
+					: Source.SourceId.ToString(EGuidFormats::Digits)
+						< (Best.Source
+							? Best.Source->SourceId.ToString(EGuidFormats::Digits)
+							: FString()));
+			if (DistanceSquared < Best.DistanceSquared || bStableTie)
+			{
+				Best.Source = &Source;
+				Best.Cell = FIntVector(U, V, 0);
+				Best.WorldCenter = WorldCenter;
+				Best.DistanceSquared = DistanceSquared;
+				Best.bRoot = bRoot;
+			}
+		}
+	};
+	if (RootMaterialState.IsValid())
+	{
+		ConsiderSource(RootMaterialState, GetActorTransform(), true);
+	}
+	for (const FFragmentAggregateSourceState& Source : AggregateSources)
+	{
+		ConsiderSource(
+			Source, Source.LocalTransform * GetActorTransform(), false);
+	}
+	if (!Best.Source)
+	{
+		return false;
+	}
+
+	FName MaterialId = Best.Source->MaterialId;
+	const FFragmentCarrierVolumeCellState* Override =
+		Best.Source->VolumeCellStates.FindByPredicate(
+			[&Best](const FFragmentCarrierVolumeCellState& CellState)
+			{
+				return CellState.Cell == Best.Cell;
+			});
+	if (Override)
+	{
+		MaterialId = Override->MaterialId;
+	}
+	if (!Program.MakeState(
+			MaterialId, 255, TOptional<uint16>(), OutState))
+	{
+		return false;
+	}
+	OutDefaultEnergy = OutState.Energy;
+	if (Override)
+	{
+		OutState.Energy = Override->Energy;
+	}
+	else if (Best.Source->VolumeFieldRevision > 0
+		|| Best.Source->VolumeEnvironmentEnergy != 0)
+	{
+		OutState.Energy = Best.Source->VolumeEnvironmentEnergy;
+	}
+	OutAddress = FMaterialElementAddress::MakeVolumeCell(
+		Best.Source->SourceId, Best.Cell);
+	OutWorldCellCenter = Best.WorldCenter;
+	return OutAddress.IsValid() && OutState.IsValid();
 }
 
-bool AFragment2DActor::IsAggregateSourceReacting(
+bool AFragment2DActor::CommitMaterialVolumeCellState(
+	const FMaterialElementAddress& Address,
+	const uint16 DefaultEnergy,
+	const FMaterialElementState& ExpectedBefore,
+	const FMaterialElementState& After,
+	const FLocalMaterialReactionProgram& Program,
+	FString& OutError)
+{
+	OutError.Reset();
+	if ((GetWorld() && GetWorld()->IsGameWorld() && !HasAuthority())
+		|| Address.Kind != EMaterialElementAddressKind::VolumeCell
+		|| !Address.OwnerId.IsValid()
+		|| After.Amount != ExpectedBefore.Amount
+		|| ExpectedBefore.Amount != 255
+		|| After.MaterialIndex == 0)
+	{
+		OutError = TEXT("carrier Volume cell state base is invalid");
+		return false;
+	}
+	const FFragmentAggregateSourceState* Target =
+		RootMaterialState.SourceId == Address.OwnerId
+			? &RootMaterialState
+			: AggregateSources.FindByPredicate(
+				[&Address](const FFragmentAggregateSourceState& Candidate)
+				{
+					return Candidate.SourceId == Address.OwnerId;
+				});
+	if (!Target || !Target->IsValid())
+	{
+		OutError = TEXT("carrier Volume address is unavailable");
+		return false;
+	}
+	const FFragmentCarrierVolumeCellState* ExistingOverride =
+		Target->VolumeCellStates.FindByPredicate(
+			[&Address](const FFragmentCarrierVolumeCellState& CellState)
+			{
+				return CellState.Cell == Address.Cell;
+			});
+	const FName CurrentMaterialId = ExistingOverride
+		? ExistingOverride->MaterialId : Target->MaterialId;
+	FMaterialElementState Canonical;
+	if (!Program.MakeState(
+		CurrentMaterialId, 255, TOptional<uint16>(), Canonical))
+	{
+		OutError = TEXT("carrier Volume material is not in the local program");
+		return false;
+	}
+	if (DefaultEnergy != Canonical.Energy)
+	{
+		OutError = TEXT("carrier Volume default energy does not match the program");
+		return false;
+	}
+	FMaterialDeltaBatch Batch;
+	Batch.BaseStoreRevision = 0;
+	Batch.TargetStoreRevision = After == ExpectedBefore ? 0 : 1;
+	Batch.ExplicitAmountDelta =
+		static_cast<int64>(After.Amount) - ExpectedBefore.Amount;
+	Batch.ExplicitEnergyDelta =
+		After.GetTotalEnergy() - ExpectedBefore.GetTotalEnergy();
+	if (!(After == ExpectedBefore))
+	{
+		Batch.ElementDeltas.Add({Address, ExpectedBefore, After});
+	}
+	return CommitMaterialVolumeElementBatch(Batch, Program, OutError);
+}
+
+bool AFragment2DActor::CommitMaterialVolumeElementBatch(
+	const FMaterialDeltaBatch& Batch,
+	const FLocalMaterialReactionProgram& Program,
+	FString& OutError)
+{
+	OutError.Reset();
+	if ((GetWorld() && GetWorld()->IsGameWorld() && !HasAuthority())
+		|| !Program.IsCompiled() || !Batch.IsValid(OutError))
+	{
+		if (OutError.IsEmpty())
+		{
+			OutError = TEXT("carrier Volume batch cannot be committed");
+		}
+		return false;
+	}
+
+	FFragmentAggregateSourceState CandidateRoot = RootMaterialState;
+	TArray<FFragmentAggregateSourceState> CandidateAggregates = AggregateSources;
+	TSet<FGuid> TopologyChanged;
+	TSet<FGuid> FieldsChanged;
+	TSet<FGuid> TouchedSources;
+	const auto FindCandidate = [
+		&CandidateRoot,
+		&CandidateAggregates](const FGuid& SourceId)
+		-> FFragmentAggregateSourceState*
+	{
+		if (CandidateRoot.SourceId == SourceId)
+		{
+			return &CandidateRoot;
+		}
+		return CandidateAggregates.FindByPredicate(
+			[&SourceId](const FFragmentAggregateSourceState& Candidate)
+			{
+				return Candidate.SourceId == SourceId;
+			});
+	};
+	for (const FMaterialElementDelta& Delta : Batch.ElementDeltas)
+	{
+		if (Delta.Address.Kind != EMaterialElementAddressKind::VolumeCell
+			|| Delta.Address.Cell.Z != 0
+			|| Delta.ExpectedBefore.Amount != 255
+			|| Delta.After.Amount != 255
+			|| Delta.After.MaterialIndex == 0)
+		{
+			OutError = TEXT("carrier Volume batch contains an unsupported delta");
+			return false;
+		}
+		FFragmentAggregateSourceState* Target =
+			FindCandidate(Delta.Address.OwnerId);
+		if (!Target || !Target->IsValid()
+			|| Delta.Address.Cell.X < 0 || Delta.Address.Cell.Y < 0
+			|| Delta.Address.Cell.X >= Target->SourceMask.Width
+			|| Delta.Address.Cell.Y >= Target->SourceMask.Height)
+		{
+			OutError = TEXT("carrier Volume batch references an unavailable layer");
+			return false;
+		}
+		const int32 CellIndex = Delta.Address.Cell.Y * Target->SourceMask.Width
+			+ Delta.Address.Cell.X;
+		if (!Target->SourceMask.SolidMask.IsValidIndex(CellIndex)
+			|| Target->SourceMask.SolidMask[CellIndex] == 0)
+		{
+			OutError = TEXT("carrier Volume batch references an empty cell");
+			return false;
+		}
+
+		FFragmentCarrierVolumeCellState* ExistingOverride =
+			Target->VolumeCellStates.FindByPredicate(
+				[&Delta](const FFragmentCarrierVolumeCellState& CellState)
+				{
+					return CellState.Cell == Delta.Address.Cell;
+				});
+		const FName CurrentMaterialId = ExistingOverride
+			? ExistingOverride->MaterialId : Target->MaterialId;
+		FMaterialElementState Current;
+		if (!Program.MakeState(
+				CurrentMaterialId, 255, TOptional<uint16>(), Current))
+		{
+			OutError = TEXT("carrier Volume batch material is not compiled");
+			return false;
+		}
+		if (ExistingOverride)
+		{
+			Current.Energy = ExistingOverride->Energy;
+		}
+		else if (Target->VolumeFieldRevision > 0
+			|| Target->VolumeEnvironmentEnergy != 0)
+		{
+			Current.Energy = Target->VolumeEnvironmentEnergy;
+		}
+		if (!(Current == Delta.ExpectedBefore))
+		{
+			OutError = TEXT("carrier Volume batch base is stale");
+			return false;
+		}
+
+		FName AfterMaterialId = NAME_None;
+		if (!Program.TryGetMaterialId(
+				Delta.After.MaterialIndex, AfterMaterialId)
+			|| AfterMaterialId.IsNone() || AfterMaterialId == TEXT("empty"))
+		{
+			OutError = TEXT("carrier Volume batch output material is invalid");
+			return false;
+		}
+		FMaterialElementState BaseState;
+		if (!Program.MakeState(
+				Target->MaterialId, 255, TOptional<uint16>(), BaseState))
+		{
+			OutError = TEXT("carrier Volume base material is not compiled");
+			return false;
+		}
+		if (Target->VolumeFieldRevision == 0
+			&& Target->VolumeEnvironmentEnergy == 0)
+		{
+			Target->VolumeEnvironmentEnergy = BaseState.Energy;
+		}
+		const uint16 EnvironmentEnergy = Target->VolumeFieldRevision > 0
+			|| Target->VolumeEnvironmentEnergy != 0
+			? Target->VolumeEnvironmentEnergy : BaseState.Energy;
+		Target->VolumeCellStates.RemoveAll(
+			[&Delta](const FFragmentCarrierVolumeCellState& CellState)
+			{
+				return CellState.Cell == Delta.Address.Cell;
+			});
+		if (AfterMaterialId != Target->MaterialId
+			|| Delta.After.Energy != EnvironmentEnergy)
+		{
+			Target->VolumeCellStates.Add({
+				Delta.Address.Cell, AfterMaterialId, Delta.After.Energy});
+		}
+		TouchedSources.Add(Target->SourceId);
+		if (Delta.After.MaterialIndex != Delta.ExpectedBefore.MaterialIndex)
+		{
+			TopologyChanged.Add(Target->SourceId);
+		}
+		if (Delta.After.Energy != Delta.ExpectedBefore.Energy)
+		{
+			FieldsChanged.Add(Target->SourceId);
+		}
+	}
+
+	for (const FGuid& SourceId : TouchedSources)
+	{
+		FFragmentAggregateSourceState* Target = FindCandidate(SourceId);
+		check(Target);
+		if (TopologyChanged.Contains(SourceId))
+		{
+			++Target->VolumeTopologyRevision;
+		}
+		if (FieldsChanged.Contains(SourceId))
+		{
+			++Target->VolumeFieldRevision;
+		}
+		Target->VolumeCellStates.Sort([](
+			const FFragmentCarrierVolumeCellState& Left,
+			const FFragmentCarrierVolumeCellState& Right)
+		{
+			return Left.Cell.X != Right.Cell.X
+				? Left.Cell.X < Right.Cell.X
+				: Left.Cell.Y != Right.Cell.Y
+					? Left.Cell.Y < Right.Cell.Y
+					: Left.Cell.Z < Right.Cell.Z;
+		});
+		if (!Target->IsValid())
+		{
+			OutError = TEXT("carrier Volume batch produced invalid state");
+			return false;
+		}
+	}
+
+	if (Batch.ElementDeltas.IsEmpty())
+	{
+		return true;
+	}
+	const FFragmentAggregateSourceState PreviousRoot = RootMaterialState;
+	TArray<FFragmentAggregateSourceState> PreviousAggregates = AggregateSources;
+	RootMaterialState = MoveTemp(CandidateRoot);
+	AggregateSources = MoveTemp(CandidateAggregates);
+	if (!RebuildMeshFromPayload())
+	{
+		RootMaterialState = PreviousRoot;
+		AggregateSources = MoveTemp(PreviousAggregates);
+		RebuildMeshFromPayload();
+		OutError = TEXT("carrier Volume batch mesh rebuild failed");
+		return false;
+	}
+	RefreshBuoyancyDensity();
+	ForceNetUpdate();
+	MarkReactionVisualizationDirty();
+	return true;
+}
+
+bool AFragment2DActor::CommitMaterialVolumePairBatch(
+	AFragment2DActor& CarrierA,
+	AFragment2DActor& CarrierB,
+	const FMaterialDeltaBatch& Batch,
+	const FLocalMaterialReactionProgram& Program,
+	FString& OutError)
+{
+	OutError.Reset();
+	if (&CarrierA == &CarrierB
+		|| !Batch.IsValid(OutError)
+		|| !Program.IsCompiled()
+		|| (CarrierA.GetWorld() && CarrierA.GetWorld()->IsGameWorld()
+			&& !CarrierA.HasAuthority())
+		|| (CarrierB.GetWorld() && CarrierB.GetWorld()->IsGameWorld()
+			&& !CarrierB.HasAuthority()))
+	{
+		if (OutError.IsEmpty())
+		{
+			OutError = TEXT("cross-carrier Volume batch is invalid");
+		}
+		return false;
+	}
+	const auto OwnsAddress = [](const AFragment2DActor& Carrier,
+		const FMaterialElementAddress& Address)
+	{
+		return Address.Kind == EMaterialElementAddressKind::VolumeCell
+			&& (Carrier.RootMaterialState.SourceId == Address.OwnerId
+				|| Carrier.AggregateSources.ContainsByPredicate(
+					[&Address](const FFragmentAggregateSourceState& Source)
+					{
+						return Source.SourceId == Address.OwnerId;
+					}));
+	};
+	FMaterialDeltaBatch BatchA;
+	FMaterialDeltaBatch BatchB;
+	BatchA.BaseStoreRevision = Batch.BaseStoreRevision;
+	BatchB.BaseStoreRevision = Batch.BaseStoreRevision;
+	for (const FMaterialElementDelta& Delta : Batch.ElementDeltas)
+	{
+		const bool bOwnedByA = OwnsAddress(CarrierA, Delta.Address);
+		const bool bOwnedByB = OwnsAddress(CarrierB, Delta.Address);
+		if (bOwnedByA == bOwnedByB)
+		{
+			OutError = TEXT("cross-carrier batch address ownership is ambiguous");
+			return false;
+		}
+		(bOwnedByA ? BatchA.ElementDeltas : BatchB.ElementDeltas).Add(Delta);
+	}
+	const auto FinishLocalBatch = [](FMaterialDeltaBatch& LocalBatch)
+	{
+		int64 BeforeAmount = 0;
+		int64 AfterAmount = 0;
+		int64 BeforeEnergy = 0;
+		int64 AfterEnergy = 0;
+		for (const FMaterialElementDelta& Delta : LocalBatch.ElementDeltas)
+		{
+			BeforeAmount += Delta.ExpectedBefore.Amount;
+			AfterAmount += Delta.After.Amount;
+			BeforeEnergy += Delta.ExpectedBefore.GetTotalEnergy();
+			AfterEnergy += Delta.After.GetTotalEnergy();
+		}
+		LocalBatch.ExplicitAmountDelta = AfterAmount - BeforeAmount;
+		LocalBatch.ExplicitEnergyDelta = AfterEnergy - BeforeEnergy;
+		LocalBatch.TargetStoreRevision = LocalBatch.ElementDeltas.IsEmpty()
+			? LocalBatch.BaseStoreRevision
+			: LocalBatch.BaseStoreRevision + 1;
+	};
+	FinishLocalBatch(BatchA);
+	FinishLocalBatch(BatchB);
+
+	const FFragmentAggregateSourceState PreviousRootA =
+		CarrierA.RootMaterialState;
+	const FFragmentAggregateSourceState PreviousRootB =
+		CarrierB.RootMaterialState;
+	const TArray<FFragmentAggregateSourceState> PreviousAggregatesA =
+		CarrierA.AggregateSources;
+	const TArray<FFragmentAggregateSourceState> PreviousAggregatesB =
+		CarrierB.AggregateSources;
+	if (!CarrierA.CommitMaterialVolumeElementBatch(
+			BatchA, Program, OutError)
+		|| !CarrierB.CommitMaterialVolumeElementBatch(
+			BatchB, Program, OutError))
+	{
+		CarrierA.RootMaterialState = PreviousRootA;
+		CarrierB.RootMaterialState = PreviousRootB;
+		CarrierA.AggregateSources = PreviousAggregatesA;
+		CarrierB.AggregateSources = PreviousAggregatesB;
+		CarrierA.RebuildMeshFromPayload();
+		CarrierB.RebuildMeshFromPayload();
+		CarrierA.RefreshBuoyancyDensity();
+		CarrierB.RefreshBuoyancyDensity();
+		CarrierA.ForceNetUpdate();
+		CarrierB.ForceNetUpdate();
+		return false;
+	}
+	return true;
+}
+
+bool AFragment2DActor::GatherMaterialVolumeElements(
+	const FLocalMaterialReactionProgram& Program,
+	TArray<FFragmentCarrierMaterialElement>& OutElements,
+	FString& OutError) const
+{
+	OutElements.Reset();
+	OutError.Reset();
+	if (!Program.IsCompiled())
+	{
+		OutError = TEXT("carrier material program is not compiled");
+		return false;
+	}
+	const auto AppendSource = [&Program, &OutElements, &OutError](
+		const FFragmentAggregateSourceState& Source,
+		const FTransform& WorldTransform)
+	{
+		if (!Source.IsValid() || !WorldTransform.IsValid())
+		{
+			return true;
+		}
+		for (int32 Index = 0; Index < Source.SourceMask.SolidMask.Num(); ++Index)
+		{
+			if (Source.SourceMask.SolidMask[Index] == 0)
+			{
+				continue;
+			}
+			const FIntVector Cell(
+				Index % Source.SourceMask.Width,
+				Index / Source.SourceMask.Width,
+				0);
+			const FFragmentCarrierVolumeCellState* Override =
+				Source.VolumeCellStates.FindByPredicate(
+					[&Cell](const FFragmentCarrierVolumeCellState& Candidate)
+					{
+						return Candidate.Cell == Cell;
+					});
+			FMaterialElementState State;
+			if (!Program.MakeState(
+					Override ? Override->MaterialId : Source.MaterialId,
+					255,
+					TOptional<uint16>(),
+					State))
+			{
+				OutError = FString::Printf(
+					TEXT("carrier material '%s' is not compiled"),
+					*(Override ? Override->MaterialId : Source.MaterialId)
+						.ToString());
+				return false;
+			}
+			const uint16 DefaultEnergy = State.Energy;
+			if (Override)
+			{
+				State.Energy = Override->Energy;
+			}
+			else if (Source.VolumeFieldRevision > 0
+				|| Source.VolumeEnvironmentEnergy != 0)
+			{
+				State.Energy = Source.VolumeEnvironmentEnergy;
+			}
+			FFragmentCarrierMaterialElement& Element =
+				OutElements.AddDefaulted_GetRef();
+			Element.Address = FMaterialElementAddress::MakeVolumeCell(
+				Source.SourceId, Cell);
+			Element.State = State;
+			Element.DefaultEnergy = DefaultEnergy;
+			Element.CellSize = Source.SourceMask.CellSize;
+			Element.bNonEnvironmentEnergy = Override
+				&& Override->Energy > Source.VolumeEnvironmentEnergy;
+			Element.WorldCenter = WorldTransform.TransformPosition(FVector(
+				(static_cast<double>(Cell.X) + 0.5
+					- static_cast<double>(Source.SourceMask.Width) * 0.5)
+					* Source.SourceMask.CellSize,
+				0.0,
+				(static_cast<double>(Cell.Y) + 0.5
+					- static_cast<double>(Source.SourceMask.Height) * 0.5)
+					* Source.SourceMask.CellSize));
+		}
+		return true;
+	};
+	if (RootMaterialState.IsValid()
+		&& !AppendSource(RootMaterialState, GetActorTransform()))
+	{
+		OutElements.Reset();
+		return false;
+	}
+	TArray<const FFragmentAggregateSourceState*> OrderedSources;
+	for (const FFragmentAggregateSourceState& Source : AggregateSources)
+	{
+		OrderedSources.Add(&Source);
+	}
+	OrderedSources.Sort([](
+		const FFragmentAggregateSourceState& Left,
+		const FFragmentAggregateSourceState& Right)
+	{
+		return Left.SourceId.ToString(EGuidFormats::Digits)
+			< Right.SourceId.ToString(EGuidFormats::Digits);
+	});
+	for (const FFragmentAggregateSourceState* Source : OrderedSources)
+	{
+		if (!AppendSource(
+				*Source, Source->LocalTransform * GetActorTransform()))
+		{
+			OutElements.Reset();
+			return false;
+		}
+	}
+	OutElements.Sort([](
+		const FFragmentCarrierMaterialElement& Left,
+		const FFragmentCarrierMaterialElement& Right)
+	{
+		return MaterialElementAddressLess(Left.Address, Right.Address);
+	});
+	return true;
+}
+
+bool AFragment2DActor::HasLocalMaterialVolumeReactionWork() const
+{
+	struct FLayer
+	{
+		const FFragmentAggregateSourceState* Source = nullptr;
+		FTransform WorldTransform = FTransform::Identity;
+	};
+	TArray<FLayer> CarrierLayers;
+	if (RootMaterialState.IsValid())
+	{
+		CarrierLayers.Add({&RootMaterialState, GetActorTransform()});
+	}
+	for (const FFragmentAggregateSourceState& Source : AggregateSources)
+	{
+		if (Source.IsValid())
+		{
+			CarrierLayers.Add({
+				&Source, Source.LocalTransform * GetActorTransform()});
+		}
+	}
+	const auto IsOccupied = [](
+		const FFragmentAggregateSourceState& Source,
+		const FIntVector& Cell)
+	{
+		const int32 Index = Cell.Y * Source.SourceMask.Width + Cell.X;
+		return Cell.Z == 0 && Cell.X >= 0 && Cell.Y >= 0
+			&& Cell.X < Source.SourceMask.Width
+			&& Cell.Y < Source.SourceMask.Height
+			&& Source.SourceMask.SolidMask.IsValidIndex(Index)
+			&& Source.SourceMask.SolidMask[Index] != 0;
+	};
+	const auto CellWorldCenter = [](
+		const FFragmentAggregateSourceState& Source,
+		const FTransform& WorldTransform,
+		const FIntVector& Cell)
+	{
+		return WorldTransform.TransformPosition(FVector(
+			(static_cast<double>(Cell.X) + 0.5
+				- static_cast<double>(Source.SourceMask.Width) * 0.5)
+				* Source.SourceMask.CellSize,
+			0.0,
+			(static_cast<double>(Cell.Y) + 0.5
+				- static_cast<double>(Source.SourceMask.Height) * 0.5)
+				* Source.SourceMask.CellSize));
+	};
+	static const FIntVector Neighbours[] = {
+		FIntVector(1, 0, 0), FIntVector(-1, 0, 0),
+		FIntVector(0, 1, 0), FIntVector(0, -1, 0) };
+	for (int32 LayerIndex = 0;
+		LayerIndex < CarrierLayers.Num(); ++LayerIndex)
+	{
+		const FLayer& Layer = CarrierLayers[LayerIndex];
+		for (const FFragmentCarrierVolumeCellState& Hot
+			: Layer.Source->VolumeCellStates)
+		{
+			if (Hot.Energy <= Layer.Source->VolumeEnvironmentEnergy)
+			{
+				continue;
+			}
+			for (const FIntVector& Offset : Neighbours)
+			{
+				if (IsOccupied(*Layer.Source, Hot.Cell + Offset))
+				{
+					return true;
+				}
+			}
+			const FVector HotCenter = CellWorldCenter(
+				*Layer.Source, Layer.WorldTransform, Hot.Cell);
+			for (int32 OtherLayerIndex = 0;
+				OtherLayerIndex < CarrierLayers.Num(); ++OtherLayerIndex)
+			{
+				if (OtherLayerIndex == LayerIndex)
+				{
+					continue;
+				}
+				const FLayer& Other = CarrierLayers[OtherLayerIndex];
+				const double MaximumDistance = FMath::Max(
+					Layer.Source->SourceMask.CellSize,
+					Other.Source->SourceMask.CellSize) * 1.05;
+				for (int32 Index = 0;
+					Index < Other.Source->SourceMask.SolidMask.Num(); ++Index)
+				{
+					if (Other.Source->SourceMask.SolidMask[Index] == 0)
+					{
+						continue;
+					}
+					const FIntVector OtherCell(
+						Index % Other.Source->SourceMask.Width,
+						Index / Other.Source->SourceMask.Width,
+						0);
+					if (FVector::DistSquared(
+							HotCenter,
+							CellWorldCenter(
+								*Other.Source,
+								Other.WorldTransform,
+								OtherCell))
+						<= FMath::Square(MaximumDistance))
+					{
+						return true;
+					}
+				}
+			}
+		}
+	}
+	return false;
+}
+
+bool AFragment2DActor::HasNonEnvironmentMaterialVolumeEnergy() const
+{
+	const auto HasNonEnvironmentEnergy = [](
+		const FFragmentAggregateSourceState& Source)
+	{
+		return Source.IsValid()
+			&& Source.VolumeCellStates.ContainsByPredicate(
+				[&Source](const FFragmentCarrierVolumeCellState& Cell)
+				{
+					return Cell.Energy > Source.VolumeEnvironmentEnergy;
+				});
+	};
+	return HasNonEnvironmentEnergy(RootMaterialState)
+		|| AggregateSources.ContainsByPredicate(HasNonEnvironmentEnergy);
+}
+
+bool AFragment2DActor::TryGetMaterialVolumeElementWorldLocation(
+	const FMaterialElementAddress& Address,
+	FVector& OutWorldLocation) const
+{
+	OutWorldLocation = FVector::ZeroVector;
+	if (Address.Kind != EMaterialElementAddressKind::VolumeCell
+		|| Address.Cell.Z != 0)
+	{
+		return false;
+	}
+	const FFragmentAggregateSourceState* Source =
+		RootMaterialState.SourceId == Address.OwnerId
+			? &RootMaterialState
+			: AggregateSources.FindByPredicate(
+				[&Address](const FFragmentAggregateSourceState& Candidate)
+				{
+					return Candidate.SourceId == Address.OwnerId;
+				});
+	if (!Source || !Source->IsValid()
+		|| Address.Cell.X < 0 || Address.Cell.Y < 0
+		|| Address.Cell.X >= Source->SourceMask.Width
+		|| Address.Cell.Y >= Source->SourceMask.Height)
+	{
+		return false;
+	}
+	const int32 Index = Address.Cell.Y * Source->SourceMask.Width
+		+ Address.Cell.X;
+	if (!Source->SourceMask.SolidMask.IsValidIndex(Index)
+		|| Source->SourceMask.SolidMask[Index] == 0)
+	{
+		return false;
+	}
+	const FVector LocalCenter(
+		(static_cast<double>(Address.Cell.X) + 0.5
+			- static_cast<double>(Source->SourceMask.Width) * 0.5)
+			* Source->SourceMask.CellSize,
+		0.0,
+		(static_cast<double>(Address.Cell.Y) + 0.5
+			- static_cast<double>(Source->SourceMask.Height) * 0.5)
+			* Source->SourceMask.CellSize);
+	const FTransform WorldTransform = Source == &RootMaterialState
+		? GetActorTransform() : Source->LocalTransform * GetActorTransform();
+	OutWorldLocation = WorldTransform.TransformPosition(LocalCenter);
+	return !OutWorldLocation.ContainsNaN();
+}
+
+bool AFragment2DActor::AdvanceLocalMaterialVolumeReactions(
+	const FLocalMaterialReactionProgram& Program,
+	const uint32 Seed,
+	const int32 LogicalStep,
+	const int32 MaxContacts,
+	TArray<FMaterialParticleEmission>& OutEmissions,
+	int32& OutProcessedContacts,
+	FString& OutError)
+{
+	OutEmissions.Reset();
+	OutProcessedContacts = 0;
+	OutError.Reset();
+	if ((GetWorld() && GetWorld()->IsGameWorld() && !HasAuthority())
+		|| !Program.IsCompiled() || LogicalStep < 0 || MaxContacts <= 0)
+	{
+		OutError = TEXT("carrier local reaction step input is invalid");
+		return false;
+	}
+
+	struct FCachedCell
+	{
+		FMaterialElementAddress Address;
+		FMaterialElementState State;
+		FVector WorldCenter = FVector::ZeroVector;
+		float CellSize = 0.0f;
+	};
+	FMaterialElementStore Store;
+	TArray<FCachedCell> Cells;
+	const auto AppendSource = [this, &Program, &Store, &Cells](
+		const FFragmentAggregateSourceState& Source,
+		const FTransform& WorldTransform)
+	{
+		if (!Source.IsValid() || !WorldTransform.IsValid())
+		{
+			return;
+		}
+		for (int32 Index = 0; Index < Source.SourceMask.SolidMask.Num(); ++Index)
+		{
+			if (Source.SourceMask.SolidMask[Index] == 0)
+			{
+				continue;
+			}
+			const FIntVector Cell(
+				Index % Source.SourceMask.Width,
+				Index / Source.SourceMask.Width,
+				0);
+			const FFragmentCarrierVolumeCellState* Override =
+				Source.VolumeCellStates.FindByPredicate(
+					[&Cell](const FFragmentCarrierVolumeCellState& Candidate)
+					{
+						return Candidate.Cell == Cell;
+					});
+			FMaterialElementState State;
+			if (!Program.MakeState(
+					Override ? Override->MaterialId : Source.MaterialId,
+					255,
+					TOptional<uint16>(),
+					State))
+			{
+				continue;
+			}
+			if (Override)
+			{
+				State.Energy = Override->Energy;
+			}
+			else if (Source.VolumeFieldRevision > 0
+				|| Source.VolumeEnvironmentEnergy != 0)
+			{
+				State.Energy = Source.VolumeEnvironmentEnergy;
+			}
+			FCachedCell& Cached = Cells.AddDefaulted_GetRef();
+			Cached.Address = FMaterialElementAddress::MakeVolumeCell(
+				Source.SourceId, Cell);
+			Cached.State = State;
+			Cached.CellSize = Source.SourceMask.CellSize;
+			Cached.WorldCenter = WorldTransform.TransformPosition(FVector(
+				(static_cast<double>(Cell.X) + 0.5
+					- static_cast<double>(Source.SourceMask.Width) * 0.5)
+					* Source.SourceMask.CellSize,
+				0.0,
+				(static_cast<double>(Cell.Y) + 0.5
+					- static_cast<double>(Source.SourceMask.Height) * 0.5)
+					* Source.SourceMask.CellSize));
+			Store.SetInitialState(Cached.Address, Cached.State);
+		}
+	};
+	if (RootMaterialState.IsValid())
+	{
+		AppendSource(RootMaterialState, GetActorTransform());
+	}
+	TArray<const FFragmentAggregateSourceState*> OrderedSources;
+	for (const FFragmentAggregateSourceState& Source : AggregateSources)
+	{
+		OrderedSources.Add(&Source);
+	}
+	OrderedSources.Sort([](
+		const FFragmentAggregateSourceState& Left,
+		const FFragmentAggregateSourceState& Right)
+	{
+		return Left.SourceId.ToString(EGuidFormats::Digits)
+			< Right.SourceId.ToString(EGuidFormats::Digits);
+	});
+	for (const FFragmentAggregateSourceState* Source : OrderedSources)
+	{
+		AppendSource(*Source, Source->LocalTransform * GetActorTransform());
+	}
+	Cells.Sort([](const FCachedCell& Left, const FCachedCell& Right)
+	{
+		return MaterialElementAddressLess(Left.Address, Right.Address);
+	});
+
+	TArray<FMaterialContact> Contacts;
+	for (int32 LeftIndex = 0; LeftIndex < Cells.Num(); ++LeftIndex)
+	{
+		const FCachedCell& Left = Cells[LeftIndex];
+		for (int32 RightIndex = LeftIndex + 1;
+			RightIndex < Cells.Num(); ++RightIndex)
+		{
+			const FCachedCell& Right = Cells[RightIndex];
+			if (Left.State.Energy == 0 && Right.State.Energy == 0)
+			{
+				continue;
+			}
+			bool bAdjacent = false;
+			if (Left.Address.OwnerId == Right.Address.OwnerId)
+			{
+				const FIntVector Difference = Left.Address.Cell - Right.Address.Cell;
+				bAdjacent = FMath::Abs(Difference.X)
+					+ FMath::Abs(Difference.Y)
+					+ FMath::Abs(Difference.Z) == 1;
+			}
+			else
+			{
+				const double MaximumDistance = FMath::Max(
+					Left.CellSize, Right.CellSize) * 1.05;
+				bAdjacent = FVector::DistSquared(
+					Left.WorldCenter, Right.WorldCenter)
+					<= FMath::Square(MaximumDistance);
+			}
+			if (bAdjacent)
+			{
+				Contacts.Emplace(Left.Address, Right.Address, 1);
+			}
+		}
+	}
+	if (Contacts.IsEmpty())
+	{
+		return true;
+	}
+	Contacts.Sort([](
+		const FMaterialContact& Left,
+		const FMaterialContact& Right)
+	{
+		if (!(Left.ElementA == Right.ElementA))
+		{
+			return MaterialElementAddressLess(Left.ElementA, Right.ElementA);
+		}
+		return MaterialElementAddressLess(Left.ElementB, Right.ElementB);
+	});
+	TArray<FMaterialContact> SelectedContacts;
+	const int32 ContactCount = FMath::Min(MaxContacts, Contacts.Num());
+	SelectedContacts.Reserve(ContactCount);
+	const int32 StartIndex = LogicalStep % Contacts.Num();
+	for (int32 Offset = 0; Offset < ContactCount; ++Offset)
+	{
+		SelectedContacts.Add(
+			Contacts[(StartIndex + Offset) % Contacts.Num()]);
+	}
+	OutProcessedContacts = SelectedContacts.Num();
+	FLocalMaterialReactionContext Context;
+	Context.Seed = Seed;
+	Context.LogicalStep = LogicalStep;
+	Context.MaxContacts = SelectedContacts.Num();
+	Context.MaxElementDeltas = SelectedContacts.Num() * 2;
+	Context.MaxEmissions = SelectedContacts.Num() * 2;
+	FMaterialDeltaBatch Batch;
+	if (!FLocalMaterialReactionKernel::Evaluate(
+			Store,
+			Program.GetThermalDefinitions(),
+			Program.GetContactRules(),
+			SelectedContacts,
+			Context,
+			Batch,
+			OutError)
+		|| !CommitMaterialVolumeElementBatch(Batch, Program, OutError))
+	{
+		return false;
+	}
+	OutEmissions = Batch.ParticleEmissions;
+	return true;
+}
+
+bool AFragment2DActor::IsRootMaterialHot() const
+{
+	return RootMaterialState.IsValid()
+		&& HasNonEnvironmentEnergy(RootMaterialState);
+}
+
+bool AFragment2DActor::IsAggregateSourceMaterialHot(
 	const FGuid& SourceId) const
 {
 	const FFragmentAggregateSourceState* Source =
@@ -1095,37 +2021,32 @@ bool AFragment2DActor::IsAggregateSourceReacting(
 			{
 				return Candidate.SourceId == SourceId;
 			});
-	return Source
-		&& Source->bHasReactionState
-		&& Source->ActiveMask.SolidMask.Contains(1);
+	return Source && HasNonEnvironmentEnergy(*Source);
 }
 
-bool AFragment2DActor::IsAnyAggregateMaterialReacting(
+bool AFragment2DActor::IsAnyAggregateMaterialHot(
 	const FName MaterialId) const
 {
 	return AggregateSources.ContainsByPredicate(
 		[MaterialId](const FFragmentAggregateSourceState& Source)
 		{
 			return Source.MaterialId == MaterialId
-				&& Source.bHasReactionState
-				&& Source.ActiveMask.SolidMask.Contains(1);
+				&& HasNonEnvironmentEnergy(Source);
 		});
 }
 
-int32 AFragment2DActor::GetRootReactionOutputCellCount() const
+int32 AFragment2DActor::GetRootMaterialOverrideCellCount() const
 {
-	return RootReactionState.bHasReactionState
-		? CountSetCells(RootReactionState.OutputMask.SolidMask)
-		: 0;
+	return CountMaterialOverrideCells(RootMaterialState);
 }
 
 FBox AFragment2DActor::GetReactiveWorldBounds() const
 {
 	FBox Bounds(ForceInit);
-	if (RootReactionState.IsValid())
+	if (RootMaterialState.IsValid())
 	{
 		Bounds += BuildMaskWorldBounds(
-			RootReactionState.SourceMask,
+			RootMaterialState.SourceMask,
 			GetActorTransform());
 	}
 	for (const FFragmentAggregateSourceState& Source : AggregateSources)
@@ -1140,7 +2061,7 @@ FBox AFragment2DActor::GetReactiveWorldBounds() const
 	return Bounds;
 }
 
-void AFragment2DActor::InitializeRootReactionState()
+void AFragment2DActor::InitializeRootMaterialState()
 {
 	const bool bSupportsReaction = SpawnPayload.FragmentId.IsValid()
 		&& !SpawnPayload.MaterialId.IsNone()
@@ -1149,38 +2070,28 @@ void AFragment2DActor::InitializeRootReactionState()
 			== EFragmentSourceGeometryStyle::VoxelBlocks;
 	if (!bSupportsReaction)
 	{
-		RootReactionState = FFragmentAggregateSourceState();
-		RootReactionRuntime.Reset();
+		RootMaterialState = FFragmentAggregateSourceState();
 		return;
 	}
-	if (RootReactionState.SourceId == SpawnPayload.FragmentId
-		&& RootReactionState.SourceMask.HasValidLayout())
+	if (RootMaterialState.SourceId == SpawnPayload.FragmentId
+		&& RootMaterialState.SourceMask.HasValidLayout())
 	{
-		RootReactionState.Material = FragmentMaterial;
-		RootReactionState.Color = FragmentColor;
+		RootMaterialState.Material = FragmentMaterial;
+		RootMaterialState.Color = FragmentColor;
 		return;
 	}
 
-	RootReactionState = FFragmentAggregateSourceState();
-	RootReactionState.SourceId = SpawnPayload.FragmentId;
-	RootReactionState.DefinitionSourceId = SpawnPayload.FragmentId;
-	RootReactionState.bOwnsLogicalSource = false;
-	RootReactionState.Revision = SpawnPayload.Revision;
-	RootReactionState.SourceMask = SpawnPayload.DetachedVoxelMask;
-	RootReactionState.LocalTransform = FTransform::Identity;
-	RootReactionState.Material = FragmentMaterial;
-	RootReactionState.MaterialId = SpawnPayload.MaterialId;
-	RootReactionState.Color = FragmentColor;
-	RootReactionState.bEnableCollision = SpawnPayload.bEnableCollision;
-	RootReactionState.OutputMask = SpawnPayload.DetachedVoxelMask;
-	RootReactionState.OutputMask.SolidMask.Init(
-		0,
-		SpawnPayload.DetachedVoxelMask.SolidMask.Num());
-	RootReactionState.ActiveMask = SpawnPayload.DetachedVoxelMask;
-	RootReactionState.ActiveMask.SolidMask.Init(
-		0,
-		SpawnPayload.DetachedVoxelMask.SolidMask.Num());
-	RootReactionRuntime.Reset();
+	RootMaterialState = FFragmentAggregateSourceState();
+	RootMaterialState.SourceId = SpawnPayload.FragmentId;
+	RootMaterialState.DefinitionSourceId = SpawnPayload.FragmentId;
+	RootMaterialState.bOwnsLogicalSource = false;
+	RootMaterialState.Revision = SpawnPayload.Revision;
+	RootMaterialState.SourceMask = SpawnPayload.DetachedVoxelMask;
+	RootMaterialState.LocalTransform = FTransform::Identity;
+	RootMaterialState.Material = FragmentMaterial;
+	RootMaterialState.MaterialId = SpawnPayload.MaterialId;
+	RootMaterialState.Color = FragmentColor;
+	RootMaterialState.bEnableCollision = SpawnPayload.bEnableCollision;
 }
 
 bool AFragment2DActor::ApplyMaterialStimulusToRootAtWorldLocation(
@@ -1188,73 +2099,9 @@ bool AFragment2DActor::ApplyMaterialStimulusToRootAtWorldLocation(
 	const FName StimulusMaterial,
 	const int32 EventSeed)
 {
-	if (!HasAuthority()
-		|| WorldLocation.ContainsNaN()
-		|| StimulusMaterial.IsNone()
-		|| !RootReactionState.IsValid()
-		|| IsRootReacting())
-	{
-		return false;
-	}
-	const FMatterFluxContentRegistryPtr Registry =
-		IMatterFluxScriptRuntime::IsAvailable()
-			? IMatterFluxScriptRuntime::Get().GetActiveRegistry()
-			: nullptr;
-	if (!Registry.IsValid())
-	{
-		return false;
-	}
-	const FMatterFluxReactionDefinition* Rule = FindReactionRule(
-		*Registry,
-		RootReactionState.MaterialId,
-		StimulusMaterial);
-	if (!Rule)
-	{
-		return false;
-	}
-
-	TUniquePtr<MatterFlux::Reaction::FSourceReactionRuntime> Candidate =
-		MakeUnique<MatterFlux::Reaction::FSourceReactionRuntime>();
-	FString Error;
-	if (!Candidate->Initialize(
-		MatterFlux::Reaction::FSourceRuntimeSettings(),
-		RootReactionState.SourceMask,
-		*Rule,
-		EventSeed,
-		Error))
-	{
-		UE_LOG(
-			LogMatterFlux,
-			Error,
-			TEXT("Detached fragment reaction initialization failed: %s"),
-			*Error);
-		return false;
-	}
-	const FVector Local = GetActorTransform().InverseTransformPosition(
-		WorldLocation);
-	const FFragmentSourceMask& Mask = RootReactionState.SourceMask;
-	const FIntPoint RequestedCell(
-		FMath::FloorToInt(
-			Local.X / Mask.CellSize
-				+ static_cast<double>(Mask.Width) * 0.5),
-		FMath::FloorToInt(
-			Local.Z / Mask.CellSize
-				+ static_cast<double>(Mask.Height) * 0.5));
-	if (!Candidate->ActivateNearest(RequestedCell, StimulusMaterial))
-	{
-		return false;
-	}
-	RootReactionRuntime = MoveTemp(Candidate);
-	if (!SynchronizeRootReactionState())
-	{
-		RootReactionRuntime.Reset();
-		return false;
-	}
-	RootReactionPropagationAccumulator = 0.0f;
-	SetActorTickEnabled(true);
-	ForceNetUpdate();
-	MarkReactionVisualizationDirty();
-	return true;
+	// Object-level propagation was removed. WorldActor authors an ordinary
+	// material element and the fixed-step contact adapter owns all reactions.
+	return false;
 }
 
 bool AFragment2DActor::ApplyMaterialStimulusAtWorldLocation(
@@ -1275,19 +2122,19 @@ bool AFragment2DActor::ApplyMaterialStimulusAtWorldLocation(
 		bool bRoot = false;
 	};
 	TArray<FCandidate, TInlineAllocator<17>> Candidates;
-	if (RootReactionState.IsValid()
-		&& RootReactionState.SourceMask.SolidMask.Contains(1)
-		&& !IsRootReacting())
+	if (RootMaterialState.IsValid()
+		&& RootMaterialState.SourceMask.SolidMask.Contains(1)
+		&& !IsRootMaterialHot())
 	{
 		const double DistanceSquared =
 			ComputeClosestSolidCellDistanceSquared(
-				RootReactionState.SourceMask,
+				RootMaterialState.SourceMask,
 				GetActorTransform(),
 				WorldLocation);
 		if (FMath::IsFinite(DistanceSquared))
 		{
 			Candidates.Add({
-				RootReactionState.SourceId,
+				RootMaterialState.SourceId,
 				DistanceSquared,
 				true});
 		}
@@ -1296,7 +2143,7 @@ bool AFragment2DActor::ApplyMaterialStimulusAtWorldLocation(
 	{
 		if (!Source.IsValid()
 			|| !Source.SourceMask.SolidMask.Contains(1)
-			|| IsAggregateSourceReacting(Source.SourceId))
+			|| IsAggregateSourceMaterialHot(Source.SourceId))
 		{
 			continue;
 		}
@@ -1481,13 +2328,13 @@ bool AFragment2DActor::ApplyMaterialStimulusInCone(
 			Candidates.Add({SourceId, BestContact, BestScore, bRoot});
 		}
 	};
-	if (RootReactionState.IsValid()
-		&& RootReactionState.SourceMask.SolidMask.Contains(1)
-		&& !IsRootReacting())
+	if (RootMaterialState.IsValid()
+		&& RootMaterialState.SourceMask.SolidMask.Contains(1)
+		&& !IsRootMaterialHot())
 	{
 		AddCandidate(
-			RootReactionState.SourceId,
-			RootReactionState.SourceMask,
+			RootMaterialState.SourceId,
+			RootMaterialState.SourceMask,
 			GetActorTransform(),
 			true);
 	}
@@ -1495,7 +2342,7 @@ bool AFragment2DActor::ApplyMaterialStimulusInCone(
 	{
 		if (Source.IsValid()
 			&& Source.SourceMask.SolidMask.Contains(1)
-			&& !IsAggregateSourceReacting(Source.SourceId))
+			&& !IsAggregateSourceMaterialHot(Source.SourceId))
 		{
 			AddCandidate(
 				Source.SourceId,
@@ -1573,9 +2420,7 @@ bool AFragment2DActor::ApplyMaterialStimulusInCone(
 
 bool AFragment2DActor::ApplyAggregateSourceStreamingState(
 	const FGuid& SourceId,
-	const FFragment2DSourceStreamingState& State,
-	const FName InOutputMaterialId,
-	const FLinearColor& InOutputColor)
+	const FFragment2DSourceStreamingState& State)
 {
 	if (!SourceId.IsValid())
 	{
@@ -1591,10 +2436,7 @@ bool AFragment2DActor::ApplyAggregateSourceStreamingState(
 		? Source->SourceMask.Width * Source->SourceMask.Height
 		: 0;
 	if (!Source
-		|| State.GetRuntimeMask().Num() != CellCount
-		|| !State.bHasReactionState
-		|| State.ReactionState.OutputMask.Num() != CellCount
-		|| State.ReactionState.ActiveMask.Num() != CellCount)
+		|| State.GetRuntimeMask().Num() != CellCount)
 	{
 		return false;
 	}
@@ -1602,22 +2444,14 @@ bool AFragment2DActor::ApplyAggregateSourceStreamingState(
 	const FFragmentAggregateSourceState Previous = *Source;
 	Source->Revision = State.Revision;
 	Source->SourceMask.SolidMask = State.GetRuntimeMask();
-	Source->OutputMask = Source->SourceMask;
-	Source->OutputMask.SolidMask = State.ReactionState.OutputMask;
-	Source->ActiveMask = Source->SourceMask;
-	Source->ActiveMask.SolidMask = State.ReactionState.ActiveMask;
-	for (uint8& Value : Source->ActiveMask.SolidMask)
+	Source->VolumeTopologyRevision = State.VolumeTopologyRevision;
+	Source->VolumeFieldRevision = State.VolumeFieldRevision;
+	Source->VolumeEnvironmentEnergy = State.VolumeEnvironmentEnergy;
+	Source->VolumeCellStates.Reset(State.VolumeCellStates.Num());
+	for (const FFragment2DMaterialVolumeCellState& Cell : State.VolumeCellStates)
 	{
-		Value = Value != 0 ? 1 : 0;
+		Source->VolumeCellStates.Add({ Cell.Cell, Cell.MaterialId, Cell.Energy });
 	}
-	Source->bHasReactionState = true;
-	Source->ReactionRuleId = State.ReactionState.RuleId;
-	Source->OutputMaterialId = InOutputMaterialId;
-	Source->OutputColor = InOutputColor;
-	Source->ReactionSeed = State.ReactionState.Seed;
-	Source->ReactionTick = State.ReactionState.Tick;
-	Source->ReactionAccumulator = State.ReactionAccumulator;
-	Source->TotalMaterialEmissionCount = State.TotalMaterialEmissionCount;
 	const bool bUpdated = Source->IsValid()
 		&& (Source->bEnableCollision
 			? RebuildMeshFromPayload()
@@ -1633,495 +2467,18 @@ bool AFragment2DActor::ApplyAggregateSourceStreamingState(
 	return true;
 }
 
-bool AFragment2DActor::SynchronizeRootReactionState()
-{
-	if (!RootReactionRuntime || !RootReactionRuntime->IsInitialized())
-	{
-		return false;
-	}
-	MatterFlux::Reaction::FSourceRuntimeSnapshot Snapshot;
-	if (!RootReactionRuntime->CaptureState(Snapshot))
-	{
-		return false;
-	}
-	RootReactionState.SourceMask.SolidMask =
-		MoveTemp(Snapshot.ReactionState.InputMask);
-	RootReactionState.OutputMask = RootReactionState.SourceMask;
-	RootReactionState.OutputMask.SolidMask =
-		MoveTemp(Snapshot.ReactionState.OutputMask);
-	RootReactionState.ActiveMask = RootReactionState.SourceMask;
-	RootReactionState.ActiveMask.SolidMask =
-		MoveTemp(Snapshot.ReactionState.ActiveMask);
-	for (uint8& Value : RootReactionState.ActiveMask.SolidMask)
-	{
-		Value = Value != 0 ? 1 : 0;
-	}
-	RootReactionState.bHasReactionState = true;
-	RootReactionState.ReactionRuleId = Snapshot.ReactionState.RuleId;
-	RootReactionState.ReactionSeed = Snapshot.ReactionState.Seed;
-	RootReactionState.ReactionTick = Snapshot.ReactionState.Tick;
-	RootReactionState.ReactionAccumulator =
-		Snapshot.ReactionAccumulator;
-	RootReactionState.TotalMaterialEmissionCount =
-		Snapshot.TotalMaterialEmissionCount;
-	if (const FMatterFluxReactionDefinition* Rule =
-		RootReactionRuntime->GetRule())
-	{
-		RootReactionState.OutputMaterialId = Rule->OutputA;
-		const FMatterFluxContentRegistryPtr Registry =
-			IMatterFluxScriptRuntime::IsAvailable()
-				? IMatterFluxScriptRuntime::Get().GetActiveRegistry()
-				: nullptr;
-		if (Registry.IsValid())
-		{
-			if (const FMatterFluxMaterialDefinition* Output =
-				Registry->Materials.Find(Rule->OutputA))
-			{
-				RootReactionState.OutputColor = Output->Color;
-			}
-		}
-	}
-	if (!RootReactionState.IsValid() || !RebuildMeshFromPayload())
-	{
-		UE_LOG(
-			LogMatterFlux,
-			Error,
-			TEXT("Detached fragment rejected its reaction mesh update"));
-		return false;
-	}
-	ForceNetUpdate();
-	MarkReactionVisualizationDirty();
-	return true;
-}
-
-void AFragment2DActor::AdvanceRootReaction(const float DeltaSeconds)
-{
-	if (!HasAuthority()
-		|| !RootReactionRuntime
-		|| !RootReactionRuntime->IsActive())
-	{
-		return;
-	}
-	const float ClampedDelta = FMath::Clamp(DeltaSeconds, 0.0f, 0.25f);
-	const MatterFlux::Reaction::FSourceAdvanceResult Result =
-		RootReactionRuntime->AdvanceAuthority(ClampedDelta);
-	if (Result.Steps > 0)
-	{
-		SynchronizeRootReactionState();
-	}
-
-	RootReactionPropagationAccumulator += ClampedDelta;
-	if (RootReactionRuntime->IsActive()
-		&& RootReactionPropagationAccumulator >= 0.2f)
-	{
-		RootReactionPropagationAccumulator = FMath::Fmod(
-			RootReactionPropagationAccumulator,
-			0.2f);
-		const FMatterFluxReactionDefinition* Rule =
-			RootReactionRuntime->GetRule();
-		if (Rule)
-		{
-			const int32 Seed = RootReactionState.ReactionSeed
-				^ static_cast<int32>(RootReactionState.ReactionTick)
-				^ static_cast<int32>(GetTypeHash(SpawnPayload.FragmentId));
-			EmitReactionParticleToAdjacentLayer(
-				RootReactionState,
-				GetActorTransform(),
-				Rule->InputB,
-				Seed);
-		}
-	}
-	if (!RootReactionRuntime->IsActive())
-	{
-		RootReactionRuntime.Reset();
-		SetActorTickEnabled(SpawnPayload.FadeOutDuration > 0.0f);
-	}
-}
-
 bool AFragment2DActor::ApplyMaterialStimulusToDetachedAggregateAtWorldLocation(
 	const FGuid& SourceId,
 	const FVector& WorldLocation,
 	const FName StimulusMaterial,
 	const int32 EventSeed)
 {
-	FFragmentAggregateSourceState* Source = AggregateSources.FindByPredicate(
-		[&SourceId](const FFragmentAggregateSourceState& Candidate)
-		{
-			return Candidate.SourceId == SourceId;
-		});
-	if (!HasAuthority()
-		|| WorldLocation.ContainsNaN()
-		|| StimulusMaterial.IsNone()
-		|| !Source
-		|| Source->bOwnsLogicalSource
-		|| !Source->IsValid()
-		|| IsAggregateSourceReacting(SourceId))
-	{
-		return false;
-	}
-	const FMatterFluxContentRegistryPtr Registry =
-		IMatterFluxScriptRuntime::IsAvailable()
-			? IMatterFluxScriptRuntime::Get().GetActiveRegistry()
-			: nullptr;
-	if (!Registry.IsValid())
-	{
-		return false;
-	}
-	const FMatterFluxReactionDefinition* Rule = FindReactionRule(
-		*Registry,
-		Source->MaterialId,
-		StimulusMaterial);
-	if (!Rule)
-	{
-		return false;
-	}
-
-	TUniquePtr<MatterFlux::Reaction::FSourceReactionRuntime> Runtime =
-		MakeUnique<MatterFlux::Reaction::FSourceReactionRuntime>();
-	FString Error;
-	if (!Runtime->Initialize(
-		MatterFlux::Reaction::FSourceRuntimeSettings(),
-		Source->SourceMask,
-		*Rule,
-		EventSeed,
-		Error))
-	{
-		UE_LOG(
-			LogMatterFlux,
-			Error,
-			TEXT("Detached aggregate layer reaction initialization failed: %s"),
-			*Error);
-		return false;
-	}
-	const FTransform WorldTransform =
-		Source->LocalTransform * GetActorTransform();
-	const FVector Local = WorldTransform.InverseTransformPosition(
-		WorldLocation);
-	const FIntPoint RequestedCell(
-		FMath::FloorToInt(
-			Local.X / Source->SourceMask.CellSize
-				+ static_cast<double>(Source->SourceMask.Width) * 0.5),
-		FMath::FloorToInt(
-			Local.Z / Source->SourceMask.CellSize
-				+ static_cast<double>(Source->SourceMask.Height) * 0.5));
-	if (!Runtime->ActivateNearest(RequestedCell, StimulusMaterial))
-	{
-		return false;
-	}
-	DetachedAggregateReactionRuntimes.Add(
-		SourceId,
-		MoveTemp(Runtime));
-	if (!SynchronizeDetachedAggregateReactionState(SourceId))
-	{
-		DetachedAggregateReactionRuntimes.Remove(SourceId);
-		return false;
-	}
-	DetachedAggregateReactionPropagationAccumulator = 0.0f;
-	SetActorTickEnabled(true);
-	return true;
-}
-
-bool AFragment2DActor::SynchronizeDetachedAggregateReactionState(
-	const FGuid& SourceId)
-{
-	TUniquePtr<MatterFlux::Reaction::FSourceReactionRuntime>* RuntimePtr =
-		DetachedAggregateReactionRuntimes.Find(SourceId);
-	FFragmentAggregateSourceState* Source = AggregateSources.FindByPredicate(
-		[&SourceId](const FFragmentAggregateSourceState& Candidate)
-		{
-			return Candidate.SourceId == SourceId;
-		});
-	if (!RuntimePtr || !RuntimePtr->Get() || !Source)
-	{
-		return false;
-	}
-	MatterFlux::Reaction::FSourceRuntimeSnapshot Snapshot;
-	if (!(*RuntimePtr)->CaptureState(Snapshot))
-	{
-		return false;
-	}
-	Source->SourceMask.SolidMask = MoveTemp(
-		Snapshot.ReactionState.InputMask);
-	Source->OutputMask = Source->SourceMask;
-	Source->OutputMask.SolidMask = MoveTemp(
-		Snapshot.ReactionState.OutputMask);
-	Source->ActiveMask = Source->SourceMask;
-	Source->ActiveMask.SolidMask = MoveTemp(
-		Snapshot.ReactionState.ActiveMask);
-	for (uint8& Value : Source->ActiveMask.SolidMask)
-	{
-		Value = Value != 0 ? 1 : 0;
-	}
-	Source->bHasReactionState = true;
-	Source->ReactionRuleId = Snapshot.ReactionState.RuleId;
-	Source->ReactionSeed = Snapshot.ReactionState.Seed;
-	Source->ReactionTick = Snapshot.ReactionState.Tick;
-	Source->ReactionAccumulator = Snapshot.ReactionAccumulator;
-	Source->TotalMaterialEmissionCount = Snapshot.TotalMaterialEmissionCount;
-	if (const FMatterFluxReactionDefinition* Rule =
-		(*RuntimePtr)->GetRule())
-	{
-		Source->OutputMaterialId = Rule->OutputA;
-		const FMatterFluxContentRegistryPtr Registry =
-			IMatterFluxScriptRuntime::IsAvailable()
-				? IMatterFluxScriptRuntime::Get().GetActiveRegistry()
-				: nullptr;
-		if (Registry.IsValid())
-		{
-			if (const FMatterFluxMaterialDefinition* Output =
-				Registry->Materials.Find(Rule->OutputA))
-			{
-				Source->OutputColor = Output->Color;
-			}
-		}
-	}
-	if (!Source->IsValid() || !RebuildMeshFromPayload())
-	{
-		return false;
-	}
-	ForceNetUpdate();
-	MarkReactionVisualizationDirty();
-	return true;
-}
-
-void AFragment2DActor::AdvanceDetachedAggregateReaction(
-	const float DeltaSeconds)
-{
-	if (!HasAuthority() || DetachedAggregateReactionRuntimes.IsEmpty())
-	{
-		return;
-	}
-	const float ClampedDelta = FMath::Clamp(DeltaSeconds, 0.0f, 0.25f);
-	TArray<FGuid> Completed;
-	TArray<FGuid> ActiveIds;
-	DetachedAggregateReactionRuntimes.GetKeys(ActiveIds);
-	ActiveIds.Sort([](const FGuid& A, const FGuid& B)
-	{
-		return A.ToString(EGuidFormats::Digits)
-			< B.ToString(EGuidFormats::Digits);
-	});
-	for (const FGuid& SourceId : ActiveIds)
-	{
-		TUniquePtr<MatterFlux::Reaction::FSourceReactionRuntime>* Runtime =
-			DetachedAggregateReactionRuntimes.Find(SourceId);
-		if (!Runtime || !Runtime->Get())
-		{
-			Completed.Add(SourceId);
-			continue;
-		}
-		const MatterFlux::Reaction::FSourceAdvanceResult Result =
-			(*Runtime)->AdvanceAuthority(ClampedDelta);
-		if (Result.Steps > 0)
-		{
-			SynchronizeDetachedAggregateReactionState(SourceId);
-		}
-		if (!(*Runtime)->IsActive())
-		{
-			Completed.Add(SourceId);
-		}
-	}
-	for (const FGuid& SourceId : Completed)
-	{
-		DetachedAggregateReactionRuntimes.Remove(SourceId);
-	}
-
-	DetachedAggregateReactionPropagationAccumulator += ClampedDelta;
-	if (!DetachedAggregateReactionRuntimes.IsEmpty()
-		&& DetachedAggregateReactionPropagationAccumulator >= 0.2f)
-	{
-		DetachedAggregateReactionPropagationAccumulator = FMath::Fmod(
-			DetachedAggregateReactionPropagationAccumulator,
-			0.2f);
-		for (const FGuid& SourceId : ActiveIds)
-		{
-			const TUniquePtr<
-				MatterFlux::Reaction::FSourceReactionRuntime>* Runtime =
-				DetachedAggregateReactionRuntimes.Find(SourceId);
-			const FFragmentAggregateSourceState* Source =
-				AggregateSources.FindByPredicate(
-					[&SourceId](const FFragmentAggregateSourceState& Candidate)
-					{
-						return Candidate.SourceId == SourceId;
-					});
-			if (!Runtime || !Runtime->Get() || !Source)
-			{
-				continue;
-			}
-			const FMatterFluxReactionDefinition* Rule = (*Runtime)->GetRule();
-			if (Rule)
-			{
-				EmitReactionParticleToAdjacentLayer(
-					*Source,
-					Source->LocalTransform * GetActorTransform(),
-					Rule->InputB,
-					Source->ReactionSeed
-						^ static_cast<int32>(Source->ReactionTick));
-				break;
-			}
-		}
-	}
-}
-
-bool AFragment2DActor::EmitReactionParticleToAdjacentLayer(
-	const FFragmentAggregateSourceState& ActiveSource,
-	const FTransform& ActiveWorldTransform,
-	const FName StimulusMaterial,
-	const int32 EventSeed)
-{
-	if (!HasAuthority()
-		|| !ActiveSource.IsValid()
-		|| !ActiveSource.bHasReactionState
-		|| StimulusMaterial.IsNone()
-		|| !ActiveWorldTransform.IsValid())
-	{
-		return false;
-	}
-	(void)EventSeed;
-	TArray<FVector, TInlineAllocator<64>> ActiveCellCenters;
-	for (int32 Index = 0;
-		Index < ActiveSource.ActiveMask.SolidMask.Num();
-		++Index)
-	{
-		if (ActiveSource.ActiveMask.SolidMask[Index] == 0)
-		{
-			continue;
-		}
-		const int32 X = Index % ActiveSource.SourceMask.Width;
-		const int32 Y = Index / ActiveSource.SourceMask.Width;
-		ActiveCellCenters.Add(ActiveWorldTransform.TransformPosition(FVector(
-			(static_cast<float>(X) + 0.5f
-				- ActiveSource.SourceMask.Width * 0.5f)
-				* ActiveSource.SourceMask.CellSize,
-			0.0f,
-			(static_cast<float>(Y) + 0.5f
-				- ActiveSource.SourceMask.Height * 0.5f)
-				* ActiveSource.SourceMask.CellSize)));
-	}
-	if (ActiveCellCenters.IsEmpty())
-	{
-		return false;
-	}
-
-	struct FAdjacentLayerContact
-	{
-		const FFragmentAggregateSourceState* Source = nullptr;
-		FTransform WorldTransform = FTransform::Identity;
-		FVector WorldLocation = FVector::ZeroVector;
-		double DistanceSquared = TNumericLimits<double>::Max();
-		int32 CellIndex = INDEX_NONE;
-		bool bRoot = false;
-	};
-	FAdjacentLayerContact Best;
-	const auto ConsiderLayer = [
-		&Best,
-		&ActiveCellCenters,
-		&ActiveSource](
-			const FFragmentAggregateSourceState& Candidate,
-			const FTransform& CandidateWorldTransform,
-			const bool bRoot)
-	{
-		if (Candidate.SourceId == ActiveSource.SourceId
-			|| !Candidate.IsValid()
-			|| Candidate.bHasReactionState
-				&& Candidate.ActiveMask.SolidMask.Contains(1))
-		{
-			return;
-		}
-		const double MaximumDistanceSquared = FMath::Square(
-			FMath::Max(
-				ActiveSource.SourceMask.CellSize,
-				Candidate.SourceMask.CellSize) * 1.05);
-		for (int32 Index = 0;
-			Index < Candidate.SourceMask.SolidMask.Num();
-			++Index)
-		{
-			if (Candidate.SourceMask.SolidMask[Index] == 0)
-			{
-				continue;
-			}
-			const int32 X = Index % Candidate.SourceMask.Width;
-			const int32 Y = Index / Candidate.SourceMask.Width;
-			const FVector CandidateCenter =
-				CandidateWorldTransform.TransformPosition(FVector(
-					(static_cast<float>(X) + 0.5f
-						- Candidate.SourceMask.Width * 0.5f)
-						* Candidate.SourceMask.CellSize,
-					0.0f,
-					(static_cast<float>(Y) + 0.5f
-						- Candidate.SourceMask.Height * 0.5f)
-						* Candidate.SourceMask.CellSize));
-			for (const FVector& ActiveCenter : ActiveCellCenters)
-			{
-				const double DistanceSquared = FVector::DistSquared(
-					ActiveCenter,
-					CandidateCenter);
-				if (DistanceSquared > MaximumDistanceSquared)
-				{
-					continue;
-				}
-				const bool bStableTieBreak = FMath::IsNearlyEqual(
-					DistanceSquared,
-					Best.DistanceSquared)
-					&& (!Best.Source
-						|| Candidate.SourceId.ToString(EGuidFormats::Digits)
-							< Best.Source->SourceId.ToString(EGuidFormats::Digits)
-						|| (Candidate.SourceId == Best.Source->SourceId
-							&& Index < Best.CellIndex));
-				if (!Best.Source
-					|| DistanceSquared < Best.DistanceSquared
-					|| bStableTieBreak)
-				{
-					Best.Source = &Candidate;
-					Best.WorldTransform = CandidateWorldTransform;
-					Best.WorldLocation = CandidateCenter;
-					Best.DistanceSquared = DistanceSquared;
-					Best.CellIndex = Index;
-					Best.bRoot = bRoot;
-				}
-			}
-		}
-	};
-	if (RootReactionState.IsValid())
-	{
-		ConsiderLayer(
-			RootReactionState,
-			GetActorTransform(),
-			true);
-	}
-	for (const FFragmentAggregateSourceState& Candidate : AggregateSources)
-	{
-		ConsiderLayer(
-			Candidate,
-			Candidate.LocalTransform * GetActorTransform(),
-			false);
-	}
-	if (!Best.Source)
-	{
-		return false;
-	}
-	if (AMatterFluxPlayableWorldActor* WorldOwner =
-		Cast<AMatterFluxPlayableWorldActor>(GetOwner()))
-	{
-		return WorldOwner->SetSimulatedMaterialAtWorldLocation(
-			Best.WorldLocation,
-			StimulusMaterial);
-	}
-	if (UWorld* World = GetWorld())
-	{
-		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
-		{
-			if (It->SetSimulatedMaterialAtWorldLocation(
-				Best.WorldLocation,
-				StimulusMaterial))
-			{
-				return true;
-			}
-		}
-	}
+	// The world material-contact adapter owns stimulus deposition for every
+	// carrier cell. Detached layers intentionally have no object-level runtime.
 	return false;
 }
 
-void AFragment2DActor::GatherRootReactionVisualTransforms(
+void AFragment2DActor::GatherRootMaterialVisualTransforms(
 	TArray<FTransform>& OutFlameTransforms,
 	TArray<MatterFlux::Rendering::FMaterialEmissionAnchor>& OutSmokeAnchors,
 	const int32 MaxVisualInstances) const
@@ -2134,7 +2491,7 @@ void AFragment2DActor::GatherRootReactionVisualTransforms(
 		IMatterFluxScriptRuntime::IsAvailable()
 			? IMatterFluxScriptRuntime::Get().GetActiveRegistry()
 			: nullptr;
-	const auto AppendState = [
+	const auto AppendVolumeFields = [
 		this,
 		&OutFlameTransforms,
 		&OutSmokeAnchors,
@@ -2143,118 +2500,87 @@ void AFragment2DActor::GatherRootReactionVisualTransforms(
 			const FFragmentAggregateSourceState& State,
 			const FTransform& VisualTransform)
 	{
-		if (!State.IsValid()
-			|| !State.bHasReactionState
-			|| !State.ActiveMask.SolidMask.Contains(1))
+		if (!State.IsValid() || !VisualTransform.IsValid())
 		{
 			return;
 		}
-		const FMatterFluxReactionDefinition* Rule = Registry.IsValid()
-			? Registry->Reactions.Find(State.ReactionRuleId)
-			: nullptr;
-		const bool bRenderFlames = Rule
-			&& MatterFlux::Reaction::UsesFlamePresentation(*Rule);
-		TArray<uint8> Occupied = State.SourceMask.SolidMask;
-		if (State.OutputMask.SolidMask.Num() == Occupied.Num())
+		const FMatterFluxMaterialDefinition* Base = Registry.IsValid()
+			? Registry->Materials.Find(State.MaterialId) : nullptr;
+		for (const FFragmentCarrierVolumeCellState& Cell
+			: State.VolumeCellStates)
 		{
-			for (int32 Index = 0; Index < Occupied.Num(); ++Index)
+			const FMatterFluxMaterialDefinition* Current = Registry.IsValid()
+				? Registry->Materials.Find(Cell.MaterialId) : nullptr;
+			uint16 BurningThreshold = Current
+				? Current->IgnitionThreshold : 0;
+			if (BurningThreshold == 0
+				&& Base
+				&& Base->CombustionProduct == Cell.MaterialId
+				&& Current
+				&& Current->Phase
+					== EMatterFluxMaterialPhase::StaticSolid)
 			{
-				Occupied[Index] = Occupied[Index] != 0
-					|| State.OutputMask.SolidMask[Index] != 0;
+				BurningThreshold = FMath::Max<uint16>(
+					Base->IgnitionThreshold,
+					static_cast<uint16>(FMath::Max(
+						static_cast<int32>(Base->CombustionEnergy) - 100,
+						0)));
 			}
-		}
-		TArray<int32> VisibleActiveCells;
-		for (int32 Index = 0;
-			Index < State.ActiveMask.SolidMask.Num();
-			++Index)
-		{
-			if (State.ActiveMask.SolidMask[Index] != 0)
+			if (BurningThreshold == 0
+				|| Cell.Energy < BurningThreshold
+				|| Cell.Energy <= State.VolumeEnvironmentEnergy
+				|| (OutFlameTransforms.Num() >= MaxVisualInstances
+					&& OutSmokeAnchors.Num() >= MaxVisualInstances))
 			{
-				VisibleActiveCells.Add(Index);
+				continue;
 			}
-		}
-		TArray<int32> SmokeSourceCells;
-		MatterFlux::FragmentGeometry::GatherTopExposedActiveMaskCells(
-			Occupied,
-			State.ActiveMask.SolidMask,
-			State.SourceMask.Width,
-			State.SourceMask.Height,
-			SmokeSourceCells);
-		TSet<int32> SmokeSourceCellSet;
-		for (const int32 SmokeSourceCell : SmokeSourceCells)
-		{
-			SmokeSourceCellSet.Add(SmokeSourceCell);
-		}
-		const FFragmentSourceMask& Mask = State.SourceMask;
-		for (const int32 Index : VisibleActiveCells)
-		{
-			if (OutFlameTransforms.Num() >= MaxVisualInstances
-				&& OutSmokeAnchors.Num() >= MaxVisualInstances)
-			{
-				break;
-			}
-			const int32 X = Index % Mask.Width;
-			const int32 Y = Index / Mask.Width;
 			const FVector LocalPosition(
-				(static_cast<float>(X) + 0.5f
-					- static_cast<float>(Mask.Width) * 0.5f)
-					* Mask.CellSize,
+				(static_cast<double>(Cell.Cell.X) + 0.5
+					- static_cast<double>(State.SourceMask.Width) * 0.5)
+					* State.SourceMask.CellSize,
 				VisualDepthOffset,
-				(static_cast<float>(Y) + 0.62f
-					- static_cast<float>(Mask.Height) * 0.5f)
-					* Mask.CellSize);
-			const FVector Position = VisualTransform.TransformPosition(
-				LocalPosition);
-			const float BaseScale = Mask.CellSize / 100.0f;
-			const FVector FlameScale(
-				BaseScale * 1.06f,
-				BaseScale * 1.06f,
-				BaseScale * 1.18f);
-			if (bRenderFlames
-				&& OutFlameTransforms.Num() < MaxVisualInstances)
+				(static_cast<double>(Cell.Cell.Y) + 0.62
+					- static_cast<double>(State.SourceMask.Height) * 0.5)
+					* State.SourceMask.CellSize);
+			const FVector WorldPosition =
+				VisualTransform.TransformPosition(LocalPosition);
+			const float BaseScale = State.SourceMask.CellSize / 100.0f;
+			if (OutFlameTransforms.Num() < MaxVisualInstances)
 			{
 				OutFlameTransforms.Emplace(
 					VisualTransform.Rotator(),
-					Position,
-					FlameScale);
+					WorldPosition,
+					FVector(
+						BaseScale * 1.06f,
+						BaseScale * 1.06f,
+						BaseScale * 1.18f));
 			}
-			if (SmokeSourceCellSet.Contains(Index)
-				&& OutSmokeAnchors.Num() < MaxVisualInstances)
+			if (OutSmokeAnchors.Num() < MaxVisualInstances)
 			{
-				float SmokeProbability = 0.7f;
-				if (Rule)
-				{
-					SmokeProbability = FMath::Clamp(
-						static_cast<float>(Rule->EmissionChancePermille)
-							/ 1000.0f,
-						0.0f,
-						1.0f);
-				}
 				MatterFlux::Rendering::FMaterialEmissionAnchor& Anchor =
 					OutSmokeAnchors.AddDefaulted_GetRef();
-				Anchor.WorldPosition = Position + FVector(
-					0.0f,
-					0.0f,
-					Mask.CellSize * 1.05f);
-				Anchor.CellSize = Mask.CellSize;
-				Anchor.EmissionProbability = SmokeProbability;
+				Anchor.WorldPosition = WorldPosition + FVector(
+					0.0f, 0.0f, State.SourceMask.CellSize * 1.05f);
+				Anchor.CellSize = State.SourceMask.CellSize;
+				Anchor.EmissionProbability = FMath::Clamp(
+					static_cast<float>(Cell.Energy - BurningThreshold)
+						/ static_cast<float>(FMath::Max<int32>(
+							1, MAX_uint16 - BurningThreshold)),
+					0.15f,
+					1.0f);
 				Anchor.Seed = GetTypeHash(State.SourceId)
-					^ static_cast<uint32>(Index) * 0x9e3779b9u;
+					^ GetTypeHash(Cell.Cell);
 			}
 		}
 	};
-	if (IsRootReacting())
+	if (RootMaterialState.IsValid())
 	{
-		AppendState(RootReactionState, GetActorTransform());
+		AppendVolumeFields(RootMaterialState, GetActorTransform());
 	}
 	for (const FFragmentAggregateSourceState& Source : AggregateSources)
 	{
-		if (!Source.bOwnsLogicalSource)
-		{
-			AppendState(
-				Source,
-				Source.LocalTransform * GetActorTransform());
-		}
+		AppendVolumeFields(
+			Source, Source.LocalTransform * GetActorTransform());
 	}
 }
 
@@ -2264,7 +2590,7 @@ void AFragment2DActor::MarkReactionVisualizationDirty() const
 	{
 		for (TActorIterator<AMatterFluxPlayableWorldActor> It(World); It; ++It)
 		{
-			It->MarkSourceReactionVisualizationDirty();
+			It->MarkSourceMaterialVisualizationDirty();
 		}
 	}
 }
@@ -2344,52 +2670,16 @@ bool AFragment2DActor::AbsorbAggregateSource(
 	Candidate.MaterialId = SourceActor.SourceMaterialId;
 	Candidate.Color = SourceActor.FragmentColor;
 	Candidate.bEnableCollision = SourceActor.bEnableSourceCollision;
-	Candidate.OutputMask = Candidate.SourceMask;
-	Candidate.OutputMask.SolidMask.Init(
-		0,
-		Candidate.SourceMask.SolidMask.Num());
-	Candidate.ActiveMask = Candidate.SourceMask;
-	Candidate.ActiveMask.SolidMask.Init(
-		0,
-		Candidate.SourceMask.SolidMask.Num());
-	if (StreamingState.bHasReactionState)
+	Candidate.VolumeTopologyRevision =
+		StreamingState.VolumeTopologyRevision;
+	Candidate.VolumeFieldRevision = StreamingState.VolumeFieldRevision;
+	Candidate.VolumeEnvironmentEnergy =
+		StreamingState.VolumeEnvironmentEnergy;
+	Candidate.VolumeCellStates.Reserve(StreamingState.VolumeCellStates.Num());
+	for (const FFragment2DMaterialVolumeCellState& Cell
+		: StreamingState.VolumeCellStates)
 	{
-		Candidate.OutputMask.SolidMask =
-			StreamingState.ReactionState.OutputMask;
-		Candidate.ActiveMask.SolidMask =
-			StreamingState.ReactionState.ActiveMask;
-		for (uint8& Value : Candidate.ActiveMask.SolidMask)
-		{
-			Value = Value != 0 ? 1 : 0;
-		}
-		Candidate.bHasReactionState = true;
-		Candidate.ReactionRuleId =
-			StreamingState.ReactionState.RuleId;
-		Candidate.ReactionSeed =
-			StreamingState.ReactionState.Seed;
-		Candidate.ReactionTick =
-			StreamingState.ReactionState.Tick;
-		Candidate.ReactionAccumulator =
-			StreamingState.ReactionAccumulator;
-		Candidate.TotalMaterialEmissionCount =
-			StreamingState.TotalMaterialEmissionCount;
-		const FMatterFluxContentRegistryPtr Registry =
-			IMatterFluxScriptRuntime::IsAvailable()
-				? IMatterFluxScriptRuntime::Get().GetActiveRegistry()
-				: nullptr;
-		if (Registry.IsValid())
-		{
-			if (const FMatterFluxReactionDefinition* Rule =
-				Registry->Reactions.Find(Candidate.ReactionRuleId))
-			{
-				Candidate.OutputMaterialId = Rule->OutputA;
-				if (const FMatterFluxMaterialDefinition* Material =
-					Registry->Materials.Find(Rule->OutputA))
-				{
-					Candidate.OutputColor = Material->Color;
-				}
-			}
-		}
+		Candidate.VolumeCellStates.Add({ Cell.Cell, Cell.MaterialId, Cell.Energy });
 	}
 	return AddAggregateSourceState(MoveTemp(Candidate), &SourceActor);
 }
@@ -2421,14 +2711,6 @@ bool AFragment2DActor::AbsorbAggregateSourceFragment(
 	Candidate.MaterialId = Payload.MaterialId;
 	Candidate.Color = SourceActor.FragmentColor;
 	Candidate.bEnableCollision = Payload.bEnableCollision;
-	Candidate.OutputMask = Candidate.SourceMask;
-	Candidate.OutputMask.SolidMask.Init(
-		0,
-		Candidate.SourceMask.SolidMask.Num());
-	Candidate.ActiveMask = Candidate.SourceMask;
-	Candidate.ActiveMask.SolidMask.Init(
-		0,
-		Candidate.SourceMask.SolidMask.Num());
 	return AddAggregateSourceState(MoveTemp(Candidate), nullptr);
 }
 
@@ -2699,7 +2981,7 @@ void AFragment2DActor::ConfigureTransientFade()
 	{
 		TransientFadeElapsed = 0.0f;
 		TransientFadeAlpha = 1.0f;
-		SetActorTickEnabled(IsRootReacting());
+		SetActorTickEnabled(IsRootMaterialHot());
 		return;
 	}
 
@@ -2878,6 +3160,24 @@ bool AFragment2DActor::RebuildMeshFromPayload()
 
 bool AFragment2DActor::RebuildAggregateSourceSections()
 {
+	const FMatterFluxContentRegistryPtr ContentRegistry =
+		IMatterFluxScriptRuntime::IsAvailable()
+			? IMatterFluxScriptRuntime::Get().GetActiveRegistry()
+			: nullptr;
+	const auto ResolveVolumeColor = [&ContentRegistry](
+		const FName MaterialId,
+		const FLinearColor& Fallback)
+	{
+		if (ContentRegistry.IsValid())
+		{
+			if (const FMatterFluxMaterialDefinition* Definition =
+				ContentRegistry->Materials.Find(MaterialId))
+			{
+				return Definition->Color;
+			}
+		}
+		return Fallback;
+	};
 	struct FRenderGroup
 	{
 		TObjectPtr<UMaterialInterface> Material;
@@ -2912,11 +3212,11 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 		&& SpawnPayload.DetachedVoxelMask.GeometryStyle
 			== EFragmentSourceGeometryStyle::VoxelBlocks
 		&& !SpawnPayload.MaterialId.IsNone();
-	const bool bUseRootReactionState = bIncludeRootVoxel
-		&& RootReactionState.SourceId == SpawnPayload.FragmentId
-		&& RootReactionState.SourceMask.HasValidLayout();
-	const FFragmentSourceMask& RootRenderMask = bUseRootReactionState
-		? RootReactionState.SourceMask
+	const bool bUseRootMaterialState = bIncludeRootVoxel
+		&& RootMaterialState.SourceId == SpawnPayload.FragmentId
+		&& RootMaterialState.SourceMask.HasValidLayout();
+	const FFragmentSourceMask& RootRenderMask = bUseRootMaterialState
+		? RootMaterialState.SourceMask
 		: SpawnPayload.DetachedVoxelMask;
 	if (bIncludeRootVoxel)
 	{
@@ -2933,24 +3233,36 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 				FragmentColor,
 				RootRenderMask.CellSize});
 		}
-		if (bUseRootReactionState
-			&& RootReactionState.bHasReactionState
-			&& RootReactionState.OutputMask.SolidMask.Contains(1))
+		if (bUseRootMaterialState)
 		{
-			const FName OutputMaterialId =
-				RootReactionState.OutputMaterialId.IsNone()
-					? FName(TEXT("output"))
-					: RootReactionState.OutputMaterialId;
-			WholeMaterials.Add({
-				FString::Printf(
+			for (const FFragmentCarrierVolumeCellState& Cell
+				: RootMaterialState.VolumeCellStates)
+			{
+				if (Cell.MaterialId == SpawnPayload.MaterialId)
+				{
+					continue;
+				}
+				const FLinearColor Color = ResolveVolumeColor(
+					Cell.MaterialId, FragmentColor);
+				const FString StableKey = FString::Printf(
 					TEXT("%s|%08x|%08x"),
-					*OutputMaterialId.ToString(),
-					RootReactionState.OutputColor.ToFColor(false).DWColor(),
-					GetTypeHash(RootRenderMask.CellSize)),
-				FragmentMaterial,
-				OutputMaterialId,
-				RootReactionState.OutputColor,
-				RootRenderMask.CellSize});
+					*Cell.MaterialId.ToString(),
+					Color.ToFColor(false).DWColor(),
+					GetTypeHash(RootRenderMask.CellSize));
+				if (!WholeMaterials.ContainsByPredicate(
+					[&StableKey](const FWholeMaterial& Existing)
+					{
+						return Existing.StableKey == StableKey;
+					}))
+				{
+					WholeMaterials.Add({
+						StableKey,
+						FragmentMaterial,
+						Cell.MaterialId,
+						Color,
+						RootRenderMask.CellSize});
+				}
+			}
 		}
 	}
 	for (const FFragmentAggregateSourceState& Source : AggregateSources)
@@ -2988,14 +3300,15 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 		{
 			AddMaterial(Source.MaterialId, Source.Color);
 		}
-		if (Source.bHasReactionState
-			&& Source.OutputMask.SolidMask.Contains(1))
+		for (const FFragmentCarrierVolumeCellState& Cell
+			: Source.VolumeCellStates)
 		{
-			AddMaterial(
-				Source.OutputMaterialId.IsNone()
-					? FName(TEXT("output"))
-					: Source.OutputMaterialId,
-				Source.OutputColor);
+			if (Cell.MaterialId != Source.MaterialId)
+			{
+				AddMaterial(
+					Cell.MaterialId,
+					ResolveVolumeColor(Cell.MaterialId, Source.Color));
+			}
 		}
 	}
 	WholeMaterials.Sort([](const FWholeMaterial& A, const FWholeMaterial& B)
@@ -3051,16 +3364,41 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 			SpawnPayload.MaterialId,
 			FragmentColor,
 			SpawnPayload.MaterialId == TEXT("leaf") ? 100 : 10);
-		if (bUseRootReactionState
-			&& RootReactionState.bHasReactionState)
+		if (bUseRootMaterialState)
 		{
-			AddRootLayer(
-				RootReactionState.OutputMask.SolidMask,
-				RootReactionState.OutputMaterialId.IsNone()
-					? FName(TEXT("output"))
-					: RootReactionState.OutputMaterialId,
-				RootReactionState.OutputColor,
-				200);
+			TMap<FName, TArray<uint8>> OverrideMasks;
+			for (const FFragmentCarrierVolumeCellState& Cell
+				: RootMaterialState.VolumeCellStates)
+			{
+				if (Cell.MaterialId == SpawnPayload.MaterialId)
+				{
+					continue;
+				}
+				TArray<uint8>& Mask = OverrideMasks.FindOrAdd(
+					Cell.MaterialId);
+				if (Mask.IsEmpty())
+				{
+					Mask.Init(0, RootRenderMask.SolidMask.Num());
+				}
+				const int32 Index = Cell.Cell.Y * RootRenderMask.Width
+					+ Cell.Cell.X;
+				if (Mask.IsValidIndex(Index)
+					&& RootRenderMask.SolidMask[Index] != 0)
+				{
+					Mask[Index] = 1;
+				}
+			}
+			TArray<FName> MaterialIds;
+			OverrideMasks.GetKeys(MaterialIds);
+			MaterialIds.Sort(FNameLexicalLess());
+			for (const FName MaterialId : MaterialIds)
+			{
+				AddRootLayer(
+					OverrideMasks.FindChecked(MaterialId),
+					MaterialId,
+					ResolveVolumeColor(MaterialId, FragmentColor),
+					300);
+			}
 		}
 	}
 	for (const FFragmentAggregateSourceState& Source : AggregateSources)
@@ -3117,15 +3455,37 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 			Source.MaterialId,
 			Source.Color,
 			Source.MaterialId == TEXT("leaf") ? 100 : 10);
-		if (Source.bHasReactionState)
+		TMap<FName, TArray<uint8>> OverrideMasks;
+		for (const FFragmentCarrierVolumeCellState& Cell
+			: Source.VolumeCellStates)
+		{
+			if (Cell.MaterialId == Source.MaterialId)
+			{
+				continue;
+			}
+			TArray<uint8>& Mask = OverrideMasks.FindOrAdd(Cell.MaterialId);
+			if (Mask.IsEmpty())
+			{
+				Mask.Init(0, Source.SourceMask.SolidMask.Num());
+			}
+			const int32 Index = Cell.Cell.Y * Source.SourceMask.Width
+				+ Cell.Cell.X;
+			if (Mask.IsValidIndex(Index)
+				&& Source.SourceMask.SolidMask[Index] != 0)
+			{
+				Mask[Index] = 1;
+			}
+		}
+		TArray<FName> MaterialIds;
+		OverrideMasks.GetKeys(MaterialIds);
+		MaterialIds.Sort(FNameLexicalLess());
+		for (const FName MaterialId : MaterialIds)
 		{
 			AddLayer(
-				Source.OutputMask.SolidMask,
-				Source.OutputMaterialId.IsNone()
-					? FName(TEXT("output"))
-					: Source.OutputMaterialId,
-				Source.OutputColor,
-				200);
+				OverrideMasks.FindChecked(MaterialId),
+				MaterialId,
+				ResolveVolumeColor(MaterialId, Source.Color),
+				300);
 		}
 	}
 	WholeLayers.RemoveAll(
@@ -3201,7 +3561,7 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 			FName MaterialId = NAME_None;
 			FLinearColor Color = FLinearColor::White;
 		};
-		TArray<FRenderLayer, TInlineAllocator<2>> RenderLayers;
+		TArray<FRenderLayer> RenderLayers;
 		if (Source.SourceMask.SolidMask.Contains(1))
 		{
 			RenderLayers.Add({
@@ -3209,15 +3569,36 @@ bool AFragment2DActor::RebuildAggregateSourceSections()
 				Source.MaterialId,
 				Source.Color});
 		}
-		if (Source.bHasReactionState
-			&& Source.OutputMask.SolidMask.Contains(1))
+		TMap<FName, TArray<uint8>> OverrideMasks;
+		for (const FFragmentCarrierVolumeCellState& Cell
+			: Source.VolumeCellStates)
+		{
+			if (Cell.MaterialId == Source.MaterialId)
+			{
+				continue;
+			}
+			TArray<uint8>& Mask = OverrideMasks.FindOrAdd(Cell.MaterialId);
+			if (Mask.IsEmpty())
+			{
+				Mask.Init(0, Source.SourceMask.SolidMask.Num());
+			}
+			const int32 Index = Cell.Cell.Y * Source.SourceMask.Width
+				+ Cell.Cell.X;
+			if (Mask.IsValidIndex(Index)
+				&& Source.SourceMask.SolidMask[Index] != 0)
+			{
+				Mask[Index] = 1;
+			}
+		}
+		TArray<FName> OverrideMaterialIds;
+		OverrideMasks.GetKeys(OverrideMaterialIds);
+		OverrideMaterialIds.Sort(FNameLexicalLess());
+		for (const FName OverrideMaterialId : OverrideMaterialIds)
 		{
 			RenderLayers.Add({
-				&Source.OutputMask.SolidMask,
-				Source.OutputMaterialId.IsNone()
-					? FName(TEXT("output"))
-					: Source.OutputMaterialId,
-				Source.OutputColor});
+				&OverrideMasks.FindChecked(OverrideMaterialId),
+				OverrideMaterialId,
+				ResolveVolumeColor(OverrideMaterialId, Source.Color)});
 		}
 
 		for (const FRenderLayer& Layer : RenderLayers)
@@ -3448,33 +3829,21 @@ bool AFragment2DActor::RebuildSimpleCollision()
 	if (SpawnPayload.bEnableCollision)
 	{
 		const bool bUseCutRootMask =
-			RootReactionState.SourceMask.HasValidLayout()
+			RootMaterialState.SourceMask.HasValidLayout()
 			&& SpawnPayload.DetachedVoxelMask.GeometryStyle
 				== EFragmentSourceGeometryStyle::VoxelBlocks;
 		if (bUseCutRootMask)
 		{
-			TArray<uint8> CollisionMask =
-				RootReactionState.SourceMask.SolidMask;
-			if (RootReactionState.bHasReactionState
-				&& RootReactionState.OutputMask.SolidMask.Num()
-					== CollisionMask.Num())
-			{
-				for (int32 Index = 0; Index < CollisionMask.Num(); ++Index)
-				{
-					CollisionMask[Index] = CollisionMask[Index] != 0
-						|| RootReactionState.OutputMask.SolidMask[Index] != 0
-						? 1
-						: 0;
-				}
-			}
+			const TArray<uint8>& CollisionMask =
+				RootMaterialState.SourceMask.SolidMask;
 			if (CollisionMask.Contains(1))
 			{
 				MatterFlux::FragmentGeometry::FFragmentGeometry2D Geometry;
 				if (!MatterFlux::FragmentGeometry::BuildFragmentGeometryFromMask(
 					CollisionMask,
-					RootReactionState.SourceMask.Width,
-					RootReactionState.SourceMask.Height,
-					RootReactionState.SourceMask.CellSize,
+					RootMaterialState.SourceMask.Width,
+					RootMaterialState.SourceMask.Height,
+					RootMaterialState.SourceMask.CellSize,
 					Geometry))
 				{
 					MeshComponent->SetCollisionEnabled(
@@ -3485,7 +3854,7 @@ bool AFragment2DActor::RebuildSimpleCollision()
 				{
 					AddContour(
 						Contour,
-						RootReactionState.SourceMask.CellSize,
+						RootMaterialState.SourceMask.CellSize,
 						FTransform::Identity);
 				}
 			}
@@ -3509,18 +3878,7 @@ bool AFragment2DActor::RebuildSimpleCollision()
 		{
 			continue;
 		}
-		TArray<uint8> CollisionMask = Source.SourceMask.SolidMask;
-		if (Source.bHasReactionState
-			&& Source.OutputMask.SolidMask.Num() == CollisionMask.Num())
-		{
-			for (int32 Index = 0; Index < CollisionMask.Num(); ++Index)
-			{
-				CollisionMask[Index] = CollisionMask[Index] != 0
-					|| Source.OutputMask.SolidMask[Index] != 0
-					? 1
-					: 0;
-			}
-		}
+		const TArray<uint8>& CollisionMask = Source.SourceMask.SolidMask;
 		MatterFlux::FragmentGeometry::FFragmentGeometry2D Geometry;
 		if (!MatterFlux::FragmentGeometry::BuildFragmentGeometryFromMask(
 				CollisionMask,

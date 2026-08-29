@@ -161,6 +161,21 @@ struct MATTERFLUX_API FMatterFluxSavedReactionState
 };
 
 USTRUCT(BlueprintType)
+struct MATTERFLUX_API FMatterFluxSavedVolumeCellState
+{
+	GENERATED_BODY()
+
+	UPROPERTY(SaveGame)
+	FIntVector Cell = FIntVector::ZeroValue;
+
+	UPROPERTY(SaveGame)
+	FName MaterialId = NAME_None;
+
+	UPROPERTY(SaveGame)
+	uint16 Energy = 0;
+};
+
+USTRUCT(BlueprintType)
 struct MATTERFLUX_API FMatterFluxSavedFragmentSourceState
 {
 	GENERATED_BODY()
@@ -170,6 +185,18 @@ struct MATTERFLUX_API FMatterFluxSavedFragmentSourceState
 
 	UPROPERTY(SaveGame)
 	int32 Revision = 0;
+
+	UPROPERTY(SaveGame)
+	int32 VolumeTopologyRevision = 0;
+
+	UPROPERTY(SaveGame)
+	int32 VolumeFieldRevision = 0;
+
+	UPROPERTY(SaveGame)
+	uint16 VolumeEnvironmentEnergy = 0;
+
+	UPROPERTY(SaveGame)
+	TArray<FMatterFluxSavedVolumeCellState> VolumeCellStates;
 
 	UPROPERTY(SaveGame)
 	TArray<uint8> RuntimeMask;
@@ -207,6 +234,69 @@ struct MATTERFLUX_API FMatterFluxTerrainHeightOverride
 };
 
 USTRUCT(BlueprintType)
+struct MATTERFLUX_API FMatterFluxTerrainSpanState
+{
+	GENERATED_BODY()
+
+	UPROPERTY(SaveGame)
+	int32 BeginN = 0;
+
+	UPROPERTY(SaveGame)
+	int32 EndNExclusive = 0;
+
+	UPROPERTY(SaveGame)
+	FName MaterialId = TEXT("soil");
+};
+
+/** One sparse non-environment terrain-cell energy value. */
+USTRUCT(BlueprintType)
+struct MATTERFLUX_API FMatterFluxTerrainEnergyState
+{
+	GENERATED_BODY()
+
+	/** N coordinate inside the owning terrain column. */
+	UPROPERTY(SaveGame)
+	int32 N = 0;
+
+	UPROPERTY(SaveGame)
+	uint16 Energy = 0;
+};
+
+/**
+ * Sparse authoritative terrain column, shared by V6 save and replication.
+ * A column can carry only field edits while its procedural topology stays implicit.
+ */
+USTRUCT(BlueprintType)
+struct MATTERFLUX_API FMatterFluxTerrainSpanOverride
+{
+	GENERATED_BODY()
+
+	UPROPERTY(SaveGame)
+	FIntPoint WorldCell = FIntPoint::ZeroValue;
+
+	/** Distinguishes an explicitly empty column from an implicit baseline column. */
+	UPROPERTY(SaveGame)
+	bool bHasTopologyOverride = false;
+
+	UPROPERTY(SaveGame)
+	TArray<FMatterFluxTerrainSpanState> Spans;
+
+	UPROPERTY(SaveGame)
+	TArray<FMatterFluxTerrainEnergyState> EnergyOverrides;
+
+	/** Stable cave/terrain face chosen by the settled MaterialWorld column. */
+	UPROPERTY(SaveGame)
+	bool bHasSettledSurface = false;
+
+	UPROPERTY(SaveGame)
+	int32 SettledSurfaceN = 0;
+
+	/** Serialized EMaterialSurfaceFace value; kept POD for save compatibility. */
+	UPROPERTY(SaveGame)
+	uint8 SettledSurfaceFace = 5;
+};
+
+USTRUCT(BlueprintType)
 struct MATTERFLUX_API FMatterFluxWorldSaveState
 {
 	GENERATED_BODY()
@@ -214,8 +304,15 @@ struct MATTERFLUX_API FMatterFluxWorldSaveState
 	UPROPERTY(SaveGame)
 	TArray<uint8> MaterialActiveState;
 
+	/** Deterministic fixed step used by the authoritative local-reaction kernel. */
+	UPROPERTY(SaveGame)
+	uint32 LocalMaterialReactionStep = 0;
+
 	UPROPERTY(SaveGame)
 	TArray<FMatterFluxTerrainHeightOverride> TerrainHeightOverrides;
+
+	UPROPERTY(SaveGame)
+	TArray<FMatterFluxTerrainSpanOverride> TerrainSpanOverrides;
 
 	UPROPERTY(SaveGame)
 	TArray<FMatterFluxSavedFragmentSourceState> FragmentSources;

@@ -6,14 +6,13 @@
 #include "Game/MatterFluxFragmentSourceReplication.h"
 #include "GameFramework/Actor.h"
 #include "Game/MatterFluxPlayableLevel.h"
-#include "Material/MatterFluxGroundReactionRuntime.h"
 #include "Material/MatterFluxCustomMap.h"
-#include "Material/MatterFluxLogicalSourceReactionIndex.h"
-#include "Material/MatterFluxSourceReactionRuntime.h"
+#include "Material/MatterFluxLocalMaterialReaction.h"
 #include "Material/MatterFluxMaterialSimulationRuntime.h"
 #include "Material/MatterFluxReplicatedMaterialState.h"
 #include "Rendering/MatterFluxSmokeVisualPool.h"
 #include "Save/MatterFluxSaveTypes.h"
+#include "Volume/MatterFluxMaterialVolume.h"
 #include "MatterFluxPlayableWorldActor.generated.h"
 
 class UDirectionalLightComponent;
@@ -30,7 +29,6 @@ class UProceduralMeshComponent;
 class UMatterFluxFragmentSourceProxyComponent;
 class AFragment2DSourceActor;
 class AFragment2DActor;
-class AMatterFluxGroundStateChunkActor;
 class AMatterFluxPlayableWorldActor;
 class AMatterFluxTwoStoreyHouseActor;
 struct FMatterFluxAsyncPopulationBuildState;
@@ -56,6 +54,7 @@ namespace MatterFlux::Rendering
 namespace MatterFlux::TerrainMesh
 {
 	struct FChunk;
+	struct FVolumeSnapshot;
 }
 
 UENUM(BlueprintType)
@@ -199,6 +198,9 @@ public:
 	bool TrySampleTerrainHeightAtWorldLocation(
 		const FVector& WorldLocation,
 		float& OutWorldHeight) const;
+	bool TryGetSettledMaterialSurfaceKey(
+		FIntPoint MaterialCell,
+		FMaterialSurfaceKey& OutSurface) const;
 	/**
 	 * Places a requested capsule center above every canonical terrain sample
 	 * that can contribute to the smoothed collision surface under its footprint.
@@ -338,6 +340,8 @@ public:
 		return PendingTerrainChunkPrefetches.Num()
 			+ TerrainChunksBuilding.Num();
 	}
+	/** Describes the exact server-side barrier holding initial player entry. */
+	FString GetInitialWorldEntryDiagnostic() const;
 	bool HasVisibleTerrainChunk(const FIntPoint Chunk) const
 	{
 		return ActiveTerrainChunks.Contains(Chunk);
@@ -410,9 +414,9 @@ public:
 		const FVector& WorldLocation,
 		FName StimulusMaterial,
 		int32 EventSeed);
-	void MarkSourceReactionVisualizationDirty()
+	void MarkSourceMaterialVisualizationDirty()
 	{
-		bSourceReactionVisualDirty = true;
+		bSourceMaterialVisualDirty = true;
 	}
 	void MaterializeFragmentAggregate(const FGuid& AggregateId);
 	/** Keeps an interaction source resident across asynchronous presentation steps. */
@@ -534,7 +538,8 @@ public:
 		float SupportSearchRadius = 0.0f,
 		int32 PreferredPowderColumnLayers = 0,
 		int32 ExplicitMaterialAmount = 0,
-		int32* OutAcceptedMaterialAmount = nullptr);
+		int32* OutAcceptedMaterialAmount = nullptr,
+		int32 SpecificEnergy = INDEX_NONE);
 	/** Read-only proof that powder is currently carried by object support. */
 	int32 GetExternalMaterialSupportCellCount() const
 	{
@@ -607,30 +612,27 @@ public:
 	bool ApplyMaterialStimulusToFirstGeneratedTree(int32 EventSeed = 404);
 
 	UFUNCTION(BlueprintPure, Category = "Playable World|Reaction")
-	int32 GetReactingSourceCount() const;
+	int32 GetHotSourceCount() const;
 
 	UFUNCTION(BlueprintPure, Category = "Playable World|Reaction")
-	int32 GetReactionOutputCellCount() const;
-	int32 GetLogicalReactionOutputCellCount(FName MaterialId) const;
-	int32 GetLogicalReactionInputCellCount(FName MaterialId) const;
-	int32 GetLogicalReactionActiveCellCount(FName MaterialId) const;
-	int32 GetLogicalReactionMaterialEmissionCount() const;
+	int32 GetMaterialOverrideCellCount() const;
+	int32 GetLogicalMaterialOverrideCellCount(FName MaterialId) const;
+	int32 GetLogicalBaseMaterialCellCount(FName MaterialId) const;
+	int32 GetLogicalHotMaterialCellCount(FName MaterialId) const;
+	int32 GetLogicalMaterialEmissionCount() const;
 	/** Read-only audit for duplicate normal/burned proxy cells. */
-	int32 GetLogicalReactionProjectionOverlapCellCount() const;
+	int32 GetLogicalMaterialProjectionOverlapCellCount() const;
 	/** Number of burned tree layers still rendered as a separate 2D overlay. */
-	int32 GetStandaloneTreeReactionOutputProjectionCount() const;
+	int32 GetStandaloneTreeMaterialOverrideProjectionCount() const;
 	/** Read-only count of currently rendered logical-source flame cells. */
-	int32 GetLogicalReactionFlameInstanceCount() const;
+	int32 GetLogicalMaterialFlameInstanceCount() const;
 
 	UFUNCTION(BlueprintPure, Category = "Playable World|Reaction")
-	int32 GetReactedGroundCellCount() const;
-	int32 GetActiveGroundReactionCellCount() const;
+	int32 GetTerrainMaterialOverrideCellCount() const;
+	int32 GetHotTerrainMaterialCellCount() const;
 
 	UFUNCTION(BlueprintPure, Category = "Playable World|Reaction")
-	int32 GetReplicatedGroundReactionByteCount() const;
-
-	bool ApplyReplicatedGroundStateChunk(
-		const FMatterFluxGroundStateChunk& State);
+	int32 GetReplicatedTerrainMaterialByteCount() const;
 
 	UFUNCTION(BlueprintPure, Category = "Playable World|Material Simulation")
 	int32 GetMaterialSimulationMinHeight() const { return MaterialSimulationMinHeightCells; }
@@ -765,6 +767,8 @@ private:
 
 	UFUNCTION()
 	void OnRep_TerrainHeightOverrides();
+	UFUNCTION()
+	void OnRep_TerrainSpanOverrides();
 
 	void RebuildLevel();
 	bool RebuildActiveCustomMap(FString& OutError);
@@ -853,7 +857,6 @@ private:
 		const MatterFlux::PlayableLevel::FLevelFragmentSource& Source);
 	void DestroyGeneratedFragmentSources();
 	void EmitActiveReactionParticles(float DeltaSeconds);
-	void AdvanceLogicalSourceReaction(float DeltaSeconds);
 	bool ApplyMaterialStimulusToLogicalFragmentSource(
 		const MatterFlux::PlayableLevel::FLevelFragmentSource& Source,
 		const FVector& WorldLocation,
@@ -869,28 +872,57 @@ private:
 		const FBox& WorldBounds,
 		TArray<const MatterFlux::PlayableLevel::FLevelFragmentSource*>&
 			OutCandidates) const;
-	bool SynchronizeLogicalSourceReactionState(
-		const FGuid& SourceId,
-		const MatterFlux::PlayableLevel::FLevelFragmentSource& Source,
-		const MatterFlux::Reaction::FSourceReactionRuntime& Runtime,
-		bool bPublish);
-	void RebuildLogicalSourceReactionVisualization();
+	void RebuildSourceMaterialVisualization();
 	void AdvanceUnifiedSmokeVisualization(float DeltaSeconds);
 	void RefreshUnifiedSmokeAnchors();
 	void RebuildGroundSmokeAnchors();
-	void InitializeGroundReaction(
+	void InitializeTerrainMaterialFields(
 		const FMatterFluxContentRegistry& Registry,
 		const MatterFlux::PlayableLevel::FLevelLayout& Layout);
-	void AdvanceGroundReaction(float DeltaSeconds);
-	void EnsureGroundReactionVisuals(
+	void AdvanceTerrainMaterialVisuals(float DeltaSeconds);
+	bool TryGetTerrainMaterialElementAtWorldLocation(
+		const FVector& WorldLocation,
+		const FLocalMaterialReactionProgram& Program,
+		FMaterialElementAddress& OutAddress,
+		FMaterialElementState& OutState,
+		FVector& OutWorldCenter,
+		FString& OutError) const;
+	bool SweepTerrainVolumeSurface(
+		const FVector& WorldStart,
+		const FVector& WorldEnd,
+		float WorldRadius,
+		FVector& OutWorldLocation,
+		FVector& OutWorldNormal,
+		FMaterialSurfaceKey& OutSurface,
+		FName& OutMaterialId) const;
+	bool BuildTerrainMaterialBatchCandidate(
+		const FMaterialDeltaBatch& Batch,
+		const FLocalMaterialReactionProgram& Program,
+		FMaterialTerrainSpanOverlay& OutTopology,
+		FMaterialVolumeFields& OutFields,
+		TArray<FIntPoint>& OutChangedColumns,
+		FString& OutError) const;
+	int32 AdvanceLocalTerrainReactions(
+		const FMatterFluxContentRegistry& Registry,
+		const FLocalMaterialReactionProgram& Program,
+		int32 MaximumContacts);
+	bool ResolveTerrainColumn(
+		FIntPoint WorldColumn,
+		TArray<FMaterialSpan>& OutSpans,
+		FString& OutError) const;
+	bool IsTerrainSurfaceExposed(const FMaterialSurfaceKey& Surface) const;
+	int32 PruneInvalidTerrainSettledSurfaceKeys();
+	bool BuildTerrainBaselineSpans(
+		FIntPoint WorldColumn,
+		TArray<FMaterialSpan>& OutSpans) const;
+	bool TryGetTerrainMaterialId(uint16 MaterialIndex, FName& OutId) const;
+	bool TryGetTerrainMaterialIndex(FName MaterialId, uint16& OutIndex) const;
+	void EnsureTerrainMaterialVisuals(
 		const FMatterFluxContentRegistry& Registry);
-	void RebuildGroundReactionVisualization();
-	void ApplyGroundReactionVisualChanges(
+	void RebuildTerrainMaterialVisualization();
+	void ApplyTerrainMaterialVisualChanges(
 		TConstArrayView<int32> ChangedCellIndices);
-	bool IsGroundReactionCellVisible(int32 CellIndex) const;
-	void InitializeGroundStateChunks();
-	void DestroyGroundStateChunks();
-	void PublishGroundReactionState();
+	bool IsTerrainMaterialCellVisible(int32 CellIndex) const;
 	void BuildLayerStreamingCache(
 		const MatterFlux::PlayableLevel::FLevelLayout& Layout);
 	void BuildTerrainStreamingCache(
@@ -919,11 +951,18 @@ private:
 	void ApplyTerrainHeightOverrides(
 		TConstArrayView<FMatterFluxTerrainHeightOverride> Overrides,
 		bool bRebuildResidentChunks);
+	bool ApplyTerrainSpanOverrides(
+		TConstArrayView<FMatterFluxTerrainSpanOverride> Overrides,
+		bool bRebuildResidentChunks);
 	void RebuildResidentTerrainChunksForCells(
 		TConstArrayView<FIntPoint> WorldCells);
+	void RefreshTerrainBuildSnapshots();
+	TSharedPtr<const MatterFlux::TerrainMesh::FVolumeSnapshot,
+		ESPMode::ThreadSafe> BuildTerrainVolumeMeshSnapshot() const;
 	void RefreshTerrainBackdropForCells(
 		TConstArrayView<FIntPoint> WorldCells);
 	void PublishTerrainHeightOverrides();
+	void PublishTerrainSpanOverrides();
 	void DestroyTerrainChunkMeshes();
 	UHierarchicalInstancedStaticMeshComponent* FindOrCreateLayerComponent(
 		const MatterFlux::PlayableLevel::FLevelLayer& Layer);
@@ -964,6 +1003,8 @@ private:
 		LiquidLayerDefinitions;
 	TArray<FIntPoint> VisibleLayerFocusChunks;
 	MatterFlux::PlayableLevel::FLevelTerrain TerrainHeightField;
+	/** Authoritative multi-span terrain edits; the height overlay is a derived compatibility cache. */
+	FMaterialTerrainSpanOverlay TerrainSpanOverrides;
 
 	UPROPERTY(Transient)
 	TMap<FIntPoint, TObjectPtr<UProceduralMeshComponent>>
@@ -977,6 +1018,8 @@ private:
 		AsyncTerrainBuildState;
 	TSharedPtr<const MatterFlux::PlayableLevel::FLevelTerrain,
 		ESPMode::ThreadSafe> AsyncTerrainHeightField;
+	TSharedPtr<const MatterFlux::TerrainMesh::FVolumeSnapshot,
+		ESPMode::ThreadSafe> AsyncTerrainVolumeSnapshot;
 	TMap<FIntPoint, uint64> TerrainChunkLastUsed;
 	uint64 TerrainChunkUseCounter = 0;
 	bool bTerrainCacheCoversWholeMap = false;
@@ -1109,12 +1152,12 @@ private:
 	TArray<FMatterFluxTerrainHeightOverride>
 		ReplicatedTerrainHeightOverrides;
 
+	UPROPERTY(ReplicatedUsing = OnRep_TerrainSpanOverrides)
+	TArray<FMatterFluxTerrainSpanOverride>
+		ReplicatedTerrainSpanOverrides;
+
 	TSet<FGuid> AppliedReplicatedFragmentSourceIds;
 	bool bReplicatedFragmentSourceStatesDirty = false;
-
-	UPROPERTY(Transient)
-	TArray<TObjectPtr<AMatterFluxGroundStateChunkActor>>
-		GroundStateChunkActors;
 
 	UPROPERTY()
 	TObjectPtr<UStaticMesh> CubeMesh;
@@ -1180,6 +1223,8 @@ private:
 		TArray<TWeakObjectPtr<AFragment2DSourceActor>> AuthoredSources;
 		FName MaterialId = NAME_None;
 		int32 EventSeed = 0;
+		/** Keeps the exact impact/source seam alive across bounded contact budgets. */
+		uint8 RemainingContactAttempts = 16;
 	};
 	TArray<FPendingMaterialStimulus> PendingMaterialStimuli;
 	struct FExternalMaterialSupportState
@@ -1216,33 +1261,34 @@ private:
 	int32 LastLiquidProjectionDirtyChunkCount = 0;
 	int32 LastLiquidProjectionRebuiltChunkCount = 0;
 	int32 LastLiquidProjectionCheckerboardPassCount = 0;
-	TUniquePtr<MatterFlux::Reaction::FGroundReactionRuntime>
-		GroundReaction;
-	TMap<FGuid, TUniquePtr<
-		MatterFlux::Reaction::FSourceReactionRuntime>>
-		ActiveSourceReactions;
-	MatterFlux::Reaction::FLogicalSourceReactionIndex
-		LogicalSourceReactionIndex;
-	TArray<FGuid> SourceReactionActiveIdsScratch;
-	TArray<FGuid> SourceReactionFinishedIdsScratch;
-	TArray<FGuid> SourceReactionPublishIdsScratch;
+	/** Stable terrain Volume identity; derived from the map seed, never an array slot. */
+	FGuid TerrainMaterialInstanceId;
+	/** Sparse non-environment terrain energy. Topology lives in TerrainSpanOverrides. */
+	FMaterialVolumeFields TerrainMaterialFields;
+	TMap<FName, uint16> TerrainMaterialIndices;
+	TMap<uint16, FName> TerrainMaterialIds;
+	TMap<uint16, FLinearColor> TerrainMaterialColors;
+	/** Geometric support identity only; material amounts remain canonical in MaterialWorld. */
+	TMap<FIntPoint, FMaterialSurfaceKey> TerrainSettledSurfaceKeys;
 	TArray<FMatterFluxFragmentSourceStateBatchUpdate>
 		FragmentSourceReplicationUpdatesScratch;
 	TArray<FVector> GroundSurfacePositions;
-	TSet<FGuid> SourcesThatActivatedGround;
 	float MaterialVisualizationAccumulator = 0.0f;
+	/** Independent fixed-step clock for solid/particle contact reactions. */
+	float LocalMaterialReactionAccumulator = 0.0f;
+	/** Persisted deterministic seed component; clients do not predict reactions. */
+	uint32 LocalMaterialReactionStep = 0;
 	/** 每帧最多提交的材料-Source 接触反应，防止大面积泄漏触发切割尖峰。 */
 	UPROPERTY(EditAnywhere, Category = "Playable World|Material Simulation",
 		meta = (ClampMin = "1", ClampMax = "64"))
-	int32 MaxMaterialSourceReactionsPerFrame = 8;
+	int32 MaxLocalMaterialCommitsPerFrame = 8;
 	bool bMaterialVisualizationDirty = false;
 	bool bMaterialVisualizationDeferredForStreaming = false;
-	float ReactionPropagationAccumulator = 0.0f;
 	float ReactionProxyFlushAccumulator = 0.0f;
-	float GroundReactionVisualAccumulator = 0.0f;
-	bool bGroundReactionVisualDirty = false;
-	bool bGroundReactionVisualNeedsFullRebuild = true;
-	TSet<int32> PendingGroundReactionVisualCellIndices;
+	float TerrainMaterialVisualAccumulator = 0.0f;
+	bool bTerrainMaterialVisualDirty = false;
+	bool bTerrainMaterialVisualNeedsFullRebuild = true;
+	TSet<int32> PendingTerrainMaterialVisualCellIndices;
 	TMap<int32, int32> GroundOutputInstanceByCell;
 	TArray<int32> GroundOutputCellByInstance;
 	TMap<int32, int32> GroundFlameInstanceByCell;
@@ -1254,9 +1300,7 @@ private:
 	TArray<MatterFlux::Rendering::FMaterialEmissionAnchor>
 		SourceSmokeAnchors;
 	MatterFlux::Rendering::FSmokeVisualPool SmokeVisualPool;
-	float SourceReactionVisualAccumulator = 0.0f;
-	bool bSourceReactionVisualDirty = false;
-	bool bBatchingGroundReactions = false;
+	bool bSourceMaterialVisualDirty = false;
 	FDelegateHandle ContentReloadHandle;
 	FDelegateHandle FragmentSourcePresenceHandle;
 	TUniquePtr<MatterFlux::PlayableLevel::FLevelLayout>

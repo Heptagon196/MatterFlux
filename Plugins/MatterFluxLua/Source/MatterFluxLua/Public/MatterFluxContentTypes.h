@@ -51,28 +51,54 @@ struct FMatterFluxMaterialDefinition
 	float DeepOpacity = 1.0f;
 	/** 从浅水过渡到深水不透明度所需的视线内液体深度（厘米）。 */
 	float OpacityDepth = 100.0f;
+	/** 每单位材料的确定性 uint16 默认比能。 */
+	uint16 DefaultEnergy = 0;
+	/** 与接触材料交换能量的整数千分比。 */
+	uint16 ConductivityPermille = 0;
+	/** 每个固定步向环境散失的比能。 */
+	uint16 CoolingPerStep = 0;
+	/** 达到此比能时发生燃烧转化；0 表示不可燃。 */
+	uint16 IgnitionThreshold = 0;
+	/** 燃烧后的普通材料；不可燃材料保持 empty。 */
+	FName CombustionProduct = TEXT("empty");
+	/** 燃烧产物获得的比能；0 表示保留点燃瞬间的能量。 */
+	uint16 CombustionEnergy = 0;
+	/** 燃烧时排放的普通材料；empty 表示不排放。 */
+	FName CombustionEmissionMaterial = TEXT("empty");
+	/** 每次点燃产生的显式普通材料排放量；不从满格固体 Amount 扣除。 */
+	uint16 CombustionEmissionAmount = 0;
+	/** 第二种燃烧排放；用于同时产生烟和短寿命火焰等普通材料。 */
+	FName CombustionSecondaryEmissionMaterial = TEXT("empty");
+	/** 第二种燃烧排放量；0 表示没有第二排放。 */
+	uint16 CombustionSecondaryEmissionAmount = 0;
+};
+
+enum class EMatterFluxReactionEmissionSourceSide : uint8
+{
+	A,
+	B
+};
+
+struct FMatterFluxReactionEmissionDefinition
+{
+	FName Material;
+	uint16 Amount = 0;
+	uint16 Energy = 0;
+	EMatterFluxReactionEmissionSourceSide SourceSide =
+		EMatterFluxReactionEmissionSourceSide::A;
 };
 
 struct FMatterFluxReactionDefinition
 {
-	/** 规则如何被触发：两格接触立即变换，或激活后持续并向邻格传播。 */
-	enum class EKind : uint8
-	{
-		Contact,
-		Propagating
-	};
-
 	FName Id; // Lua 中稳定且全局唯一的规则 ID。
-	EKind Kind = EKind::Contact;
-	FName InputA; // 主反应物；传播规则中是被逐步消耗的物质。
-	FName InputB; // 接触物；传播规则中是激活该反应的物质。
+	FName InputA; // 接触一侧的材料。
+	FName InputB; // 接触另一侧的材料。
 	FName OutputA; // InputA 完成反应后的产物，empty 表示清空。
-	FName OutputB; // InputB 完成接触反应后的产物。
-	int32 ChancePermille = 1000; // 首次触发概率，使用整数千分比。
-	FName EmissionMaterial; // 持续反应活跃时产生的副产物；empty 表示不排放。
-	int32 PropagationChancePermille = 0; // 向四邻域传播的每步概率。
-	int32 DurationSteps = 0; // 从激活到完成转换的固定模拟步数。
-	int32 EmissionChancePermille = 0; // 每个固定步产生副产物事件的概率。
+	FName OutputB; // InputB 完成反应后的产物。
+	int32 ChancePermille = 1000; // 触发概率，使用整数千分比。
+	int32 EnergyDeltaA = 0; // 接触提交时对 A 的比能变化。
+	int32 EnergyDeltaB = 0; // 接触提交时对 B 的比能变化。
+	TArray<FMatterFluxReactionEmissionDefinition, TInlineAllocator<2>> Emissions;
 };
 
 struct FMatterFluxDecoratorDefinition

@@ -25,7 +25,7 @@
 namespace MatterFluxMagicTests
 {
 	const TCHAR* BasicPack = TEXT(R"LUA(
-content.set_manifest("magic.test", 1, 2)
+content.set_manifest("magic.test", 1, 3)
 content.register_spell({
 	id = "spell.spark_bolt",
 	name = "Spark Bolt",
@@ -56,7 +56,7 @@ content.register_wand({
 )LUA");
 
 	const TCHAR* ProgramPack = TEXT(R"LUA(
-content.set_manifest("magic.program", 1, 2)
+content.set_manifest("magic.program", 1, 3)
 content.register_spell({
 	id = "spell.add_five", name = "Add Five", kind = "modifier",
 	mana_cost = 1, damage_add = 5, draw_count = 1
@@ -83,7 +83,7 @@ content.register_wand({
 )LUA");
 
 	const TCHAR* DirectCutPack = TEXT(R"LUA(
-content.set_manifest("magic.direct_cut", 1, 2)
+content.set_manifest("magic.direct_cut", 1, 3)
 content.register_spell({
 	id = "spell.direct_cut", name = "Direct Cut", kind = "cut",
 	damage = 12, range = 500, radius = 60, thickness = 30
@@ -91,7 +91,7 @@ content.register_spell({
 )LUA");
 
 	const TCHAR* DirectFlamePack = TEXT(R"LUA(
-content.set_manifest("magic.direct_flame", 1, 2)
+content.set_manifest("magic.direct_flame", 1, 3)
 content.register_material({
 	id = "fire", density = 0.01, hardness = 0,
 	color_r = 1, color_g = 0.24, color_b = 0.01, color_a = 0.92,
@@ -104,7 +104,7 @@ content.register_spell({
 )LUA");
 
 	const TCHAR* ExpandedTriggerBudgetPack = TEXT(R"LUA(
-content.set_manifest("magic.expanded_trigger_budget", 1, 2)
+content.set_manifest("magic.expanded_trigger_budget", 1, 3)
 content.register_spell({
 	id = "spell.projectile", name = "Projectile", kind = "projectile",
 	mana_cost = 0, damage = 1, speed = 1000, lifetime = 1, radius = 8
@@ -1028,7 +1028,7 @@ bool FMatterFluxMagicComplexElementalProgramTest::RunTest(
 	const FMatterFluxMagicProjectilePlan& Carrier = First.Projectiles[0];
 	const FMatterFluxMagicProjectilePlan& Water = First.Projectiles[1];
 	const FMatterFluxMagicProjectilePlan& Sand = First.Projectiles[2];
-	TestEqual(TEXT("Outer damage modifier affects only the carrier"),
+	TestEqual(TEXT("Branch modifier affects the trigger carrier"),
 		Carrier.Damage, 20.0f);
 	TestEqual(TEXT("Carrier keeps multicast spread"),
 		Carrier.SpreadDegrees, 10.5f);
@@ -1038,16 +1038,16 @@ bool FMatterFluxMagicComplexElementalProgramTest::RunTest(
 	{
 		const FMatterFluxMagicProjectilePlan& Fire =
 			Carrier.OnImpactProjectiles[0];
-		TestEqual(TEXT("Payload-local modifier affects the fire payload"),
-			Fire.Damage, 10.0f);
+		TestEqual(TEXT("Inherited and payload-local modifiers stack"),
+			Fire.Damage, 20.0f);
 		TestEqual(TEXT("Fire payload remains a material projectile"),
 			Fire.BodyMaterial, FName(TEXT("fire")));
 		TestEqual(TEXT("Fire payload carries its configured material amount"),
 			Fire.MaterialAmount, 5);
 	}
-	TestEqual(TEXT("Carrier modifier does not leak into water branch"),
+	TestEqual(TEXT("Branch modifier does not leak into water sibling"),
 		Water.Damage, 0.0f);
-	TestEqual(TEXT("Payload modifier does not leak into water branch"),
+	TestEqual(TEXT("Payload modifier does not leak into water sibling"),
 		Water.BodyMaterial, FName(TEXT("water")));
 	TestEqual(TEXT("Later branch retains multicast spread"),
 		Water.SpreadDegrees, 10.5f);
@@ -1520,17 +1520,20 @@ bool FMatterFluxMagicModifierMulticastTriggerTest::RunTest(
 			2);
 		if (Plan.Projectiles.Num() == 2)
 		{
-			TestEqual(TEXT("Modifier reaches first projectile"),
+			TestEqual(TEXT("Modifier reaches first projectile in its subtree"),
 				Plan.Projectiles[0].Damage,
 				15.0f);
+			TestEqual(TEXT("Modifier reaches the trigger carrier in its subtree"),
+				Plan.Projectiles[1].Damage,
+				6.0f);
 			TestEqual(TEXT("Trigger has one compiled payload"),
 				Plan.Projectiles[1].OnImpactProjectiles.Num(),
 				1);
 			if (Plan.Projectiles[1].OnImpactProjectiles.Num() == 1)
 			{
-				TestEqual(TEXT("Payload projectile damage"),
+				TestEqual(TEXT("Modifier reaches the trigger payload in its subtree"),
 					Plan.Projectiles[1].OnImpactProjectiles[0].Damage,
-					10.0f);
+					15.0f);
 			}
 		}
 		TestEqual(TEXT("Every compiled card consumes mana"),
@@ -3072,9 +3075,6 @@ bool FMatterFluxMagicAcidCorrosionSpellTest::RunTest(
 	}
 	TestTrue(TEXT("Acid relies on corrosion instead of generic impact damage"),
 		FMath::IsNearlyZero(AcidSpell->Damage));
-	TestTrue(TEXT("Terrain corrosion is a contact reaction"),
-		TerrainCorrosion->Kind
-			== FMatterFluxReactionDefinition::EKind::Contact);
 	TestEqual(TEXT("Contact corrosion consumes the acid input"),
 		TerrainCorrosion->OutputA, FName(TEXT("empty")));
 	TestEqual(TEXT("Contact corrosion creates no replacement acid material"),
@@ -3113,7 +3113,7 @@ bool FMatterFluxMagicAcidCorrosionSpellTest::RunTest(
 			TEXT("acid"),
 			991));
 	TestFalse(TEXT("Direct acid stimulus never starts a propagating reaction"),
-		Source->IsReacting());
+		Source->IsMaterialHot());
 	TArray<MatterFlux::Rendering::FMaterialEmissionAnchor> SmokeAnchors;
 	Source->GatherReactionSmokeAnchors(SmokeAnchors, 16);
 	TestTrue(TEXT("Non-propagating corrosion exposes no source-wide anchors"),
@@ -3324,6 +3324,16 @@ bool FMatterFluxMagicMaterialBodyProjectileTest::RunTest(
 	TestEqual(TEXT("Flame spell creates real particles on its spawn frame"),
 		MaterialWorld->GetAirborneSimulatedMaterialParticleCount(TEXT("fire")),
 		FlameProjectile->GetPresentation().MaterialAmount);
+	TArray<MatterFlux::Material::FAirborneParticle> FlameParticles;
+	MaterialWorld->GetAirborneSimulatedMaterialParticles(
+		FlameProjectile->GetMaterialParticleBatchId(), FlameParticles);
+	TestTrue(TEXT("Sparse flame particles cover the visible spell body"),
+		!FlameParticles.IsEmpty()
+		&& !FlameParticles.ContainsByPredicate(
+			[](const MatterFlux::Material::FAirborneParticle& Particle)
+			{
+				return Particle.Radius < 15.0f;
+			}));
 	TestTrue(TEXT("Flame particle volume is canonical before impact"),
 		MaterialWorld->GetSimulatedMaterialAmount(TEXT("fire"))
 			> FireAmountBefore);
@@ -3486,8 +3496,6 @@ bool FMatterFluxMagicProjectileMaterialSweepTest::RunTest(
 	{
 		return false;
 	}
-	TestTrue(TEXT("Water extinguishing uses the generic contact reaction kind"),
-		Extinguish->Kind == FMatterFluxReactionDefinition::EKind::Contact);
 	TestEqual(TEXT("Contact chemistry removes the incoming fire material"),
 		Extinguish->OutputA, FName(TEXT("empty")));
 

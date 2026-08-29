@@ -1647,7 +1647,7 @@ namespace MatterFlux::PlayableLevel
 					TEXT("forest.flower.gold"),
 					TEXT("YellowFlowerCluster"),
 					TEXT("flower_gold"),
-					FLinearColor(1.0f, 0.55f, 0.015f),
+					FLinearColor(0.96f, 0.86f, 0.20f),
 					42,
 					0x59454c4cu,
 					190.0f
@@ -1809,19 +1809,6 @@ namespace MatterFlux::PlayableLevel
 		{
 			return false;
 		}
-		const double FirstCellX = FirstCellCenter.X / CellSize;
-		const double FirstCellY = FirstCellCenter.Y / CellSize;
-		if (!FMath::IsFinite(FirstCellX)
-			|| !FMath::IsFinite(FirstCellY)
-			|| FirstCellX < static_cast<double>(MIN_int32)
-			|| FirstCellX > static_cast<double>(MAX_int32)
-			|| FirstCellY < static_cast<double>(MIN_int32)
-			|| FirstCellY > static_cast<double>(MAX_int32))
-		{
-			return false;
-		}
-		const int64 FirstWorldCellX = FMath::FloorToInt64(FirstCellX);
-		const int64 FirstWorldCellY = FMath::FloorToInt64(FirstCellY);
 		if (WorldCellX >= MIN_int32 && WorldCellX <= MAX_int32
 			&& WorldCellY >= MIN_int32 && WorldCellY <= MAX_int32)
 		{
@@ -1835,6 +1822,33 @@ namespace MatterFlux::PlayableLevel
 				return FMath::IsFinite(OutHeight);
 			}
 		}
+		return TrySampleGeneratedWorldCell(
+			WorldCellX, WorldCellY, OutHeight, OutColorBand);
+	}
+
+	bool FLevelTerrain::TrySampleGeneratedWorldCell(
+		const int64 WorldCellX,
+		const int64 WorldCellY,
+		float& OutHeight,
+		uint8& OutColorBand) const
+	{
+		if (!IsValid())
+		{
+			return false;
+		}
+		const double FirstCellX = FirstCellCenter.X / CellSize;
+		const double FirstCellY = FirstCellCenter.Y / CellSize;
+		if (!FMath::IsFinite(FirstCellX)
+			|| !FMath::IsFinite(FirstCellY)
+			|| FirstCellX < static_cast<double>(MIN_int32)
+			|| FirstCellX > static_cast<double>(MAX_int32)
+			|| FirstCellY < static_cast<double>(MIN_int32)
+			|| FirstCellY > static_cast<double>(MAX_int32))
+		{
+			return false;
+		}
+		const int64 FirstWorldCellX = FMath::FloorToInt64(FirstCellX);
+		const int64 FirstWorldCellY = FMath::FloorToInt64(FirstCellY);
 		const int64 LocalX = WorldCellX - FirstWorldCellX;
 		const int64 LocalY = WorldCellY - FirstWorldCellY;
 		if (LocalX >= 0 && LocalX < Width
@@ -2393,7 +2407,7 @@ namespace MatterFlux::PlayableLevel
 			{TEXT("forest.flower.pink"), TEXT("InfinitePinkFlowerCluster"), TEXT("flower_pink"),
 				FLinearColor(1.0f, 0.025f, 0.36f), 0x50494e4bu, 4, false},
 			{TEXT("forest.flower.gold"), TEXT("InfiniteYellowFlowerCluster"), TEXT("flower_gold"),
-				FLinearColor(1.0f, 0.55f, 0.015f), 0x59454c4cu, 4, false},
+				FLinearColor(0.96f, 0.86f, 0.20f), 0x59454c4cu, 12, false},
 			{TEXT("forest.flower.blue"), TEXT("InfinitePurpleFlowerCluster"), TEXT("flower_blue"),
 				FLinearColor(0.42f, 0.025f, 1.0f), 0x50555250u, 4, false}
 		};

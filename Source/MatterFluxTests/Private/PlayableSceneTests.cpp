@@ -33,6 +33,7 @@
 #include "IMatterFluxScriptRuntime.h"
 #include "Materials/MaterialInterface.h"
 #include "Materials/Material.h"
+#include "Misc/ScopeExit.h"
 #include "Materials/MaterialExpressionDepthFade.h"
 #include "Materials/MaterialExpressionCustom.h"
 #include "Materials/MaterialExpressionLinearInterpolate.h"
@@ -1664,6 +1665,177 @@ bool FMatterFluxPristineSourceBatchingTest::RunTest(
 	TestTrue(
 		TEXT("Collision-enabled trunks share chunk collision meshes"),
 		bFoundBatchedCollision);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxTerrainVolumeCaveMeshTest,
+	"MatterFlux.Playable.TerrainVolumeMeshSupportsCavesAndChunkSeams",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxTerrainVolumeCaveMeshTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	MatterFlux::PlayableLevel::FLevelTerrain Terrain;
+	Terrain.Width = 4;
+	Terrain.Height = 3;
+	Terrain.CellSize = 100.0f;
+	Terrain.BottomZ = 0.0f;
+	Terrain.FirstCellCenter = FVector2D(50.0, 50.0);
+	Terrain.Heights.Init(800.0f, Terrain.Width * Terrain.Height);
+	Terrain.ColorBands.Init(1, Terrain.Heights.Num());
+	Terrain.BandColors = {
+		FLinearColor(0.20f, 0.16f, 0.10f),
+		FLinearColor(0.30f, 0.52f, 0.20f),
+		FLinearColor(0.45f, 0.45f, 0.45f)};
+	if (!TestTrue(TEXT("Cave test terrain is valid"), Terrain.IsValid()))
+	{
+		return false;
+	}
+
+	MatterFlux::TerrainMesh::FVolumeSnapshot SealedCavity;
+	SealedCavity.SoilMaterialIndex = 1;
+	SealedCavity.SurfaceMaterialIndex = 2;
+	SealedCavity.MaterialColors.Add(1, Terrain.BandColors[0]);
+	SealedCavity.MaterialColors.Add(2, Terrain.BandColors[1]);
+	SealedCavity.ColumnOverrides.Add(
+		FIntPoint(1, 1),
+		{FMaterialSpan(0, 2, 1), FMaterialSpan(5, 7, 1),
+			FMaterialSpan(7, 8, 2)});
+	MatterFlux::TerrainMesh::FChunk SealedChunk;
+	if (!TestTrue(TEXT("A sealed cavity builds as a terrain volume"),
+		MatterFlux::TerrainMesh::BuildChunk(
+			Terrain, SealedCavity, FIntPoint::ZeroValue, 4, SealedChunk)))
+	{
+		return false;
+	}
+	TestTrue(TEXT("The edited chunk records the volume surface path"),
+		SealedChunk.bUsesVolumeSurface);
+	bool bHasFloor = false;
+	bool bHasCeiling = false;
+	bool bHasPositiveUWall = false;
+	bool bHasNegativeUWall = false;
+	bool bHasPositiveVWall = false;
+	bool bHasNegativeVWall = false;
+	int32 RenderTriangleIndices = 0;
+	for (const MatterFlux::TerrainMesh::FSection& Section
+		: SealedChunk.Sections)
+	{
+		RenderTriangleIndices += Section.Triangles.Num();
+		for (const FVector& Normal : Section.Normals)
+		{
+			bHasFloor |= Normal.Equals(FVector::UpVector);
+			bHasCeiling |= Normal.Equals(-FVector::UpVector);
+			bHasPositiveUWall |= Normal.Equals(FVector::ForwardVector);
+			bHasNegativeUWall |= Normal.Equals(-FVector::ForwardVector);
+			bHasPositiveVWall |= Normal.Equals(FVector::RightVector);
+			bHasNegativeVWall |= Normal.Equals(-FVector::RightVector);
+		}
+	}
+	TestTrue(TEXT("A sealed cavity has an interior floor"), bHasFloor);
+	TestTrue(TEXT("A sealed cavity has an interior ceiling"), bHasCeiling);
+	TestTrue(TEXT("A sealed cavity has both U walls"),
+		bHasPositiveUWall && bHasNegativeUWall);
+	TestTrue(TEXT("A sealed cavity has both V walls"),
+		bHasPositiveVWall && bHasNegativeVWall);
+	TestEqual(TEXT("Volume collision contains every rendered face"),
+		SealedChunk.CollisionSurface.Triangles.Num(), RenderTriangleIndices);
+	MatterFlux::TerrainMesh::FSurfaceHit FloorHit;
+	TestTrue(TEXT("A falling particle hits the internal cave floor"),
+		MatterFlux::TerrainMesh::SweepVolumeSurface(
+			Terrain,
+			SealedCavity,
+			FVector(150.0, 150.0, 400.0),
+			FVector(150.0, 150.0, 100.0),
+			0.0f,
+			FloorHit));
+	TestTrue(TEXT("Cave floor uses a stable positive-N surface key"),
+		FloorHit.Surface == FMaterialSurfaceKey{
+			FIntPoint(1, 1), 2, EMaterialSurfaceFace::PositiveN});
+	TestTrue(TEXT("Cave floor impact retains its interior height"),
+		FMath::IsNearlyEqual(FloorHit.LocalLocation.Z, 200.0));
+	MatterFlux::TerrainMesh::FSurfaceHit CeilingHit;
+	TestTrue(TEXT("An upward particle hits the internal cave ceiling"),
+		MatterFlux::TerrainMesh::SweepVolumeSurface(
+			Terrain,
+			SealedCavity,
+			FVector(150.0, 150.0, 400.0),
+			FVector(150.0, 150.0, 600.0),
+			0.0f,
+			CeilingHit));
+	TestTrue(TEXT("Cave ceiling uses a stable negative-N surface key"),
+		CeilingHit.Surface == FMaterialSurfaceKey{
+			FIntPoint(1, 1), 5, EMaterialSurfaceFace::NegativeN});
+	MatterFlux::TerrainMesh::FSurfaceHit WallHit;
+	TestTrue(TEXT("A horizontal particle hits an internal cave wall"),
+		MatterFlux::TerrainMesh::SweepVolumeSurface(
+			Terrain,
+			SealedCavity,
+			FVector(150.0, 150.0, 350.0),
+			FVector(250.0, 150.0, 350.0),
+			0.0f,
+			WallHit));
+	TestTrue(TEXT("Cave wall uses the neighboring solid cell address"),
+		WallHit.Surface == FMaterialSurfaceKey{
+			FIntPoint(2, 1), 3, EMaterialSurfaceFace::NegativeU});
+
+	MatterFlux::TerrainMesh::FVolumeSnapshot Tunnel = SealedCavity;
+	Tunnel.ColumnOverrides.Reset();
+	for (int32 X = 0; X < Terrain.Width; ++X)
+	{
+		Tunnel.ColumnOverrides.Add(
+			FIntPoint(X, 1),
+			{FMaterialSpan(0, 2, 1), FMaterialSpan(5, 7, 1),
+				FMaterialSpan(7, 8, 2)});
+	}
+	MatterFlux::TerrainMesh::FChunk WestChunk;
+	MatterFlux::TerrainMesh::FChunk EastChunk;
+	if (!TestTrue(TEXT("West half of a through tunnel builds"),
+		MatterFlux::TerrainMesh::BuildChunk(
+			Terrain, Tunnel, FIntPoint(0, 0), 2, WestChunk))
+		|| !TestTrue(TEXT("East half of a through tunnel builds"),
+			MatterFlux::TerrainMesh::BuildChunk(
+				Terrain, Tunnel, FIntPoint(1, 0), 2, EastChunk)))
+	{
+		return false;
+	}
+	const auto CountFloorVertices = [](
+		const MatterFlux::TerrainMesh::FChunk& Chunk)
+	{
+		int32 Count = 0;
+		for (const MatterFlux::TerrainMesh::FSection& Section : Chunk.Sections)
+		{
+			for (int32 Index = 0; Index < Section.Vertices.Num(); ++Index)
+			{
+				Count += Section.Normals[Index].Equals(FVector::UpVector)
+					&& FMath::IsNearlyEqual(Section.Vertices[Index].Z, 200.0)
+					? 1 : 0;
+			}
+		}
+		return Count;
+	};
+	TestEqual(TEXT("Greedy meshing merges the west tunnel floor rectangle"),
+		CountFloorVertices(WestChunk), 4);
+	TestEqual(TEXT("Greedy meshing merges the east tunnel floor rectangle"),
+		CountFloorVertices(EastChunk), 4);
+	const auto HasSeamVertexAt = [](const MatterFlux::TerrainMesh::FChunk& Chunk,
+		const double Z)
+	{
+		return Chunk.CollisionSurface.Vertices.ContainsByPredicate(
+			[Z](const FVector& Vertex)
+			{
+				return FMath::IsNearlyEqual(Vertex.X, 200.0)
+					&& FMath::IsNearlyEqual(Vertex.Z, Z);
+			});
+	};
+	TestTrue(TEXT("Tunnel floor reaches the west side of the chunk seam"),
+		HasSeamVertexAt(WestChunk, 200.0));
+	TestTrue(TEXT("Tunnel floor reaches the east side of the chunk seam"),
+		HasSeamVertexAt(EastChunk, 200.0));
+	TestTrue(TEXT("Tunnel ceiling reaches the west side of the chunk seam"),
+		HasSeamVertexAt(WestChunk, 500.0));
+	TestTrue(TEXT("Tunnel ceiling reaches the east side of the chunk seam"),
+		HasSeamVertexAt(EastChunk, 500.0));
 	return true;
 }
 
@@ -4030,6 +4202,9 @@ bool FMatterFluxTerrainWorldCutTest::RunTest(const FString& Parameters)
 		TestTrue(
 			TEXT("The save contains sparse terrain height overrides"),
 			!SaveState.TerrainHeightOverrides.IsEmpty());
+		TestTrue(
+			TEXT("The V6 save contains authoritative terrain Span columns"),
+			!SaveState.TerrainSpanOverrides.IsEmpty());
 		AMatterFluxPlayableWorldActor* RestoredWorldActor =
 			World->SpawnActor<AMatterFluxPlayableWorldActor>();
 		if (!TestNotNull(
@@ -5227,11 +5402,11 @@ bool FMatterFluxReactingSourceStreamingTest::RunTest(
 		0);
 	WorldActor->Tick(0.1f);
 	const int32 InputBeforeUnload =
-		WorldActor->GetLogicalReactionInputCellCount(TEXT("wood"));
+		WorldActor->GetLogicalBaseMaterialCellCount(TEXT("wood"));
 	const int32 OutputBeforeUnload =
-		WorldActor->GetLogicalReactionOutputCellCount(TEXT("wood"));
+		WorldActor->GetLogicalMaterialOverrideCellCount(TEXT("wood"));
 	const int32 SmokeBeforeUnload =
-		WorldActor->GetLogicalReactionMaterialEmissionCount();
+		WorldActor->GetLogicalMaterialEmissionCount();
 
 	WorldActor->SetWorldStreamingFocus(
 		FVector(10000000.0, 10000000.0, 0.0));
@@ -5250,11 +5425,11 @@ bool FMatterFluxReactingSourceStreamingTest::RunTest(
 		0);
 	TestTrue(
 		TEXT("Logical reaction continues independently of render residency"),
-		WorldActor->GetLogicalReactionInputCellCount(TEXT("wood"))
+		WorldActor->GetLogicalBaseMaterialCellCount(TEXT("wood"))
 			< InputBeforeUnload
-			|| WorldActor->GetLogicalReactionOutputCellCount(TEXT("wood"))
+			|| WorldActor->GetLogicalMaterialOverrideCellCount(TEXT("wood"))
 				> OutputBeforeUnload
-			|| WorldActor->GetLogicalReactionMaterialEmissionCount()
+			|| WorldActor->GetLogicalMaterialEmissionCount()
 				> SmokeBeforeUnload);
 
 	WorldActor->SetWorldStreamingFocus(FVector::ZeroVector);
@@ -5263,7 +5438,7 @@ bool FMatterFluxReactingSourceStreamingTest::RunTest(
 		WorldActor->Tick(0.1f);
 	}
 	const int32 FinalOutputCount =
-		WorldActor->GetReactionOutputCellCount();
+		WorldActor->GetMaterialOverrideCellCount();
 	TestTrue(TEXT("Logical sources retain solid reaction output"),
 		FinalOutputCount > 0);
 
@@ -5273,7 +5448,7 @@ bool FMatterFluxReactingSourceStreamingTest::RunTest(
 	WorldActor->SetWorldStreamingFocus(FVector::ZeroVector);
 	WorldActor->Tick(0.0f);
 	TestEqual(TEXT("Render streaming preserves logical output exactly"),
-		WorldActor->GetReactionOutputCellCount(),
+		WorldActor->GetMaterialOverrideCellCount(),
 		FinalOutputCount);
 	return true;
 }

@@ -1,6 +1,5 @@
 #include "Material/MatterFluxMaterialWorld.h"
 #include "Material/MatterFluxMaterialSimulationRuntime.h"
-#include "Game/MatterFluxGroundStateChunkActor.h"
 #include "Game/MatterFluxPlayableWorldActor.h"
 #include "Misc/AutomationTest.h"
 
@@ -1512,11 +1511,22 @@ bool FMatterFluxBodyWakeRestitutionWorkScaleTest::RunTest(
 	TestEqual(TEXT("The displacement transaction conserves every moved quantum"),
 		World.SumMaterialAmount(TEXT("water")), AmountBefore);
 
-	const MatterFlux::Material::FStepStats Stats = World.Step();
+	int32 TotalMovedCells = 0;
+	int32 MaximumRestitutionVisitedCells = 0;
+	for (int32 Step = 0;
+		Step <= Settings.BodyWakeRefillDelaySteps + 1;
+		++Step)
+	{
+		const MatterFlux::Material::FStepStats Stats = World.Step();
+		TotalMovedCells += Stats.MovedCells;
+		MaximumRestitutionVisitedCells = FMath::Max(
+			MaximumRestitutionVisitedCells,
+			Stats.RestitutionVisitedCells);
+	}
 	TestTrue(TEXT("Wake restitution performs useful transfers"),
-		Stats.MovedCells > 0);
+		TotalMovedCells > 0);
 	TestTrue(TEXT("Restitution search is bounded by one active-region traversal"),
-		Stats.RestitutionVisitedCells <= Seeds.Num() * 2);
+		MaximumRestitutionVisitedCells <= Seeds.Num() * 2);
 	TestEqual(TEXT("Batched restitution conserves exact lake volume"),
 		World.SumMaterialAmount(TEXT("water")), AmountBefore);
 	return true;
@@ -1667,7 +1677,7 @@ bool FMatterFluxAcidCorrosionTest::RunTest(const FString& Parameters)
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxMaterialRuntimeFocusDebtTest,
-	"MatterFlux.Material.Runtime.FocusChangeDefersButPreservesFixedStepDebt",
+	"MatterFlux.Material.Runtime.FocusChangeConsumesFixedStepWithoutStarvation",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 
 bool FMatterFluxMaterialRuntimeFocusDebtTest::RunTest(
@@ -1706,28 +1716,25 @@ bool FMatterFluxMaterialRuntimeFocusDebtTest::RunTest(
 	const MatterFlux::Material::FRuntimeAdvanceResult FocusFrame =
 		Runtime.AdvanceAuthority(0.05f, NextFocuses);
 	TestTrue(TEXT("Focus change is observable"), FocusFrame.bFocusChanged);
-	TestEqual(TEXT("Focus frame performs no simulation steps"), FocusFrame.Steps, 0);
+	TestEqual(TEXT("Focus frame still performs its due simulation step"),
+		FocusFrame.Steps, 1);
 	TestEqual(
-		TEXT("Focus frame preserves the unmoved cell"),
+		TEXT("Due step moves the source cell without focus starvation"),
 		Runtime.GetMaterialAt(FIntPoint(8, 1)),
-		FName(TEXT("water")));
-	TestTrue(
-		TEXT("Deferred fixed-step debt still reserves the next frame"),
+		NAME_None);
+	TestEqual(TEXT("Water moves during the focus-changing frame"),
+		Runtime.GetMaterialAt(FIntPoint(8, 0)), FName(TEXT("water")));
+	TestFalse(
+		TEXT("Consumed fixed-step debt releases the next frame"),
 		Runtime.WillAdvanceStep(0.0f));
 
 	const MatterFlux::Material::FRuntimeAdvanceResult DebtFrame =
 		Runtime.AdvanceAuthority(0.0f, NextFocuses);
 	TestFalse(TEXT("Stable focus is not reported as changed"), DebtFrame.bFocusChanged);
-	TestEqual(TEXT("Deferred debt advances on the next frame"), DebtFrame.Steps, 1);
-	TestTrue(TEXT("The deferred step changes simulation state"), DebtFrame.bStateChanged);
+	TestEqual(TEXT("No duplicate deferred step remains"), DebtFrame.Steps, 0);
+	TestFalse(TEXT("No-step frame does not report a state change"),
+		DebtFrame.bStateChanged);
 	TestEqual(TEXT("Logical step advances exactly once"), Runtime.GetLogicalStep(), 1);
-	TestEqual(
-		TEXT("Water moves after deferred debt is consumed"),
-		Runtime.GetMaterialAt(FIntPoint(8, 0)),
-		FName(TEXT("water")));
-	TestFalse(
-		TEXT("Consumed fixed-step debt releases the following frame"),
-		Runtime.WillAdvanceStep(0.0f));
 	return true;
 }
 
@@ -3447,91 +3454,231 @@ bool FMatterFluxReplicatedSnapshotCompressionTest::RunTest(
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FMatterFluxGroundStateChunkRoundTripTest,
-	"MatterFlux.Material.GroundStateChunkIsAtomicBoundedAndLossless",
-	EAutomationTestFlags::EditorContext
-		| EAutomationTestFlags::ProductFilter)
+	FMatterFluxAirborneParticleStableIdentityTest,
+	"MatterFlux.Material.AirborneParticlesUseStableElementIdentity",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 
-bool FMatterFluxGroundStateChunkRoundTripTest::RunTest(
+bool FMatterFluxAirborneParticleStableIdentityTest::RunTest(
 	const FString& Parameters)
 {
-	constexpr int32 Width = MatterFlux::PlayableLevel::TerrainCellsX;
-	constexpr int32 Height = MatterFlux::PlayableLevel::TerrainCellsY;
-	const FIntPoint ChunkCoordinate(3, 2);
-	TArray<uint8> Output;
-	TArray<uint8> Active;
-	Output.Init(0, Width * Height);
-	Active.Init(0, Width * Height);
-	for (int32 LocalY = 0; LocalY < 64; ++LocalY)
-	{
-		for (int32 LocalX = 0; LocalX < 64; ++LocalX)
-		{
-			const int32 X = ChunkCoordinate.X * 64 + LocalX;
-			const int32 Y = ChunkCoordinate.Y * 64 + LocalY;
-			const int32 Index = Y * Width + X;
-			Output[Index] = (LocalX + LocalY * 3) % 11 == 0 ? 1 : 0;
-			Active[Index] = (LocalX * 5 + LocalY) % 17 < 3
-				? static_cast<uint8>(12 - (LocalY % 5))
-				: 0;
-		}
-	}
-
-	FMatterFluxGroundStateChunk State;
+	(void)Parameters;
+	FMatterFluxContentRegistry Registry = MakeLiquidRegistry();
+	Registry.Materials.FindChecked(TEXT("water")).DefaultEnergy = 321;
+	MatterFlux::Material::FRuntimeSettings Settings;
+	Settings.World.ChunkSize = 8;
+	Settings.World.ActiveChunkRadius = 0;
+	Settings.World.MaxActiveChunks = 1;
+	MatterFlux::Material::FSimulationRuntime Runtime;
 	FString Error;
-	if (!TestTrue(
-		TEXT("A 64x64 ground state chunk encodes"),
-		State.Encode(
-			ChunkCoordinate,
-			37,
-			Output,
-			Active,
-			Width,
-			Height,
-			Error)))
+	const FIntPoint Focuses[] = { FIntPoint::ZeroValue };
+	if (!TestTrue(TEXT("Particle runtime initializes"),
+		Runtime.Initialize(Settings, Registry, 79, Focuses, Error)))
 	{
 		AddError(Error);
 		return false;
 	}
-	TestTrue(
-		TEXT("Chunk payload always fits one actor bunch"),
-		State.StateBytes.Num() > 0 && State.StateBytes.Num() <= 4608);
 
-	TArray<uint8> DecodedOutput;
-	TArray<uint8> DecodedActive;
-	DecodedOutput.Init(0, Width * Height);
-	DecodedActive.Init(0, Width * Height);
-	TestTrue(
-		TEXT("Chunk applies to a full client mask"),
-		State.DecodeInto(
-			DecodedOutput,
-			DecodedActive,
-			Width,
-			Height,
-			Error));
-	TestEqual(TEXT("Chunk output is exact"), DecodedOutput, Output);
-	TestEqual(TEXT("Chunk burn timers are exact"), DecodedActive, Active);
+	const FVector Positions[] = {
+		FVector(1, 2, 3), FVector(4, 5, 6), FVector(7, 8, 9)
+	};
+	const FGuid BatchId = Runtime.SpawnAirborneParticles(
+		TEXT("water"), Positions, {}, 3, 17, 2.0f, 1.0f, 4.0f, 90210);
+	TArray<MatterFlux::Material::FAirborneParticle> Before;
+	Runtime.GetAirborneParticlesForBatch(BatchId, Before);
+	TestEqual(TEXT("All particles spawned"), Before.Num(), 3);
+	TSet<FGuid> StableIds;
+	for (const MatterFlux::Material::FAirborneParticle& Particle : Before)
+	{
+		TestTrue(TEXT("Particle identity is a valid GUID"),
+			Particle.ParticleId.IsValid());
+		TestEqual(TEXT("Particle inherits material default energy"),
+			static_cast<int32>(Particle.Energy), 321);
+		StableIds.Add(Particle.ParticleId);
+	}
+	TestEqual(TEXT("Particle identities are unique"), StableIds.Num(), 3);
 
-	FMatterFluxGroundStateChunk Corrupt = State;
-	Corrupt.StateHash ^= 0xdeadbeefu;
-	TArray<uint8> UntouchedOutput;
-	TArray<uint8> UntouchedActive;
-	UntouchedOutput.Init(0, Width * Height);
-	UntouchedActive.Init(0, Width * Height);
-	TestFalse(
-		TEXT("CRC-corrupt chunk is rejected before mask mutation"),
-		Corrupt.DecodeInto(
-			UntouchedOutput,
-			UntouchedActive,
-			Width,
-			Height,
-			Error));
-	TestFalse(
-		TEXT("Rejected chunk leaves output untouched"),
-		UntouchedOutput.ContainsByPredicate(
-			[](const uint8 Value) { return Value != 0; }));
-	TestFalse(
-		TEXT("Rejected chunk leaves active state untouched"),
-		UntouchedActive.ContainsByPredicate(
-			[](const uint8 Value) { return Value != 0; }));
+	const FGuid RemovedId = Before[1].ParticleId;
+	Runtime.RemoveAirborneParticles(
+		[RemovedId](const MatterFlux::Material::FAirborneParticle& Particle)
+		{
+			return Particle.ParticleId == RemovedId;
+		});
+	TArray<MatterFlux::Material::FAirborneParticle> After;
+	Runtime.GetAirborneParticlesForBatch(BatchId, After);
+	TestEqual(TEXT("One particle is removed"), After.Num(), 2);
+	for (const MatterFlux::Material::FAirborneParticle& Particle : After)
+	{
+		TestTrue(TEXT("Swap removal cannot change another particle identity"),
+			StableIds.Contains(Particle.ParticleId)
+				&& Particle.ParticleId != RemovedId);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxMaterialWorldLocalThermalReactionTest,
+	"MatterFlux.Material.WorldUsesLocalThermalReactionKernel",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxMaterialWorldLocalThermalReactionTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	FMatterFluxContentRegistry Registry;
+	FMatterFluxMaterialDefinition Wood;
+	Wood.Id = TEXT("wood");
+	Wood.Phase = EMatterFluxMaterialPhase::StaticSolid;
+	Wood.DefaultEnergy = 100;
+	Wood.ConductivityPermille = 1000;
+	Wood.IgnitionThreshold = 300;
+	Wood.CombustionProduct = TEXT("charcoal");
+	Registry.Materials.Add(Wood.Id, Wood);
+	FMatterFluxMaterialDefinition Fire;
+	Fire.Id = TEXT("fire");
+	Fire.Phase = EMatterFluxMaterialPhase::StaticSolid;
+	Fire.DefaultEnergy = 60000;
+	Fire.ConductivityPermille = 1000;
+	Registry.Materials.Add(Fire.Id, Fire);
+	FMatterFluxMaterialDefinition Charcoal;
+	Charcoal.Id = TEXT("charcoal");
+	Charcoal.Phase = EMatterFluxMaterialPhase::StaticSolid;
+	Charcoal.DefaultEnergy = 100;
+	Charcoal.ConductivityPermille = 250;
+	Registry.Materials.Add(Charcoal.Id, Charcoal);
+
+	MatterFlux::Material::FWorldSettings Settings;
+	Settings.ChunkSize = 8;
+	Settings.ActiveChunkRadius = 0;
+	Settings.MaxActiveChunks = 1;
+	MatterFlux::Material::FChunkedMaterialWorld World;
+	FString Error;
+	if (!TestTrue(TEXT("Thermal world initializes"),
+		World.Initialize(Settings, Registry, 1234, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	TestTrue(TEXT("Wood cell is authored"),
+		World.SetCell(FIntPoint(0, 0), TEXT("wood")));
+	TestTrue(TEXT("Fire cell is authored"),
+		World.SetCell(FIntPoint(1, 0), TEXT("fire")));
+	const MatterFlux::Material::FStepStats Stats = World.Step();
+	TestTrue(TEXT("Local thermal kernel commits a changed contact"),
+		Stats.ReactedPairs > 0);
+	MatterFlux::Material::FCellSnapshot Heated;
+	TestTrue(TEXT("Heated cell remains queryable"),
+		World.TryGetCellSnapshot(FIntPoint(0, 0), Heated));
+	TestEqual(TEXT("Ignition is a material conversion, not a reaction state"),
+		Heated.MaterialId, FName(TEXT("charcoal")));
+	TestTrue(TEXT("Specific energy remains a canonical cell fact"),
+		Heated.Energy >= Wood.IgnitionThreshold);
+
+	TArray<uint8> State;
+	TestTrue(TEXT("Energy-bearing world exports"),
+		World.ExportActiveState(1, State, Error));
+	MatterFlux::Material::FChunkedMaterialWorld Restored;
+	TestTrue(TEXT("Restore world initializes"),
+		Restored.Initialize(Settings, Registry, 1234, Error));
+	int32 LogicalStep = INDEX_NONE;
+	FIntPoint Focus;
+	TestTrue(TEXT("Energy-bearing world imports"),
+		Restored.ImportActiveState(State, LogicalStep, Focus, Error));
+	MatterFlux::Material::FCellSnapshot RoundTrip;
+	TestTrue(TEXT("Restored heated cell exists"),
+		Restored.TryGetCellSnapshot(FIntPoint(0, 0), RoundTrip));
+	TestEqual(TEXT("Energy round-trips exactly"), RoundTrip.Energy, Heated.Energy);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxAirborneParticleLocalContactTest,
+	"MatterFlux.Material.AirborneParticleUsesUnifiedLocalContact",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxAirborneParticleLocalContactTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	FMatterFluxContentRegistry Registry = MakeLiquidRegistry();
+	FMatterFluxMaterialDefinition Fire;
+	Fire.Id = TEXT("fire");
+	Fire.Phase = EMatterFluxMaterialPhase::Gas;
+	Fire.DefaultEnergy = 60000;
+	Fire.ConductivityPermille = 800;
+	Registry.Materials.Add(Fire.Id, Fire);
+	FMatterFluxMaterialDefinition Smoke;
+	Smoke.Id = TEXT("smoke");
+	Smoke.Phase = EMatterFluxMaterialPhase::Gas;
+	Smoke.DefaultEnergy = 400;
+	Smoke.LifetimeSteps = 8;
+	Registry.Materials.Add(Smoke.Id, Smoke);
+	Registry.Materials.FindChecked(TEXT("water")).DefaultEnergy = 100;
+	Registry.Materials.FindChecked(TEXT("water")).ConductivityPermille = 800;
+	FMatterFluxReactionDefinition Extinguish;
+	Extinguish.Id = TEXT("fire_water_extinguish");
+	Extinguish.InputA = TEXT("fire");
+	Extinguish.InputB = TEXT("water");
+	Extinguish.OutputA = TEXT("empty");
+	Extinguish.OutputB = TEXT("water");
+	FMatterFluxReactionEmissionDefinition SmokeEmission;
+	SmokeEmission.Material = TEXT("smoke");
+	SmokeEmission.Amount = 2;
+	SmokeEmission.Energy = 400;
+	SmokeEmission.SourceSide = EMatterFluxReactionEmissionSourceSide::A;
+	Extinguish.Emissions.Add(SmokeEmission);
+	Registry.Reactions.Add(Extinguish.Id, Extinguish);
+
+	MatterFlux::Material::FRuntimeSettings Settings;
+	Settings.World.ChunkSize = 8;
+	Settings.World.ActiveChunkRadius = 0;
+	Settings.World.MaxActiveChunks = 1;
+	MatterFlux::Material::FSimulationRuntime Runtime;
+	FString Error;
+	const FIntPoint Focuses[] = { FIntPoint::ZeroValue };
+	if (!TestTrue(TEXT("Unified contact runtime initializes"),
+		Runtime.Initialize(Settings, Registry, 81, Focuses, Error)))
+	{
+		AddError(Error);
+		return false;
+	}
+	TestTrue(TEXT("Settled water is authored"),
+		Runtime.SetCell(FIntPoint::ZeroValue, TEXT("water")));
+	const FVector Position[] = { FVector::ZeroVector };
+	const FGuid Batch = Runtime.SpawnAirborneParticles(
+		TEXT("fire"), Position, {}, 1, 7, 2.0f, 0.0f, 1.0f, 55);
+	TArray<MatterFlux::Material::FAirborneParticle> Particles;
+	Runtime.GetAirborneParticlesForBatch(Batch, Particles);
+	if (!TestEqual(TEXT("One fire particle exists"), Particles.Num(), 1))
+	{
+		return false;
+	}
+	TestTrue(TEXT("World/particle contact commits through the unified kernel"),
+		Runtime.ReactAirborneParticleAt(
+			FIntPoint::ZeroValue, Particles[0].ParticleId, Error));
+	TestEqual(TEXT("Empty particle output consumes only the canonical particle"),
+		Runtime.CountAirborneParticles(TEXT("fire")), 0);
+	TestEqual(TEXT("Paired settled output remains water"),
+		Runtime.GetMaterialAt(FIntPoint::ZeroValue), FName(TEXT("water")));
+	TestEqual(TEXT("Emission is not duplicated before adapter commit"),
+		Runtime.CountAirborneParticles(TEXT("smoke")), 0);
+	TestEqual(TEXT("Committed emission becomes one canonical particle"),
+		Runtime.MaterializePendingReactionEmissions(
+			[](const FIntVector& GridCell)
+			{
+				return FVector(GridCell);
+			}),
+		1);
+	TestEqual(TEXT("Emission amount is conserved"),
+		Runtime.SumAirborneMaterialAmount(TEXT("smoke")), static_cast<int64>(2));
+	const FIntPoint DepositCell(1, 0);
+	TestEqual(TEXT("Heated airborne deposit is accepted"),
+		Runtime.AddCellAmount(DepositCell, TEXT("water"), 100, 500), 100);
+	TestEqual(TEXT("Cool material merges into the same column"),
+		Runtime.AddCellAmount(DepositCell, TEXT("water"), 100, 100), 100);
+	MatterFlux::Material::FCellSnapshot Deposit;
+	TestTrue(TEXT("Merged energy-bearing deposit exists"),
+		Runtime.TryGetCellSnapshot(DepositCell, Deposit));
+	TestEqual(TEXT("Specific energy is amount weighted"), Deposit.Energy,
+		static_cast<uint16>(300));
 	return true;
 }

@@ -374,7 +374,7 @@ bool FMatterFluxFragmentSourceProxyUnifiedReactionOutputTest::RunTest(
 		TEXT("Burning one trunk cell commits its residue state"),
 		Proxy->ApplySourceState(
 			Trunk.SourceId,
-			{0},
+			{1},
 			{1},
 			TEXT("charcoal"),
 			FLinearColor(0.10f, 0.08f, 0.06f),
@@ -382,8 +382,12 @@ bool FMatterFluxFragmentSourceProxyUnifiedReactionOutputTest::RunTest(
 		EMatterFluxFragmentSourceProxyApplyResult::Changed);
 	Proxy->FlushPendingChanges();
 	TestEqual(
+		TEXT("A converted cell has exactly one material projection"),
+		Proxy->GetBaseOverrideOverlapCellCount(),
+		0);
+	TestEqual(
 		TEXT("Charcoal is not drawn as a second 2D tree projection"),
-		Proxy->GetStandaloneTreeOutputProjectionCount(),
+		Proxy->GetStandaloneTreeMaterialOverrideProjectionCount(),
 		0);
 	return true;
 }

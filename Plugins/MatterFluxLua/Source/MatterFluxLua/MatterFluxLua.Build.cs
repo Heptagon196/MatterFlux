@@ -19,6 +19,6 @@ public class MatterFluxLua : ModuleRules
 		PrivateIncludePaths.Add(
 			Path.Combine(ModuleDirectory, "../../ThirdParty/Lua/src"));
 
-		PublicDefinitions.Add("MATTERFLUX_LUA_SCHEMA_VERSION=2");
+		PublicDefinitions.Add("MATTERFLUX_LUA_SCHEMA_VERSION=3");
 	}
 }

@@ -4,8 +4,9 @@
 #include "GameFramework/Actor.h"
 #include "Fragment/Fragment2DSourceStreamingState.h"
 #include "Fragment/FragmentTypes.h"
-#include "Material/MatterFluxReaction.h"
 #include "Rendering/MatterFluxSmokeVisualPool.h"
+#include "Volume/MatterFluxMaterialVolume.h"
+#include "Volume/MatterFluxMaterialVolumeReplication.h"
 #include "Fragment2DSourceActor.generated.h"
 
 class UFragment2DAsset;
@@ -15,7 +16,11 @@ class UProceduralMeshComponent;
 class UInstancedStaticMeshComponent;
 class UPointLightComponent;
 class AFragment2DActor;
+class AMatterFluxPlayableWorldActor;
 class UFragmentSimulationSubsystem;
+struct FMaterialElementState;
+struct FMaterialDeltaBatch;
+struct FMaterialElementDelta;
 
 UCLASS(Blueprintable)
 class MATTERFLUX_API AFragment2DSourceActor : public AActor
@@ -28,7 +33,6 @@ public:
 	virtual void OnConstruction(const FTransform& Transform) override;
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
-	virtual void Tick(float DeltaSeconds) override;
 	virtual bool IsNetRelevantFor(
 		const AActor* RealViewer,
 		const AActor* ViewTarget,
@@ -89,23 +93,28 @@ public:
 	int32 GetMaskWidth() const;
 	int32 GetMaskHeight() const;
 	float GetCellSize() const;
+	const FGuid& GetSourceId() const { return SourceId; }
 	int32 GetMinFragmentAreaPixels() const;
 	int32 GetMaxFragmentsPerBreak() const;
 	const TArray<uint8>& GetRuntimeMask() const { return RuntimeMask; }
 	int32 GetRemainingInputCellCount() const;
 	int32 GetOutputCellCount() const;
 	int32 GetActiveCellCount() const;
-	int32 GetTotalMaterialEmissionCount() const
+	/** Diagnostic: cells simultaneously present in base and replacement render masks. */
+	int32 GetMaterialProjectionOverlapCellCount() const;
+	int32 GetReplicatedMaterialVolumeCellCount() const
 	{
-		return TotalMaterialEmissionCount;
+		return ReplicatedMaterialVolumeState.Cells.Num();
 	}
-	int32 GetReplicatedReactionByteCount() const
+	int32 GetReplicatedMaterialVolumeFieldRevision() const
 	{
-		return ReplicatedReactionInputMask.Num()
-			+ ReplicatedReactionOutputMask.Num()
-			+ ReplicatedReactionActiveMask.Num();
+		return ReplicatedMaterialVolumeState.FieldRevision;
 	}
-	bool IsReacting() const;
+	/** Emissions are ordinary particles owned by MaterialWorld, never Source state. */
+	int32 GetTotalMaterialEmissionCount() const { return 0; }
+	/** Legacy object reaction payload was removed; Volume state uses the world Fast Array. */
+	int32 GetReplicatedReactionByteCount() const { return 0; }
+	bool IsMaterialHot() const;
 	/** Stable mask-derived bounds used by world simulation indexes. */
 	FBox GetCanonicalWorldBounds() const;
 	FBox GetActiveWorldBounds() const;
@@ -117,13 +126,42 @@ public:
 		FVector& OutImpactLocation,
 		FVector& OutImpactNormal) const;
 	FName GetReactionStimulusMaterial() const;
+	/** Derives shared flame instances and smoke anchors from immutable cell state. */
+	void GatherReactionVisualTransforms(
+		TArray<FTransform>& OutFlameTransforms,
+		TArray<MatterFlux::Rendering::FMaterialEmissionAnchor>& OutSmokeAnchors,
+		int32 MaxVisualInstances) const;
+	/** Compatibility projection for callers that only consume smoke. */
 	void GatherReactionSmokeAnchors(
 		TArray<MatterFlux::Rendering::FMaterialEmissionAnchor>& OutAnchors,
 		int32 MaxAnchors) const;
-	bool HasReactionRule() const
-	{
-		return FindReactionRule() != nullptr;
-	}
+	bool HasLocalMaterialRule() const;
+	/** Read-only shadow used while fragment authority migrates from Mask to Volume. */
+	bool BuildMaterialVolumeInstance(FMaterialVolumeInstance& OutInstance) const;
+	/** Resolve an occupied legacy X/Z cell to its stable Volume U/V/N address. */
+	bool TryGetMaterialVolumeCellAtWorldLocation(
+		const FVector& WorldLocation,
+		FIntVector& OutVolumeCell) const;
+	uint16 GetMaterialVolumeCellEnergy(
+		const FIntVector& VolumeCell,
+		uint16 DefaultEnergy) const;
+	/** Validate and commit one field-only update without touching topology revision. */
+	bool CommitMaterialVolumeCellEnergy(
+		const FIntVector& VolumeCell,
+		uint16 DefaultEnergy,
+		uint16 ExpectedEnergy,
+		uint16 AfterEnergy);
+	/** Atomically commits material identity plus energy for one occupied Volume cell. */
+	bool CommitMaterialVolumeCellState(
+		const FIntVector& VolumeCell,
+		uint16 DefaultEnergy,
+		const FMaterialElementState& ExpectedBefore,
+		const FMaterialElementState& After,
+		FString& OutError);
+	/** Validates every touched cell, then swaps topology and fields as one commit. */
+	bool CommitMaterialVolumeElementBatch(
+		const FMaterialDeltaBatch& Batch,
+		FString& OutError);
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Fragment")
 	TObjectPtr<UProceduralMeshComponent> MeshComponent;
@@ -193,6 +231,9 @@ protected:
 	void OnRep_ProceduralSource();
 
 	UFUNCTION()
+	void OnRep_MaterialVolumeState();
+
+	UFUNCTION()
 	void OnRep_SourceAppearance();
 
 	UFUNCTION()
@@ -201,35 +242,40 @@ protected:
 	UFUNCTION()
 	void OnRep_AggregateSeparationCollisionSuppressed();
 
-	UFUNCTION()
-	void OnRep_ReactionState();
-
 	void ApplyBrokenState();
 	void ApplySourceCollisionState();
 	void UpdateAggregateSeparationGracePeriod();
 	void EndAggregateSeparationGracePeriod();
 	void ApplySourceMaterial();
-	void AdvanceReaction(float DeltaSeconds);
-	void RebuildReactionVisualization();
-	void RebuildOutputMesh();
+	void RebuildMaterialVisualization();
+	void RebuildOutputMesh(const TArray<uint8>& OutputCells, FName OutputMaterialId);
 	void EnsureReactionVisualComponents();
-	void AddMaterialEmissions(const TArray<FIntPoint>& Cells);
 	void MarkSharedSmokeVisualizationDirty() const;
 	FIntPoint WorldToMaskCell(const FVector& WorldLocation) const;
-	void PublishReactionState();
-	const FMatterFluxReactionDefinition* FindReactionRule() const;
-	const FMatterFluxReactionDefinition* FindReactionRule(
-		FName StimulusMaterial) const;
+	bool BuildMaterialProjection(
+		TArray<uint8>& OutOutputCells,
+		TArray<uint8>& OutHotCells,
+		FName& OutOutputMaterialId,
+		uint16& OutIgnitionThreshold) const;
 	void EnsureInitialized();
-	bool RebuildSourceMesh();
+	bool RebuildSourceMesh(const TArray<uint8>* RenderMask = nullptr);
 	void BuildDefaultMask(TArray<uint8>& OutMask) const;
 	void RefreshPresenceRegistration();
+	void RefreshMaterialVolumeTopology();
+	void PublishReplicatedMaterialVolumeState();
+	bool ApplyReplicatedMaterialVolumeState(FString& OutError);
 
 	UPROPERTY(Transient)
 	TArray<uint8> RuntimeMask;
 
+	UPROPERTY(ReplicatedUsing = OnRep_MaterialVolumeState)
+	FMatterFluxReplicatedMaterialVolumeState ReplicatedMaterialVolumeState;
+
 	UPROPERTY(Transient)
 	TArray<uint8> SupportAnchorMask;
+
+	UPROPERTY(Transient)
+	TArray<uint8> RenderedSourceMask;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> DynamicFragmentMaterial;
@@ -251,22 +297,18 @@ protected:
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> StimulusMaterialInstance;
-
-
-	UPROPERTY(Replicated)
-	TArray<uint8> ReplicatedReactionInputMask;
-
-	UPROPERTY(Replicated)
-	TArray<uint8> ReplicatedReactionOutputMask;
-
-	UPROPERTY(Replicated)
-	TArray<uint8> ReplicatedReactionActiveMask;
-
-	UPROPERTY(ReplicatedUsing = OnRep_ReactionState)
-	int32 ReactionRevision = 0;
-
 private:
 	friend class UFragmentSimulationSubsystem;
+	friend class AMatterFluxPlayableWorldActor;
+
+	bool PrepareMaterialVolumeElementDeltas(
+		TConstArrayView<FMaterialElementDelta> Deltas,
+		FMaterialVolumeTopology& OutTopology,
+		FMaterialVolumeFields& OutFields,
+		FString& OutError) const;
+	void CommitPreparedMaterialVolumeState(
+		FMaterialVolumeTopology&& Topology,
+		FMaterialVolumeFields&& Fields);
 
 	struct FPreparedFragmentDamage
 	{
@@ -283,19 +325,12 @@ private:
 		bool bForceDetachedPhysics = false) const;
 	bool CommitPreparedDamage(FPreparedFragmentDamage& Transaction);
 
-	TUniquePtr<MatterFlux::Reaction::FMaskReaction>
-		ReactionSimulation;
-	TArray<uint8> OutputMask;
-	TArray<uint8> VisibleActiveMask;
-	float ReactionAccumulator = 0.0f;
-	float ReactionVisualAccumulator = 0.0f;
-	int32 TotalMaterialEmissionCount = 0;
 	FGuid RegisteredPresenceSourceId;
 	TWeakObjectPtr<AActor> AggregateSeparationCarrier;
 	FTimerHandle AggregateSeparationTimerHandle;
 	double AggregateSeparationEarliestEndSeconds = 0.0;
 	double AggregateSeparationDeadlineSeconds = 0.0;
-	bool bReactionVisualDirty = false;
-	bool bReactionGeometryDirty = false;
 	bool bSourceMeshProjectionEnabled = true;
+	TOptional<FMaterialVolumeTopology> MaterialVolumeTopology;
+	FMaterialVolumeFields MaterialVolumeFields;
 };

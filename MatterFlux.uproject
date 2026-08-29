@@ -42,6 +42,14 @@
 			"Enabled": true
 		},
 		{
+			"Name": "OnlineSubsystem",
+			"Enabled": true
+		},
+		{
+			"Name": "OnlineSubsystemNull",
+			"Enabled": true
+		},
+		{
 			"Name": "GeometryProcessing",
 			"Enabled": true
 		},

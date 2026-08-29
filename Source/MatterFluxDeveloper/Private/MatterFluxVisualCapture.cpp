@@ -24,7 +24,6 @@
 #include "GameFramework/Pawn.h"
 #include "Game/MatterFluxPlayableWorldActor.h"
 #include "Game/MatterFluxPlayableLevel.h"
-#include "Game/MatterFluxGroundStateChunkActor.h"
 #include "Game/MatterFluxPlayerController.h"
 #include "Game/MatterFluxPlayerState.h"
 #include "Game/MatterFluxTwoStoreyHouseActor.h"
@@ -274,16 +273,16 @@ namespace
 				: -1.0,
 			PlayableWorld.GetSimulatedMaterialCount(TEXT("fire")),
 			PlayableWorld.GetSimulatedMaterialAmount(TEXT("fire")),
-			PlayableWorld.GetReactingSourceCount(),
-			PlayableWorld.GetLogicalReactionActiveCellCount(TEXT("wood")),
-			PlayableWorld.GetLogicalReactionActiveCellCount(TEXT("leaf")),
-			PlayableWorld.GetLogicalReactionActiveCellCount(TEXT("grass")),
-			PlayableWorld.GetLogicalReactionActiveCellCount(TEXT("grassland")),
-			PlayableWorld.GetReactionOutputCellCount(),
-			PlayableWorld.GetLogicalReactionMaterialEmissionCount(),
-			PlayableWorld.GetLogicalReactionFlameInstanceCount(),
-			PlayableWorld.GetActiveGroundReactionCellCount(),
-			PlayableWorld.GetReactedGroundCellCount(),
+			PlayableWorld.GetHotSourceCount(),
+			PlayableWorld.GetLogicalHotMaterialCellCount(TEXT("wood")),
+			PlayableWorld.GetLogicalHotMaterialCellCount(TEXT("leaf")),
+			PlayableWorld.GetLogicalHotMaterialCellCount(TEXT("grass")),
+			PlayableWorld.GetLogicalHotMaterialCellCount(TEXT("grassland")),
+			PlayableWorld.GetMaterialOverrideCellCount(),
+			PlayableWorld.GetLogicalMaterialEmissionCount(),
+			PlayableWorld.GetLogicalMaterialFlameInstanceCount(),
+			PlayableWorld.GetHotTerrainMaterialCellCount(),
+			PlayableWorld.GetTerrainMaterialOverrideCellCount(),
 			PlayerProjectiles);
 	}
 
@@ -912,7 +911,7 @@ namespace
 				if (!PlayableWorld->ApplyMaterialStimulusToLogicalFragmentAggregate(
 					State->AggregateId,
 					StimulusPoint,
-					NAME_None,
+					TEXT("fire"),
 					State->EventSeed))
 				{
 					UE_LOG(
@@ -7709,12 +7708,6 @@ namespace
 			{
 				It->SetActorHiddenInGame(true);
 				It->SetActorEnableCollision(false);
-			}
-			for (TActorIterator<AMatterFluxGroundStateChunkActor> It(World); It; ++It)
-			{
-				It->SetActorHiddenInGame(true);
-				It->SetActorEnableCollision(false);
-				It->SetActorTickEnabled(false);
 			}
 			for (TActorIterator<AMatterFluxMagicProjectile> It(World); It; ++It)
 			{

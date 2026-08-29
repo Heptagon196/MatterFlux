@@ -982,7 +982,7 @@ bool FMatterFluxReactionTopSurfaceTest::RunTest(const FString& Parameters)
 	};
 	TArray<int32> VisibleCells;
 	if (!TestTrue(TEXT("Valid reaction masks are accepted"),
-		MatterFlux::FragmentGeometry::GatherTopExposedActiveMaskCells(
+		MatterFlux::FragmentGeometry::GatherTopExposedMarkedMaskCells(
 			Occupied, Active, 2, 3, VisibleCells)))
 	{
 		return false;
@@ -1013,7 +1013,7 @@ bool FMatterFluxReactionVisibleSurfaceTest::RunTest(
 	TArray<int32> VisibleCells;
 	if (!TestTrue(
 		TEXT("Visible reaction masks are accepted"),
-		MatterFlux::FragmentGeometry::GatherTopExposedActiveMaskCells(
+		MatterFlux::FragmentGeometry::GatherTopExposedMarkedMaskCells(
 			Occupied,
 			Active,
 			2,

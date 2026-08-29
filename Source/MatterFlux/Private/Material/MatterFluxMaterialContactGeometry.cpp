@@ -31,17 +31,19 @@ namespace MatterFlux::Material
 
 		const bool bUsesLiquidColumn =
 			Phase == EMatterFluxMaterialPhase::Liquid;
+		const float HorizontalContactScale =
+			Phase == EMatterFluxMaterialPhase::Gas ? 0.75f : 0.52f;
 		FMaterialContactGeometry Result;
 		Result.ColumnHeight = bUsesLiquidColumn
 			? LiquidColumnHeight
 			: CellSize;
 		Result.CenterOffsetZ = Result.ColumnHeight * 0.5f;
 		Result.HalfExtent = FVector(
-			CellSize * 0.52f,
-			CellSize * 0.52f,
+			CellSize * HorizontalContactScale,
+			CellSize * HorizontalContactScale,
 			Result.ColumnHeight * 0.5f);
 		Result.RadialContactRadius = FMath::Max(
-			CellSize * 0.52f,
+			CellSize * HorizontalContactScale,
 			Result.ColumnHeight * 0.5f);
 		Result.GroundVerticalTolerance = bUsesLiquidColumn
 			? FMath::Max(CellSize, LiquidColumnHeight)

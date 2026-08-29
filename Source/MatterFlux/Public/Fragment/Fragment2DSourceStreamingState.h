@@ -1,59 +1,48 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Material/MatterFluxSourceReactionRuntime.h"
+
+struct FFragment2DMaterialVolumeCellState
+{
+	FIntVector Cell = FIntVector::ZeroValue;
+	FName MaterialId = NAME_None;
+	uint16 Energy = 0;
+
+	bool operator==(const FFragment2DMaterialVolumeCellState& Other) const = default;
+};
 
 struct FFragment2DSourceStreamingState
-	: public MatterFlux::Reaction::FSourceRuntimeSnapshot
 {
 	int32 Revision = 0;
-	bool bHasReactionState = false;
-
-	bool CaptureReactionState(
-		const MatterFlux::Reaction::FSourceReactionRuntime& Runtime)
-	{
-		if (!Runtime.CaptureState(*this))
-		{
-			return false;
-		}
-		bHasReactionState = true;
-		StandaloneRuntimeMask.Reset();
-		return true;
-	}
-
+	int32 VolumeTopologyRevision = 0;
+	int32 VolumeFieldRevision = 0;
+	uint16 VolumeEnvironmentEnergy = 0;
+	TArray<FFragment2DMaterialVolumeCellState> VolumeCellStates;
 	void SetRuntimeMask(TArray<uint8> InRuntimeMask)
 	{
-		if (bHasReactionState)
-		{
-			ReactionState.InputMask = MoveTemp(InRuntimeMask);
-			StandaloneRuntimeMask.Reset();
-		}
-		else
-		{
-			StandaloneRuntimeMask = MoveTemp(InRuntimeMask);
-		}
+		RuntimeMask = MoveTemp(InRuntimeMask);
 	}
 
 	const TArray<uint8>& GetRuntimeMask() const
 	{
-		return bHasReactionState
-			? ReactionState.InputMask
-			: StandaloneRuntimeMask;
+		return RuntimeMask;
 	}
 
 	int32 GetStoredMaskValueCount() const
 	{
-		return StandaloneRuntimeMask.Num()
-			+ ReactionState.InputMask.Num()
-			+ ReactionState.OutputMask.Num()
-			+ ReactionState.ActiveMask.Num();
+		return RuntimeMask.Num()
+			+ VolumeCellStates.Num()
+				* static_cast<int32>(sizeof(FFragment2DMaterialVolumeCellState));
 	}
 
 	bool HasPersistentChanges() const
 	{
-		return Revision > 0 || bHasReactionState;
+		return Revision > 0
+			|| VolumeTopologyRevision > 0
+			|| VolumeFieldRevision > 0
+			|| !VolumeCellStates.IsEmpty();
 	}
 
 private:
-	TArray<uint8> StandaloneRuntimeMask;
+	TArray<uint8> RuntimeMask;
 };

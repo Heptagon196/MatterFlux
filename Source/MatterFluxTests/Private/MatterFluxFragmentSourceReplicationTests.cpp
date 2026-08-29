@@ -8,32 +8,27 @@ namespace
 	constexpr int32 ReplicationBenchmarkCellCount = 1024;
 	constexpr int32 ReplicationBenchmarkIterations = 256;
 
-	FFragment2DSourceStreamingState MakeReactionState(
+	FFragment2DSourceStreamingState MakeVolumeState(
 		const int32 SourceIndex)
 	{
 		FFragment2DSourceStreamingState State;
 		State.Revision = 1;
-		State.bHasReactionState = true;
-		State.ReactionState.RuleId = TEXT("replication_benchmark");
-		State.ReactionState.Seed = 1000 + SourceIndex;
 		TArray<uint8> InputMask;
 		InputMask.SetNumUninitialized(ReplicationBenchmarkCellCount);
-		State.ReactionState.OutputMask.Init(
-			0,
-			ReplicationBenchmarkCellCount);
-		State.ReactionState.ActiveMask.Init(
-			0,
-			ReplicationBenchmarkCellCount);
 		for (int32 CellIndex = 0;
 			CellIndex < ReplicationBenchmarkCellCount;
 			++CellIndex)
 		{
 			InputMask[CellIndex] =
 				((CellIndex + SourceIndex) % 5) != 0 ? 1 : 0;
-			State.ReactionState.OutputMask[CellIndex] =
-				((CellIndex + SourceIndex) % 23) == 0 ? 1 : 0;
-			State.ReactionState.ActiveMask[CellIndex] =
-				((CellIndex + SourceIndex) % 31) == 0 ? 7 : 0;
+			if (((CellIndex + SourceIndex) % 64) == 0
+				&& InputMask[CellIndex] != 0)
+			{
+				State.VolumeCellStates.Add({
+					FIntVector(CellIndex % 32, CellIndex / 32, 0),
+					TEXT("charcoal"),
+					static_cast<uint16>(40000 + SourceIndex) });
+			}
 		}
 		State.SetRuntimeMask(MoveTemp(InputMask));
 		return State;
@@ -50,7 +45,7 @@ namespace
 		Updates.Reserve(SourceCount);
 		for (int32 SourceIndex = 0; SourceIndex < SourceCount; ++SourceIndex)
 		{
-			SourceStates.Add(MakeReactionState(SourceIndex));
+			SourceStates.Add(MakeVolumeState(SourceIndex));
 		}
 		for (int32 SourceIndex = SourceCount - 1;
 			SourceIndex >= 0;
@@ -73,7 +68,7 @@ namespace
 			ReplicatedStates.UpsertAuthorityBatch(
 				Updates,
 				SourceCount,
-				SourceCount * 384),
+				SourceCount * 1024),
 			EMatterFluxFragmentSourceStateUpsertResult::Committed))
 		{
 			return false;
@@ -85,6 +80,8 @@ namespace
 		{
 			RuntimeBuffers.Add(Item.PackedRuntimeMask.GetData());
 		}
+		const int32 ExpectedPayloadBytes =
+			ReplicatedStates.GetAuthorityPayloadByteCount();
 
 		const double StartSeconds = FPlatformTime::Seconds();
 		for (int32 Iteration = 0;
@@ -94,12 +91,12 @@ namespace
 			for (FFragment2DSourceStreamingState& State : SourceStates)
 			{
 				++State.Revision;
-				++State.ReactionState.Tick;
+				++State.VolumeFieldRevision;
 			}
 			if (ReplicatedStates.UpsertAuthorityBatch(
 				Updates,
 				SourceCount,
-				SourceCount * 384)
+				SourceCount * 1024)
 				!= EMatterFluxFragmentSourceStateUpsertResult::Committed)
 			{
 				Test.AddError(TEXT("Repeated Source batch was rejected"));
@@ -116,9 +113,9 @@ namespace
 			ReplicatedStates.Items.Num(),
 			SourceCount)
 			|| !Test.TestEqual(
-				TEXT("Batch byte accounting covers all three masks"),
+				TEXT("Batch byte accounting covers one mask and sparse Volume cells"),
 				ReplicatedStates.GetAuthorityPayloadByteCount(),
-				SourceCount * 384))
+				ExpectedPayloadBytes))
 		{
 			return false;
 		}
@@ -194,6 +191,73 @@ namespace
 			/ ReplicationBenchmarkIterations;
 		return true;
 	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxFragmentSourceVolumeStateReplicationTest,
+	"MatterFlux.Network.FragmentSourceVolumeStateReplicatesAtomically",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxFragmentSourceVolumeStateReplicationTest::RunTest(
+	const FString& Parameters)
+{
+	(void)Parameters;
+	const FGuid SourceId =
+		FGuid::NewDeterministicGuid(TEXT("replicated.volume.source"), 1);
+	FFragment2DSourceStreamingState State;
+	State.Revision = 8;
+	State.VolumeTopologyRevision = 5;
+	State.VolumeFieldRevision = 7;
+	State.VolumeEnvironmentEnergy = 100;
+	State.SetRuntimeMask({ 1, 1 });
+	State.VolumeCellStates.Add({
+		FIntVector(1, 0, 0), TEXT("charcoal"), 42000 });
+
+	FMatterFluxReplicatedFragmentSourceStateList States;
+	const FMatterFluxFragmentSourceStateBatchUpdate Update{SourceId, &State};
+	if (!TestEqual(TEXT("Valid Volume state commits"),
+		States.UpsertAuthorityBatch(MakeArrayView(&Update, 1), 4, 4096),
+		EMatterFluxFragmentSourceStateUpsertResult::Committed)
+		|| !TestEqual(TEXT("One Source is published"), States.Items.Num(), 1))
+	{
+		return false;
+	}
+	const FMatterFluxReplicatedFragmentSourceState& Item = States.Items[0];
+	TestEqual(TEXT("Topology revision is part of the atomic item"),
+		Item.VolumeTopologyRevision, 5);
+	TestEqual(TEXT("Field revision is part of the atomic item"),
+		Item.VolumeFieldRevision, 7);
+	TestEqual(TEXT("Environment energy is part of the atomic item"),
+		Item.VolumeEnvironmentEnergy, static_cast<uint16>(100));
+	if (!TestEqual(TEXT("Sparse Volume state is published"),
+		Item.VolumeCellStates.Num(), 1))
+	{
+		return false;
+	}
+	TestEqual(TEXT("Replicated cell address remains stable"),
+		Item.VolumeCellStates[0].Cell, FIntVector(1, 0, 0));
+	TestEqual(TEXT("Replicated cell material uses its stable name"),
+		Item.VolumeCellStates[0].MaterialId, FName(TEXT("charcoal")));
+	TestEqual(TEXT("Replicated cell energy remains exact"),
+		Item.VolumeCellStates[0].Energy, static_cast<uint16>(42000));
+
+	FFragment2DSourceStreamingState Duplicate = State;
+	Duplicate.Revision = 9;
+	const FFragment2DMaterialVolumeCellState DuplicateCell =
+		Duplicate.VolumeCellStates[0];
+	Duplicate.VolumeCellStates.Add(DuplicateCell);
+	const FMatterFluxFragmentSourceStateBatchUpdate InvalidUpdate{
+		SourceId, &Duplicate };
+	TestEqual(TEXT("Duplicate Volume addresses reject the whole update"),
+		States.UpsertAuthorityBatch(
+			MakeArrayView(&InvalidUpdate, 1), 4, 4096),
+		EMatterFluxFragmentSourceStateUpsertResult::InvalidState);
+	TestEqual(TEXT("Rejected update leaves the prior revision untouched"),
+		States.Items[0].Revision, 8);
+	TestEqual(TEXT("Rejected update leaves the prior Volume payload untouched"),
+		States.Items[0].VolumeCellStates.Num(), 1);
+	return true;
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(

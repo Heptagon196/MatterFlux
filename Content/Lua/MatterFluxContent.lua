@@ -3,4 +3,4 @@
 -- Items, Quests, Creatures, Dialogues, Shops, and Maps
 -- module directories and are concatenated in deterministic path order.
 
-content.set_manifest("matterflux.default", 23, 2)
+content.set_manifest("matterflux.default", 25, 3)

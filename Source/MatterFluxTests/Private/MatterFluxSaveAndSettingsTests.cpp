@@ -74,6 +74,66 @@ bool FMatterFluxSaveInitializationTest::RunTest(const FString& Parameters)
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxVersionFiveReactionStateRejectionTest,
+	"MatterFlux.Save.VersionFiveReactionStateRejectedWithoutMutation",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxVersionFiveReactionStateRejectionTest::RunTest(
+	const FString& Parameters)
+{
+	using namespace MatterFluxSaveTests;
+	(void)Parameters;
+	FString Error;
+	UMatterFluxSaveGame* SourceReactionSave = MakeValidSave(5551);
+	SourceReactionSave->SaveVersion = 5;
+	FMatterFluxSavedFragmentSourceState Source;
+	Source.SourceId = FGuid::NewDeterministicGuid(TEXT("legacy.source"), 1);
+	Source.RuntimeMask = { 1 };
+	Source.bHasReactionState = true;
+	Source.ReactionState.RuleId = TEXT("legacy.burning");
+	Source.ReactionState.Width = 1;
+	Source.ReactionState.Height = 1;
+	Source.ReactionState.InputMask = { 1 };
+	Source.ReactionState.OutputMask = { 0 };
+	Source.ReactionState.ActiveMask = { 2 };
+	SourceReactionSave->WorldState.FragmentSources = { Source };
+	const FGuid SourceIdBefore =
+		SourceReactionSave->WorldState.FragmentSources[0].SourceId;
+	TestFalse(TEXT("V5 source ReactionState is explicitly incompatible"),
+		SourceReactionSave->ValidateAndMigrate(Error));
+	TestTrue(TEXT("Incompatibility identifies ReactionState"),
+		Error.Contains(TEXT("ReactionState")));
+	TestEqual(TEXT("Failed V5 migration does not update the version"),
+		SourceReactionSave->SaveVersion, 5);
+	TestEqual(TEXT("Failed V5 migration does not change source identity"),
+		SourceReactionSave->WorldState.FragmentSources[0].SourceId,
+		SourceIdBefore);
+	TestTrue(TEXT("Failed V5 migration preserves the active mask"),
+		SourceReactionSave->WorldState.FragmentSources[0]
+			.ReactionState.ActiveMask == TArray<uint8>({ 2 }));
+
+	UMatterFluxSaveGame* GroundReactionSave = MakeValidSave(5552);
+	GroundReactionSave->SaveVersion = 5;
+	GroundReactionSave->WorldState.bHasGroundReactionState = true;
+	GroundReactionSave->WorldState.GroundReactionState = Source.ReactionState;
+	Error.Reset();
+	TestFalse(TEXT("V5 ground ReactionState is explicitly incompatible"),
+		GroundReactionSave->ValidateAndMigrate(Error));
+	TestEqual(TEXT("Failed ground migration remains V5"),
+		GroundReactionSave->SaveVersion, 5);
+
+	UMatterFluxSaveGame* CleanSave = MakeValidSave(5553);
+	CleanSave->SaveVersion = 5;
+	Error.Reset();
+	TestTrue(TEXT("Reaction-free V5 save migrates"),
+		CleanSave->ValidateAndMigrate(Error));
+	TestEqual(TEXT("Reaction-free V5 save becomes current"),
+		CleanSave->SaveVersion, UMatterFluxSaveGame::CurrentVersion);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxSaveCorruptionTest,
 	"MatterFlux.Save.CorruptPayloadRejected",
 	EAutomationTestFlags::EditorContext
@@ -133,7 +193,7 @@ bool FMatterFluxSaveCorruptionTest::RunTest(const FString& Parameters)
 	Source.ReactionState.OutputMask = { 0 };
 	Source.ReactionState.ActiveMask = { 3 };
 	ActiveCountdownSave->WorldState.FragmentSources = { Source };
-	TestTrue(TEXT("A multi-step active reaction is saveable"),
+	TestFalse(TEXT("Object-level active reactions are no longer saveable"),
 		ActiveCountdownSave->ValidateAndMigrate(Error));
 
 	UMatterFluxSaveGame* OrphanedActiveCellSave = MakeValidSave();
@@ -177,6 +237,27 @@ bool FMatterFluxSaveMemoryRoundTripTest::RunTest(const FString& Parameters)
 	Source->Progression.Revision = 7;
 	Source->CustomMapId = TEXT("story.paper_magic");
 	Source->PlayerTransform.SetLocation(FVector(120.0, 0.0, 340.0));
+	Source->WorldState.LocalMaterialReactionStep = 77;
+	FMatterFluxSavedFragmentSourceState& FragmentSource =
+		Source->WorldState.FragmentSources.AddDefaulted_GetRef();
+	FragmentSource.SourceId =
+		FGuid::NewDeterministicGuid(TEXT("save.volume.source"), 1);
+	FragmentSource.Revision = 3;
+	FragmentSource.VolumeTopologyRevision = 4;
+	FragmentSource.VolumeFieldRevision = 6;
+	FragmentSource.VolumeEnvironmentEnergy = 100;
+	FragmentSource.RuntimeMask = { 1, 1 };
+	FragmentSource.VolumeCellStates.Add({
+		FIntVector(1, 0, 0), TEXT("charcoal"), 42000 });
+	FMatterFluxTerrainSpanOverride& TerrainColumn =
+		Source->WorldState.TerrainSpanOverrides.AddDefaulted_GetRef();
+	TerrainColumn.WorldCell = FIntPoint(12, -4);
+	TerrainColumn.Spans = {
+		{ 0, 2, TEXT("soil") },
+		{ 5, 8, TEXT("stone") } };
+	TerrainColumn.bHasSettledSurface = true;
+	TerrainColumn.SettledSurfaceN = 5;
+	TerrainColumn.SettledSurfaceFace = 4;
 
 	TArray<uint8> Bytes;
 	if (!TestTrue(TEXT("Save serializes to memory"),
@@ -211,6 +292,54 @@ bool FMatterFluxSaveMemoryRoundTripTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("Player location round-trips"),
 		Loaded->PlayerTransform.GetLocation(),
 		FVector(120.0, 0.0, 340.0));
+	TestEqual(TEXT("Local reaction fixed step round-trips"),
+		Loaded->WorldState.LocalMaterialReactionStep,
+		static_cast<uint32>(77));
+	if (!TestEqual(TEXT("Volume Source round-trips"),
+		Loaded->WorldState.FragmentSources.Num(), 1))
+	{
+		return false;
+	}
+	const FMatterFluxSavedFragmentSourceState& LoadedFragment =
+		Loaded->WorldState.FragmentSources[0];
+	TestEqual(TEXT("Volume topology revision round-trips"),
+		LoadedFragment.VolumeTopologyRevision, 4);
+	TestEqual(TEXT("Volume field revision round-trips"),
+		LoadedFragment.VolumeFieldRevision, 6);
+	TestEqual(TEXT("Volume environment energy round-trips"),
+		LoadedFragment.VolumeEnvironmentEnergy, static_cast<uint16>(100));
+	if (!TestEqual(TEXT("Sparse Volume cell state round-trips"),
+		LoadedFragment.VolumeCellStates.Num(), 1))
+	{
+		return false;
+	}
+	TestEqual(TEXT("Volume cell address is stable"),
+		LoadedFragment.VolumeCellStates[0].Cell, FIntVector(1, 0, 0));
+	TestEqual(TEXT("Volume cell material round-trips by stable name"),
+		LoadedFragment.VolumeCellStates[0].MaterialId,
+		FName(TEXT("charcoal")));
+	TestEqual(TEXT("Volume cell energy round-trips"),
+		LoadedFragment.VolumeCellStates[0].Energy,
+		static_cast<uint16>(42000));
+	if (!TestEqual(TEXT("Sparse terrain span column round-trips"),
+		Loaded->WorldState.TerrainSpanOverrides.Num(), 1))
+	{
+		return false;
+	}
+	const FMatterFluxTerrainSpanOverride& LoadedTerrain =
+		Loaded->WorldState.TerrainSpanOverrides[0];
+	TestEqual(TEXT("Terrain span column address remains stable"),
+		LoadedTerrain.WorldCell, FIntPoint(12, -4));
+	TestEqual(TEXT("Cave floor and ceiling spans both round-trip"),
+		LoadedTerrain.Spans.Num(), 2);
+	TestEqual(TEXT("Terrain span material uses a stable content name"),
+		LoadedTerrain.Spans[1].MaterialId, FName(TEXT("stone")));
+	TestTrue(TEXT("Settled cave surface identity round-trips"),
+		LoadedTerrain.bHasSettledSurface);
+	TestEqual(TEXT("Settled cave surface N remains stable"),
+		LoadedTerrain.SettledSurfaceN, 5);
+	TestEqual(TEXT("Settled cave surface face remains stable"),
+		LoadedTerrain.SettledSurfaceFace, static_cast<uint8>(4));
 	return true;
 }
 

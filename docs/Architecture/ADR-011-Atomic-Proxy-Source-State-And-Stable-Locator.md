@@ -2,6 +2,7 @@
 
 - 状态：已采纳并实施
 - 日期：2026-08-10
+- 取代说明：ADR-015 部分取代本决策。代理只投影 Volume/Fields 快照，不再持有 reaction active mask 或材料真值。
 
 ## 背景
 
@@ -89,4 +90,3 @@ ProceduralMesh 顶点数：active 更新保持旧 mesh，结束前仍保持，de
 一次客户端 Source delta 现在从 Fast Array 计划、mask 解包、代理查找到逻辑提交都只随变化量
 增长，并且没有 runtime/residue 或逻辑/可视半提交窗口。代价是 locator 的正确性依赖代理数组
 结构只通过整体设置入口变化；这个约束比让任意调用方直接修改内部数组更窄，也更容易测试。
-

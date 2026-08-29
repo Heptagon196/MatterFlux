@@ -82,6 +82,10 @@ public:
 		return Presentation;
 	}
 	int32 GetMaterialBodyVoxelCount() const;
+	FGuid GetMaterialParticleBatchId() const
+	{
+		return MaterialParticleBatchId;
+	}
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Magic")
 	TObjectPtr<USphereComponent> Collision;

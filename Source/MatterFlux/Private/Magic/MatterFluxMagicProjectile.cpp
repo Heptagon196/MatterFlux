@@ -512,12 +512,28 @@ bool AMatterFluxMagicProjectile::TryBeginAirborneMaterialProjection()
 		InitialVelocities.Add(
 			BaseVelocity + Random.VRand() * VelocityJitter);
 	}
+	// The visible body is a volume represented by a bounded number of canonical
+	// particles. Derive each particle's contact radius from its share of that
+	// volume. The old fixed 5 cm cap left a 45 cm five-particle flame jet with
+	// large authority holes: it visibly crossed a tree but only ignited when one
+	// random point happened to pass within roughly 3 cm of a material cell.
+	const float BodyRadius =
+		FMath::Clamp(Presentation.Radius, 2.0f, 100.0f) * 0.92f;
+	const float ParticleCoverageRadius = FMath::Clamp(
+		BodyRadius * 0.90f
+			/ FMath::Max(
+				FMath::Pow(
+					static_cast<float>(MaterialBodyVoxelPositions.Num()),
+					1.0f / 3.0f),
+				1.0f),
+		1.5f,
+		FMath::Min(BodyRadius, 24.0f));
 	MaterialParticleBatchId = PlayableWorld->SpawnAirborneSimulatedMaterial(
 		Presentation.BodyMaterial,
 		Presentation.MaterialAmount,
 		WorldPositions,
 		InitialVelocities,
-		FMath::Clamp(MaterialBodyVoxelSpacing * 0.28f, 1.5f, 5.0f),
+		ParticleCoverageRadius,
 		Presentation.GravityScale,
 		Presentation.Lifetime,
 		ServerEventSeed);

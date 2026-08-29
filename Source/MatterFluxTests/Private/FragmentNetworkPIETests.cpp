@@ -1,4 +1,5 @@
 #include "AbilitySystemComponent.h"
+#include "Editor/EditorEngine.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -195,20 +196,12 @@ namespace
 				|| Left.MaterialId != Right.MaterialId
 				|| !Left.Color.Equals(Right.Color)
 				|| Left.bEnableCollision != Right.bEnableCollision
-				|| Left.bHasReactionState != Right.bHasReactionState
-				|| Left.ReactionRuleId != Right.ReactionRuleId
-				|| Left.OutputMaterialId != Right.OutputMaterialId
-				|| !Left.OutputColor.Equals(Right.OutputColor)
-				|| Left.ReactionSeed != Right.ReactionSeed
-				|| Left.ReactionTick != Right.ReactionTick
-				|| Left.ReactionAccumulator != Right.ReactionAccumulator
-				|| Left.TotalMaterialEmissionCount != Right.TotalMaterialEmissionCount
-				|| Left.OutputMask.Width != Right.OutputMask.Width
-				|| Left.OutputMask.Height != Right.OutputMask.Height
-				|| Left.OutputMask.SolidMask != Right.OutputMask.SolidMask
-				|| Left.ActiveMask.Width != Right.ActiveMask.Width
-				|| Left.ActiveMask.Height != Right.ActiveMask.Height
-				|| Left.ActiveMask.SolidMask != Right.ActiveMask.SolidMask)
+				|| Left.VolumeTopologyRevision
+					!= Right.VolumeTopologyRevision
+				|| Left.VolumeFieldRevision != Right.VolumeFieldRevision
+				|| Left.VolumeEnvironmentEnergy
+					!= Right.VolumeEnvironmentEnergy
+				|| Left.VolumeCellStates != Right.VolumeCellStates)
 			{
 				return false;
 			}
@@ -229,9 +222,12 @@ namespace
 			UWorld* Server = nullptr;
 			TArray<UWorld*> Clients;
 			FindPIEWorlds(Server, Clients);
-			if (!Server || Clients.Num() != 2)
+			const int32 ExpectedClientCount = bRequestedLateJoin ? 3 : 2;
+			if (!Server || Clients.Num() != ExpectedClientCount)
 			{
-				return FailOnTimeout(TEXT("Dedicated server and two client PIE worlds were not created."));
+				return FailOnTimeout(*FString::Printf(
+					TEXT("Dedicated server and %d client PIE worlds were not created."),
+					ExpectedClientCount));
 			}
 
 			if (!bValidatedMaterialState)
@@ -295,10 +291,8 @@ namespace
 					return FailOnTimeout(
 						TEXT("The server could not ignite a logical tree source."));
 				}
-				// Hold the deterministic cell state stable while the Fast Array add
-				// reaches both clients; replication remains active when actor Tick is
-				// disabled.
-				ServerWorldActor->SetActorTickEnabled(false);
+				// The stimulus is an authored World element. Keep the fixed-step owner
+				// ticking until its contact with the materialized tree Volume commits.
 				ServerWorldActor->ForceNetUpdate();
 				bRequestedLogicalReaction = true;
 				BeginNextPhase();
@@ -314,41 +308,127 @@ namespace
 				AMatterFluxPlayableWorldActor* ClientBWorldActor =
 					FindPlayableWorldActor(Clients[1]);
 				const int32 ServerInput = ServerWorldActor
-					? ServerWorldActor->GetLogicalReactionInputCellCount(TEXT("wood"))
+					? ServerWorldActor->GetLogicalBaseMaterialCellCount(TEXT("wood"))
 					: 0;
 				if (!ServerWorldActor
 					|| !ClientAWorldActor
 					|| !ClientBWorldActor
-					|| ServerWorldActor->GetReactingSourceCount() <= 0
-					|| ClientAWorldActor->GetReactingSourceCount() <= 0
-					|| ClientBWorldActor->GetReactingSourceCount() <= 0
+					|| ServerWorldActor->GetHotSourceCount() <= 0
+					|| ClientAWorldActor->GetHotSourceCount() <= 0
+					|| ClientBWorldActor->GetHotSourceCount() <= 0
 					|| ServerInput <= 0
-					|| ClientAWorldActor->GetLogicalReactionInputCellCount(TEXT("wood"))
+					|| ClientAWorldActor->GetLogicalBaseMaterialCellCount(TEXT("wood"))
 						!= ServerInput
-					|| ClientBWorldActor->GetLogicalReactionInputCellCount(TEXT("wood"))
+					|| ClientBWorldActor->GetLogicalBaseMaterialCellCount(TEXT("wood"))
 						!= ServerInput)
 				{
-					return FailOnTimeout(
-						TEXT("Logical source reaction Fast Array state did not converge on both clients."));
+					return FailOnTimeout(*FString::Printf(
+						TEXT("Materialized source Volume state did not converge: hot=%d/%d/%d wood=%d/%d/%d."),
+						ServerWorldActor
+							? ServerWorldActor->GetHotSourceCount() : -1,
+						ClientAWorldActor
+							? ClientAWorldActor->GetHotSourceCount() : -1,
+						ClientBWorldActor
+							? ClientBWorldActor->GetHotSourceCount() : -1,
+						ServerInput,
+						ClientAWorldActor
+							? ClientAWorldActor->GetLogicalBaseMaterialCellCount(TEXT("wood")) : -1,
+						ClientBWorldActor
+							? ClientBWorldActor->GetLogicalBaseMaterialCellCount(TEXT("wood")) : -1));
 				}
-				UWorld* NetworkWorlds[] = {
-					Server, Clients[0], Clients[1]
-				};
-				for (int32 WorldIndex = 0; WorldIndex < 3; ++WorldIndex)
+				bValidatedLogicalReaction = true;
+				BeginNextPhase();
+				return false;
+			}
+
+			if (!bRequestedLateJoin)
+			{
+				if (!GEditor)
 				{
-					UWorld* NetworkWorld = NetworkWorlds[WorldIndex];
-					for (TActorIterator<AFragment2DSourceActor> It(
-						NetworkWorld); It; ++It)
+					Test->AddError(TEXT("Editor engine was unavailable for the late-join request."));
+					return true;
+				}
+				GEditor->RequestLateJoin();
+				bRequestedLateJoin = true;
+				BeginNextPhase();
+				return false;
+			}
+
+			if (!bValidatedLateJoin)
+			{
+				AMatterFluxPlayableWorldActor* ServerWorldActor =
+					FindPlayableWorldActor(Server);
+				AMatterFluxPlayableWorldActor* ClientAWorldActor =
+					FindPlayableWorldActor(Clients[0]);
+				AMatterFluxPlayableWorldActor* ClientBWorldActor =
+					FindPlayableWorldActor(Clients[1]);
+				AMatterFluxPlayableWorldActor* LateWorldActor =
+					FindPlayableWorldActor(Clients[2]);
+				if (!ServerWorldActor
+					|| !ClientAWorldActor
+					|| !ClientBWorldActor
+					|| !LateWorldActor
+					|| LateWorldActor->GetAppliedMaterialStateRevision() <= 0
+					|| LateWorldActor->GetAppliedMaterialStateRevision()
+						!= ClientAWorldActor->GetAppliedMaterialStateRevision()
+					|| LateWorldActor->GetAppliedMaterialStateRevision()
+						!= ClientBWorldActor->GetAppliedMaterialStateRevision()
+					|| LateWorldActor->GetMaterialSimulationStep()
+						!= ClientAWorldActor->GetMaterialSimulationStep()
+					|| LateWorldActor->GetMaterialSimulationStep()
+						!= ClientBWorldActor->GetMaterialSimulationStep()
+					|| LateWorldActor->GetHotSourceCount() <= 0
+					|| LateWorldActor->GetHotSourceCount()
+						!= ClientAWorldActor->GetHotSourceCount()
+					|| LateWorldActor->GetHotSourceCount()
+						!= ClientBWorldActor->GetHotSourceCount()
+					|| LateWorldActor->GetLogicalBaseMaterialCellCount(TEXT("wood"))
+						!= ServerWorldActor->GetLogicalBaseMaterialCellCount(TEXT("wood")))
+				{
+					return FailOnTimeout(*FString::Printf(
+						TEXT("Late client did not converge after joining a mutated world: revision=%d/%d/%d, step=%d/%d/%d, hot=%d/%d/%d, wood=%d/%d."),
+						ClientAWorldActor
+							? ClientAWorldActor->GetAppliedMaterialStateRevision() : -1,
+						ClientBWorldActor
+							? ClientBWorldActor->GetAppliedMaterialStateRevision() : -1,
+						LateWorldActor
+							? LateWorldActor->GetAppliedMaterialStateRevision() : -1,
+						ClientAWorldActor
+							? ClientAWorldActor->GetMaterialSimulationStep() : -1,
+						ClientBWorldActor
+							? ClientBWorldActor->GetMaterialSimulationStep() : -1,
+						LateWorldActor
+							? LateWorldActor->GetMaterialSimulationStep() : -1,
+						ClientAWorldActor
+							? ClientAWorldActor->GetHotSourceCount() : -1,
+						ClientBWorldActor
+							? ClientBWorldActor->GetHotSourceCount() : -1,
+						LateWorldActor ? LateWorldActor->GetHotSourceCount() : -1,
+						ServerWorldActor
+							? ServerWorldActor->GetLogicalBaseMaterialCellCount(TEXT("wood")) : -1,
+						LateWorldActor
+							? LateWorldActor->GetLogicalBaseMaterialCellCount(TEXT("wood")) : -1));
+				}
+				static const FName MaterialIds[] =
+				{
+					TEXT("water"),
+					TEXT("lava"),
+					TEXT("sand"),
+					TEXT("steam"),
+					TEXT("stone")
+				};
+				for (const FName MaterialId : MaterialIds)
+				{
+					if (LateWorldActor->GetSimulatedMaterialCount(MaterialId)
+						!= ClientAWorldActor->GetSimulatedMaterialCount(MaterialId)
+						|| LateWorldActor->GetSimulatedMaterialCount(MaterialId)
+							!= ClientBWorldActor->GetSimulatedMaterialCount(MaterialId))
 					{
-						if (!It->IsActorBeingDestroyed() && It->IsReacting())
-						{
-							return FailOnTimeout(
-								TEXT("Logical tree reaction was incorrectly assigned to a materialized Source Actor."));
-						}
+						return FailOnTimeout(
+							TEXT("Late client imported different material amounts from the current snapshot."));
 					}
 				}
-				ServerWorldActor->SetActorTickEnabled(true);
-				bValidatedLogicalReaction = true;
+				bValidatedLateJoin = true;
 				BeginNextPhase();
 				return false;
 			}
@@ -428,7 +508,7 @@ namespace
 							return Source
 								&& Source->SourceId == Definition.SourceId;
 						});
-					if (Entry && *Entry && !(*Entry)->IsReacting())
+					if (Entry && *Entry && !(*Entry)->IsMaterialHot())
 					{
 						Root = *Entry;
 						ExpectedAggregateMemberCount = 0;
@@ -439,7 +519,7 @@ namespace
 								Member.AggregateId == Definition.AggregateId ? 1 : 0;
 						}
 						// Carrier 的根部体素保存在 SpawnPayload /
-						// RootReactionState；AggregateSources 只记录其余层。
+						// RootMaterialState；AggregateSources 只记录其余层。
 						--ExpectedAggregateMemberCount;
 						break;
 					}
@@ -852,6 +932,8 @@ namespace
 		bool bValidatedMaterialState = false;
 		bool bRequestedLogicalReaction = false;
 		bool bValidatedLogicalReaction = false;
+		bool bRequestedLateJoin = false;
+		bool bValidatedLateJoin = false;
 		bool bAggregateCutCommitted = false;
 		bool bRequestedAggregateFelling = false;
 		bool bValidatedAggregateCarrier = false;

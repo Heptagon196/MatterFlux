@@ -610,6 +610,22 @@ namespace MatterFluxLua
 			|| Definition.Phase == EMatterFluxMaterialPhase::Powder
 			|| Definition.Phase == EMatterFluxMaterialPhase::Liquid
 			|| Definition.Phase == EMatterFluxMaterialPhase::Gas;
+		const bool bCombustible = Definition.IgnitionThreshold != 0;
+		const bool bValidCombustionProduct =
+			Definition.CombustionProduct == TEXT("empty")
+			|| IsValidContentId(Definition.CombustionProduct.ToString());
+		const bool bValidCombustionEmission =
+			Definition.CombustionEmissionMaterial == TEXT("empty")
+				? Definition.CombustionEmissionAmount == 0
+				: IsValidContentId(
+					Definition.CombustionEmissionMaterial.ToString())
+					&& Definition.CombustionEmissionAmount != 0;
+		const bool bValidSecondaryCombustionEmission =
+			Definition.CombustionSecondaryEmissionMaterial == TEXT("empty")
+				? Definition.CombustionSecondaryEmissionAmount == 0
+				: IsValidContentId(
+					Definition.CombustionSecondaryEmissionMaterial.ToString())
+					&& Definition.CombustionSecondaryEmissionAmount != 0;
 		if (!IsFiniteNonNegative(Definition.Density)
 			|| !IsFiniteNonNegative(Definition.Hardness)
 			|| !FMath::IsFinite(Definition.Color.R)
@@ -627,6 +643,20 @@ namespace MatterFluxLua
 			|| !FMath::IsFinite(Definition.MovementResistance)
 			|| Definition.MovementResistance < 0.0f
 			|| Definition.MovementResistance > 8.0f
+			|| Definition.ConductivityPermille > 1000
+			|| !bValidCombustionProduct
+			|| !bValidCombustionEmission
+			|| !bValidSecondaryCombustionEmission
+			|| (bCombustible
+				&& Definition.CombustionProduct == TEXT("empty"))
+			|| (!bCombustible
+				&& (Definition.CombustionProduct != TEXT("empty")
+					|| Definition.CombustionEnergy != 0
+					|| Definition.CombustionEmissionMaterial != TEXT("empty")
+					|| Definition.CombustionEmissionAmount != 0
+					|| Definition.CombustionSecondaryEmissionMaterial
+						!= TEXT("empty")
+					|| Definition.CombustionSecondaryEmissionAmount != 0))
 			|| !bValidPhase)
 		{
 			OutError = FString::Printf(
@@ -650,19 +680,25 @@ namespace MatterFluxLua
 		FString& OutError)
 	{
 		const FString Id = Definition.Id.ToString();
-		const bool bPropagating = Definition.Kind
-			== FMatterFluxReactionDefinition::EKind::Propagating;
 		const bool bValidOutputA =
 			Definition.OutputA == TEXT("empty")
 			|| IsValidContentId(Definition.OutputA.ToString());
 		const bool bValidOutputB =
 			Definition.OutputB == TEXT("empty")
 			|| IsValidContentId(Definition.OutputB.ToString());
-		const bool bValidEmission =
-			Definition.EmissionMaterial == TEXT("empty")
-				? Definition.EmissionChancePermille == 0
-				: IsValidContentId(
-					Definition.EmissionMaterial.ToString());
+		bool bValidEmissions = Definition.Emissions.Num() <= 2;
+		for (const FMatterFluxReactionEmissionDefinition& Emission
+			: Definition.Emissions)
+		{
+			bValidEmissions = bValidEmissions
+				&& IsValidContentId(Emission.Material.ToString())
+				&& Emission.Material != TEXT("empty")
+				&& Emission.Amount != 0
+				&& (Emission.SourceSide
+					== EMatterFluxReactionEmissionSourceSide::A
+					|| Emission.SourceSide
+						== EMatterFluxReactionEmissionSourceSide::B);
+		}
 		if (!IsValidContentId(Id)
 			|| !IsValidContentId(Definition.InputA.ToString())
 			|| !IsValidContentId(Definition.InputB.ToString())
@@ -670,14 +706,11 @@ namespace MatterFluxLua
 			|| !bValidOutputB
 			|| Definition.ChancePermille < 0
 			|| Definition.ChancePermille > 1000
-			|| (bPropagating
-				&& (!bValidEmission
-					|| Definition.PropagationChancePermille < 0
-					|| Definition.PropagationChancePermille > 1000
-					|| Definition.DurationSteps < 1
-					|| Definition.DurationSteps > 255
-					|| Definition.EmissionChancePermille < 0
-					|| Definition.EmissionChancePermille > 1000)))
+			|| Definition.EnergyDeltaA < -65535
+			|| Definition.EnergyDeltaA > 65535
+			|| Definition.EnergyDeltaB < -65535
+			|| Definition.EnergyDeltaB > 65535
+			|| !bValidEmissions)
 		{
 			OutError = FString::Printf(
 				TEXT("reaction '%s' contains invalid data"),
@@ -694,10 +727,6 @@ namespace MatterFluxLua
 		for (const TPair<FName, FMatterFluxReactionDefinition>& Pair
 			: Registry.Reactions)
 		{
-			if (Pair.Value.Kind != Definition.Kind)
-			{
-				continue;
-			}
 			const bool bSameInputPair =
 				(Pair.Value.InputA == Definition.InputA
 					&& Pair.Value.InputB == Definition.InputB)
@@ -1628,18 +1657,45 @@ namespace MatterFluxLua
 				return MaterialId == TEXT("empty")
 					|| Registry.Materials.Contains(MaterialId);
 			};
+			bool bMissingEmissionMaterial = false;
+			for (const FMatterFluxReactionEmissionDefinition& Emission
+				: Pair.Value.Emissions)
+			{
+				bMissingEmissionMaterial = bMissingEmissionMaterial
+					|| !Registry.Materials.Contains(Emission.Material);
+			}
 			if (!Registry.Materials.Contains(Pair.Value.InputA)
 				|| !Registry.Materials.Contains(Pair.Value.InputB)
 				|| !IsKnownOutput(Pair.Value.OutputA)
 				|| !IsKnownOutput(Pair.Value.OutputB)
-				|| (Pair.Value.Kind
-						== FMatterFluxReactionDefinition::EKind::Propagating
-					&& Pair.Value.EmissionMaterial != TEXT("empty")
-					&& !Registry.Materials.Contains(
-						Pair.Value.EmissionMaterial)))
+				|| bMissingEmissionMaterial)
 			{
 				OutError = FString::Printf(
 					TEXT("reaction '%s' references a missing material"),
+					*Pair.Key.ToString());
+				return false;
+			}
+		}
+		for (const TPair<FName, FMatterFluxMaterialDefinition>& Pair
+			: Registry.Materials)
+		{
+			const FMatterFluxMaterialDefinition& Material = Pair.Value;
+			const bool bMissingProduct =
+				Material.CombustionProduct != TEXT("empty")
+				&& !Registry.Materials.Contains(Material.CombustionProduct);
+			const bool bMissingEmission =
+				Material.CombustionEmissionMaterial != TEXT("empty")
+				&& !Registry.Materials.Contains(
+					Material.CombustionEmissionMaterial);
+			const bool bMissingSecondaryEmission =
+				Material.CombustionSecondaryEmissionMaterial != TEXT("empty")
+				&& !Registry.Materials.Contains(
+					Material.CombustionSecondaryEmissionMaterial);
+			if (bMissingProduct || bMissingEmission
+				|| bMissingSecondaryEmission)
+			{
+				OutError = FString::Printf(
+					TEXT("material '%s' combustion references a missing material"),
 					*Pair.Key.ToString());
 				return false;
 			}
@@ -2662,6 +2718,13 @@ namespace MatterFluxLua
 		int32 Mobility = 255;
 		int32 Dispersion = 128;
 		int32 LifetimeSteps = 0;
+		int32 DefaultEnergy = 0;
+		int32 ConductivityPermille = 0;
+		int32 CoolingPerStep = 0;
+		int32 IgnitionThreshold = 0;
+		int32 CombustionEnergy = 0;
+		int32 CombustionEmissionAmount = 0;
+		int32 CombustionSecondaryEmissionAmount = 0;
 		if (ArgumentCount == 1 && lua_istable(State, 1))
 		{
 			// Lua 作者只面对命名字段。C++ 在这一条深模块接口后完成
@@ -2669,6 +2732,9 @@ namespace MatterFluxLua
 			const int32 TableIndex = lua_absindex(State, 1);
 			FString Id;
 			FString Phase = TEXT("static");
+			FString CombustionProduct = TEXT("empty");
+			FString CombustionEmissionMaterial = TEXT("empty");
+			FString CombustionSecondaryEmissionMaterial = TEXT("empty");
 			float Density = std::numeric_limits<float>::quiet_NaN();
 			float Hardness = std::numeric_limits<float>::quiet_NaN();
 			float ColorR = std::numeric_limits<float>::quiet_NaN();
@@ -2708,7 +2774,37 @@ namespace MatterFluxLua
 					Definition.DeepOpacity, Error)
 				|| !ReadTableNumberField(
 					State, TableIndex, "opacity_depth",
-					Definition.OpacityDepth, Error))
+					Definition.OpacityDepth, Error)
+				|| !ReadTableIntegerField(
+					State, TableIndex, "default_energy", DefaultEnergy, Error)
+				|| !ReadTableIntegerField(
+					State, TableIndex, "conductivity_permille",
+					ConductivityPermille, Error)
+				|| !ReadTableIntegerField(
+					State, TableIndex, "cooling_per_step", CoolingPerStep, Error)
+				|| !ReadTableIntegerField(
+					State, TableIndex, "ignition_threshold",
+					IgnitionThreshold, Error)
+				|| !ReadTableIntegerField(
+					State, TableIndex, "combustion_energy",
+					CombustionEnergy, Error)
+				|| !ReadTableStringField(
+					State, TableIndex, "combustion_product",
+					CombustionProduct, false, Error)
+				|| !ReadTableStringField(
+					State, TableIndex, "combustion_emission_material",
+					CombustionEmissionMaterial, false, Error)
+				|| !ReadTableIntegerField(
+					State, TableIndex, "combustion_emission_amount",
+					CombustionEmissionAmount, Error)
+				|| !ReadTableStringField(
+					State, TableIndex,
+					"combustion_secondary_emission_material",
+					CombustionSecondaryEmissionMaterial, false, Error)
+				|| !ReadTableIntegerField(
+					State, TableIndex,
+					"combustion_secondary_emission_amount",
+					CombustionSecondaryEmissionAmount, Error))
 			{
 				return FailLuaCall(State, Error);
 			}
@@ -2716,6 +2812,11 @@ namespace MatterFluxLua
 			Definition.Density = Density;
 			Definition.Hardness = Hardness;
 			Definition.Color = FLinearColor(ColorR, ColorG, ColorB, ColorA);
+			Definition.CombustionProduct = FName(*CombustionProduct);
+			Definition.CombustionEmissionMaterial =
+				FName(*CombustionEmissionMaterial);
+			Definition.CombustionSecondaryEmissionMaterial =
+				FName(*CombustionSecondaryEmissionMaterial);
 			if (Phase == TEXT("static"))
 			{
 				Definition.Phase = EMatterFluxMaterialPhase::StaticSolid;
@@ -2778,15 +2879,39 @@ namespace MatterFluxLua
 			|| Dispersion < 0
 			|| Dispersion > 255
 			|| LifetimeSteps < 0
-			|| LifetimeSteps > 255)
+			|| LifetimeSteps > 255
+			|| DefaultEnergy < 0
+			|| DefaultEnergy > MAX_uint16
+			|| ConductivityPermille < 0
+			|| ConductivityPermille > 1000
+			|| CoolingPerStep < 0
+			|| CoolingPerStep > MAX_uint16
+			|| IgnitionThreshold < 0
+			|| IgnitionThreshold > MAX_uint16
+			|| CombustionEnergy < 0
+			|| CombustionEnergy > MAX_uint16
+			|| CombustionEmissionAmount < 0
+			|| CombustionEmissionAmount > MAX_uint16
+			|| CombustionSecondaryEmissionAmount < 0
+			|| CombustionSecondaryEmissionAmount > MAX_uint16)
 		{
 			return FailLuaCall(
 				State,
-				TEXT("material mobility, dispersion, and lifetime_steps must be between 0 and 255"));
+				TEXT("material mobility/lifetime or uint16 thermal field is out of range"));
 		}
 		Definition.Mobility = static_cast<uint8>(Mobility);
 		Definition.Dispersion = static_cast<uint8>(Dispersion);
 		Definition.LifetimeSteps = static_cast<uint8>(LifetimeSteps);
+		Definition.DefaultEnergy = static_cast<uint16>(DefaultEnergy);
+		Definition.ConductivityPermille =
+			static_cast<uint16>(ConductivityPermille);
+		Definition.CoolingPerStep = static_cast<uint16>(CoolingPerStep);
+		Definition.IgnitionThreshold = static_cast<uint16>(IgnitionThreshold);
+		Definition.CombustionEnergy = static_cast<uint16>(CombustionEnergy);
+		Definition.CombustionEmissionAmount =
+			static_cast<uint16>(CombustionEmissionAmount);
+		Definition.CombustionSecondaryEmissionAmount =
+			static_cast<uint16>(CombustionSecondaryEmissionAmount);
 		if (!GetExecutionContext(State).Builder->AddMaterial(Definition, Error))
 		{
 			return FailLuaCall(State, Error);
@@ -2820,13 +2945,20 @@ namespace MatterFluxLua
 				lua_pop(State, 1);
 				return bRead;
 			};
-			const auto ReadIntegerField = [State, TableIndex, &Error](
+			const auto ReadRequiredIntegerField = [State, TableIndex, &Error](
 				const char* Field, int32& OutValue)
 			{
 				lua_getfield(State, TableIndex, Field);
 				const bool bRead = ReadInteger(State, -1, OutValue, Error);
 				lua_pop(State, 1);
 				return bRead;
+			};
+			const auto HasField = [State, TableIndex](const char* Field)
+			{
+				lua_getfield(State, TableIndex, Field);
+				const bool bHasField = lua_type(State, -1) != LUA_TNIL;
+				lua_pop(State, 1);
+				return bHasField;
 			};
 
 			FString Id;
@@ -2835,14 +2967,13 @@ namespace MatterFluxLua
 			FString InputB;
 			FString OutputA;
 			FString OutputB;
-			FString Emission;
 			if (!ReadIdField("id", Id)
 				|| !ReadIdField("kind", Kind)
 				|| !ReadIdField("input_a", InputA)
 				|| !ReadIdField("input_b", InputB)
 				|| !ReadIdField("output_a", OutputA)
 				|| !ReadIdField("output_b", OutputB)
-				|| !ReadIntegerField(
+				|| !ReadRequiredIntegerField(
 					"chance_permille", Definition.ChancePermille))
 			{
 				return FailLuaCall(State, Error);
@@ -2852,28 +2983,86 @@ namespace MatterFluxLua
 			Definition.InputB = FName(*InputB);
 			Definition.OutputA = FName(*OutputA);
 			Definition.OutputB = FName(*OutputB);
-			if (Kind == TEXT("contact"))
-			{
-				Definition.Kind = FMatterFluxReactionDefinition::EKind::Contact;
-			}
-			else if (Kind == TEXT("propagating"))
-			{
-				Definition.Kind = FMatterFluxReactionDefinition::EKind::Propagating;
-				if (!ReadIdField("emission_material", Emission)
-					|| !ReadIntegerField("propagation_permille",
-						Definition.PropagationChancePermille)
-					|| !ReadIntegerField("duration_steps", Definition.DurationSteps)
-					|| !ReadIntegerField("emission_permille",
-						Definition.EmissionChancePermille))
-				{
-					return FailLuaCall(State, Error);
-				}
-				Definition.EmissionMaterial = FName(*Emission);
-			}
-			else
+			if (Kind == TEXT("propagating")
+				|| HasField("propagation_permille")
+				|| HasField("duration_steps")
+				|| HasField("emission_material")
+				|| HasField("emission_permille"))
 			{
 				return FailLuaCall(State,
-					TEXT("reaction kind must be 'contact' or 'propagating'"));
+					TEXT("schema 3 removed propagating reactions; define local contact rules and material thermal fields"));
+			}
+			if (Kind != TEXT("contact"))
+			{
+				return FailLuaCall(State,
+					TEXT("schema 3 reaction kind must be 'contact'"));
+			}
+			if (!ReadTableIntegerField(State, TableIndex, "energy_delta_a",
+					Definition.EnergyDeltaA, Error)
+				|| !ReadTableIntegerField(State, TableIndex, "energy_delta_b",
+					Definition.EnergyDeltaB, Error))
+			{
+				return FailLuaCall(State, Error);
+			}
+
+			const auto ParseEmission = [State, TableIndex, &Definition, &Error](
+				const int32 Ordinal)
+			{
+				const FString Prefix = FString::Printf(
+					TEXT("emission_%d_"), Ordinal);
+				const FString MaterialField = Prefix + TEXT("material");
+				const FString AmountField = Prefix + TEXT("amount");
+				const FString EnergyField = Prefix + TEXT("energy");
+				const FString SourceField = Prefix + TEXT("source");
+				FTCHARToUTF8 MaterialUtf8(*MaterialField);
+				FTCHARToUTF8 AmountUtf8(*AmountField);
+				FTCHARToUTF8 EnergyUtf8(*EnergyField);
+				FTCHARToUTF8 SourceUtf8(*SourceField);
+				FString Material;
+				FString SourceSide = TEXT("a");
+				int32 Amount = 0;
+				int32 Energy = 0;
+				if (!ReadTableStringField(State, TableIndex,
+						MaterialUtf8.Get(), Material, false, Error)
+					|| !ReadTableIntegerField(State, TableIndex,
+						AmountUtf8.Get(), Amount, Error)
+					|| !ReadTableIntegerField(State, TableIndex,
+						EnergyUtf8.Get(), Energy, Error)
+					|| !ReadTableStringField(State, TableIndex,
+						SourceUtf8.Get(), SourceSide, false, Error))
+				{
+					return false;
+				}
+				const bool bAnyField = !Material.IsEmpty()
+					|| Amount != 0 || Energy != 0 || SourceSide != TEXT("a");
+				if (!bAnyField)
+				{
+					return true;
+				}
+				if (!IsValidContentId(Material)
+					|| Material == TEXT("empty")
+					|| Amount < 1 || Amount > MAX_uint16
+					|| Energy < 0 || Energy > MAX_uint16
+					|| (SourceSide != TEXT("a") && SourceSide != TEXT("b")))
+				{
+					Error = FString::Printf(
+						TEXT("reaction emission %d contains invalid data"),
+						Ordinal);
+					return false;
+				}
+				FMatterFluxReactionEmissionDefinition& Emission =
+					Definition.Emissions.AddDefaulted_GetRef();
+				Emission.Material = FName(*Material);
+				Emission.Amount = static_cast<uint16>(Amount);
+				Emission.Energy = static_cast<uint16>(Energy);
+				Emission.SourceSide = SourceSide == TEXT("a")
+					? EMatterFluxReactionEmissionSourceSide::A
+					: EMatterFluxReactionEmissionSourceSide::B;
+				return true;
+			};
+			if (!ParseEmission(1) || !ParseEmission(2))
+			{
+				return FailLuaCall(State, Error);
 			}
 		}
 		else

@@ -53,6 +53,8 @@ namespace MatterFlux::Material
 		uint16 Amount = 255;
 		/** 剩余存在步数；0 表示不会自行消散。 */
 		uint8 RemainingLifetime = 0;
+		/** Deterministic specific energy carried by this material amount. */
+		uint16 Energy = 0;
 	};
 
 	struct FSeedCell
@@ -62,6 +64,19 @@ namespace MatterFlux::Material
 		int32 SupportHeight = 0;
 		/** Initial conserved occupancy for liquids; empty/static cells remain full. */
 		uint16 Amount = 255;
+		/** 0 uses the material's authored default energy. */
+		uint16 Energy = 0;
+	};
+
+	/** A validated kernel emission waiting for its geometry adapter. */
+	struct FReactionEmission
+	{
+		FGuid ParticleId;
+		FName MaterialId = NAME_None;
+		FIntVector GridCell = FIntVector::ZeroValue;
+		uint16 Amount = 0;
+		uint16 Energy = 0;
+		uint16 RemainingLifetimeSteps = 0;
 	};
 
 	/**
@@ -105,6 +120,11 @@ namespace MatterFlux::Material
 			const FIntPoint& WorldCell,
 			FName MaterialId,
 			uint16 Amount);
+		bool SetCellAmount(
+			const FIntPoint& WorldCell,
+			FName MaterialId,
+			uint16 Amount,
+			uint16 Energy);
 		/**
 		 * Adds conserved material to a surface column without discarding another
 		 * flowing material already occupying that column. Layers are ordered by
@@ -115,6 +135,23 @@ namespace MatterFlux::Material
 			const FIntPoint& WorldCell,
 			FName MaterialId,
 			uint16 Amount);
+		int32 AddCellAmount(
+			const FIntPoint& WorldCell,
+			FName MaterialId,
+			uint16 Amount,
+			uint16 Energy);
+		/**
+		 * Evaluates one stable airborne-particle/surface contact through the same
+		 * immutable local reaction kernel used by cell/cell contacts. The particle
+		 * values are committed only after the complete delta batch validates.
+		 */
+		bool ReactAirborneParticleAt(
+			const FIntPoint& WorldCell,
+			const FGuid& ParticleId,
+			FName& InOutMaterialId,
+			uint16& InOutAmount,
+			uint16& InOutEnergy,
+			FString& OutError);
 		/**
 		 * Atomically rolls an incoming powder packet across the current canonical
 		 * surface until adding it preserves the material's angle of repose.
@@ -197,6 +234,8 @@ namespace MatterFlux::Material
 		 * changed and therefore require disposable projection rebuilds.
 		 */
 		void ConsumeProjectionDirtyChunks(TArray<FIntPoint>& OutChunks);
+		/** Moves committed reaction emissions to the canonical particle adapter. */
+		void ConsumeReactionEmissions(TArray<FReactionEmission>& OutEmissions);
 		bool ExportActiveState(
 			int32 LogicalStep,
 			TArray<uint8>& OutState,

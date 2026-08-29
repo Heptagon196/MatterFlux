@@ -293,9 +293,9 @@ bool FMatterFluxPlayerForwardFlameTest::RunTest(
 		1);
 	TestTrue(
 		TEXT("Forward wood target is reacting"),
-		Ahead->IsReacting());
+		Ahead->IsMaterialHot());
 	TestFalse(
 		TEXT("Target behind the player stays unlit"),
-		Behind->IsReacting());
+		Behind->IsMaterialHot());
 	return true;
 }

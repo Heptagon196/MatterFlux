@@ -11,7 +11,7 @@ class MATTERFLUX_API UMatterFluxSaveGame : public USaveGame
 	GENERATED_BODY()
 
 public:
-	static constexpr int32 CurrentVersion = 5;
+	static constexpr int32 CurrentVersion = 6;
 
 	void InitializeNew(int32 InMapSeed);
 	bool ValidateAndMigrate(FString& OutError);

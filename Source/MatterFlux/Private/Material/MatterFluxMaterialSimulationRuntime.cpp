@@ -55,8 +55,15 @@ namespace MatterFlux::Material
 			return false;
 		}
 		Candidate->SetSimulationFocuses(CurrentFocuses);
+		TMap<FName, uint16> CandidateDefaultEnergies;
+		for (const TPair<FName, FMatterFluxMaterialDefinition>& Pair
+			: Registry.Materials)
+		{
+			CandidateDefaultEnergies.Add(Pair.Key, Pair.Value.DefaultEnergy);
+		}
 		RuntimeSettings = Settings;
 		MaterialWorld = MoveTemp(Candidate);
+		DefaultMaterialEnergies = MoveTemp(CandidateDefaultEnergies);
 		bReplicationDirty = true;
 		return true;
 	}
@@ -67,6 +74,7 @@ namespace MatterFlux::Material
 		RuntimeSettings = FRuntimeSettings();
 		CurrentFocuses.Reset();
 		AirborneParticles.Reset();
+		DefaultMaterialEnergies.Reset();
 		StepAccumulator = 0.0f;
 		LogicalStep = 0;
 		AppliedStateRevision = INDEX_NONE;
@@ -350,7 +358,8 @@ namespace MatterFlux::Material
 		const float Radius,
 		const float GravityScale,
 		const float Lifetime,
-		const int32 EventSeed)
+		const int32 EventSeed,
+		const int32 SpecificEnergy)
 	{
 		if (!MaterialWorld
 			|| MaterialId.IsNone()
@@ -361,7 +370,9 @@ namespace MatterFlux::Material
 			|| Radius <= 0.0f
 			|| !FMath::IsFinite(GravityScale)
 			|| !FMath::IsFinite(Lifetime)
-			|| Lifetime <= 0.0f)
+			|| Lifetime <= 0.0f
+			|| (SpecificEnergy != INDEX_NONE
+				&& (SpecificEnergy < 0 || SpecificEnergy > MAX_uint16)))
 		{
 			return FGuid();
 		}
@@ -387,6 +398,12 @@ namespace MatterFlux::Material
 			}
 			FAirborneParticle& Particle =
 				AirborneParticles.AddDefaulted_GetRef();
+			const uint32 StableOrdinal = static_cast<uint32>(Index) + 1u;
+			Particle.ParticleId = FGuid(
+				BatchId.A ^ 0x9e3779b9u,
+				BatchId.B ^ StableOrdinal * 0x85ebca6bu,
+				BatchId.C ^ StableOrdinal * 0xc2b2ae35u,
+				BatchId.D ^ StableOrdinal * 0x27d4eb2fu);
 			Particle.BatchId = BatchId;
 			Particle.MaterialId = MaterialId;
 			Particle.WorldPosition = WorldPositions[Index];
@@ -401,8 +418,10 @@ namespace MatterFlux::Material
 				+ (Index < Remainder ? 1 : 0);
 			Particle.ConservedMaterialAmount =
 				Particle.CellCount * ConservedAmountPerCell;
+			Particle.Energy = SpecificEnergy == INDEX_NONE
+				? DefaultMaterialEnergies.FindRef(MaterialId)
+				: static_cast<uint16>(SpecificEnergy);
 			Particle.EventSeed = EventSeed;
-			Particle.ParticleIndex = Index;
 		}
 		bReplicationDirty |= HasAirborneParticleBatch(BatchId);
 		return HasAirborneParticleBatch(BatchId) ? BatchId : FGuid();
@@ -534,6 +553,134 @@ namespace MatterFlux::Material
 		return RemovedAmount;
 	}
 
+	int32 FSimulationRuntime::MaterializePendingReactionEmissions(
+		const TFunctionRef<FVector(const FIntVector&)> ResolveWorldPosition)
+	{
+		if (!MaterialWorld)
+		{
+			return 0;
+		}
+		TArray<FReactionEmission> Emissions;
+		MaterialWorld->ConsumeReactionEmissions(Emissions);
+		return MaterializeReactionEmissions(Emissions, ResolveWorldPosition);
+	}
+
+	int32 FSimulationRuntime::MaterializeReactionEmissions(
+		const TConstArrayView<FReactionEmission> Emissions,
+		const TFunctionRef<FVector(const FIntVector&)> ResolveWorldPosition)
+	{
+		int32 MaterializedCount = 0;
+		for (const FReactionEmission& Emission : Emissions)
+		{
+			const FVector WorldPosition = ResolveWorldPosition(Emission.GridCell);
+			if (!Emission.ParticleId.IsValid()
+				|| Emission.MaterialId.IsNone()
+				|| Emission.Amount == 0
+				|| WorldPosition.ContainsNaN()
+				|| AirborneParticles.ContainsByPredicate(
+					[&Emission](const FAirborneParticle& Existing)
+					{
+						return Existing.ParticleId == Emission.ParticleId;
+					}))
+			{
+				continue;
+			}
+			FAirborneParticle& Particle = AirborneParticles.AddDefaulted_GetRef();
+			Particle.ParticleId = Emission.ParticleId;
+			Particle.MaterialId = Emission.MaterialId;
+			Particle.WorldPosition = WorldPosition;
+			Particle.Radius = 2.0f;
+			Particle.RemainingLifetime = Emission.RemainingLifetimeSteps > 0
+				? Emission.RemainingLifetimeSteps * RuntimeSettings.StepSeconds
+				: 1.0f;
+			Particle.CellCount = FMath::Max(
+				1,
+				FMath::DivideAndRoundUp(
+					static_cast<int32>(Emission.Amount), 255));
+			Particle.ConservedMaterialAmount = Emission.Amount;
+			Particle.Energy = Emission.Energy;
+			Particle.EventSeed = static_cast<int32>(
+				GetTypeHash(Emission.ParticleId));
+			++MaterializedCount;
+		}
+		bReplicationDirty |= MaterializedCount > 0;
+		return MaterializedCount;
+	}
+
+	bool FSimulationRuntime::ReactAirborneParticleAt(
+		const FIntPoint& WorldCell,
+		const FGuid& ParticleId,
+		FString& OutError)
+	{
+		OutError.Reset();
+		if (!MaterialWorld || !ParticleId.IsValid())
+		{
+			OutError = TEXT("material world or airborne particle identity is invalid");
+			return false;
+		}
+		const int32 ParticleIndex = AirborneParticles.IndexOfByPredicate(
+			[&ParticleId](const FAirborneParticle& Particle)
+			{
+				return Particle.ParticleId == ParticleId;
+			});
+		if (!AirborneParticles.IsValidIndex(ParticleIndex))
+		{
+			OutError = TEXT("airborne material element does not exist");
+			return false;
+		}
+
+		FAirborneParticle& Particle = AirborneParticles[ParticleIndex];
+		if (!ReactAirborneParticleAt(WorldCell, Particle, OutError))
+		{
+			return false;
+		}
+		if (Particle.ConservedMaterialAmount == 0)
+		{
+			AirborneParticles.RemoveAtSwap(
+				ParticleIndex, 1, EAllowShrinking::No);
+		}
+		bReplicationDirty = true;
+		return true;
+	}
+
+	bool FSimulationRuntime::ReactAirborneParticleAt(
+		const FIntPoint& WorldCell,
+		FAirborneParticle& Particle,
+		FString& OutError)
+	{
+		OutError.Reset();
+		if (!MaterialWorld || !Particle.ParticleId.IsValid())
+		{
+			OutError = TEXT("material world or airborne particle identity is invalid");
+			return false;
+		}
+		if (Particle.ConservedMaterialAmount <= 0
+			|| Particle.ConservedMaterialAmount > MAX_uint16)
+		{
+			OutError = TEXT("airborne material amount is outside the local element range");
+			return false;
+		}
+		uint16 PacketAmount = static_cast<uint16>(
+			Particle.ConservedMaterialAmount);
+		FName PacketMaterial = Particle.MaterialId;
+		uint16 PacketEnergy = Particle.Energy;
+		if (!MaterialWorld->ReactAirborneParticleAt(
+				WorldCell,
+				Particle.ParticleId,
+				PacketMaterial,
+				PacketAmount,
+				PacketEnergy,
+				OutError))
+		{
+			return false;
+		}
+		Particle.MaterialId = PacketMaterial;
+		Particle.ConservedMaterialAmount = PacketAmount;
+		Particle.Energy = PacketEnergy;
+		bReplicationDirty = true;
+		return true;
+	}
+
 	bool FSimulationRuntime::SetCell(
 		const FIntPoint& WorldCell,
 		const FName MaterialId)
@@ -549,11 +696,25 @@ namespace MatterFlux::Material
 		const FName MaterialId,
 		const uint16 Amount)
 	{
+		return SetCellAmount(
+			WorldCell,
+			MaterialId,
+			Amount,
+			DefaultMaterialEnergies.FindRef(MaterialId));
+	}
+
+	bool FSimulationRuntime::SetCellAmount(
+		const FIntPoint& WorldCell,
+		const FName MaterialId,
+		const uint16 Amount,
+		const uint16 Energy)
+	{
 		const bool bChanged = MaterialWorld
 			&& MaterialWorld->SetCellAmount(
 				WorldCell,
 				MaterialId,
-				Amount);
+				Amount,
+				Energy);
 		bReplicationDirty |= bChanged;
 		return bChanged;
 	}
@@ -563,8 +724,22 @@ namespace MatterFlux::Material
 		const FName MaterialId,
 		const uint16 Amount)
 	{
+		return AddCellAmount(
+			WorldCell,
+			MaterialId,
+			Amount,
+			DefaultMaterialEnergies.FindRef(MaterialId));
+	}
+
+	int32 FSimulationRuntime::AddCellAmount(
+		const FIntPoint& WorldCell,
+		const FName MaterialId,
+		const uint16 Amount,
+		const uint16 Energy)
+	{
 		const int32 Accepted = MaterialWorld
-			? MaterialWorld->AddCellAmount(WorldCell, MaterialId, Amount)
+			? MaterialWorld->AddCellAmount(
+				WorldCell, MaterialId, Amount, Energy)
 			: 0;
 		bReplicationDirty |= Accepted > 0;
 		return Accepted;
@@ -595,6 +770,16 @@ namespace MatterFlux::Material
 	{
 		const bool bChanged = MaterialWorld.IsValid()
 			&& MaterialWorld->SetExternalSupportHeight(WorldCell, Height);
+		bReplicationDirty |= bChanged;
+		return bChanged;
+	}
+
+	bool FSimulationRuntime::SetSupportHeight(
+		const FIntPoint& WorldCell,
+		const int32 Height)
+	{
+		const bool bChanged = MaterialWorld.IsValid()
+			&& MaterialWorld->SetSupportHeight(WorldCell, Height);
 		bReplicationDirty |= bChanged;
 		return bChanged;
 	}

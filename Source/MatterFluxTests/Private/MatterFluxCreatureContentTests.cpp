@@ -24,7 +24,7 @@ bool FMatterFluxCreatureContentRegistrationTest::RunTest(
 	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
 	const FMatterFluxContentRegistryPtr Baseline = Runtime.GetActiveRegistry();
 	const FString Source = TEXT(R"LUA(
-content.set_manifest("creature.test", 1, 2)
+content.set_manifest("creature.test", 1, 3)
 content.register_item({ id="std.coin", name="金币", max_stack=999999, use_action="none", consume_count=0 })
 content.register_spell({ id="std.default", name="火花弹", kind="projectile", mana_cost=1, damage=4, speed=600, lifetime=2, radius=8 })
 content.register_quest({ id="std.init_quest.kill_enemy", description="击败敌人", category="objective", objective="never", target_count=1, activation_creature_spawns={ { creature_id="std.slime", marker_id="test.slime.0" }, { creature_id="std.slime", marker_id="test.slime.1" } } })
@@ -107,7 +107,7 @@ bool FMatterFluxShopCategoryDslTest::RunTest(const FString& Parameters)
 		return false;
 	}
 	const FString Source = EngineSource + TEXT(R"LUA(
-content.set_manifest("shop.category.test", 1, 2)
+content.set_manifest("shop.category.test", 1, 3)
 item.define({ id="std.coin", name="金币", max_stack=999999 })
 spell.define({ id="spell.test", name="测试飞弹", icon="paper/default", mana_cost=1 }, function(api)
 	api.projectile({ damage=1, speed=100, lifetime=1, radius=4 })
@@ -171,7 +171,7 @@ bool FMatterFluxCreatureBehaviorTreeLuaTest::RunTest(
 		return false;
 	}
 	const FString ValidSource = EngineSource + TEXT(R"LUA(
-content.set_manifest("behavior.tree.test", 1, 2)
+content.set_manifest("behavior.tree.test", 1, 3)
 creature.define({
     id="enemy.tree", name="Tree Enemy", faction="hostile", level="normal",
     health=20, width=60, height=120, wait_for_first_sight=true
@@ -233,7 +233,7 @@ end)
 
 	const FMatterFluxContentRegistryPtr Baseline = Runtime.GetActiveRegistry();
 	const FString InvalidSource = EngineSource + TEXT(R"LUA(
-content.set_manifest("behavior.tree.invalid", 1, 2)
+content.set_manifest("behavior.tree.invalid", 1, 3)
 creature.define({
     id="enemy.invalid", name="Invalid", faction="hostile", level="normal"
 }, function(ai)
@@ -253,7 +253,7 @@ end)
 		Runtime.GetActiveRegistry() == Baseline);
 
 	const FString DeprecatedConfigureSource = EngineSource + TEXT(R"LUA(
-content.set_manifest("behavior.tree.deprecated", 1, 2)
+content.set_manifest("behavior.tree.deprecated", 1, 3)
 creature.define({
     id="enemy.deprecated", name="Deprecated", faction="hostile", level="normal"
 }, function(ai)

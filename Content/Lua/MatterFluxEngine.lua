@@ -50,7 +50,11 @@ function material.define(definition)
 		"id", "density", "hardness",
 		"color_r", "color_g", "color_b", "color_a",
 		"phase", "mobility", "dispersion", "movement_resistance", "lifetime_steps",
-		"shallow_opacity", "deep_opacity", "opacity_depth"
+		"shallow_opacity", "deep_opacity", "opacity_depth",
+		"default_energy", "conductivity_permille", "cooling_per_step",
+		"ignition_threshold", "combustion_product", "combustion_energy",
+		"combustion_emission_material", "combustion_emission_amount",
+		"combustion_secondary_emission_material", "combustion_secondary_emission_amount"
 	}, "material")
 	register_material_compiled(compiled)
 end

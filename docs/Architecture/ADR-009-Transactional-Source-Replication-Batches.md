@@ -2,6 +2,7 @@
 
 - 状态：已采纳并实施
 - 日期：2026-08-10
+- 取代说明：ADR-015 部分取代本决策。旧 Source Reaction Fast Array 由带 Revision/Hash 的 Volume Delta 与快照协议取代。
 
 ## 背景
 

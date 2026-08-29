@@ -33,6 +33,7 @@
 namespace MatterFluxNetworkScaleTests
 {
 	constexpr int32 MovementFrames = 120;
+	constexpr float ActionTargetDistance = 180.0f;
 	constexpr int32 MovementWarmupFrames = 10;
 
 	const FGameplayAbilitySpec* FindWandAbilitySpec(
@@ -436,14 +437,20 @@ namespace MatterFluxNetworkScaleTests
 					: nullptr;
 				const UMatterFluxMagicInventoryComponent* Inventory =
 					PlayerState ? PlayerState->GetMagicInventory() : nullptr;
+				const bool bActorInfoValid = ASC
+					&& ASC->AbilityActorInfo.IsValid();
+				const bool bLocallyControlled = bActorInfoValid
+					&& ASC->AbilityActorInfo->IsLocallyControlled();
+				const int32 WandCount = Inventory
+					? Inventory->GetOwnedWands().Num()
+					: INDEX_NONE;
 				if (!Character
 					|| !PlayerState
 					|| !ASC
-					|| !ASC->AbilityActorInfo.IsValid()
-					|| !ASC->AbilityActorInfo->IsLocallyControlled()
+					|| !bActorInfoValid
+					|| !bLocallyControlled
 					|| !Inventory
-					|| Inventory->GetOwnedWands().Num()
-						!= UGA_CastWand::EquipmentSlotCount + 2
+					|| WandCount != UGA_CastWand::EquipmentSlotCount + 2
 					|| !FindWandAbilitySpec(ASC, 0)
 					|| !FindWandAbilitySpec(ASC, 1)
 					|| !FindWandAbilitySpec(ASC, 2)
@@ -451,8 +458,23 @@ namespace MatterFluxNetworkScaleTests
 					|| !FindPlayableWorldActor(*Client)
 					|| !FindCharacterByPlayerId(Server, PlayerState->GetPlayerId()))
 				{
-					return FailOnTimeout(
-						TEXT("A client pawn, PlayerState, ASC ability, or server pawn was not ready."));
+					return FailOnTimeout(FString::Printf(
+						TEXT("Client readiness failed: character=%d player_state=%d asc=%d actor_info=%d local=%d inventory=%d wands=%d specs=%d%d%d%d client_world=%d server_pawn=%d; entry=%s."),
+						Character != nullptr,
+						PlayerState != nullptr,
+						ASC != nullptr,
+						bActorInfoValid,
+						bLocallyControlled,
+						Inventory != nullptr,
+						WandCount,
+						FindWandAbilitySpec(ASC, 0) != nullptr,
+						FindWandAbilitySpec(ASC, 1) != nullptr,
+						FindWandAbilitySpec(ASC, 2) != nullptr,
+						FindWandAbilitySpec(ASC, 3) != nullptr,
+						FindPlayableWorldActor(*Client) != nullptr,
+						PlayerState && FindCharacterByPlayerId(
+							Server, PlayerState->GetPlayerId()) != nullptr,
+						*ServerWorldActor->GetInitialWorldEntryDiagnostic()));
 				}
 				ReadyPlayerIds.Add(PlayerState->GetPlayerId());
 			}
@@ -687,7 +709,8 @@ namespace MatterFluxNetworkScaleTests
 			AFragment2DSourceActor* Source = Character
 				? SpawnTestSource(
 					Server,
-					Character->GetActorLocation() + Direction * 260.0f,
+					Character->GetActorLocation()
+						+ Direction * ActionTargetDistance,
 					SourceId,
 					TEXT("stone"))
 				: nullptr;
@@ -755,19 +778,36 @@ namespace MatterFluxNetworkScaleTests
 			AMatterFluxCharacter* Character = Controller
 				? Cast<AMatterFluxCharacter>(Controller->GetPawn())
 				: nullptr;
-			UAbilitySystemComponent* ASC = Character
-				? Character->GetAbilitySystemComponent()
+			const AMatterFluxPlayerState* PlayerState = Controller
+				? Controller->GetPlayerState<AMatterFluxPlayerState>()
 				: nullptr;
-			const FGameplayAbilitySpec* WandSpec =
-				FindWandAbilitySpec(ASC, 0);
-			if (!ASC
-				|| !WandSpec
-				|| !ASC->TryActivateAbility(WandSpec->Handle, true))
+			const int32 PlayerIndex = PlayerState
+				? PlayerIds.IndexOfByKey(PlayerState->GetPlayerId())
+				: INDEX_NONE;
+			const AMatterFluxCharacter* ServerCharacter =
+				PlayerIds.IsValidIndex(PlayerIndex)
+					? FindCharacterByPlayerId(Server, PlayerIds[PlayerIndex])
+					: nullptr;
+			const AFragment2DSourceActor* ServerSource =
+				CutSourceIds.IsValidIndex(PlayerIndex)
+					? FindSource(Server, CutSourceIds[PlayerIndex])
+					: nullptr;
+			FVector AimDirection = ServerCharacter && ServerSource
+				? ServerSource->GetActorLocation()
+					- ServerCharacter->GetActorLocation()
+				: FVector::ZeroVector;
+			AimDirection.Z = 0.0f;
+			if (!Character || !AimDirection.Normalize())
 			{
 				Test->AddError(
-					TEXT("A local client's cut ability request was not accepted by GAS."));
+					TEXT("A local client's cut ability target could not be resolved."));
 				return true;
 			}
+			// Exercise the real client input path. It sends the aim vector through the
+			// owning Character RPC before the server-only GAS ability executes.
+			Character->ApplyPlayerOperation(
+				EMatterFluxPlayerOperation::Cut,
+				FVector2D(AimDirection.X, AimDirection.Y));
 		}
 		CutRequestTime = FPlatformTime::Seconds();
 		TransitionTo(EScenarioPhase::WaitForCutReplication);
@@ -866,11 +906,12 @@ namespace MatterFluxNetworkScaleTests
 			AFragment2DSourceActor* Source = Character
 				? SpawnTestSource(
 					Server,
-					Character->GetActorLocation() + Direction * 260.0f,
+					Character->GetActorLocation()
+						+ Direction * ActionTargetDistance,
 					SourceId,
 					TEXT("wood"))
 				: nullptr;
-			if (!Source || !Source->HasReactionRule())
+			if (!Source || !Source->HasLocalMaterialRule())
 			{
 				Test->AddError(TEXT("Could not spawn a reactive replicated flame target."));
 				return true;
@@ -946,32 +987,23 @@ namespace MatterFluxNetworkScaleTests
 				Direction = FVector::ForwardVector;
 			}
 			Source->SetActorLocation(
-				Character->GetActorLocation() + Direction * 260.0f,
+				Character->GetActorLocation()
+					+ Direction * ActionTargetDistance,
 				false,
 				nullptr,
 				ETeleportType::TeleportPhysics);
 			Source->ForceNetUpdate();
 		}
 
-		for (UWorld* Client : Clients)
+		ObservedFlameSourceIds.Reset();
+		NextFlameActivationIndex = 0;
+		if (!ActivateFlameForPlayerIndex(Server, Clients, 0))
 		{
-			APlayerController* Controller =
-				Client ? FindLocalPlayerController(*Client) : nullptr;
-			if (AMatterFluxCharacter* Character = Controller
-				? Cast<AMatterFluxCharacter>(Controller->GetPawn())
-				: nullptr)
-			{
-				// Exercise the same throttling, recording and GAS request path as
-				// the player's right-click input.
-				Character->ApplyPlayerOperation(
-					EMatterFluxPlayerOperation::CastWand,
-					FVector2D::ZeroVector,
-					1);
-				continue;
-			}
-			return FailOnTimeout(
-				TEXT("A local client character disappeared before flame activation."));
+			Test->AddError(
+				TEXT("The first local client flame probe could not be activated."));
+			return true;
 		}
+		NextFlameActivationIndex = 1;
 		FlameRequestTime = FPlatformTime::Seconds();
 		TransitionTo(EScenarioPhase::WaitForFlameReplication);
 		return false;
@@ -1007,12 +1039,22 @@ namespace MatterFluxNetworkScaleTests
 		// waiting for the unrelated decoration streaming queue to drain; on a
 		// far-apart union that queue can outlive the complete wood burn cycle.
 		// Final convergence below still requires streaming to become idle.
-		for (const FGuid& SourceId : FlameSourceIds)
+		for (int32 SourceIndex = 0;
+			SourceIndex < NextFlameActivationIndex;
+			++SourceIndex)
 		{
-			const int32 SourceIndex = FlameSourceIds.IndexOfByKey(SourceId);
+			if (!FlameSourceIds.IsValidIndex(SourceIndex))
+			{
+				continue;
+			}
+			const FGuid& SourceId = FlameSourceIds[SourceIndex];
+			if (ObservedFlameSourceIds.Contains(SourceId))
+			{
+				continue;
+			}
 			const AFragment2DSourceActor* ServerSource =
 				FindSource(Server, SourceId);
-			if (!ServerSource || !ServerSource->IsReacting())
+			if (!ServerSource || !ServerSource->IsMaterialHot())
 			{
 				FString Diagnostics;
 				for (int32 Index = 0; Index < PlayerIds.Num(); ++Index)
@@ -1044,7 +1086,7 @@ namespace MatterFluxNetworkScaleTests
 						TEXT(" p%d(target=%d active=%d along=%.1f lateral=%.1f char=%s targetLoc=%s)"),
 						PlayerIds[Index],
 						Target != nullptr,
-						Target ? Target->IsReacting() : false,
+						Target ? Target->IsMaterialHot() : false,
 						Along,
 						Lateral,
 						*CharacterLocation.ToCompactString(),
@@ -1074,16 +1116,86 @@ namespace MatterFluxNetworkScaleTests
 					|| ClientSource->SourceMaterialId != TEXT("wood")
 					|| ClientSource->GetActiveCellCount() <= 0)
 				{
-					return FailOnTimeout(
-						TEXT("Active source state did not replicate to every client."));
+					return FailOnTimeout(FString::Printf(
+						TEXT("Active source state did not replicate to every client: source=%d material=%s hot=%d replicated_cells=%d replicated_field_revision=%d."),
+						ClientSource != nullptr,
+						ClientSource
+							? *ClientSource->SourceMaterialId.ToString()
+							: TEXT("None"),
+						ClientSource ? ClientSource->GetActiveCellCount() : -1,
+						ClientSource
+							? ClientSource->GetReplicatedMaterialVolumeCellCount()
+							: -1,
+						ClientSource
+							? ClientSource->GetReplicatedMaterialVolumeFieldRevision()
+							: -1));
 				}
 			}
+			ObservedFlameSourceIds.Add(SourceId);
+			if (NextFlameActivationIndex < FlameSourceIds.Num())
+			{
+				if (!ActivateFlameForPlayerIndex(
+						Server, Clients, NextFlameActivationIndex))
+				{
+					Test->AddError(FString::Printf(
+						TEXT("Local client flame probe %d could not be activated."),
+						NextFlameActivationIndex));
+					return true;
+				}
+				++NextFlameActivationIndex;
+				TransitionTo(EScenarioPhase::WaitForFlameReplication);
+				return false;
+			}
+		}
+		if (ObservedFlameSourceIds.Num() != FlameSourceIds.Num())
+		{
+			return false;
 		}
 		FlameReplicationMilliseconds =
 			(FPlatformTime::Seconds() - FlameRequestTime) * 1000.0;
 		bFlameReplicationObserved = true;
 		TransitionTo(EScenarioPhase::WaitForFlameReplication);
 		return false;
+	}
+
+	bool ActivateFlameForPlayerIndex(
+		UWorld& Server,
+		const TArray<UWorld*>& Clients,
+		const int32 PlayerIndex)
+	{
+		if (!PlayerIds.IsValidIndex(PlayerIndex)
+			|| !FlameSourceIds.IsValidIndex(PlayerIndex))
+		{
+			return false;
+		}
+		UWorld* Client = FindClientForPlayerId(
+			Clients, PlayerIds[PlayerIndex]);
+		APlayerController* Controller = Client
+			? FindLocalPlayerController(*Client)
+			: nullptr;
+		AMatterFluxCharacter* Character = Controller
+			? Cast<AMatterFluxCharacter>(Controller->GetPawn())
+			: nullptr;
+		const AMatterFluxCharacter* ServerCharacter =
+			FindCharacterByPlayerId(Server, PlayerIds[PlayerIndex]);
+		const AFragment2DSourceActor* ServerSource =
+			FindSource(Server, FlameSourceIds[PlayerIndex]);
+		FVector AimDirection = ServerCharacter && ServerSource
+			? ServerSource->GetActorLocation()
+				- ServerCharacter->GetActorLocation()
+			: FVector::ZeroVector;
+		AimDirection.Z = 0.0f;
+		if (!Character || !AimDirection.Normalize())
+		{
+			return false;
+		}
+		// Exercise the same owning-Character RPC and server-only GAS path as the
+		// player's right-click input while keeping fixed-step probes deterministic.
+		Character->ApplyPlayerOperation(
+			EMatterFluxPlayerOperation::CastWand,
+			FVector2D(AimDirection.X, AimDirection.Y),
+			1);
+		return true;
 	}
 
 	bool WaitForFinalConvergence(
@@ -1488,7 +1600,8 @@ namespace MatterFluxNetworkScaleTests
 		// with client count. Movement, ability execution, result replication and
 		// their p95/latency gates keep the strict 45-second gameplay timeout.
 		const bool bScalableReadinessPhase =
-			Phase == EScenarioPhase::WaitForInitialStreaming
+			Phase == EScenarioPhase::WaitForWorlds
+			|| Phase == EScenarioPhase::WaitForInitialStreaming
 			|| Phase == EScenarioPhase::WaitForMovementConvergence
 			|| Phase == EScenarioPhase::WaitForCutTargets
 			|| Phase == EScenarioPhase::WaitForFlameTargets
@@ -1520,6 +1633,8 @@ namespace MatterFluxNetworkScaleTests
 	bool bMeasureFrames = false;
 	bool bFlameReplicationObserved = false;
 	bool bScenarioSeedApplied = false;
+	int32 NextFlameActivationIndex = 0;
+	TSet<FGuid> ObservedFlameSourceIds;
 	int32 MovementFrame = 0;
 	int32 InitialVisibleTerrainChunks = 0;
 	int32 PeakSourceActorCount = 0;

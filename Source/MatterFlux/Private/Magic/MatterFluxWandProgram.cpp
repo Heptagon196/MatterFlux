@@ -40,6 +40,24 @@ namespace MatterFluxWandProgram
 		bool bOverrideColor = false;
 		FLinearColor Color = FLinearColor::White;
 		float OrbitRadius = 0.0f;
+
+		void Apply(const FMatterFluxSpellDefinition& Modifier)
+		{
+			DamageAdd += Modifier.DamageAdd;
+			DamageMultiplier *= Modifier.DamageMultiplier;
+			SpeedMultiplier *= Modifier.SpeedMultiplier;
+			LifetimeMultiplier *= Modifier.LifetimeMultiplier;
+			SpreadDegrees += Modifier.SpreadDelta;
+			if (Modifier.bOverrideColor)
+			{
+				bOverrideColor = true;
+				Color = Modifier.Color;
+			}
+			if (Modifier.OrbitRadius > 0.0f)
+			{
+				OrbitRadius = Modifier.OrbitRadius;
+			}
+		}
 	};
 
 	struct FEvaluationContext
@@ -169,16 +187,14 @@ namespace MatterFluxWandProgram
 			int32 DrawCount,
 			const int32 TriggerDepth,
 			TArray<FMatterFluxMagicProjectilePlan>& OutProjectiles,
-			TArray<FMatterFluxMagicCasterEffectPlan>& OutCasterEffects)
+			TArray<FMatterFluxMagicCasterEffectPlan>& OutCasterEffects,
+			const FPendingModifiers& InheritedModifiers)
 		{
 			if (TriggerDepth > MaximumTriggerDepth)
 			{
 				Error = TEXT("wand program exceeded its trigger depth budget");
 				return false;
 			}
-			FPendingModifiers Pending;
-			Pending.SpreadDegrees = Wand.Spread;
-			float SequenceSpreadDelta = 0.0f;
 			while (DrawCount > 0)
 			{
 				--DrawCount;
@@ -195,29 +211,36 @@ namespace MatterFluxWandProgram
 				switch (Spell->Kind)
 				{
 				case EMatterFluxSpellKind::Modifier:
-					Pending.DamageAdd += Spell->DamageAdd;
-					Pending.DamageMultiplier *= Spell->DamageMultiplier;
-					Pending.SpeedMultiplier *= Spell->SpeedMultiplier;
-					Pending.LifetimeMultiplier *=
-						Spell->LifetimeMultiplier;
-					Pending.SpreadDegrees += Spell->SpreadDelta;
-					if (Spell->bOverrideColor)
+				{
+					FPendingModifiers ChildModifiers = InheritedModifiers;
+					ChildModifiers.Apply(*Spell);
+					if (!CompileSequence(
+						Spell->DrawCount,
+						TriggerDepth,
+						OutProjectiles,
+						OutCasterEffects,
+						ChildModifiers))
 					{
-						Pending.bOverrideColor = true;
-						Pending.Color = Spell->Color;
+						return false;
 					}
-					if (Spell->OrbitRadius > 0.0f)
-					{
-						Pending.OrbitRadius = Spell->OrbitRadius;
-					}
-					DrawCount += Spell->DrawCount;
 					break;
+				}
 
 				case EMatterFluxSpellKind::Multicast:
-					SequenceSpreadDelta += Spell->SpreadDelta;
-					Pending.SpreadDegrees += Spell->SpreadDelta;
-					DrawCount += Spell->DrawCount;
+				{
+					FPendingModifiers ChildModifiers = InheritedModifiers;
+					ChildModifiers.SpreadDegrees += Spell->SpreadDelta;
+					if (!CompileSequence(
+						Spell->DrawCount,
+						TriggerDepth,
+						OutProjectiles,
+						OutCasterEffects,
+						ChildModifiers))
+					{
+						return false;
+					}
 					break;
+				}
 
 				case EMatterFluxSpellKind::TriggerModifier:
 				{
@@ -229,12 +252,14 @@ namespace MatterFluxWandProgram
 						1,
 						TriggerDepth + 1,
 						CarrierProjectiles,
-						CarrierCasterEffects)
+						CarrierCasterEffects,
+						InheritedModifiers)
 						|| !CompileSequence(
 							1,
 							TriggerDepth + 1,
 							PayloadProjectiles,
-							PayloadCasterEffects))
+							PayloadCasterEffects,
+							InheritedModifiers))
 					{
 						return false;
 					}
@@ -248,41 +273,6 @@ namespace MatterFluxWandProgram
 					for (FMatterFluxMagicProjectilePlan& Carrier
 						: CarrierProjectiles)
 					{
-						Carrier.Damage = FMath::Max(
-							0.0f,
-							(Carrier.Damage + Pending.DamageAdd)
-								* Pending.DamageMultiplier);
-						Carrier.Speed *= Pending.SpeedMultiplier;
-						Carrier.Lifetime *= Pending.LifetimeMultiplier;
-						const float PreviousSpread = Carrier.SpreadDegrees;
-						Carrier.SpreadDegrees +=
-							Pending.SpreadDegrees - Wand.Spread;
-						if (FMath::IsNearlyZero(Carrier.SpreadDegrees))
-						{
-							Carrier.SpawnAngleDegrees = 0.0f;
-						}
-						else if (!FMath::IsNearlyZero(PreviousSpread))
-						{
-							// Preserve the carrier's deterministic random percentile
-							// while expanding it into the final outer spread range.
-							Carrier.SpawnAngleDegrees *=
-								Carrier.SpreadDegrees / PreviousSpread;
-						}
-						else
-						{
-							Carrier.SpawnAngleDegrees = Random.FRandRange(
-								-Carrier.SpreadDegrees,
-								Carrier.SpreadDegrees);
-						}
-						if (Pending.bOverrideColor)
-						{
-							Carrier.bOverrideColor = true;
-							Carrier.Color = Pending.Color;
-						}
-						if (Pending.OrbitRadius > 0.0f)
-						{
-							Carrier.OrbitRadius = Pending.OrbitRadius;
-						}
 						if (Spell->CarrierLifetimeOverride > 0.0f)
 						{
 							Carrier.Lifetime = Spell->CarrierLifetimeOverride;
@@ -300,8 +290,6 @@ namespace MatterFluxWandProgram
 						}
 					}
 					OutProjectiles.Append(MoveTemp(CarrierProjectiles));
-					Pending = FPendingModifiers();
-					Pending.SpreadDegrees = Wand.Spread + SequenceSpreadDelta;
 					break;
 				}
 
@@ -317,22 +305,23 @@ namespace MatterFluxWandProgram
 					Projectile.SpellId = Spell->Id;
 					Projectile.Damage = FMath::Max(
 						0.0f,
-						(Spell->Damage + Pending.DamageAdd)
-							* Pending.DamageMultiplier);
+						(Spell->Damage + InheritedModifiers.DamageAdd)
+							* InheritedModifiers.DamageMultiplier);
 					Projectile.Speed = Spell->bSpawnStationary
 						? 0.0f
-						: Spell->Speed * Pending.SpeedMultiplier;
+						: Spell->Speed * InheritedModifiers.SpeedMultiplier;
 					Projectile.Lifetime =
-						Spell->Lifetime * Pending.LifetimeMultiplier;
+						Spell->Lifetime * InheritedModifiers.LifetimeMultiplier;
 					Projectile.Radius = Spell->Radius;
 					Projectile.GravityScale = Spell->GravityScale;
-					Projectile.SpreadDegrees = Pending.SpreadDegrees;
+					Projectile.SpreadDegrees =
+						InheritedModifiers.SpreadDegrees;
 					Projectile.SpawnAngleDegrees =
-						FMath::IsNearlyZero(Pending.SpreadDegrees)
+						FMath::IsNearlyZero(InheritedModifiers.SpreadDegrees)
 							? 0.0f
 							: Random.FRandRange(
-								-Pending.SpreadDegrees,
-								Pending.SpreadDegrees);
+								-InheritedModifiers.SpreadDegrees,
+								InheritedModifiers.SpreadDegrees);
 					Projectile.BodyMaterial = Spell->BodyMaterial;
 					Projectile.MaterialAmount = Spell->MaterialAmount;
 					Projectile.SpawnForwardOffset =
@@ -342,16 +331,18 @@ namespace MatterFluxWandProgram
 					Projectile.bUsePlaneVisual = Spell->bUsePlaneVisual;
 					Projectile.bUseVerticalPlaneVisual =
 						Spell->bUseVerticalPlaneVisual;
-					Projectile.bOverrideColor = Pending.bOverrideColor;
-					Projectile.Color = Pending.Color;
-					Projectile.OrbitRadius = Pending.OrbitRadius;
+					Projectile.bOverrideColor =
+						InheritedModifiers.bOverrideColor;
+					Projectile.Color = InheritedModifiers.Color;
+					Projectile.OrbitRadius = InheritedModifiers.OrbitRadius;
 					TArray<FMatterFluxMagicCasterEffectPlan> TriggerCasterEffects;
 					if (Spell->Kind == EMatterFluxSpellKind::Trigger
 						&& (!CompileSequence(
 							Spell->TriggerDrawCount,
 							TriggerDepth + 1,
 							Projectile.OnImpactProjectiles,
-							TriggerCasterEffects)
+							TriggerCasterEffects,
+							InheritedModifiers)
 							|| !TriggerCasterEffects.IsEmpty()))
 					{
 						if (Error.IsEmpty())
@@ -361,9 +352,6 @@ namespace MatterFluxWandProgram
 						return false;
 					}
 					OutProjectiles.Add(MoveTemp(Projectile));
-					Pending = FPendingModifiers();
-					Pending.SpreadDegrees = Wand.Spread + SequenceSpreadDelta;
-					DrawCount += Spell->DrawCount;
 					break;
 				}
 
@@ -379,8 +367,6 @@ namespace MatterFluxWandProgram
 					Effect.Type = EMatterFluxMagicCasterEffectType::Jump;
 					Effect.VerticalImpulse = Spell->VerticalImpulse;
 					OutCasterEffects.Add(MoveTemp(Effect));
-					Pending = FPendingModifiers();
-					Pending.SpreadDegrees = Wand.Spread + SequenceSpreadDelta;
 					break;
 				}
 				default:
@@ -447,11 +433,14 @@ bool FMatterFluxWandProgram::Evaluate(
 		OutError = Context.Error;
 		return false;
 	}
+	FPendingModifiers RootModifiers;
+	RootModifiers.SpreadDegrees = Context.Wand.Spread;
 	if (!Context.CompileSequence(
 		Wand->DrawCount,
 		0,
 		Context.Plan.Projectiles,
-		Context.Plan.CasterEffects))
+		Context.Plan.CasterEffects,
+		RootModifiers))
 	{
 		OutError = Context.Error;
 		return false;

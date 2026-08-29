@@ -1435,9 +1435,9 @@ namespace MatterFlux::FragmentGeometry
 		return true;
 	}
 
-	bool GatherTopExposedActiveMaskCells(
+	bool GatherTopExposedMarkedMaskCells(
 		const TArray<uint8>& OccupiedMask,
-		const TArray<uint8>& ActiveMask,
+		const TArray<uint8>& MarkedMask,
 		const int32 Width,
 		const int32 Height,
 		TArray<int32>& OutCellIndices)
@@ -1446,13 +1446,13 @@ namespace MatterFlux::FragmentGeometry
 		const int64 CellCount = static_cast<int64>(Width) * Height;
 		if (Width <= 0 || Height <= 0
 			|| CellCount != OccupiedMask.Num()
-			|| CellCount != ActiveMask.Num())
+			|| CellCount != MarkedMask.Num())
 		{
 			return false;
 		}
-		for (int32 Index = 0; Index < ActiveMask.Num(); ++Index)
+		for (int32 Index = 0; Index < MarkedMask.Num(); ++Index)
 		{
-			if (ActiveMask[Index] == 0 || OccupiedMask[Index] == 0)
+			if (MarkedMask[Index] == 0 || OccupiedMask[Index] == 0)
 			{
 				continue;
 			}

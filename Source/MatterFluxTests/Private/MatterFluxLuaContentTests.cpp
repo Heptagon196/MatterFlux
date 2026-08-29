@@ -13,7 +13,7 @@
 namespace MatterFluxLuaTests
 {
 	const TCHAR* ValidSource = TEXT(R"LUA(
-content.set_manifest("test.pack", 7, 2)
+content.set_manifest("test.pack", 7, 3)
 content.register_material("soil", 1.5, 0.8, 0.3, 0.2, 0.1, 1.0)
 content.register_decorator("forest.tree", "tree", "soil", 0.4, 2, 8, true)
 content.register_entity("enemy.slime", "slime_wander", 35.0, 180.0)
@@ -53,14 +53,31 @@ bool FMatterFluxLuaModularSpellApiTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("All quest modules loaded"), First->Quests.Num(), 10);
 	TestEqual(TEXT("All structure modules loaded"), First->Structures.Num(), 1);
 	TestEqual(TEXT("All custom map modules loaded"), First->CustomMaps.Num(), 3);
-	TestEqual(TEXT("Modular content revision"), First->Manifest.Revision, 23);
+	TestEqual(TEXT("Modular content revision"), First->Manifest.Revision, 25);
 	const FMatterFluxMaterialDefinition* Fire = First->Materials.Find(TEXT("fire"));
 	if (TestNotNull(TEXT("Default fire material compiled"), Fire))
 	{
 		TestTrue(TEXT("Fire remains a generic gas material"),
 			Fire->Phase == EMatterFluxMaterialPhase::Gas);
 		TestEqual(TEXT("Named lifetime_steps field is compiled"),
-			static_cast<int32>(Fire->LifetimeSteps), 6);
+			static_cast<int32>(Fire->LifetimeSteps), 4);
+	}
+	const FMatterFluxMaterialDefinition* GoldFlower =
+		First->Materials.Find(TEXT("flower_gold"));
+	const FMatterFluxDecoratorDefinition* GoldFlowerDecorator =
+		First->Decorators.Find(TEXT("forest.flower.gold"));
+	if (TestNotNull(TEXT("Gold flower material compiled"), GoldFlower)
+		&& TestNotNull(TEXT("Gold flower decorator compiled"), GoldFlowerDecorator))
+	{
+		TestTrue(
+			TEXT("Gold flowers use a pale yellow rather than a lava-orange color"),
+			GoldFlower->Color.G >= 0.80f
+				&& GoldFlower->Color.B >= 0.15f);
+		TestTrue(
+			TEXT("Gold flower scatter is sparser than the other flower fields"),
+			GoldFlowerDecorator->SpawnWeight <= 0.12f
+				&& GoldFlowerDecorator->MinCount <= 80
+				&& GoldFlowerDecorator->MaxCount <= 120);
 	}
 	const FMatterFluxMaterialDefinition* Water = First->Materials.Find(TEXT("water"));
 	const FMatterFluxMaterialDefinition* Sand = First->Materials.Find(TEXT("sand"));
@@ -186,7 +203,7 @@ bool FMatterFluxLuaProgressionDefinitionsTest::RunTest(
 	}
 
 	const FString ValidProgressionSource = EngineSource + TEXT(R"LUA(
-content.set_manifest("progression.test", 1, 2)
+content.set_manifest("progression.test", 1, 3)
 item.define({
     id = "item.coin", name = "Coin", category = "material",
     max_stack = 999
@@ -237,7 +254,7 @@ end)
 
 	const FMatterFluxContentRegistryPtr Baseline = Runtime.GetActiveRegistry();
 	const FString CyclicSource = EngineSource + TEXT(R"LUA(
-content.set_manifest("progression.cycle", 1, 2)
+content.set_manifest("progression.cycle", 1, 3)
 quest.define({
     id = "quest.a", description = "A", category = "main",
     prerequisites = { "quest.b" }
@@ -288,7 +305,7 @@ bool FMatterFluxLuaSpellCapabilityBoundaryTest::RunTest(
 		return false;
 	}
 	const FString BypassAttempt = EngineSource + TEXT(R"LUA(
-content.set_manifest("invalid.spell.capability", 1, 2)
+content.set_manifest("invalid.spell.capability", 1, 3)
 spell.define({
     id = "invalid.raw_damage",
     name = "Bypass",
@@ -313,7 +330,7 @@ end)
 		Runtime.GetActiveRegistry() == Baseline);
 
 	const FString ImpactOnlyAttempt = EngineSource + TEXT(R"LUA(
-content.set_manifest("invalid.impact.only", 1, 2)
+content.set_manifest("invalid.impact.only", 1, 3)
 material.define({
     id = "fire", density = 0.01, hardness = 0,
     color_r = 1, color_g = 0.2, color_b = 0.02
@@ -360,7 +377,7 @@ bool FMatterFluxLuaRegistrationTest::RunTest(const FString& Parameters)
 	if (TestTrue(TEXT("A registry is active"), Registry.IsValid()))
 	{
 		TestEqual(TEXT("Pack id"), Registry->Manifest.PackId, TEXT("test.pack"));
-		TestEqual(TEXT("Schema"), Registry->Manifest.SchemaVersion, 2);
+		TestEqual(TEXT("Schema"), Registry->Manifest.SchemaVersion, 3);
 		TestEqual(TEXT("Revision"), Registry->Manifest.Revision, 7);
 		TestEqual(TEXT("Material count"), Registry->Materials.Num(), 1);
 		TestEqual(TEXT("Decorator count"), Registry->Decorators.Num(), 1);
@@ -386,7 +403,7 @@ bool FMatterFluxLuaFragmentationSettingsTest::RunTest(
 	FString Error;
 	const FString ConfiguredSource = TEXT(R"LUA(
 content.configure_fragmentation(7)
-content.set_manifest("fragmentation.pack", 1, 2)
+content.set_manifest("fragmentation.pack", 1, 3)
 )LUA");
 	if (TestTrue(
 		TEXT("Valid fragmentation settings load"),
@@ -410,7 +427,7 @@ content.set_manifest("fragmentation.pack", 1, 2)
 		Runtime.GetActiveRegistry();
 	const FString InvalidSource = TEXT(R"LUA(
 content.configure_fragmentation(0)
-content.set_manifest("invalid.fragmentation", 1, 2)
+content.set_manifest("invalid.fragmentation", 1, 3)
 )LUA");
 	Error.Reset();
 	TestFalse(
@@ -454,28 +471,47 @@ bool FMatterFluxLuaMaterialSimulationRegistrationTest::RunTest(
 	const FString& Parameters)
 {
 	const FString Source = TEXT(R"LUA(
-content.set_manifest("simulation.pack", 1, 2)
-content.register_material("water", 1.0, 0.1, 0.1, 0.4, 0.9, 0.8, "liquid", 255, 220)
+content.set_manifest("simulation.pack", 1, 3)
+content.register_material({
+    id = "water", density = 1.0, hardness = 0.1,
+    color_r = 0.1, color_g = 0.4, color_b = 0.9, color_a = 0.8,
+    phase = "liquid", mobility = 255, dispersion = 220,
+    default_energy = 120, conductivity_permille = 700,
+    cooling_per_step = 6, ignition_threshold = 0,
+})
 content.register_material("lava", 2.8, 0.2, 1.0, 0.2, 0.0, 1.0, "liquid", 96, 32)
 content.register_material("steam", 0.1, 0.0, 0.8, 0.8, 0.8, 0.5, "gas", 255, 255)
 content.register_material("stone", 3.0, 1.0, 0.3, 0.3, 0.3, 1.0, "static", 0, 0)
-content.register_material("wood", 0.8, 0.7, 0.3, 0.2, 0.1, 1.0, "static", 0, 0)
+content.register_material({
+    id = "wood", density = 0.8, hardness = 0.7,
+    color_r = 0.3, color_g = 0.2, color_b = 0.1, color_a = 1.0,
+    phase = "static", mobility = 0, dispersion = 0,
+	default_energy = 120, conductivity_permille = 180,
+	cooling_per_step = 3, ignition_threshold = 30000,
+	combustion_product = "charcoal", combustion_energy = 52000,
+    combustion_emission_material = "smoke",
+    combustion_emission_amount = 1,
+	combustion_secondary_emission_material = "fire",
+	combustion_secondary_emission_amount = 2,
+})
 content.register_material("fire", 0.01, 0.0, 1.0, 0.3, 0.0, 0.9, "gas", 255, 255)
 content.register_material("smoke", 0.05, 0.0, 0.2, 0.2, 0.2, 0.6, "gas", 255, 220)
 content.register_material("charcoal", 0.7, 0.4, 0.08, 0.07, 0.06, 1.0, "static", 0, 0)
 content.register_reaction("water_lava", "water", "lava", "steam", "stone", 1000)
 content.register_reaction({
     id = "wood_burn",
-    kind = "propagating",
+    kind = "contact",
     input_a = "wood",
     input_b = "fire",
     output_a = "charcoal",
     output_b = "fire",
     chance_permille = 1000,
-    propagation_permille = 650,
-    duration_steps = 12,
-    emission_material = "smoke",
-    emission_permille = 700,
+    energy_delta_a = -400,
+    energy_delta_b = -25,
+    emission_1_material = "smoke",
+    emission_1_amount = 1,
+    emission_1_energy = 12000,
+    emission_1_source = "a",
 })
 )LUA");
 
@@ -505,25 +541,66 @@ content.register_reaction({
 		TestEqual(TEXT("Lua material dispersion is parsed"),
 			static_cast<int32>(Water.Dispersion),
 			220);
+		TestEqual(TEXT("Lua default energy is parsed"),
+			static_cast<int32>(Water.DefaultEnergy), 120);
+		TestEqual(TEXT("Lua conductivity is parsed"),
+			static_cast<int32>(Water.ConductivityPermille), 700);
+		const FMatterFluxMaterialDefinition& Wood =
+			Registry->Materials.FindChecked(TEXT("wood"));
+		TestEqual(TEXT("Lua ignition threshold is parsed"),
+			static_cast<int32>(Wood.IgnitionThreshold), 30000);
+		TestEqual(TEXT("Lua combustion product is parsed"),
+			Wood.CombustionProduct, FName(TEXT("charcoal")));
+		TestEqual(TEXT("Lua combustion heat is parsed"),
+			static_cast<int32>(Wood.CombustionEnergy), 52000);
+		TestEqual(TEXT("Lua secondary combustion emission is parsed"),
+			Wood.CombustionSecondaryEmissionMaterial, FName(TEXT("fire")));
+		TestEqual(TEXT("Lua secondary combustion emission amount is parsed"),
+			static_cast<int32>(Wood.CombustionSecondaryEmissionAmount), 2);
 		const FMatterFluxReactionDefinition& Reaction =
 			Registry->Reactions.FindChecked(TEXT("water_lava"));
 		TestEqual(TEXT("Lua reaction input A"), Reaction.InputA, FName(TEXT("water")));
 		TestEqual(TEXT("Lua reaction output B"), Reaction.OutputB, FName(TEXT("stone")));
 		TestEqual(TEXT("Lua reaction probability"), Reaction.ChancePermille, 1000);
-		const FMatterFluxReactionDefinition& PropagatingReaction =
+		const FMatterFluxReactionDefinition& BurningContact =
 			Registry->Reactions.FindChecked(TEXT("wood_burn"));
-		TestTrue(TEXT("Lua compiles fire as a generic propagating reaction"),
-			PropagatingReaction.Kind
-				== FMatterFluxReactionDefinition::EKind::Propagating);
-		TestEqual(TEXT("Lua propagating input"),
-			PropagatingReaction.InputA, FName(TEXT("wood")));
-		TestEqual(TEXT("Lua propagating output"),
-			PropagatingReaction.OutputA, FName(TEXT("charcoal")));
-		TestEqual(TEXT("Lua reaction duration"),
-			PropagatingReaction.DurationSteps, 12);
-		TestEqual(TEXT("Lua reaction emission probability"),
-			PropagatingReaction.EmissionChancePermille, 700);
+		TestEqual(TEXT("Lua contact energy delta A"),
+			BurningContact.EnergyDeltaA, -400);
+		TestEqual(TEXT("Lua contact energy delta B"),
+			BurningContact.EnergyDeltaB, -25);
+		TestEqual(TEXT("Lua contact emission count"),
+			BurningContact.Emissions.Num(), 1);
+		if (BurningContact.Emissions.Num() == 1)
+		{
+			TestEqual(TEXT("Lua emission material"),
+				BurningContact.Emissions[0].Material,
+				FName(TEXT("smoke")));
+			TestEqual(TEXT("Lua emission energy"),
+				static_cast<int32>(BurningContact.Emissions[0].Energy), 12000);
+		}
 	}
+
+	const FMatterFluxContentRegistryPtr Baseline = Runtime.GetActiveRegistry();
+	const FString PropagatingSource = TEXT(R"LUA(
+content.set_manifest("legacy.propagating", 1, 3)
+content.register_reaction({
+    id = "legacy_burn", kind = "propagating",
+    input_a = "wood", input_b = "fire",
+    output_a = "charcoal", output_b = "fire",
+    chance_permille = 1000, propagation_permille = 500,
+    duration_steps = 8, emission_material = "smoke",
+    emission_permille = 500,
+})
+)LUA");
+	Error.Reset();
+	TestFalse(TEXT("Schema 3 rejects propagating reactions"),
+		Runtime.LoadContentPackFromSource(
+			PropagatingSource, TEXT("LegacyPropagatingReaction"), Error));
+	TestTrue(TEXT("Propagating rejection explains the migration"),
+		Error.Contains(TEXT("schema 3"))
+			&& Error.Contains(TEXT("local contact")));
+	TestTrue(TEXT("Rejected propagating content preserves registry"),
+		Runtime.GetActiveRegistry() == Baseline);
 
 	MatterFluxLuaTests::RestoreDefault(Runtime);
 	return true;
@@ -1043,7 +1120,7 @@ bool FMatterFluxLuaCustomMapBoundsTest::RunTest(const FString& Parameters)
 		return false;
 	}
 	const FString InvalidSource = EngineSource + TEXT(R"LUA(
-content.set_manifest("unsafe.map", 1, 2)
+content.set_manifest("unsafe.map", 1, 3)
 material.define({
     id = "stone", density = 2.0, hardness = 1.0,
     color_r = 0.3, color_g = 0.3, color_b = 0.3, color_a = 1.0
@@ -1239,8 +1316,7 @@ bool FMatterFluxLuaAcidChemistryTest::RunTest(const FString& Parameters)
 			: Registry->Reactions)
 		{
 			const FMatterFluxReactionDefinition& Rule = Pair.Value;
-			if (Rule.Kind == FMatterFluxReactionDefinition::EKind::Contact
-				&& Rule.InputA == TEXT("acid")
+			if (Rule.InputA == TEXT("acid")
 				&& Rule.InputB == Target)
 			{
 				Found = &Rule;
@@ -1257,13 +1333,11 @@ bool FMatterFluxLuaAcidChemistryTest::RunTest(const FString& Parameters)
 			TestEqual(TEXT("Corrosion creates no acid-family product"),
 				Found->OutputB, FName(TEXT("empty")));
 			TestTrue(TEXT("Contact corrosion has no additional emission"),
-				Found->EmissionMaterial.IsNone()
-					|| Found->EmissionMaterial == TEXT("empty"));
+				Found->Emissions.IsEmpty());
 		}
 	}
 
 	bool bHasAcidWaterReaction = false;
-	bool bHasPropagatingAcidReaction = false;
 	for (const TPair<FName, FMatterFluxReactionDefinition>& Pair
 		: Registry->Reactions)
 	{
@@ -1271,14 +1345,9 @@ bool FMatterFluxLuaAcidChemistryTest::RunTest(const FString& Parameters)
 		bHasAcidWaterReaction |=
 			(Rule.InputA == TEXT("acid") && Rule.InputB == TEXT("water"))
 			|| (Rule.InputA == TEXT("water") && Rule.InputB == TEXT("acid"));
-		bHasPropagatingAcidReaction |=
-			Rule.Kind == FMatterFluxReactionDefinition::EKind::Propagating
-			&& (Rule.InputA == TEXT("acid") || Rule.InputB == TEXT("acid"));
 	}
 	TestFalse(TEXT("Acid and water have no chemical reaction rule"),
 		bHasAcidWaterReaction);
-	TestFalse(TEXT("Acid corrosion never self-propagates through solids"),
-		bHasPropagatingAcidReaction);
 	return true;
 }
 
@@ -1291,7 +1360,7 @@ bool FMatterFluxLuaLiquidOpticsRegistrationTest::RunTest(
 	const FString& Parameters)
 {
 	const FString Source = TEXT(R"LUA(
-content.set_manifest("liquid.optics.pack", 1, 2)
+content.set_manifest("liquid.optics.pack", 1, 3)
 content.register_material({
     id = "water",
     density = 1.0,
@@ -1399,7 +1468,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FMatterFluxLuaDecoratorCollisionTypeTest::RunTest(const FString& Parameters)
 {
 	const FString Source = TEXT(R"LUA(
-content.set_manifest("invalid.collision", 1, 2)
+content.set_manifest("invalid.collision", 1, 3)
 content.register_material("soil", 1.0, 1.0, 0.3, 0.2, 0.1, 1.0)
 content.register_decorator("forest.tree", "tree", "soil", 1.0, 1, 1, "yes")
 )LUA");
@@ -1439,7 +1508,7 @@ bool FMatterFluxLuaTransactionTest::RunTest(const FString& Parameters)
 	const FMatterFluxContentRegistryPtr Baseline = Runtime.GetActiveRegistry();
 	const FString BaselineHash = Baseline->Manifest.VersionHash;
 	const FString InvalidSource = TEXT(R"LUA(
-content.set_manifest("broken.pack", 1, 2)
+content.set_manifest("broken.pack", 1, 3)
 content.register_material("same", 1, 1, 1, 1, 1, 1)
 content.register_material("same", 1, 1, 1, 1, 1, 1)
 )LUA");
@@ -1477,7 +1546,7 @@ bool FMatterFluxLuaDuplicateReactionPairTest::RunTest(
 	const FMatterFluxContentRegistryPtr Baseline =
 		Runtime.GetActiveRegistry();
 	const FString Source = TEXT(R"LUA(
-content.set_manifest("duplicate.reaction.pair", 1, 2)
+content.set_manifest("duplicate.reaction.pair", 1, 3)
 content.register_material("water", 1.0, 0.0, 0.1, 0.2, 0.8, 1.0)
 content.register_material("lava", 2.8, 0.0, 1.0, 0.2, 0.0, 1.0)
 content.register_reaction("first", "water", "lava", "water", "lava", 500)
@@ -1513,7 +1582,7 @@ bool FMatterFluxLuaBoundedDecoratorCountTest::RunTest(
 	const FMatterFluxContentRegistryPtr Baseline =
 		Runtime.GetActiveRegistry();
 	const FString Source = TEXT(R"LUA(
-content.set_manifest("oversized.decorator", 1, 2)
+content.set_manifest("oversized.decorator", 1, 3)
 content.register_material("grass", 1.0, 0.0, 0.1, 0.8, 0.1, 1.0)
 content.register_decorator("forest.grass", "surface_scatter", "grass", 1.0, 0, 2147483647, false)
 )LUA");
@@ -1548,7 +1617,7 @@ bool FMatterFluxLuaEmbeddedNullSourceTest::RunTest(
 		Runtime.GetActiveRegistry();
 	const TCHAR SourceWithEmbeddedNull[] =
 		TEXT(
-			"content.set_manifest(\"null.source\", 1, 2)\n"
+			"content.set_manifest(\"null.source\", 1, 3)\n"
 			"\0"
 			"error(\"this suffix must not be hidden\")");
 	const FString Source(
@@ -1581,7 +1650,7 @@ bool FMatterFluxLuaEmbeddedNullSourceTest::RunTest(
 	TestFalse(
 		TEXT("Source origins cannot contain hidden suffixes"),
 		Runtime.LoadContentPackFromSource(
-			TEXT("content.set_manifest(\"null.origin\", 1, 2)"),
+			TEXT("content.set_manifest(\"null.origin\", 1, 3)"),
 			InvalidOrigin,
 			Error));
 	TestTrue(
@@ -1643,7 +1712,7 @@ assert(load == nil)
 assert(collectgarbage == nil)
 assert(math.random == nil)
 assert(math.randomseed == nil)
-content.set_manifest("sandbox.pack", 1, 2)
+content.set_manifest("sandbox.pack", 1, 3)
 )LUA");
 
 	IMatterFluxScriptRuntime& Runtime = IMatterFluxScriptRuntime::Get();
@@ -1709,7 +1778,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FMatterFluxLuaPlayableSceneTest::RunTest(const FString& Parameters)
 {
 	const FString Source = TEXT(R"LUA(
-content.set_manifest("scene.pack", 2, 2)
+content.set_manifest("scene.pack", 2, 3)
 content.register_material("custom_grass", 0.3, 0.2, 0.8, 0.1, 0.4, 1.0)
 content.register_decorator("forest.grass", "surface_scatter", "custom_grass", 1.0, 12, 12)
 )LUA");

@@ -66,6 +66,114 @@ namespace
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxColdSourceVisibilityKeepsReactionLightOffTest,
+	"MatterFlux.Fragment.Visual.ColdSourceVisibilityKeepsReactionLightOff",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxColdSourceVisibilityKeepsReactionLightOffTest::RunTest(
+	const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	AMatterFluxReactionLightTestSourceActor* Source = World
+		? World->SpawnActor<AMatterFluxReactionLightTestSourceActor>()
+		: nullptr;
+	if (!TestNotNull(TEXT("Cold source spawns"), Source))
+	{
+		return false;
+	}
+
+	FFragmentSourceMask Mask;
+	Mask.Width = 2;
+	Mask.Height = 3;
+	Mask.CellSize = 10.0f;
+	Mask.MinFragmentAreaPixels = 1;
+	Mask.MaxFragmentsPerBreak = 4;
+	Mask.SupportMode = EFragmentSupportMode::Bottom;
+	Mask.SolidMask.Init(1, Mask.Width * Mask.Height);
+	if (!TestTrue(
+			TEXT("Cold wood source initializes"),
+			Source->InitializeFromProceduralMask(
+				Mask,
+				FGuid::NewDeterministicGuid(
+					TEXT("ColdSourceReactionLight"),
+					1),
+				FLinearColor(0.35f, 0.16f, 0.05f),
+				TEXT("wood"))))
+	{
+		return false;
+	}
+
+	Source->EnsureReactionVisualComponentsForTest();
+	TestFalse(
+		TEXT("A newly registered reaction light starts hidden"),
+		Source->IsReactionFireLightVisibleForTest());
+
+	Source->RebuildMaterialVisualizationForTest();
+	TestFalse(
+		TEXT("A cold material projection keeps the reaction light hidden"),
+		Source->IsReactionFireLightVisibleForTest());
+
+	Source->SetSourceMeshProjectionEnabled(false);
+	Source->SetSourceMeshProjectionEnabled(true);
+	TestFalse(
+		TEXT("Re-enabling the source mesh cannot recursively enable the reaction light"),
+		Source->IsReactionFireLightVisibleForTest());
+
+	if (TestTrue(
+			TEXT("Heating one occupied wood cell reaches ignition"),
+			Source->CommitMaterialVolumeCellEnergy(
+				FIntVector(0, 0, 0),
+				100,
+				100,
+				200)))
+	{
+		TestTrue(
+			TEXT("A genuinely hot material projection enables the reaction light"),
+			Source->IsReactionFireLightVisibleForTest());
+		TestTrue(
+			TEXT("A genuinely hot material projection creates flame instances"),
+			Source->GetReactionFlameInstanceCountForTest() > 0);
+		Source->SetSourceMeshProjectionEnabled(false);
+		TestFalse(
+			TEXT("Proxy-owned base geometry cannot hide the reaction carrier actor"),
+			Source->IsHidden());
+		TestFalse(
+			TEXT("Proxy-owned base geometry hides only source mesh sections"),
+			Source->IsAnySourceMeshSectionVisibleForTest());
+		TestTrue(
+			TEXT("A hot proxy-owned source keeps its reaction light visible"),
+			Source->IsReactionFireLightVisibleForTest());
+		TestTrue(
+			TEXT("A hot proxy-owned source keeps its flame instances visible"),
+			Source->AreReactionFlamesVisibleForTest());
+		Source->SetSourceMeshProjectionEnabled(true);
+		TestTrue(
+			TEXT("Returning base geometry ownership restores source mesh sections"),
+			Source->IsAnySourceMeshSectionVisibleForTest());
+		TestTrue(
+			TEXT("Source visibility changes preserve a hot projection's light"),
+			Source->IsReactionFireLightVisibleForTest());
+		TestTrue(
+			TEXT("Source visibility changes preserve hot flame visibility"),
+			Source->AreReactionFlamesVisibleForTest());
+	}
+	if (TestTrue(
+			TEXT("Cooling the occupied wood cell restores ambient energy"),
+			Source->CommitMaterialVolumeCellEnergy(
+				FIntVector(0, 0, 0),
+				100,
+				200,
+				100)))
+	{
+		TestFalse(
+			TEXT("Cooling the material projection disables the reaction light"),
+			Source->IsReactionFireLightVisibleForTest());
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FMatterFluxSupportedRemainderTest,
 	"MatterFlux.Fragment.Support.SupportedRemainderStaysStatic",
 	EAutomationTestFlags::EditorContext
@@ -980,12 +1088,12 @@ bool FMatterFluxDetachedItemRepeatedCutTest::RunTest(
 	Request.EventSeed = 908;
 	Request.MaxAffectedSources = 1;
 	const int32 SolidCellsBefore = Algo::Count(
-		Item->RootReactionState.SourceMask.SolidMask,
+		Item->RootMaterialState.SourceMask.SolidMask,
 		static_cast<uint8>(1));
 	TestEqual(TEXT("The world cut accepts the detached logical item"),
 		UFragmentSimulationSubsystem::ExecuteWorldCut(World, Request), 1);
 	const int32 SolidCellsAfter = Algo::Count(
-		Item->RootReactionState.SourceMask.SolidMask,
+		Item->RootMaterialState.SourceMask.SolidMask,
 		static_cast<uint8>(1));
 	TestTrue(TEXT("The first cut immediately removes detached material"),
 		SolidCellsAfter < SolidCellsBefore);
@@ -994,9 +1102,9 @@ bool FMatterFluxDetachedItemRepeatedCutTest::RunTest(
 	TArray<MatterFlux::FragmentGeometry::FFragmentComponent>
 		RemainingComponents;
 	MatterFlux::FragmentGeometry::ExtractConnectedComponents(
-		Item->RootReactionState.SourceMask.SolidMask,
-		Item->RootReactionState.SourceMask.Width,
-		Item->RootReactionState.SourceMask.Height,
+		Item->RootMaterialState.SourceMask.SolidMask,
+		Item->RootMaterialState.SourceMask.Width,
+		Item->RootMaterialState.SourceMask.Height,
 		RemainingComponents);
 	TestTrue(
 		TEXT("The cut leaves multiple disconnected material components"),
@@ -1006,7 +1114,7 @@ bool FMatterFluxDetachedItemRepeatedCutTest::RunTest(
 	for (TActorIterator<AFragment2DActor> It(World); It; ++It)
 	{
 		const int32 PieceCells = Algo::Count(
-			It->RootReactionState.SourceMask.SolidMask,
+			It->RootMaterialState.SourceMask.SolidMask,
 			static_cast<uint8>(1));
 		if (!It->IsActorBeingDestroyed() && PieceCells > 0)
 		{
