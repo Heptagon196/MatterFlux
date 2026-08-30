@@ -231,6 +231,15 @@ public:
 class MATTERFLUX_API FLocalMaterialReactionProgram
 {
 public:
+	/**
+	 * Derives the visible-flame threshold from material facts only. A hot
+	 * combustion product remains visibly burning at its precursor's ignition
+	 * threshold; no object-level burning state or actor-specific rule is kept.
+	 */
+	static uint16 ResolveVisibleFlameThreshold(
+		const FMatterFluxContentRegistry& Registry,
+		FName CurrentMaterialId,
+		FName PrecursorHint = NAME_None);
 	bool Compile(
 		const FMatterFluxContentRegistry& Registry,
 		FString& OutError);

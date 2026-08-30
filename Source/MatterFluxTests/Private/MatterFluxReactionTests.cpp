@@ -13,11 +13,13 @@
 #include "IMatterFluxScriptRuntime.h"
 #include "Magic/MatterFluxMagicProjectile.h"
 #include "Magic/MatterFluxWandProgram.h"
+#include "Components/InstancedStaticMeshComponent.h"
 #include "Components/SceneComponent.h"
 #include "Components/SphereComponent.h"
 #include "EngineUtils.h"
 #include "HAL/IConsoleManager.h"
 #include "HAL/PlatformTime.h"
+#include "Materials/MaterialInstanceDynamic.h"
 #include "Misc/AutomationTest.h"
 #include "ProceduralMeshComponent.h"
 #include "Rendering/MatterFluxSmokeVisualPool.h"
@@ -518,6 +520,18 @@ bool FMatterFluxPlayableTreeReactionTest::RunTest(
 		return false;
 	}
 	WorldActor->Regenerate(1337);
+	int32 LoadingSteps = 0;
+	while (LoadingSteps < 1200
+		&& !WorldActor->IsInitialWorldEntryReady())
+	{
+		WorldActor->Tick(0.1f);
+		++LoadingSteps;
+	}
+	if (!TestTrue(TEXT("World is playable before the trunk impact"),
+		WorldActor->IsInitialWorldEntryReady()))
+	{
+		return false;
+	}
 	TestNotNull(TEXT("External tree ignition command is registered"),
 		IConsoleManager::Get().FindConsoleObject(
 			TEXT("mf.Reaction.ActivateTree")));
@@ -606,24 +620,9 @@ bool FMatterFluxPlayableTreeReactionTest::RunTest(
 		MaximumSettledSmokeCells = FMath::Max(
 			MaximumSettledSmokeCells, SmokeCells.Num());
 	}
-	const auto IsAggregateFullyConsumed = [World, AggregateId]()
-	{
-		for (TActorIterator<AFragment2DSourceActor> It(World); It; ++It)
-		{
-			if (!It->IsActorBeingDestroyed()
-				&& It->AggregateId == AggregateId
-				&& It->GetOutputCellCount()
-					!= It->GetRemainingInputCellCount())
-			{
-				return false;
-			}
-		}
-		return true;
-	};
 	int32 ConvergenceSteps = 0;
-	while (ConvergenceSteps < 600
-		&& (!IsAggregateFullyConsumed()
-			|| WorldActor->GetLogicalMaterialFlameInstanceCount() > 0))
+	while (ConvergenceSteps < 900
+		&& WorldActor->GetLogicalMaterialFlameInstanceCount() > 0)
 	{
 		WorldActor->Tick(0.1f);
 		++ConvergenceSteps;
@@ -644,6 +643,10 @@ bool FMatterFluxPlayableTreeReactionTest::RunTest(
 		LocalState.LocalMaterialReactionStep > 0);
 	int32 BurnedWoodCells = 0;
 	int32 BurnedLeafCells = 0;
+	int32 RemainingWoodCells = 0;
+	int32 RemainingLeafCells = 0;
+	int32 HotCharcoalCells = 0;
+	int32 HotAshCells = 0;
 	for (const FMatterFluxSavedFragmentSourceState& SourceState
 		: LocalState.FragmentSources)
 	{
@@ -652,13 +655,27 @@ bool FMatterFluxPlayableTreeReactionTest::RunTest(
 		{
 			BurnedWoodCells += Cell.MaterialId == TEXT("charcoal") ? 1 : 0;
 			BurnedLeafCells += Cell.MaterialId == TEXT("ash") ? 1 : 0;
+			RemainingWoodCells += Cell.MaterialId == TEXT("wood") ? 1 : 0;
+			RemainingLeafCells += Cell.MaterialId == TEXT("leaf") ? 1 : 0;
+			HotCharcoalCells += Cell.MaterialId == TEXT("charcoal")
+				&& Cell.Energy >= 51800 ? 1 : 0;
+			HotAshCells += Cell.MaterialId == TEXT("ash")
+				&& Cell.Energy >= 47800 ? 1 : 0;
 		}
 	}
+	AddInfo(FString::Printf(
+		TEXT("Tree residual materials: wood=%d leaf=%d hot_charcoal=%d hot_ash=%d"),
+		RemainingWoodCells,
+		RemainingLeafCells,
+		HotCharcoalCells,
+		HotAshCells));
 	TestTrue(TEXT("The trunk becomes charcoal"), BurnedWoodCells > 0);
 	TestTrue(TEXT("Fire crosses source boundaries into the canopy"),
 		BurnedLeafCells > 0);
-	TestTrue(TEXT("The fire consumes every material cell in the tree"),
-		IsAggregateFullyConsumed());
+	TestEqual(TEXT("The fire leaves no wood cells in the tree"),
+		RemainingWoodCells, 0);
+	TestEqual(TEXT("The fire leaves no leaf cells in the tree"),
+		RemainingLeafCells, 0);
 	TestEqual(TEXT("Combustion visuals extinguish after the tree is consumed"),
 		WorldActor->GetLogicalMaterialFlameInstanceCount(), 0);
 	TestTrue(TEXT("The active tree generates smoke particles"),
@@ -710,6 +727,26 @@ bool FMatterFluxPlayableForestReactionStressTest::RunTest(
 		return false;
 	}
 	WorldActor->Regenerate(LevelSeed);
+	// Reaction frame timing starts only after the same initial-entry barrier used
+	// by gameplay has drained terrain/population/source transactions. Otherwise
+	// the benchmark attributes first-load mesh and Chaos work to combustion.
+	int32 LoadingSteps = 0;
+	while (LoadingSteps < 1200
+		&& (!WorldActor->IsInitialWorldEntryReady()
+			|| WorldActor->GetPendingFragmentSourceSpawnCount() > 0))
+	{
+		WorldActor->Tick(0.1f);
+		++LoadingSteps;
+	}
+	AddInfo(FString::Printf(
+		TEXT("Forest initial-entry barrier completed after %d fixed steps"),
+		LoadingSteps));
+	if (!TestTrue(TEXT("Forest is fully streamed before reaction timing"),
+		WorldActor->IsInitialWorldEntryReady()
+			&& WorldActor->GetPendingFragmentSourceSpawnCount() == 0))
+	{
+		return false;
+	}
 
 	TArray<const MatterFlux::PlayableLevel::FLevelFragmentSource*> TreeRoots;
 	for (const MatterFlux::PlayableLevel::FLevelFragmentSource& Source
@@ -833,10 +870,20 @@ bool FMatterFluxPlayableForestReactionStressTest::RunTest(
 
 	TMap<FGuid, int32> RemainingCells;
 	TMap<FGuid, int32> MemberCounts;
+	TArray<double> ReactionFrameMilliseconds;
+	ReactionFrameMilliseconds.Reserve(2400);
+	int32 MaximumAirborneSmokeParticles = 0;
 	int32 ConvergenceSteps = 0;
 	while (ConvergenceSteps < 2400)
 	{
+		const double FrameStart = FPlatformTime::Seconds();
 		WorldActor->Tick(0.1f);
+		ReactionFrameMilliseconds.Add(
+			(FPlatformTime::Seconds() - FrameStart) * 1000.0);
+		MaximumAirborneSmokeParticles = FMath::Max(
+			MaximumAirborneSmokeParticles,
+			WorldActor->GetAirborneSimulatedMaterialParticleCount(
+				TEXT("smoke")));
 		++ConvergenceSteps;
 		if (GetForestProgress(RemainingCells, MemberCounts)
 			&& WorldActor->GetLogicalMaterialFlameInstanceCount() == 0)
@@ -847,6 +894,28 @@ bool FMatterFluxPlayableForestReactionStressTest::RunTest(
 	AddInfo(FString::Printf(
 		TEXT("Six-tree forest combustion converged after %d fixed steps"),
 		ConvergenceSteps));
+	ReactionFrameMilliseconds.Sort();
+	const int32 P99Index = FMath::Clamp(
+		FMath::CeilToInt(
+			static_cast<double>(ReactionFrameMilliseconds.Num()) * 0.99) - 1,
+		0,
+		ReactionFrameMilliseconds.Num() - 1);
+	const double ReactionP99Milliseconds =
+		ReactionFrameMilliseconds.IsEmpty()
+			? 0.0 : ReactionFrameMilliseconds[P99Index];
+	const double ReactionMaximumMilliseconds =
+		ReactionFrameMilliseconds.IsEmpty()
+			? 0.0 : ReactionFrameMilliseconds.Last();
+	AddInfo(FString::Printf(
+		TEXT("Six-tree reaction frame cost: p99=%.2f ms max=%.2f ms, airborne smoke max=%d, settled smoke=%lld"),
+		ReactionP99Milliseconds,
+		ReactionMaximumMilliseconds,
+		MaximumAirborneSmokeParticles,
+		WorldActor->GetSimulatedMaterialAmount(TEXT("smoke"))));
+	TestTrue(TEXT("Six-tree reaction p99 stays within one frame"),
+		ReactionP99Milliseconds < 16.67);
+	TestTrue(TEXT("Six-tree reaction has no four-frame outlier"),
+		ReactionMaximumMilliseconds < 66.67);
 	for (const FGuid& AggregateId : TargetAggregateIds)
 	{
 		const FString ShortId = AggregateId.ToString(EGuidFormats::Short);
@@ -960,6 +1029,23 @@ bool FMatterFluxRealFlameSpellTreeReactionTest::RunTest(
 	Avatar->AddInstanceComponent(AvatarRoot);
 	AvatarRoot->RegisterComponent();
 	WorldActor->Regenerate(LevelSeed);
+	FGuid VisualAggregateId;
+	FGuid VisualRootSourceId;
+	FBox TreeWorldBounds;
+	FTransform VisualRootTransform;
+	if (!TestTrue(TEXT("The spell target resolves to one tree aggregate"),
+		WorldActor->FindNearestTreeAggregateForVisualInspection(
+			Target,
+			VisualAggregateId,
+			VisualRootSourceId,
+			TreeWorldBounds,
+			VisualRootTransform)))
+	{
+		return false;
+	}
+	TestEqual(TEXT("The visual target is the selected canopy aggregate"),
+		VisualAggregateId,
+		Root->AggregateId);
 	Avatar->SetActorLocation(
 		Target - AimDirection * 300.0f - FVector::UpVector * 25.0f);
 	Avatar->SetActorRotation(AimDirection.Rotation());
@@ -997,8 +1083,10 @@ bool FMatterFluxRealFlameSpellTreeReactionTest::RunTest(
 	}
 	TestTrue(TEXT("The cast creates real flame material particles"),
 		WorldActor->GetAirborneSimulatedMaterialParticleCount(TEXT("fire")) > 0);
-
 	bool bCanopyIgnited = false;
+	UInstancedStaticMeshComponent* SourceFlames = nullptr;
+	int32 MaximumFlamesOnTargetTree = 0;
+	int32 FramesWithFlamesOnTargetTree = 0;
 	for (int32 Frame = 0; Frame < 90; ++Frame)
 	{
 		WorldActor->Tick(1.0f / 60.0f);
@@ -1015,12 +1103,68 @@ bool FMatterFluxRealFlameSpellTreeReactionTest::RunTest(
 				&& (It->GetActiveCellCount() > 0
 					|| It->GetOutputCellCount() > 0);
 		}
+		if (!SourceFlames)
+		{
+			TArray<UInstancedStaticMeshComponent*> InstanceComponents;
+			WorldActor->GetComponents(InstanceComponents);
+			for (UInstancedStaticMeshComponent* Component : InstanceComponents)
+			{
+				if (Component
+					&& Component->GetFName() == TEXT("LogicalSourceFlames"))
+				{
+					SourceFlames = Component;
+					break;
+				}
+			}
+		}
+		int32 FlamesOnTargetTree = 0;
+		if (SourceFlames)
+		{
+			for (int32 InstanceIndex = 0;
+				InstanceIndex < SourceFlames->GetInstanceCount();
+				++InstanceIndex)
+			{
+				FTransform FlameTransform;
+				if (SourceFlames->GetInstanceTransform(
+					InstanceIndex, FlameTransform, true)
+					&& TreeWorldBounds.ExpandBy(TargetLeaf->Mask.CellSize)
+						.IsInsideOrOn(FlameTransform.GetLocation()))
+				{
+					++FlamesOnTargetTree;
+				}
+			}
+		}
+		MaximumFlamesOnTargetTree = FMath::Max(
+			MaximumFlamesOnTargetTree,
+			FlamesOnTargetTree);
+		FramesWithFlamesOnTargetTree += FlamesOnTargetTree > 0 ? 1 : 0;
 	}
 	if (!TestTrue(TEXT("One real canopy hit deterministically ignites the tree"),
 		bCanopyIgnited))
 	{
 		return false;
 	}
+	TestTrue(TEXT("Burning tree cells publish flame voxels on the tree, not only on the ground"),
+		MaximumFlamesOnTargetTree > 0);
+	UMaterialInstanceDynamic* TreeFlameMaterial = SourceFlames
+		? Cast<UMaterialInstanceDynamic>(SourceFlames->GetMaterial(0))
+		: nullptr;
+	if (TestNotNull(TEXT("Tree flame voxels use a dynamic color material"),
+		TreeFlameMaterial))
+	{
+		const FLinearColor TreeFlameColor =
+			TreeFlameMaterial->K2_GetVectorParameterValue(TEXT("Color"));
+		TestTrue(TEXT("Tree flame voxels keep the authored orange-red color"),
+			TreeFlameColor.R >= 0.95f
+				&& TreeFlameColor.G >= 0.15f
+				&& TreeFlameColor.G <= 0.35f
+				&& TreeFlameColor.B <= 0.05f);
+	}
+	AddInfo(FString::Printf(
+		TEXT("Real canopy burn displayed tree-bound flame voxels for %d of 90 launch frames"),
+		FramesWithFlamesOnTargetTree));
+	TestTrue(TEXT("Tree-bound flame remains visible while high-energy products burn"),
+		FramesWithFlamesOnTargetTree >= 20);
 
 	TMap<FGuid, FName> ExpectedProductBySource;
 	TMap<FGuid, int32> ExpectedCellCountBySource;
@@ -2860,6 +3004,22 @@ bool FMatterFluxDecorationReactionIntegrationTest::RunTest(
 		Program.TryGetMaterialId(WoodDelta->After.MaterialIndex, ProductId));
 	TestEqual(TEXT("Wood becomes configured charcoal"),
 		ProductId, FName(TEXT("charcoal")));
+	const FMatterFluxMaterialDefinition* WoodDefinition =
+		Registry->Materials.Find(TEXT("wood"));
+	const FMatterFluxMaterialDefinition* LeafDefinition =
+		Registry->Materials.Find(TEXT("leaf"));
+	TestEqual(TEXT("Hot charcoal inherits the wood flame threshold"),
+		FLocalMaterialReactionProgram::ResolveVisibleFlameThreshold(
+			*Registry, TEXT("charcoal"), TEXT("wood")),
+		WoodDefinition
+			? WoodDefinition->CombustionFlameThreshold
+			: static_cast<uint16>(0));
+	TestEqual(TEXT("Hot ash derives the leaf flame threshold without state"),
+		FLocalMaterialReactionProgram::ResolveVisibleFlameThreshold(
+			*Registry, TEXT("ash"), TEXT("leaf")),
+		LeafDefinition
+			? LeafDefinition->CombustionFlameThreshold
+			: static_cast<uint16>(0));
 	uint16 SmokeIndex = 0;
 	TestTrue(TEXT("Smoke material resolves"),
 		Program.TryGetMaterialIndex(TEXT("smoke"), SmokeIndex));

@@ -644,6 +644,12 @@ namespace MatterFluxLua
 			|| Definition.MovementResistance < 0.0f
 			|| Definition.MovementResistance > 8.0f
 			|| Definition.ConductivityPermille > 1000
+			|| (Definition.CombustionFlameThreshold != 0
+				&& (Definition.CombustionFlameThreshold
+						< Definition.IgnitionThreshold
+					|| (Definition.CombustionEnergy != 0
+						&& Definition.CombustionFlameThreshold
+							> Definition.CombustionEnergy)))
 			|| !bValidCombustionProduct
 			|| !bValidCombustionEmission
 			|| !bValidSecondaryCombustionEmission
@@ -652,6 +658,7 @@ namespace MatterFluxLua
 			|| (!bCombustible
 				&& (Definition.CombustionProduct != TEXT("empty")
 					|| Definition.CombustionEnergy != 0
+					|| Definition.CombustionFlameThreshold != 0
 					|| Definition.CombustionEmissionMaterial != TEXT("empty")
 					|| Definition.CombustionEmissionAmount != 0
 					|| Definition.CombustionSecondaryEmissionMaterial
@@ -2723,6 +2730,7 @@ namespace MatterFluxLua
 		int32 CoolingPerStep = 0;
 		int32 IgnitionThreshold = 0;
 		int32 CombustionEnergy = 0;
+		int32 CombustionFlameThreshold = 0;
 		int32 CombustionEmissionAmount = 0;
 		int32 CombustionSecondaryEmissionAmount = 0;
 		if (ArgumentCount == 1 && lua_istable(State, 1))
@@ -2788,6 +2796,9 @@ namespace MatterFluxLua
 				|| !ReadTableIntegerField(
 					State, TableIndex, "combustion_energy",
 					CombustionEnergy, Error)
+				|| !ReadTableIntegerField(
+					State, TableIndex, "combustion_flame_threshold",
+					CombustionFlameThreshold, Error)
 				|| !ReadTableStringField(
 					State, TableIndex, "combustion_product",
 					CombustionProduct, false, Error)
@@ -2890,6 +2901,8 @@ namespace MatterFluxLua
 			|| IgnitionThreshold > MAX_uint16
 			|| CombustionEnergy < 0
 			|| CombustionEnergy > MAX_uint16
+			|| CombustionFlameThreshold < 0
+			|| CombustionFlameThreshold > MAX_uint16
 			|| CombustionEmissionAmount < 0
 			|| CombustionEmissionAmount > MAX_uint16
 			|| CombustionSecondaryEmissionAmount < 0
@@ -2908,6 +2921,8 @@ namespace MatterFluxLua
 		Definition.CoolingPerStep = static_cast<uint16>(CoolingPerStep);
 		Definition.IgnitionThreshold = static_cast<uint16>(IgnitionThreshold);
 		Definition.CombustionEnergy = static_cast<uint16>(CombustionEnergy);
+		Definition.CombustionFlameThreshold =
+			static_cast<uint16>(CombustionFlameThreshold);
 		Definition.CombustionEmissionAmount =
 			static_cast<uint16>(CombustionEmissionAmount);
 		Definition.CombustionSecondaryEmissionAmount =

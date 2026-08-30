@@ -379,7 +379,8 @@ public:
 	/** Materializes pristine mask proxies intersecting Bounds, then returns all active sources there. */
 	void GatherFragmentSourcesInBounds(
 		const FBox& Bounds,
-		TArray<AFragment2DSourceActor*>& OutSources);
+		TArray<AFragment2DSourceActor*>& OutSources,
+		bool bFlushProxyChanges = true);
 	/** Sweeps only fixed authored sources; characters and detached fragments are excluded. */
 	bool SweepFixedFragmentSource(
 		const FVector& Start,
@@ -1281,7 +1282,7 @@ private:
 	/** 每帧最多提交的材料-Source 接触反应，防止大面积泄漏触发切割尖峰。 */
 	UPROPERTY(EditAnywhere, Category = "Playable World|Material Simulation",
 		meta = (ClampMin = "1", ClampMax = "64"))
-	int32 MaxLocalMaterialCommitsPerFrame = 8;
+	int32 MaxLocalMaterialCommitsPerFrame = 4;
 	bool bMaterialVisualizationDirty = false;
 	bool bMaterialVisualizationDeferredForStreaming = false;
 	float ReactionProxyFlushAccumulator = 0.0f;

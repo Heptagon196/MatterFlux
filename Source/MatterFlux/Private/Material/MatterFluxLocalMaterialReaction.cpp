@@ -789,11 +789,17 @@ bool FLocalMaterialReactionKernel::Evaluate(
 			OutError = TEXT("reaction output has no thermal definition");
 			return false;
 		}
-		if (Context.bApplyCooling && Thermal->CoolingPerStep > 0)
+		if (Context.bApplyCooling
+			&& Thermal->CoolingPerStep > 0
+			&& State.Energy > Thermal->DefaultEnergy)
 		{
+			const int32 CoolingDelta = FMath::Min<int32>(
+				Thermal->CoolingPerStep,
+				static_cast<int32>(State.Energy)
+					- static_cast<int32>(Thermal->DefaultEnergy));
 			ApplySpecificEnergyDelta(
 				State,
-				-static_cast<int32>(Thermal->CoolingPerStep),
+				-CoolingDelta,
 				OutBatch.ExplicitEnergyDelta);
 		}
 	}

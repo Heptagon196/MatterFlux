@@ -114,6 +114,11 @@ public:
 	int32 GetTotalMaterialEmissionCount() const { return 0; }
 	/** Legacy object reaction payload was removed; Volume state uses the world Fast Array. */
 	int32 GetReplicatedReactionByteCount() const { return 0; }
+	/** Cheap scheduler query; sparse fields are the only non-ambient reaction work. */
+	bool HasNonEnvironmentMaterialVolumeEnergy() const
+	{
+		return !MaterialVolumeFields.EnergyOverrides.IsEmpty();
+	}
 	bool IsMaterialHot() const;
 	/** Stable mask-derived bounds used by world simulation indexes. */
 	FBox GetCanonicalWorldBounds() const;
@@ -248,6 +253,8 @@ protected:
 	void EndAggregateSeparationGracePeriod();
 	void ApplySourceMaterial();
 	void RebuildMaterialVisualization();
+	void RefreshMaterialReactionVisualization();
+	void ApplyMaterialReactionVisualProjection(const TArray<uint8>& HotCells);
 	void RebuildOutputMesh(const TArray<uint8>& OutputCells, FName OutputMaterialId);
 	void EnsureReactionVisualComponents();
 	void MarkSharedSmokeVisualizationDirty() const;

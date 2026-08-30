@@ -63,6 +63,8 @@ struct FMatterFluxMaterialDefinition
 	FName CombustionProduct = TEXT("empty");
 	/** 燃烧产物获得的比能；0 表示保留点燃瞬间的能量。 */
 	uint16 CombustionEnergy = 0;
+	/** 高能燃烧产物仍投影火焰的最低比能；0 表示使用点燃阈值。 */
+	uint16 CombustionFlameThreshold = 0;
 	/** 燃烧时排放的普通材料；empty 表示不排放。 */
 	FName CombustionEmissionMaterial = TEXT("empty");
 	/** 每次点燃产生的显式普通材料排放量；不从满格固体 Amount 扣除。 */

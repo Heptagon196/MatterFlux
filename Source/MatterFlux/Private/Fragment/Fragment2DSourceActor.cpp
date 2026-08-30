@@ -1342,7 +1342,7 @@ bool AFragment2DSourceActor::CommitMaterialVolumeCellEnergy(
 	if (bCommitted)
 	{
 		PublishReplicatedMaterialVolumeState();
-		RebuildMaterialVisualization();
+		RefreshMaterialReactionVisualization();
 		MarkSharedSmokeVisualizationDirty();
 		ForceNetUpdate();
 	}
@@ -1391,9 +1391,19 @@ bool AFragment2DSourceActor::CommitMaterialVolumeCellState(
 	{
 		MaterialVolumeFields.SetEnergy(VolumeCell, After.Energy);
 	}
+	const bool bTopologyChanged = !MaterialVolumeTopology.IsSet()
+		|| Candidate.TopologyRevision
+			!= MaterialVolumeTopology->TopologyRevision;
 	MaterialVolumeTopology = MoveTemp(Candidate);
 	PublishReplicatedMaterialVolumeState();
-	RebuildMaterialVisualization();
+	if (bTopologyChanged)
+	{
+		RebuildMaterialVisualization();
+	}
+	else
+	{
+		RefreshMaterialReactionVisualization();
+	}
 	MarkSharedSmokeVisualizationDirty();
 	ForceNetUpdate();
 	return true;
@@ -1499,10 +1509,20 @@ void AFragment2DSourceActor::CommitPreparedMaterialVolumeState(
 	FMaterialVolumeFields&& Fields)
 {
 	check(Topology.IsValid() && Fields.IsValid());
+	const bool bTopologyChanged = !MaterialVolumeTopology.IsSet()
+		|| Topology.TopologyRevision
+			!= MaterialVolumeTopology->TopologyRevision;
 	MaterialVolumeTopology = MoveTemp(Topology);
 	MaterialVolumeFields = MoveTemp(Fields);
 	PublishReplicatedMaterialVolumeState();
-	RebuildMaterialVisualization();
+	if (bTopologyChanged)
+	{
+		RebuildMaterialVisualization();
+	}
+	else
+	{
+		RefreshMaterialReactionVisualization();
+	}
 	MarkSharedSmokeVisualizationDirty();
 	ForceNetUpdate();
 }
@@ -1591,7 +1611,10 @@ void AFragment2DSourceActor::OnRep_ProceduralSource()
 
 void AFragment2DSourceActor::PublishReplicatedMaterialVolumeState()
 {
-	if (!HasAuthority() || !SourceId.IsValid() || !MaterialVolumeTopology.IsSet())
+	if (!HasAuthority()
+		|| GetNetMode() == NM_Standalone
+		|| !SourceId.IsValid()
+		|| !MaterialVolumeTopology.IsSet())
 	{
 		return;
 	}
@@ -1864,7 +1887,24 @@ void AFragment2DSourceActor::RebuildMaterialVisualization()
 	RebuildSourceMesh(&BaseCells);
 	RebuildOutputMesh(OutputCells, OutputMaterialId);
 	ApplySourceCollisionState();
+	ApplyMaterialReactionVisualProjection(HotCells);
+}
 
+void AFragment2DSourceActor::RefreshMaterialReactionVisualization()
+{
+	EnsureReactionVisualComponents();
+	TArray<uint8> OutputCells;
+	TArray<uint8> HotCells;
+	FName OutputMaterialId = NAME_None;
+	uint16 IgnitionThreshold = 0;
+	BuildMaterialProjection(
+		OutputCells, HotCells, OutputMaterialId, IgnitionThreshold);
+	ApplyMaterialReactionVisualProjection(HotCells);
+}
+
+void AFragment2DSourceActor::ApplyMaterialReactionVisualProjection(
+	const TArray<uint8>& HotCells)
+{
 	const int32 Width = GetMaskWidth();
 	const int32 Height = GetMaskHeight();
 	const float CellSize = GetCellSize();
@@ -2145,8 +2185,6 @@ bool AFragment2DSourceActor::BuildMaterialProjection(
 		}
 		FName MaterialId = NAME_None;
 		Program.TryGetMaterialId(MaterialIndex, MaterialId);
-		const FMatterFluxMaterialDefinition* CurrentDefinition =
-			Registry->Materials.Find(MaterialId);
 		if (MaterialIndex != SourceMaterialIndex)
 		{
 			OutOutputCells[Index] = 1;
@@ -2156,25 +2194,9 @@ bool AFragment2DSourceActor::BuildMaterialProjection(
 			}
 		}
 		const uint16 Energy = MaterialVolumeFields.GetEnergy(Cell);
-		uint16 CellFlameThreshold = CurrentDefinition
-			? CurrentDefinition->IgnitionThreshold : 0;
-		// A hot, solid combustion residue (wood -> charcoal) is visibly burning
-		// only near its authored combustion energy. The remaining lower heat can
-		// still propagate without being rendered as a permanent flame. Powder ash
-		// is inert and never inherits the original leaf threshold.
-		if (CellFlameThreshold == 0
-			&& SourceDefinition
-			&& SourceDefinition->CombustionProduct == MaterialId
-			&& CurrentDefinition
-			&& CurrentDefinition->Phase
-				== EMatterFluxMaterialPhase::StaticSolid)
-		{
-			CellFlameThreshold = FMath::Max<uint16>(
-				SourceDefinition->IgnitionThreshold,
-				static_cast<uint16>(FMath::Max(
-					static_cast<int32>(SourceDefinition->CombustionEnergy) - 100,
-					0)));
-		}
+		const uint16 CellFlameThreshold =
+			FLocalMaterialReactionProgram::ResolveVisibleFlameThreshold(
+				*Registry, MaterialId, SourceMaterialId);
 		if (Energy > MaterialVolumeFields.EnvironmentEnergy
 			&& CellFlameThreshold > 0
 			&& Energy >= CellFlameThreshold)

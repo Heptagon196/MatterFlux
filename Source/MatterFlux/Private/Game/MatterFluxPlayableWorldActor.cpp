@@ -1196,6 +1196,7 @@ void AMatterFluxPlayableWorldActor::Tick(const float DeltaSeconds)
 	SCOPE_CYCLE_COUNTER(STAT_MatterFluxWorldTick);
 	Super::Tick(DeltaSeconds);
 	FMatterFluxContentRegistryPtr MaterialRegistry;
+	bool bResolvedPendingMaterialContacts = false;
 	// A projectile deposit records the Source face it geometrically hit. Resolve
 	// that authored contact before any streaming/proxy flush can replace or
 	// unregister the current Source projection, and before the liquid solver can
@@ -1211,6 +1212,7 @@ void AMatterFluxPlayableWorldActor::Tick(const float DeltaSeconds)
 		if (MaterialRegistry.IsValid())
 		{
 			ResolveMaterialInteractions(*MaterialRegistry);
+			bResolvedPendingMaterialContacts = true;
 		}
 	}
 	if (bReplicatedFragmentSourceStatesDirty)
@@ -1464,8 +1466,20 @@ void AMatterFluxPlayableWorldActor::Tick(const float DeltaSeconds)
 			}
 		}
 	}
+	bool bHasStaticSourceReactionWork = false;
+	for (const TPair<FGuid, TObjectPtr<AFragment2DSourceActor>>& Pair
+		: GeneratedFragmentSources)
+	{
+		if (IsValid(Pair.Value)
+			&& !Pair.Value->IsActorBeingDestroyed()
+			&& Pair.Value->HasNonEnvironmentMaterialVolumeEnergy())
+		{
+			bHasStaticSourceReactionWork = true;
+			break;
+		}
+	}
 	const bool bHasLocalVolumeReactionWork =
-		!GeneratedFragmentSources.IsEmpty() || bHasDynamicCarrierReactionWork;
+		bHasStaticSourceReactionWork || bHasDynamicCarrierReactionWork;
 	if (bHasLocalVolumeReactionWork)
 	{
 		LocalMaterialReactionAccumulator = FMath::Min(
@@ -1477,7 +1491,10 @@ void AMatterFluxPlayableWorldActor::Tick(const float DeltaSeconds)
 		{
 			LocalMaterialReactionAccumulator = 0.0f;
 			++LocalMaterialReactionStep;
-			ResolveMaterialInteractions(*MaterialRegistry);
+			if (!bResolvedPendingMaterialContacts)
+			{
+				ResolveMaterialInteractions(*MaterialRegistry);
+			}
 		}
 	}
 	else
@@ -3126,6 +3143,7 @@ void AMatterFluxPlayableWorldActor::AdvanceAirborneMaterialParticles(
 			MaximumGravityScale)
 		&& AirborneBounds.GetExtent().GetMax() <= 10000.0f;
 	TArray<AFragment2DSourceActor*> FixedSourceCandidates;
+	bool bUseSharedFixedSourceCandidates = false;
 	bool bMayHitDynamicPhysics = true;
 	if (bHasCompactAirborneBounds)
 	{
@@ -3134,7 +3152,36 @@ void AMatterFluxPlayableWorldActor::AdvanceAirborneMaterialParticles(
 			+ FMath::Abs(GravityZ) * MaximumGravityScale
 				* FMath::Square(FMath::Clamp(DeltaSeconds, 0.0f, 0.10f));
 		const FBox SweepBounds = AirborneBounds.ExpandBy(BroadphaseExpansion);
-		GatherFragmentSourcesInBounds(SweepBounds, FixedSourceCandidates);
+		// Query the registered spatial index once without materializing every
+		// pristine logical Source covered by a widely distributed particle batch.
+		// Sparse candidate sets are cheaper to share; dense sets stay local per
+		// particle so forest-scale bounds do not become a Cartesian scan.
+		if (UFragmentSimulationSubsystem* FragmentSubsystem =
+			World->GetSubsystem<UFragmentSimulationSubsystem>())
+		{
+			FragmentSubsystem->GatherSourcesInBounds(
+				SweepBounds, FixedSourceCandidates);
+		}
+		constexpr int32 MaximumSharedFixedSourceCandidates = 64;
+		if (FixedSourceCandidates.Num()
+			<= MaximumSharedFixedSourceCandidates)
+		{
+			TArray<const MatterFlux::PlayableLevel::FLevelFragmentSource*>
+				LogicalCandidates;
+			GatherLogicalFragmentSourceCandidates(SweepBounds, LogicalCandidates);
+			bUseSharedFixedSourceCandidates =
+				FixedSourceCandidates.Num() + LogicalCandidates.Num()
+					<= MaximumSharedFixedSourceCandidates;
+			if (bUseSharedFixedSourceCandidates && !LogicalCandidates.IsEmpty())
+			{
+				GatherFragmentSourcesInBounds(
+					SweepBounds, FixedSourceCandidates, false);
+			}
+		}
+		if (!bUseSharedFixedSourceCandidates)
+		{
+			FixedSourceCandidates.Reset();
+		}
 
 		FCollisionObjectQueryParams BroadphaseObjectQuery;
 		BroadphaseObjectQuery.AddObjectTypesToQuery(ECC_PhysicsBody);
@@ -3163,25 +3210,50 @@ void AMatterFluxPlayableWorldActor::AdvanceAirborneMaterialParticles(
 	// grains are still independent facts, so amortize their canonical handoff
 	// across a short settling window instead of performing thousands of stable-
 	// surface searches and dirty-neighborhood wakes in one game-thread frame.
-	constexpr int32 MaximumPowderSurfaceTransfersPerFrame = 128;
+	// Keep the expensive particle-to-canonical-surface handoff inside a stable
+	// frame budget. At 60 Hz this retires 960 grains/second, so large powder
+	// spells settle promptly without coupling their instantaneous contact count
+	// to a game-thread hitch.
+	const int32 MaximumPowderSurfaceTransfersPerFrame = FMath::Clamp(
+		FMath::FloorToInt(FMath::Max(DeltaSeconds, 0.0f) * 960.0f),
+		8,
+		16);
+	const int32 MaximumNonPowderSurfaceTransfersPerFrame = FMath::Clamp(
+		FMath::FloorToInt(FMath::Max(DeltaSeconds, 0.0f) * 120.0f),
+		1,
+		2);
+	int32 RemainingNonPowderSurfaceTransfers =
+		MaximumNonPowderSurfaceTransfersPerFrame;
 	int32 RemainingPowderSurfaceTransfers =
 		MaximumPowderSurfaceTransfersPerFrame;
 	constexpr int32 MaximumComplexPowderSurfaceTransfersPerFrame = 8;
 	int32 RemainingComplexPowderSurfaceTransfers =
 		MaximumComplexPowderSurfaceTransfersPerFrame;
 	TSet<FIntPoint> AirbornePowderDestinationCells;
+	// Dense Source regions cannot share one forest-wide candidate array, but
+	// querying the same spatial index independently for thousands of neighbouring
+	// particles is equally wasteful. Cache bounded three-dimensional bins for this
+	// advance; the exact particle sweep still filters the cached candidates.
+	const float FixedSourceCandidateBinSize = FMath::Max(
+		MaterialSimulationCellSize * 4.0f,
+		200.0f);
+	TMap<FIntVector, TArray<AFragment2DSourceActor*>>
+		FixedSourceCandidatesByBin;
 	const int32 Transferred = MaterialSimulation->AdvanceAirborneParticles(
 		DeltaSeconds,
 		[this,
 			World,
 			GravityZ,
-			bHasCompactAirborneBounds,
+			bUseSharedFixedSourceCandidates,
 			bMayHitDynamicPhysics,
 			&FixedSourceCandidates,
 			&PendingSubmergedPowderExchanges,
+			&RemainingNonPowderSurfaceTransfers,
 			&RemainingPowderSurfaceTransfers,
 			&RemainingComplexPowderSurfaceTransfers,
 			&AirbornePowderDestinationCells,
+			FixedSourceCandidateBinSize,
+			&FixedSourceCandidatesByBin,
 			&RecordSettledSurface](
 			MatterFlux::Material::FAirborneParticle& Particle,
 			const float StepSeconds)
@@ -3191,6 +3263,25 @@ void AMatterFluxPlayableWorldActor::AdvanceAirborneMaterialParticles(
 			Particle.Velocity.Z +=
 				GravityZ * Particle.GravityScale * StepSeconds;
 			const FVector End = Start + Particle.Velocity * StepSeconds;
+			const FMovementMediumDefinition* ImpactMedium =
+				MaterialMovementMedia.Find(Particle.MaterialId);
+			const bool bIsPowderImpact = ImpactMedium
+				&& ImpactMedium->Phase == EMatterFluxMaterialPhase::Powder;
+			// A zero-displacement element cannot cross a new contact boundary. Keep
+			// it airborne until its authored lifetime expires instead of repeating
+			// source/material/physics/terrain sweeps whose segment is a point. The
+			// expiry frame still executes the canonical material handoff below.
+			const bool bStationary =
+				Start.Equals(End, UE_KINDA_SMALL_NUMBER);
+			if (bStationary
+				&& (Particle.RemainingLifetime > 0.0f
+					|| (bIsPowderImpact
+						? RemainingPowderSurfaceTransfers <= 0
+						: RemainingNonPowderSurfaceTransfers <= 0)))
+			{
+				Particle.WorldPosition = End;
+				return false;
+			}
 
 			bool bHasImpact = false;
 			float BestDistanceSquared = MAX_flt;
@@ -3232,16 +3323,77 @@ void AMatterFluxPlayableWorldActor::AdvanceAirborneMaterialParticles(
 			FVector FixedImpactLocation;
 			FVector FixedImpactNormal;
 			AFragment2DSourceActor* FixedSource = nullptr;
-			const bool bHitFixedSource = bHasCompactAirborneBounds
-				? SweepFixedFragmentSourceCandidates(
-					FixedSourceCandidates,
-					Start,
-					End,
-					Particle.Radius,
-					FixedImpactLocation,
-					FixedImpactNormal,
-					FixedSource)
-				: SweepFixedFragmentSource(
+			TArray<AFragment2DSourceActor*> LocalFixedSourceCandidates;
+			const TArray<AFragment2DSourceActor*>* SweepCandidates =
+				&FixedSourceCandidates;
+			if (!bUseSharedFixedSourceCandidates)
+			{
+				FBox ParticleSweepBounds(ForceInit);
+				ParticleSweepBounds += Start;
+				ParticleSweepBounds += End;
+				ParticleSweepBounds = ParticleSweepBounds.ExpandBy(
+					FMath::Max(Particle.Radius, 0.0f));
+				const FIntVector MinimumBin(
+					FMath::FloorToInt(ParticleSweepBounds.Min.X
+						/ FixedSourceCandidateBinSize),
+					FMath::FloorToInt(ParticleSweepBounds.Min.Y
+						/ FixedSourceCandidateBinSize),
+					FMath::FloorToInt(ParticleSweepBounds.Min.Z
+						/ FixedSourceCandidateBinSize));
+				const FIntVector MaximumBin(
+					FMath::FloorToInt(ParticleSweepBounds.Max.X
+						/ FixedSourceCandidateBinSize),
+					FMath::FloorToInt(ParticleSweepBounds.Max.Y
+						/ FixedSourceCandidateBinSize),
+					FMath::FloorToInt(ParticleSweepBounds.Max.Z
+						/ FixedSourceCandidateBinSize));
+				for (int32 BinZ = MinimumBin.Z; BinZ <= MaximumBin.Z; ++BinZ)
+				{
+					for (int32 BinY = MinimumBin.Y; BinY <= MaximumBin.Y; ++BinY)
+					{
+						for (int32 BinX = MinimumBin.X; BinX <= MaximumBin.X; ++BinX)
+						{
+							const FIntVector Bin(BinX, BinY, BinZ);
+							TArray<AFragment2DSourceActor*>* BinCandidates =
+								FixedSourceCandidatesByBin.Find(Bin);
+							if (!BinCandidates)
+							{
+								TArray<AFragment2DSourceActor*> Gathered;
+								const FVector BinMinimum(
+									static_cast<double>(BinX)
+										* FixedSourceCandidateBinSize,
+									static_cast<double>(BinY)
+										* FixedSourceCandidateBinSize,
+									static_cast<double>(BinZ)
+										* FixedSourceCandidateBinSize);
+								GatherFragmentSourcesInBounds(
+									FBox(
+										BinMinimum,
+										BinMinimum + FVector(
+											FixedSourceCandidateBinSize)),
+									Gathered,
+									false);
+								BinCandidates =
+									&FixedSourceCandidatesByBin.Add(
+										Bin, MoveTemp(Gathered));
+							}
+							for (AFragment2DSourceActor* Candidate : *BinCandidates)
+							{
+								if (IsValid(Candidate)
+									&& Candidate->GetCanonicalWorldBounds().Intersect(
+										ParticleSweepBounds))
+								{
+									LocalFixedSourceCandidates.AddUnique(Candidate);
+								}
+							}
+						}
+					}
+				}
+				SweepCandidates = &LocalFixedSourceCandidates;
+			}
+			const bool bHitFixedSource =
+				SweepFixedFragmentSourceCandidates(
+					*SweepCandidates,
 					Start,
 					End,
 					Particle.Radius,
@@ -3455,12 +3607,11 @@ void AMatterFluxPlayableWorldActor::AdvanceAirborneMaterialParticles(
 				}
 			}
 
-			const FMovementMediumDefinition* ImpactMedium =
-				MaterialMovementMedia.Find(Particle.MaterialId);
-			const bool bIsPowderImpact = ImpactMedium
-				&& ImpactMedium->Phase == EMatterFluxMaterialPhase::Powder;
-			const bool bHasSurfaceTransferBudget = !bIsPowderImpact
-				|| RemainingPowderSurfaceTransfers > 0;
+			const bool bHasSurfaceTransferBudget =
+				bIsPowderImpact
+					? RemainingPowderSurfaceTransfers > 0
+					: !bStationary
+						|| RemainingNonPowderSurfaceTransfers > 0;
 			bool bUsedDirectTerrainPowderTransfer = false;
 			int32 Deposited = 0;
 			// Fixed-source collision has already identified trees, walls, roofs,
@@ -3600,6 +3751,11 @@ void AMatterFluxPlayableWorldActor::AdvanceAirborneMaterialParticles(
 				if (bIsPowderImpact)
 				{
 					--RemainingPowderSurfaceTransfers;
+				}
+				else
+				{
+					RemainingNonPowderSurfaceTransfers -=
+						bStationary ? 1 : 0;
 				}
 				return true;
 			}
@@ -6224,7 +6380,8 @@ bool AMatterFluxPlayableWorldActor::ApplyMaterialStimulusToLogicalFragmentAggreg
 
 void AMatterFluxPlayableWorldActor::GatherFragmentSourcesInBounds(
 	const FBox& Bounds,
-	TArray<AFragment2DSourceActor*>& OutSources)
+	TArray<AFragment2DSourceActor*>& OutSources,
+	const bool bFlushProxyChanges)
 {
 	OutSources.Reset();
 	if (!HasAuthority() || !Bounds.IsValid)
@@ -6256,21 +6413,10 @@ void AMatterFluxPlayableWorldActor::GatherFragmentSourcesInBounds(
 		SpawnFragmentSource(*Source);
 	}
 
-	for (const TPair<FGuid, TObjectPtr<AFragment2DSourceActor>>& Pair
-		: GeneratedFragmentSources)
-	{
-		AFragment2DSourceActor* Source = Pair.Value;
-		if (IsValid(Source)
-			&& !Source->IsActorBeingDestroyed()
-			&& Source->GetCanonicalWorldBounds().Intersect(Bounds))
-		{
-			OutSources.Add(Source);
-		}
-	}
-	// Houses and other independently spawned cuttable actors register with the
-	// shared fragment subsystem rather than this world's streamed-source map.
-	// Contact chemistry must see both ownership models; AddUnique also removes
-	// streamed sources returned by both stores.
+	// Every initialized Source, including streamed sources and independently
+	// spawned houses, registers in this spatial index. Do not also scan the full
+	// GeneratedFragmentSources map: distributed airborne particles would turn
+	// that fallback into O(particles * all-sources) work.
 	if (UFragmentSimulationSubsystem* FragmentSubsystem =
 		GetWorld()
 			? GetWorld()->GetSubsystem<UFragmentSimulationSubsystem>()
@@ -6285,11 +6431,27 @@ void AMatterFluxPlayableWorldActor::GatherFragmentSourcesInBounds(
 				&& !Source->bBroken
 				&& Source->GetCanonicalWorldBounds().Intersect(Bounds))
 			{
-				OutSources.AddUnique(Source);
+				OutSources.Add(Source);
 			}
 		}
 	}
-	if (FragmentSourceProxy)
+	else
+	{
+		// The subsystem exists in normal worlds; retain a bounded correctness
+		// fallback for unusual construction-time callers.
+		for (const TPair<FGuid, TObjectPtr<AFragment2DSourceActor>>& Pair
+			: GeneratedFragmentSources)
+		{
+			AFragment2DSourceActor* Source = Pair.Value;
+			if (IsValid(Source)
+				&& !Source->IsActorBeingDestroyed()
+				&& Source->GetCanonicalWorldBounds().Intersect(Bounds))
+			{
+				OutSources.Add(Source);
+			}
+		}
+	}
+	if (bFlushProxyChanges && FragmentSourceProxy)
 	{
 		FragmentSourceProxy->FlushPendingChanges();
 	}
@@ -7117,18 +7279,24 @@ int32 AMatterFluxPlayableWorldActor::GetHotSourceCount() const
 	for (const TPair<FGuid, FFragment2DSourceStreamingState>& Pair
 		: StreamedFragmentSourceStates)
 	{
-		if (!FindFragmentSourceDefinition(Pair.Key))
+		const MatterFlux::PlayableLevel::FLevelFragmentSource* Source =
+			FindFragmentSourceDefinition(Pair.Key);
+		if (!Source)
 		{
 			continue;
 		}
 		const bool bHot = Registry.IsValid()
 			&& Pair.Value.VolumeCellStates.ContainsByPredicate(
-				[&Registry](const FFragment2DMaterialVolumeCellState& Cell)
+				[&Registry, Source](
+					const FFragment2DMaterialVolumeCellState& Cell)
 				{
-					const FMatterFluxMaterialDefinition* Material =
-						Registry->Materials.Find(Cell.MaterialId);
-					return Material && Material->IgnitionThreshold > 0
-						&& Cell.Energy >= Material->IgnitionThreshold;
+					const uint16 Threshold =
+						FLocalMaterialReactionProgram::
+							ResolveVisibleFlameThreshold(
+								*Registry,
+								Cell.MaterialId,
+								Source->MaterialId);
+					return Threshold > 0 && Cell.Energy >= Threshold;
 				});
 		if (bHot)
 		{
@@ -8231,13 +8399,15 @@ void AMatterFluxPlayableWorldActor::
 		const FMatterFluxContentRegistryPtr Registry =
 			IMatterFluxScriptRuntime::IsAvailable()
 				? IMatterFluxScriptRuntime::Get().GetActiveRegistry() : nullptr;
-		const FMatterFluxMaterialDefinition* Definition = nullptr;
+		uint16 FlameThreshold = 0;
 		if (Span && TryGetTerrainMaterialId(Span->MaterialIndex, MaterialId)
 			&& Registry.IsValid())
 		{
-			Definition = Registry->Materials.Find(MaterialId);
+			FlameThreshold =
+				FLocalMaterialReactionProgram::ResolveVisibleFlameThreshold(
+					*Registry, MaterialId);
 		}
-		if (!Definition || Pair.Value < Definition->IgnitionThreshold)
+		if (FlameThreshold == 0 || Pair.Value < FlameThreshold)
 		{
 			continue;
 		}
@@ -8457,20 +8627,26 @@ void AMatterFluxPlayableWorldActor::
 	{
 		for (TActorIterator<AFragment2DActor> It(World); It; ++It)
 		{
-			It->GatherRootMaterialVisualTransforms(
-				FlameTransforms,
-				SourceSmokeAnchors,
-				MaxVisualInstances);
+			if (It->HasNonEnvironmentMaterialVolumeEnergy())
+			{
+				It->GatherRootMaterialVisualTransforms(
+					FlameTransforms,
+					SourceSmokeAnchors,
+					MaxVisualInstances);
+			}
 		}
 	}
 	if (UWorld* World = GetWorld())
 	{
 		for (TActorIterator<AFragment2DSourceActor> It(World); It; ++It)
 		{
-			It->GatherReactionVisualTransforms(
-				FlameTransforms,
-				SourceSmokeAnchors,
-				MaxVisualInstances);
+			if (It->HasNonEnvironmentMaterialVolumeEnergy())
+			{
+				It->GatherReactionVisualTransforms(
+					FlameTransforms,
+					SourceSmokeAnchors,
+					MaxVisualInstances);
+			}
 		}
 	}
 	MatterFlux::Rendering::SynchronizeInstancesWithoutClearing(
@@ -9108,11 +9284,11 @@ bool AMatterFluxPlayableWorldActor::ApplyPersistentFragmentSourceStateToProxy(
 				OutputMaterial = Cell.MaterialId;
 			}
 		}
-		const FMatterFluxMaterialDefinition* CellMaterial = Registry.IsValid()
-			? Registry->Materials.Find(Cell.MaterialId)
-			: nullptr;
-		bHot |= CellMaterial && CellMaterial->IgnitionThreshold > 0
-			&& Cell.Energy >= CellMaterial->IgnitionThreshold;
+		const uint16 FlameThreshold = Registry.IsValid()
+			? FLocalMaterialReactionProgram::ResolveVisibleFlameThreshold(
+				*Registry, Cell.MaterialId, Definition->MaterialId)
+			: 0;
+		bHot |= FlameThreshold > 0 && Cell.Energy >= FlameThreshold;
 	}
 	if (Registry.IsValid())
 	{
@@ -9517,8 +9693,11 @@ void AMatterFluxPlayableWorldActor::ResolveMaterialInteractions(
 	int32 AcceptedReactions = 0;
 	TArray<FIntPoint> ChangedTerrainColumns;
 	TArray<FIntPoint> TopologyChangedTerrainColumns;
-	const int32 WorldSourceMaterialCommitLimit = FMath::Max(
-		1, MaxLocalMaterialCommitsPerFrame / 4);
+	// Authored projectile contacts already carry a stable geometric Source seam.
+	// Let them consume the current atomic batch before their short-lived World
+	// elements expire; the global commit ceiling still bounds total work.
+	const int32 WorldSourceMaterialCommitLimit =
+		MaxLocalMaterialCommitsPerFrame;
 	TArray<FPendingMaterialStimulus> PendingStimuli =
 		MoveTemp(PendingMaterialStimuli);
 	PendingMaterialStimuli.Reset();
@@ -9865,7 +10044,8 @@ void AMatterFluxPlayableWorldActor::ResolveMaterialInteractions(
 							++AcceptedReactions;
 							bTerrainMaterialVisualDirty = true;
 							bTerrainMaterialVisualNeedsFullRebuild = true;
-							bMaterialVisualizationDirty = true;
+							bMaterialVisualizationDirty |=
+								!(WorldAfter == WorldBefore);
 							continue;
 						}
 					}
@@ -10218,7 +10398,8 @@ void AMatterFluxPlayableWorldActor::ResolveMaterialInteractions(
 						Source->SourceId, UpdatedSourceState);
 				}
 				++AcceptedReactions;
-				bMaterialVisualizationDirty = true;
+				bMaterialVisualizationDirty |=
+					!(WorldAfter == WorldBefore);
 				if (!(WorldAfter == WorldBefore))
 				{
 					break;
@@ -10353,6 +10534,7 @@ void AMatterFluxPlayableWorldActor::ResolveMaterialInteractions(
 					WorldAfter.Amount,
 					WorldAfter.Energy);
 			}
+			bMaterialVisualizationDirty |= !(WorldAfter == WorldBefore);
 			// Contact evaluation uses a stable pre-pass snapshot. Once the
 			// particle has transformed, it cannot react with another overlapping
 			// Source from that stale snapshot in the same simulation step.
@@ -10526,9 +10708,10 @@ void AMatterFluxPlayableWorldActor::ResolveMaterialInteractions(
 					[CarrierContactPoint](const FIntVector&)
 					{
 						return CarrierContactPoint;
-					});
+				});
 				++AcceptedReactions;
-				bMaterialVisualizationDirty = true;
+				bMaterialVisualizationDirty |=
+					!(WorldAfter == WorldBefore);
 				if (!(WorldAfter == WorldBefore))
 				{
 					break;
@@ -10567,7 +10750,6 @@ void AMatterFluxPlayableWorldActor::ResolveMaterialInteractions(
 		}
 		bTerrainMaterialVisualDirty = true;
 		bTerrainMaterialVisualNeedsFullRebuild = true;
-		bMaterialVisualizationDirty = true;
 	}
 
 	// Terrain, particles and authored Sources share one atomic-commit ceiling,
@@ -10877,7 +11059,6 @@ void AMatterFluxPlayableWorldActor::ResolveMaterialInteractions(
 					});
 			}
 			++AcceptedReactions;
-			bMaterialVisualizationDirty = true;
 		}
 	}
 
@@ -10935,6 +11116,10 @@ void AMatterFluxPlayableWorldActor::ResolveMaterialInteractions(
 		if (AcceptedReactions >= InternalVolumeReactionCommitLimit)
 		{
 			break;
+		}
+		if (!Source->HasNonEnvironmentMaterialVolumeEnergy())
+		{
+			continue;
 		}
 		FMaterialVolumeInstance Instance;
 		if (!Source->BuildMaterialVolumeInstance(Instance))
@@ -11241,6 +11426,18 @@ void AMatterFluxPlayableWorldActor::ResolveMaterialInteractions(
 			{
 				continue;
 			}
+			if (!LeftSource->HasNonEnvironmentMaterialVolumeEnergy()
+				&& !RightSource->HasNonEnvironmentMaterialVolumeEnergy())
+			{
+				continue;
+			}
+			const double ContactDistance = FMath::Max(
+				LeftSource->GetCellSize(), RightSource->GetCellSize()) * 1.05;
+			if (!LeftSource->GetCanonicalWorldBounds().ExpandBy(ContactDistance)
+				.Intersect(RightSource->GetCanonicalWorldBounds()))
+			{
+				continue;
+			}
 			FMaterialVolumeInstance RightInstance;
 			TArray<FCrossVolumeCell> RightCells;
 			if (!GatherCrossVolumeCells(*RightSource, RightInstance, RightCells))
@@ -11373,10 +11570,6 @@ void AMatterFluxPlayableWorldActor::ResolveMaterialInteractions(
 			}
 			++AcceptedReactions;
 		}
-	}
-	if (AcceptedReactions > 0)
-	{
-		bMaterialVisualizationDirty = true;
 	}
 }
 

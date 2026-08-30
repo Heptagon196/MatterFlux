@@ -2504,28 +2504,13 @@ void AFragment2DActor::GatherRootMaterialVisualTransforms(
 		{
 			return;
 		}
-		const FMatterFluxMaterialDefinition* Base = Registry.IsValid()
-			? Registry->Materials.Find(State.MaterialId) : nullptr;
 		for (const FFragmentCarrierVolumeCellState& Cell
 			: State.VolumeCellStates)
 		{
-			const FMatterFluxMaterialDefinition* Current = Registry.IsValid()
-				? Registry->Materials.Find(Cell.MaterialId) : nullptr;
-			uint16 BurningThreshold = Current
-				? Current->IgnitionThreshold : 0;
-			if (BurningThreshold == 0
-				&& Base
-				&& Base->CombustionProduct == Cell.MaterialId
-				&& Current
-				&& Current->Phase
-					== EMatterFluxMaterialPhase::StaticSolid)
-			{
-				BurningThreshold = FMath::Max<uint16>(
-					Base->IgnitionThreshold,
-					static_cast<uint16>(FMath::Max(
-						static_cast<int32>(Base->CombustionEnergy) - 100,
-						0)));
-			}
+			const uint16 BurningThreshold = Registry.IsValid()
+				? FLocalMaterialReactionProgram::ResolveVisibleFlameThreshold(
+					*Registry, Cell.MaterialId, State.MaterialId)
+				: 0;
 			if (BurningThreshold == 0
 				|| Cell.Energy < BurningThreshold
 				|| Cell.Energy <= State.VolumeEnvironmentEnergy

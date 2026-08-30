@@ -34,6 +34,7 @@
 ---@field ignition_threshold? integer 点燃阈值，0 表示不可燃。
 ---@field combustion_product? MatterFluxContentId 燃烧后的普通材料；可燃材料必须指定。
 ---@field combustion_energy? integer 燃烧产物获得的比能；0 表示保留点燃瞬间能量。
+---@field combustion_flame_threshold? integer 燃烧产物继续投影可见火焰的最低比能；0 表示使用点燃阈值。
 ---@field combustion_emission_material? MatterFluxContentId 燃烧时排放的普通材料。
 ---@field combustion_emission_amount? integer 每次点燃产生的显式普通材料排放量；不从满格固体 Amount 扣除。
 ---@field combustion_secondary_emission_material? MatterFluxContentId 燃烧时同时排放的第二种普通材料。

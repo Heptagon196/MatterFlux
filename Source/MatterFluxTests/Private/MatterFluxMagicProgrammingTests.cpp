@@ -2852,6 +2852,21 @@ bool FMatterFluxSandSphereLandingFramePerformanceTest::RunTest(
 		return false;
 	}
 	MaterialWorld->Regenerate(808080);
+	// Measure the sand transaction after the same initial-entry barrier used by
+	// gameplay. Terrain mesh/collision streaming is independent work and would
+	// otherwise make this test report first-load cost as powder landing cost.
+	int32 LoadingSteps = 0;
+	while (LoadingSteps < 1200
+		&& !MaterialWorld->IsInitialWorldEntryReady())
+	{
+		MaterialWorld->Tick(0.1f);
+		++LoadingSteps;
+	}
+	if (!TestTrue(TEXT("World is fully streamed before sand timing"),
+		MaterialWorld->IsInitialWorldEntryReady()))
+	{
+		return false;
+	}
 	float TerrainZ = 0.0f;
 	MaterialWorld->TrySampleTerrainHeightAtWorldLocation(
 		FVector::ZeroVector,
@@ -2920,7 +2935,7 @@ bool FMatterFluxSandSphereLandingFramePerformanceTest::RunTest(
 		MaximumProjectileMilliseconds));
 	TestTrue(TEXT("Sand sphere finishes settling"),
 		Projectile->IsActorBeingDestroyed());
-	TestTrue(TEXT("Sand-sphere landing world frame stays below two frames"),
+	TestTrue(TEXT("Sand-sphere landing world frame stays within two frames"),
 		MaximumWorldMilliseconds < 33.34);
 	TestTrue(TEXT("Sand-sphere projection frame stays below one frame"),
 		MaximumProjectileMilliseconds < 16.67);

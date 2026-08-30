@@ -28,6 +28,8 @@ namespace MatterFlux::Material
 		int32 BodyWakeRefillDelaySteps = 8;
 		/** Target fixed-step duration of the progressive body-wake refill. */
 		int32 BodyWakeRefillDurationSteps = 16;
+		/** Deterministic dirty-cell work budget; dirty chunks rotate across steps. */
+		int32 MaxCandidateCellsPerStep = 2048;
 
 		bool IsValid() const;
 	};

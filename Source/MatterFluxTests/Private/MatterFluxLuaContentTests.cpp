@@ -489,6 +489,7 @@ content.register_material({
 	default_energy = 120, conductivity_permille = 180,
 	cooling_per_step = 3, ignition_threshold = 30000,
 	combustion_product = "charcoal", combustion_energy = 52000,
+	combustion_flame_threshold = 50000,
     combustion_emission_material = "smoke",
     combustion_emission_amount = 1,
 	combustion_secondary_emission_material = "fire",
@@ -553,6 +554,8 @@ content.register_reaction({
 			Wood.CombustionProduct, FName(TEXT("charcoal")));
 		TestEqual(TEXT("Lua combustion heat is parsed"),
 			static_cast<int32>(Wood.CombustionEnergy), 52000);
+		TestEqual(TEXT("Lua combustion flame threshold is parsed"),
+			static_cast<int32>(Wood.CombustionFlameThreshold), 50000);
 		TestEqual(TEXT("Lua secondary combustion emission is parsed"),
 			Wood.CombustionSecondaryEmissionMaterial, FName(TEXT("fire")));
 		TestEqual(TEXT("Lua secondary combustion emission amount is parsed"),

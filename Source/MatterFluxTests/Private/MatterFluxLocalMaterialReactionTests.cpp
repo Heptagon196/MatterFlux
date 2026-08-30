@@ -189,6 +189,20 @@ bool FMatterFluxLocalMaterialIsolatedCoolingTest::RunTest(
 		TestEqual(TEXT("The isolated element loses configured specific energy"),
 			static_cast<int32>(Delta->After.Energy), 49800);
 	}
+	Store.SetInitialState(World(1), { 1, 255, HotSolid.DefaultEnergy, 0 });
+	CoolingContext.CoolingElements = { World(1) };
+	FMaterialDeltaBatch AmbientBatch;
+	TestTrue(TEXT("The kernel accepts an ambient cooling check"),
+		FLocalMaterialReactionKernel::Evaluate(
+			Store,
+			{ HotSolid },
+			{},
+			{},
+			CoolingContext,
+			AmbientBatch,
+			Error));
+	TestEqual(TEXT("Cooling never drives a material below environment energy"),
+		AmbientBatch.ElementDeltas.Num(), 0);
 	return true;
 }
 

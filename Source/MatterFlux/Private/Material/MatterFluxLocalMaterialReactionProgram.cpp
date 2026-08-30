@@ -7,6 +7,63 @@ namespace
 	constexpr uint16 MaximumMaterialIndex = 0x7fffu;
 }
 
+uint16 FLocalMaterialReactionProgram::ResolveVisibleFlameThreshold(
+	const FMatterFluxContentRegistry& Registry,
+	const FName CurrentMaterialId,
+	const FName PrecursorHint)
+{
+	const FMatterFluxMaterialDefinition* Current =
+		Registry.Materials.Find(CurrentMaterialId);
+	if (!Current)
+	{
+		return 0;
+	}
+	if (Current->IgnitionThreshold > 0)
+	{
+		return Current->CombustionFlameThreshold > 0
+			? Current->CombustionFlameThreshold
+			: Current->IgnitionThreshold;
+	}
+
+	const auto GetPrecursorThreshold = [&Registry, CurrentMaterialId](
+		const FName CandidateId)
+	{
+		const FMatterFluxMaterialDefinition* Candidate =
+			Registry.Materials.Find(CandidateId);
+		return Candidate
+			&& Candidate->IgnitionThreshold > 0
+			&& Candidate->CombustionProduct == CurrentMaterialId
+				? (Candidate->CombustionFlameThreshold > 0
+					? Candidate->CombustionFlameThreshold
+					: Candidate->IgnitionThreshold)
+				: static_cast<uint16>(0);
+	};
+	if (!PrecursorHint.IsNone())
+	{
+		if (const uint16 HintThreshold =
+			GetPrecursorThreshold(PrecursorHint))
+		{
+			return HintThreshold;
+		}
+	}
+
+	// World cells do not retain precursor history. Select the lowest compatible
+	// threshold deterministically, so the same logical material state projects
+	// identically regardless of registry/map iteration order.
+	uint16 Threshold = 0;
+	for (const TPair<FName, FMatterFluxMaterialDefinition>& Pair
+		: Registry.Materials)
+	{
+		const uint16 CandidateThreshold = GetPrecursorThreshold(Pair.Key);
+		if (CandidateThreshold > 0
+			&& (Threshold == 0 || CandidateThreshold < Threshold))
+		{
+			Threshold = CandidateThreshold;
+		}
+	}
+	return Threshold;
+}
+
 bool FLocalMaterialReactionProgram::Compile(
 	const FMatterFluxContentRegistry& Registry,
 	FString& OutError)

@@ -53,6 +53,7 @@ function material.define(definition)
 		"shallow_opacity", "deep_opacity", "opacity_depth",
 		"default_energy", "conductivity_permille", "cooling_per_step",
 		"ignition_threshold", "combustion_product", "combustion_energy",
+		"combustion_flame_threshold",
 		"combustion_emission_material", "combustion_emission_amount",
 		"combustion_secondary_emission_material", "combustion_secondary_emission_amount"
 	}, "material")

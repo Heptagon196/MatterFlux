@@ -516,6 +516,7 @@ namespace MatterFlux::Material
 		TArray<FResolvedMaterial> Materials;
 		TMap<FName, uint16> MaterialIndices;
 		FLocalMaterialReactionProgram LocalReactionProgram;
+		TSet<uint32> ConfiguredReactionPairs;
 		TArray<FReactionEmission> PendingReactionEmissions;
 		int32 LocalReactionRevision = 0;
 		TMap<FIntPoint, TUniquePtr<FChunk>> Chunks;
@@ -1199,15 +1200,50 @@ namespace MatterFlux::Material
 			{
 				return false;
 			}
-			return LocalReactionProgram.GetContactRules().ContainsByPredicate(
-				[FirstMaterialIndex, SecondMaterialIndex](
-					const FLocalMaterialContactRule& Reaction)
-				{
-					return (Reaction.InputA == FirstMaterialIndex
-							&& Reaction.InputB == SecondMaterialIndex)
-						|| (Reaction.InputA == SecondMaterialIndex
-							&& Reaction.InputB == FirstMaterialIndex);
-				});
+			const uint16 Minimum = FMath::Min(
+				FirstMaterialIndex, SecondMaterialIndex);
+			const uint16 Maximum = FMath::Max(
+				FirstMaterialIndex, SecondMaterialIndex);
+			return ConfiguredReactionPairs.Contains(
+				(static_cast<uint32>(Minimum) << 16u)
+					| static_cast<uint32>(Maximum));
+		}
+
+		bool CanMaterialPairChange(
+			const FCell& First,
+			const FCell& Second) const
+		{
+			if (First.MaterialIndex == 0
+				|| Second.MaterialIndex == 0
+				|| First.MaterialIndex >= Materials.Num()
+				|| Second.MaterialIndex >= Materials.Num())
+			{
+				return false;
+			}
+			if (HasConfiguredReactionPair(
+				First.MaterialIndex, Second.MaterialIndex))
+			{
+				return true;
+			}
+			const FResolvedMaterial& FirstMaterial =
+				Materials[First.MaterialIndex];
+			const FResolvedMaterial& SecondMaterial =
+				Materials[Second.MaterialIndex];
+			const bool bCanConduct = First.Energy != Second.Energy
+				&& FMath::Min(
+					FirstMaterial.ConductivityPermille,
+					SecondMaterial.ConductivityPermille) > 0;
+			const bool bCanCool =
+				(FirstMaterial.CoolingPerStep > 0
+					&& First.Energy > FirstMaterial.DefaultEnergy)
+				|| (SecondMaterial.CoolingPerStep > 0
+					&& Second.Energy > SecondMaterial.DefaultEnergy);
+			const bool bCanIgnite =
+				(FirstMaterial.IgnitionThreshold > 0
+					&& First.Energy >= FirstMaterial.IgnitionThreshold)
+				|| (SecondMaterial.IgnitionThreshold > 0
+					&& Second.Energy >= SecondMaterial.IgnitionThreshold);
+			return bCanConduct || bCanCool || bCanIgnite;
 		}
 
 		void MarkChunkForBaselineResume(
@@ -2597,6 +2633,10 @@ namespace MatterFlux::Material
 			{
 				return false;
 			}
+			if (!CanMaterialPairChange(*FirstCell, *SecondCell))
+			{
+				return false;
+			}
 
 			const FMaterialElementAddress FirstAddress =
 				FMaterialElementAddress::MakeWorldCell(FIntVector(
@@ -2700,6 +2740,8 @@ namespace MatterFlux::Material
 			&& BodyWakeRefillDelaySteps <= 256
 			&& BodyWakeRefillDurationSteps >= 1
 			&& BodyWakeRefillDurationSteps <= 256
+			&& MaxCandidateCellsPerStep >= 256
+			&& MaxCandidateCellsPerStep <= 262144
 			&& (!bUseSurfaceTopology
 				|| (MinSurfaceCell.X < MaxSurfaceCellExclusive.X
 					&& MinSurfaceCell.Y < MaxSurfaceCellExclusive.Y));
@@ -2827,6 +2869,15 @@ namespace MatterFlux::Material
 		{
 			Impl = MakeUnique<FImpl>();
 			return false;
+		}
+		for (const FLocalMaterialContactRule& Rule
+			: Impl->LocalReactionProgram.GetContactRules())
+		{
+			const uint16 Minimum = FMath::Min(Rule.InputA, Rule.InputB);
+			const uint16 Maximum = FMath::Max(Rule.InputA, Rule.InputB);
+			Impl->ConfiguredReactionPairs.Add(
+				(static_cast<uint32>(Minimum) << 16u)
+					| static_cast<uint32>(Maximum));
 		}
 		const TArray<FIntPoint> InitialFocuses = {
 			FIntPoint::ZeroValue
@@ -6463,25 +6514,58 @@ namespace MatterFlux::Material
 		{
 			TRACE_CPUPROFILER_EVENT_SCOPE(
 				MatterFlux_MaterialStep_GatherDirtyCells);
+			TArray<FIntPoint> DirtyChunks;
 			for (const TPair<FIntPoint, TUniquePtr<FImpl::FChunk>>& Pair
 				: Impl->Chunks)
 			{
-				FImpl::FChunk& Chunk = *Pair.Value;
-				if (!Impl->IsChunkSimulated(Pair.Key)
-					|| !Chunk.HasDirtyCells())
+				if (Impl->IsChunkSimulated(Pair.Key)
+					&& Pair.Value->HasDirtyCells())
+				{
+					DirtyChunks.Add(Pair.Key);
+				}
+			}
+			DirtyChunks.Sort([](const FIntPoint A, const FIntPoint B)
+			{
+				return A.Y != B.Y ? A.Y < B.Y : A.X < B.X;
+			});
+			const int32 FirstChunk = DirtyChunks.IsEmpty()
+				? 0
+				: static_cast<int32>(Impl->Tick % DirtyChunks.Num());
+			for (int32 Offset = 0;
+				Offset < DirtyChunks.Num()
+					&& CellsToVisit.Num()
+						< Impl->Settings.MaxCandidateCellsPerStep;
+				++Offset)
+			{
+				const FIntPoint ChunkCoordinate =
+					DirtyChunks[(FirstChunk + Offset) % DirtyChunks.Num()];
+				TUniquePtr<FImpl::FChunk>* ChunkEntry =
+					Impl->Chunks.Find(ChunkCoordinate);
+				if (!ChunkEntry || !ChunkEntry->IsValid())
 				{
 					continue;
 				}
-
-				for (const int32 CellIndex : Chunk.DirtyCellIndices)
+				FImpl::FChunk* Chunk = ChunkEntry->Get();
+				const int32 RemainingBudget =
+					Impl->Settings.MaxCandidateCellsPerStep
+						- CellsToVisit.Num();
+				const int32 ConsumedDirtyCells = FMath::Min(
+					RemainingBudget, Chunk->DirtyCellIndices.Num());
+				for (int32 DirtyIndex = 0;
+					DirtyIndex < ConsumedDirtyCells;
+					++DirtyIndex)
 				{
+					const int32 CellIndex =
+						Chunk->DirtyCellIndices[DirtyIndex];
 					CellsToVisit.Add(FIntPoint(
-						Pair.Key.X * Impl->Settings.ChunkSize
+						ChunkCoordinate.X * Impl->Settings.ChunkSize
 							+ CellIndex % Impl->Settings.ChunkSize,
-						Pair.Key.Y * Impl->Settings.ChunkSize
+						ChunkCoordinate.Y * Impl->Settings.ChunkSize
 							+ CellIndex / Impl->Settings.ChunkSize));
+					Chunk->DirtyCellFlags[CellIndex] = false;
 				}
-				Chunk.ResetDirty();
+				Chunk->DirtyCellIndices.RemoveAt(
+					0, ConsumedDirtyCells, EAllowShrinking::No);
 			}
 			CellsToVisit.Sort([Tick = Impl->Tick](
 				const FIntPoint& A,
@@ -6997,7 +7081,10 @@ namespace MatterFlux::Material
 		}
 
 		TMap<FIntPoint, FImpl::FSurfacePuddleShape> SurfaceLiquidShapes;
-		if (Impl->Settings.bUseSurfaceTopology)
+		constexpr int32 MaximumRoundedPuddleCells = 256;
+		constexpr int32 MaximumPuddleClassificationCandidates = 1024;
+		if (Impl->Settings.bUseSurfaceTopology
+			&& CellsToVisit.Num() <= MaximumPuddleClassificationCandidates)
 		{
 			TRACE_CPUPROFILER_EVENT_SCOPE(
 				MatterFlux_MaterialStep_ClassifySurfaceLiquids);
@@ -7013,6 +7100,7 @@ namespace MatterFlux::Material
 				FIntPoint(1, -1)
 			};
 			TSet<FIntPoint> ClassifiedCells;
+			TSet<uint16> OversizedLiquidMaterials;
 			for (const FIntPoint Root : CellsToVisit)
 			{
 				const FImpl::FCell* RootCell = Impl->FindCell(Root);
@@ -7022,6 +7110,11 @@ namespace MatterFlux::Material
 					|| Impl->Materials[RootCell->MaterialIndex].Phase
 						!= EMatterFluxMaterialPhase::Liquid)
 				{
+					continue;
+				}
+				if (OversizedLiquidMaterials.Contains(RootCell->MaterialIndex))
+				{
+					ClassifiedCells.Add(Root);
 					continue;
 				}
 
@@ -7037,7 +7130,8 @@ namespace MatterFlux::Material
 				double WeightedY = static_cast<double>(Root.Y)
 					* RootCell->Amount;
 				for (int32 QueueIndex = 0;
-					QueueIndex < Component.Num();
+					QueueIndex < Component.Num()
+						&& Component.Num() <= MaximumRoundedPuddleCells;
 					++QueueIndex)
 				{
 					const FIntPoint Current = Component[QueueIndex];
@@ -7070,12 +7164,20 @@ namespace MatterFlux::Material
 						Maximum.Y = FMath::Max(Maximum.Y, Neighbor.Y);
 					}
 				}
+				if (Component.Num() > MaximumRoundedPuddleCells)
+				{
+					// Rounded-puddle guidance is intentionally a small-component
+					// heuristic. Once one connected component exceeds its bound,
+					// do not flood the whole lake or repeat the same partial flood
+					// for every dirty cell of that material in this fixed step.
+					OversizedLiquidMaterials.Add(RootCell->MaterialIndex);
+					continue;
+				}
 				const int32 Width = Maximum.X - Minimum.X + 1;
 				const int32 Height = Maximum.Y - Minimum.Y + 1;
 				const int8 AxisBias = Height >= Width + 2
 					? -1
 					: (Width >= Height + 2 ? 1 : 0);
-				constexpr int32 MaximumRoundedPuddleCells = 256;
 				if (Component.Num() <= MaximumRoundedPuddleCells
 					&& TotalAmount > 0)
 				{
