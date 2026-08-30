@@ -8,6 +8,7 @@
 #include "FragmentTestActors.h"
 #include "Game/MatterFluxCharacter.h"
 #include "Game/MatterFluxPlayerOperation.h"
+#include "Game/MatterFluxTwoStoreyHouseActor.h"
 #include "GameFramework/GameStateBase.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/PlayerController.h"
@@ -67,6 +68,48 @@ namespace
 			if (It->IsLocalController())
 			{
 				return *It;
+			}
+		}
+		return nullptr;
+	}
+
+	AMatterFluxTwoStoreyHouseActor* FindVisibleGeneratedHouse(
+		UWorld* World,
+		const TOptional<FVector> ExpectedLocation = TOptional<FVector>())
+	{
+		AMatterFluxTwoStoreyHouseActor* BestHouse = nullptr;
+		double BestDistanceSquared = TNumericLimits<double>::Max();
+		for (TActorIterator<AMatterFluxTwoStoreyHouseActor> It(World); It; ++It)
+		{
+			if (It->IsHidden())
+			{
+				continue;
+			}
+			const double DistanceSquared = ExpectedLocation.IsSet()
+				? FVector::DistSquared(It->GetActorLocation(), ExpectedLocation.GetValue())
+				: 0.0;
+			if (DistanceSquared < BestDistanceSquared)
+			{
+				BestHouse = *It;
+				BestDistanceSquared = DistanceSquared;
+			}
+		}
+		return BestHouse;
+	}
+
+	UProceduralMeshComponent* FindHouseWholeObjectMesh(
+		AMatterFluxTwoStoreyHouseActor* House)
+	{
+		TArray<UProceduralMeshComponent*> Meshes;
+		if (House)
+		{
+			House->GetComponents(Meshes);
+		}
+		for (UProceduralMeshComponent* Mesh : Meshes)
+		{
+			if (Mesh && Mesh->GetFName() == TEXT("CuttableWholeObjectMesh"))
+			{
+				return Mesh;
 			}
 		}
 		return nullptr;
@@ -1056,6 +1099,146 @@ namespace
 		FVector InitialHostLocation = FVector::ZeroVector;
 	};
 
+	class FVerifyRemoteHouseProjectionCommand final
+		: public IAutomationLatentCommand
+	{
+	public:
+		explicit FVerifyRemoteHouseProjectionCommand(
+			FAutomationTestBase* InTest)
+			: Test(InTest)
+			, StartedAt(FPlatformTime::Seconds())
+		{
+		}
+
+		virtual bool Update() override
+		{
+			UWorld* Host = nullptr;
+			TArray<UWorld*> Clients;
+			FindListenPIEWorlds(Host, Clients);
+			if (!Host || Clients.Num() != 1)
+			{
+				return FailOnTimeout(
+					TEXT("The house projection test did not create one listen host and one remote client."));
+			}
+
+			AMatterFluxTwoStoreyHouseActor* HostHouse =
+				FindVisibleGeneratedHouse(Host);
+			AMatterFluxTwoStoreyHouseActor* ClientHouse =
+				FindVisibleGeneratedHouse(
+					Clients[0],
+					HostHouse
+						? TOptional<FVector>(HostHouse->GetActorLocation())
+						: TOptional<FVector>());
+			if (HostHouse && ClientHouse && !bPositionedRemotePlayerAtHouse)
+			{
+				for (TActorIterator<APlayerController> It(Host); It; ++It)
+				{
+					if (It->IsLocalController() || !It->GetPawn())
+					{
+						continue;
+					}
+					It->GetPawn()->SetActorLocation(
+						HostHouse->GetActorLocation()
+							+ FVector(0.0f, 0.0f, 250.0f),
+						false,
+						nullptr,
+						ETeleportType::TeleportPhysics);
+					bPositionedRemotePlayerAtHouse = true;
+					ProjectionStartedAt = FPlatformTime::Seconds();
+					return false;
+				}
+			}
+			UProceduralMeshComponent* HostMesh =
+				FindHouseWholeObjectMesh(HostHouse);
+			UProceduralMeshComponent* ClientMesh =
+				FindHouseWholeObjectMesh(ClientHouse);
+			const int32 HostSectionCount = HostMesh
+				? HostMesh->GetNumSections() : 0;
+			const int32 ClientSectionCount = ClientMesh
+				? ClientMesh->GetNumSections() : 0;
+			bool bClientHasUpperFloorTier = false;
+			for (TActorIterator<AFragment2DSourceActor> It(Clients[0]); It; ++It)
+			{
+				bClientHasUpperFloorTier |= It->GetOwner() == ClientHouse
+					&& It->StructuralFloorTier > 0;
+			}
+			if (HostSectionCount > 0
+				&& ClientSectionCount == HostSectionCount
+				&& ClientMesh->IsVisible()
+				&& bClientHasUpperFloorTier)
+			{
+				Test->TestEqual(
+					TEXT("The remote client builds the same wall, floor, and roof mesh sections as the listen host"),
+					ClientSectionCount,
+					HostSectionCount);
+				Test->TestTrue(
+					TEXT("The remote house cuttable projection is visible"),
+					ClientMesh->IsVisible());
+				Test->TestTrue(
+					TEXT("The remote house preserves replicated upper-floor projection metadata"),
+					bClientHasUpperFloorTier);
+				return true;
+			}
+
+			if (!bPositionedRemotePlayerAtHouse
+				|| FPlatformTime::Seconds() - ProjectionStartedAt < 15.0)
+			{
+				return false;
+			}
+			int32 ClientOwnedSourceCount = 0;
+			int32 ClientTaggedSourceCount = 0;
+			int32 ClientValidLayoutCount = 0;
+			int32 ClientTotalSourceCount = 0;
+			int32 ClientHouseOwnedSourceCount = 0;
+			int32 ClientNullOwnerSourceCount = 0;
+			for (TActorIterator<AFragment2DSourceActor> It(Clients[0]); It; ++It)
+			{
+				++ClientTotalSourceCount;
+				ClientHouseOwnedSourceCount +=
+					Cast<AMatterFluxTwoStoreyHouseActor>(It->GetOwner()) ? 1 : 0;
+				ClientNullOwnerSourceCount += It->GetOwner() ? 0 : 1;
+				if (It->GetOwner() != ClientHouse)
+				{
+					continue;
+				}
+				++ClientOwnedSourceCount;
+				ClientTaggedSourceCount += It->ActorHasTag(
+					TEXT("MatterFluxHouseStructure")) ? 1 : 0;
+				ClientValidLayoutCount +=
+					It->ProceduralSource.HasValidLayout() ? 1 : 0;
+			}
+			Test->AddError(FString::Printf(
+				TEXT("Remote house projection stayed incomplete: host sections=%d, client sections=%d, client visible=%s, matched owned sources=%d, tagged sources=%d, valid layouts=%d, total sources=%d, any-house-owned sources=%d, null-owner sources=%d."),
+				HostSectionCount,
+				ClientSectionCount,
+				ClientMesh && ClientMesh->IsVisible()
+					? TEXT("true") : TEXT("false"),
+				ClientOwnedSourceCount,
+				ClientTaggedSourceCount,
+				ClientValidLayoutCount,
+				ClientTotalSourceCount,
+				ClientHouseOwnedSourceCount,
+				ClientNullOwnerSourceCount));
+			return true;
+		}
+
+	private:
+		bool FailOnTimeout(const TCHAR* Message)
+		{
+			if (FPlatformTime::Seconds() - StartedAt < 30.0)
+			{
+				return false;
+			}
+			Test->AddError(Message);
+			return true;
+		}
+
+		FAutomationTestBase* Test = nullptr;
+		double StartedAt = 0.0;
+		double ProjectionStartedAt = 0.0;
+		bool bPositionedRemotePlayerAtHouse = false;
+	};
+
 	bool RunListenServerScenario(
 		FAutomationTestBase& Test,
 		const int32 ExpectedPlayerCount,
@@ -1152,6 +1335,45 @@ namespace
 		return true;
 	}
 
+	bool RunRemoteHouseProjectionScenario(FAutomationTestBase& Test)
+	{
+		if (!Test.TestNotNull(
+			TEXT("Isolated remote-house projection map created"),
+			FAutomationEditorCommonUtils::CreateNewMap()))
+		{
+			return false;
+		}
+
+		Test.AddExpectedError(
+			TEXT("FNetGUIDCache::SupportsObject: Level /Temp/"),
+			EAutomationExpectedErrorFlags::Contains,
+			-1,
+			false);
+		Test.AddExpectedError(
+			TEXT("RegisterNetGUID_Client: Guid with pathname"),
+			EAutomationExpectedErrorFlags::Contains,
+			-1,
+			false);
+
+		FRequestPlaySessionParams RequestParams;
+		ULevelEditorPlaySettings* PlaySettings =
+			NewObject<ULevelEditorPlaySettings>();
+		PlaySettings->SetPlayNetMode(EPlayNetMode::PIE_ListenServer);
+		PlaySettings->SetRunUnderOneProcess(true);
+		PlaySettings->SetPlayNumberOfClients(2);
+		PlaySettings->bLaunchSeparateServer = false;
+		RequestParams.EditorPlaySettings = PlaySettings;
+		FAutomationEditorCommonUtils::SetPlaySessionStartToActiveViewport(
+			RequestParams);
+		PlaySettings->AddToRoot();
+		ADD_LATENT_AUTOMATION_COMMAND(
+			FStartPIEForAutomationCommand(RequestParams));
+		ADD_LATENT_AUTOMATION_COMMAND(
+			FVerifyRemoteHouseProjectionCommand(&Test));
+		ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+		return true;
+	}
+
 	bool RunStandingCutFragmentCameraScenario(FAutomationTestBase& Test)
 	{
 		if (!Test.TestNotNull(
@@ -1219,6 +1441,18 @@ bool FMatterFluxFourPlayerListenServerPIETest::RunTest(
 		*this,
 		4,
 		TEXT("ListenHostThreeClientsAutomation"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMatterFluxRemoteHouseProjectionPIETest,
+	"MatterFlux.Playable.House.Network.RemoteClientBuildsVisibleCuttableProjection",
+	EAutomationTestFlags::EditorContext
+		| EAutomationTestFlags::ProductFilter)
+
+bool FMatterFluxRemoteHouseProjectionPIETest::RunTest(
+	const FString& Parameters)
+{
+	return RunRemoteHouseProjectionScenario(*this);
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(

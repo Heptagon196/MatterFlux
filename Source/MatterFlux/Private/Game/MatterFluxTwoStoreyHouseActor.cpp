@@ -740,7 +740,12 @@ void AMatterFluxTwoStoreyHouseActor::SpawnCuttableStructureSources()
 					? EMatterFluxMaterialStructuralRole::Furniture
 					: EMatterFluxMaterialStructuralRole::Wall;
 		if (!Source->InitializeFromProceduralMask(
-			Mask, SourceId, Group.Color, MaterialId, StructuralRole))
+			Mask,
+			SourceId,
+			Group.Color,
+			MaterialId,
+			StructuralRole,
+			Group.FloorTier))
 		{
 			Source->Destroy();
 			return;
@@ -1059,8 +1064,7 @@ void AMatterFluxTwoStoreyHouseActor::RebuildCuttableWholeObjectMesh(
 			LocalTransform,
 			Source->GetCellSize(),
 			Source->StructuralRole,
-			Source->ActorHasTag(TEXT("MatterFluxHouseGroup.UpperFloor"))
-				? 1 : 0});
+			Source->StructuralFloorTier});
 	}
 	SourceViews.Sort([](const FSourceView& A, const FSourceView& B)
 	{
@@ -1326,9 +1330,11 @@ void AMatterFluxTwoStoreyHouseActor::
 	for (TActorIterator<AFragment2DSourceActor> It(GetWorld()); It; ++It)
 	{
 		AFragment2DSourceActor* Source = *It;
+		// AActor::Tags are server-local metadata and do not replicate. Ownership
+		// is the stable network association; every Source owned by this house is
+		// one of its cuttable structure projections.
 		if (!IsValid(Source)
 			|| Source->GetOwner() != this
-			|| !Source->ActorHasTag(TEXT("MatterFluxHouseStructure"))
 			|| CuttableStructureSources.Contains(Source))
 		{
 			continue;

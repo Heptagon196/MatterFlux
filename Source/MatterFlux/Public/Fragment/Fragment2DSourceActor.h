@@ -42,7 +42,8 @@ public:
 		const FLinearColor& InColor = FLinearColor::White,
 		FName InMaterialId = NAME_None,
 		EMatterFluxMaterialStructuralRole InStructuralRole =
-			EMatterFluxMaterialStructuralRole::None);
+			EMatterFluxMaterialStructuralRole::None,
+		int32 InStructuralFloorTier = 0);
 	/** Restore an existing procedural source to its pristine mask under a new ID. */
 	bool ResetForStreamingReuse(const FGuid& InSourceId);
 	bool CaptureStreamingState(
@@ -163,6 +164,10 @@ public:
 	UPROPERTY(Replicated, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Material")
 	EMatterFluxMaterialStructuralRole StructuralRole =
 		EMatterFluxMaterialStructuralRole::None;
+
+	/** Stable projection tier for multi-floor structures; replicated with spawn state. */
+	UPROPERTY(Replicated, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment|Material")
+	int32 StructuralFloorTier = 0;
 
 	UPROPERTY(Replicated, VisibleAnywhere, BlueprintReadOnly, Category = "Fragment")
 	int32 Revision = 0;

@@ -170,6 +170,10 @@ void AFragment2DSourceActor::GetLifetimeReplicatedProps(TArray<FLifetimeProperty
 		AFragment2DSourceActor,
 		StructuralRole,
 		COND_InitialOnly);
+	DOREPLIFETIME_CONDITION(
+		AFragment2DSourceActor,
+		StructuralFloorTier,
+		COND_InitialOnly);
 	DOREPLIFETIME(AFragment2DSourceActor, Revision);
 	DOREPLIFETIME(AFragment2DSourceActor, bBroken);
 	DOREPLIFETIME_CONDITION(
@@ -221,7 +225,8 @@ bool AFragment2DSourceActor::InitializeFromProceduralMask(
 	const FGuid& InSourceId,
 	const FLinearColor& InColor,
 	const FName InMaterialId,
-	const EMatterFluxMaterialStructuralRole InStructuralRole)
+	const EMatterFluxMaterialStructuralRole InStructuralRole,
+	const int32 InStructuralFloorTier)
 {
 	const bool bColorValid =
 		FMath::IsFinite(InColor.R)
@@ -239,6 +244,7 @@ bool AFragment2DSourceActor::InitializeFromProceduralMask(
 	SourceId = InSourceId;
 	SourceMaterialId = InMaterialId;
 	StructuralRole = InStructuralRole;
+	StructuralFloorTier = FMath::Max(0, InStructuralFloorTier);
 	FragmentColor = InColor;
 	RuntimeMask = ProceduralSource.SolidMask;
 	if (!MatterFlux::FragmentGeometry::BuildSupportAnchorMask(
@@ -254,6 +260,7 @@ bool AFragment2DSourceActor::InitializeFromProceduralMask(
 		SourceId.Invalidate();
 		SourceMaterialId = NAME_None;
 		StructuralRole = EMatterFluxMaterialStructuralRole::None;
+		StructuralFloorTier = 0;
 		RefreshPresenceRegistration();
 		return false;
 	}
@@ -281,6 +288,7 @@ bool AFragment2DSourceActor::InitializeFromProceduralMask(
 		SourceId.Invalidate();
 		SourceMaterialId = NAME_None;
 		StructuralRole = EMatterFluxMaterialStructuralRole::None;
+		StructuralFloorTier = 0;
 		FragmentColor = FLinearColor::White;
 		RefreshPresenceRegistration();
 		return false;
