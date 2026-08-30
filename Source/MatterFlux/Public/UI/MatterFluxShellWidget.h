@@ -31,9 +31,9 @@ class MATTERFLUX_API UMatterFluxShellWidget : public UUserWidget
 	GENERATED_BODY()
 
 public:
-	// Multiplayer is intentionally kept behind one compile-time presentation
-	// gate while its unfinished implementation remains available for later work.
-	static constexpr bool IsMultiplayerEntryEnabled() { return false; }
+	// Keep multiplayer availability centralized so the menu and its guarded
+	// actions cannot drift apart.
+	static constexpr bool IsMultiplayerEntryEnabled() { return true; }
 	static FName GetStoryMapId() { return TEXT("story.paper_magic"); }
 	static int32 ResolveOwnedCoinQuantity(
 		const AMatterFluxPlayerState* PlayerState);

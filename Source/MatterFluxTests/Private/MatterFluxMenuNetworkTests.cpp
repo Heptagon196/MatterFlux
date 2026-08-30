@@ -206,36 +206,35 @@ bool FMatterFluxFrontEndNavigationCannotEnterGameplayTest::RunTest(
 		Shell->GetView(),
 		EMatterFluxShellView::SinglePlayerMenu);
 
+	TestTrue(
+		TEXT("Multiplayer entry is enabled for this build"),
+		UMatterFluxShellWidget::IsMultiplayerEntryEnabled());
 	Shell->ShowMultiplayerMenu();
 	TestEqual(
-		TEXT("Disabled multiplayer navigation returns to the start menu"),
+		TEXT("Multiplayer navigation opens the multiplayer menu"),
 		Shell->GetView(),
-		EMatterFluxShellView::StartMenu);
-	TestEqual(
-		TEXT("Disabled multiplayer navigation explains why it is unavailable"),
-		Shell->GetTransientNotice(),
-		FString(TEXT("联机模式暂未开放")));
+		EMatterFluxShellView::MultiplayerMenu);
 
 	Shell->ShowCreateRoomMenu();
 	TestEqual(
-		TEXT("Create-room cannot bypass the multiplayer entry gate"),
+		TEXT("Create-room navigation opens the host flow"),
 		Shell->GetView(),
-		EMatterFluxShellView::StartMenu);
-	Shell->ShowJoinRoomMenu();
-	TestEqual(
-		TEXT("Join-room cannot bypass the multiplayer entry gate"),
-		Shell->GetView(),
-		EMatterFluxShellView::StartMenu);
+		EMatterFluxShellView::CreateRoomMenu);
 	Shell->RequestHostRoom();
 	TestEqual(
-		TEXT("Host requests cannot bypass the multiplayer entry gate"),
+		TEXT("A host request without a controller remains in the host flow"),
 		Shell->GetView(),
-		EMatterFluxShellView::StartMenu);
+		EMatterFluxShellView::CreateRoomMenu);
+	Shell->ShowJoinRoomMenu();
+	TestEqual(
+		TEXT("Join-room navigation opens the join flow"),
+		Shell->GetView(),
+		EMatterFluxShellView::JoinRoomMenu);
 	Shell->RequestJoinRoom();
 	TestEqual(
-		TEXT("Join requests cannot bypass the multiplayer entry gate"),
+		TEXT("A join request without a controller remains in the join flow"),
 		Shell->GetView(),
-		EMatterFluxShellView::StartMenu);
+		EMatterFluxShellView::JoinRoomMenu);
 	TestTrue(
 		TEXT("All non-launching button paths finish in front-end context"),
 		Shell->IsStartMenuOpen());
